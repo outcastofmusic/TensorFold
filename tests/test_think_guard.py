@@ -150,9 +150,21 @@ def test_a_failed_check_ends_the_checks():
 
 
 def test_the_state_keeps_the_newest_reasoning():
-    state = guard_state("q", "é" * 20000 + "end")
+    state = guard_state("q", "é" * 25000 + "end")
     assert state.startswith("User's request:\nq\n\nReasoning so far:\n[earlier reasoning left out]\n")
     assert state.endswith("end") and "�" not in state
+
+
+def test_past_the_limit_the_state_still_extends_the_last_one_until_the_next_drop():
+    """Old reasoning goes in whole steps, so a decision session can resume between drops."""
+
+    from tensorfold.engine.think_guard import DROP_STEP, MAX_REASONING_BYTES
+
+    long = "x" * (MAX_REASONING_BYTES + 100)
+    one, two = guard_state("q", long), guard_state("q", long + "A further paragraph.\n\n")
+    assert two.startswith(one) and len(one.encode()) < MAX_REASONING_BYTES + 100
+    after_drop = guard_state("q", long + "y" * DROP_STEP)
+    assert not after_drop.startswith(one) and after_drop.endswith("y")
 
 
 # --- through the server: real check threads, a decision server over HTTP ---------------------------------------
@@ -161,13 +173,14 @@ class Decisions:
     """A SystemOne server: yes (0.95) once the state says "settled", else 0.05; ``fail`` answers 502."""
 
     def __init__(self, fail=False):
-        self.states, self.fail = [], fail
+        self.states, self.sessions, self.fail = [], [], fail
         decisions = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 decisions.states.append(body["state"])
+                decisions.sessions.append(body.get("session"))
                 if decisions.fail or self.path != "/v1/systemone" or body["model"] != "clef":
                     self.send_response(502)
                     self.end_headers()
@@ -239,6 +252,7 @@ def test_the_server_closes_thinking_after_the_yes_and_reports_the_checks(tmp_pat
     assert 2 <= guard["yes_paragraph"] <= guard["closed_at_paragraph"] == len(paragraphs)
     assert guard["model"] == "clef" and guard["checks"][-1]["p"] == 0.95
     assert d.states[0] == "User's request:\nIs it done?\n\nReasoning so far:\nOne.\n\n"
+    assert len(set(d.sessions)) == 1 and len(d.sessions[0]) == 32          # one session for the reply's checks
 
 
 def test_decoding_does_not_wait_for_a_check(tmp_path, decisions):

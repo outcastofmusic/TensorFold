@@ -653,8 +653,8 @@ class App:
 
         if prepared.guard <= 0:
             return None
-        config, request = self.think_guard, last_user_text(body.get("messages"))
-        return ThinkGuard(lambda reasoning: decide(config, request, reasoning), prepared.guard,
+        config, request, session = self.think_guard, last_user_text(body.get("messages")), uuid.uuid4().hex
+        return ThinkGuard(lambda reasoning: decide(config, request, reasoning, session), prepared.guard,
                           think_end=self.tok.token_to_id("</think>"), model=config.model,
                           decode=lambda ids: self.tok.decode(ids, skip_special_tokens=False),
                           encode=lambda text: self.tok.encode(text, add_special_tokens=False).ids)

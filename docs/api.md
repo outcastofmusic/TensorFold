@@ -232,8 +232,9 @@ decodes on from the reply, as for a required tool call.
 
 A CUDA server started with `--thinking-guard URL` asks a decision model whether the thinking is enough, after
 each paragraph of thinking (text followed by a blank line). The question goes to `URL/systemone`, for example a
-TensorFold serving Cloudflare's Clef, as one `noul` question about the user's last message and the newest 24,000
-bytes of reasoning. Checks run on background threads, one at a time per reply, and decoding never waits for
+TensorFold serving Cloudflare's Clef, as one `noul` question about the user's last message and at most 40,000 bytes
+of the newest reasoning, older reasoning dropped in 10,000-byte steps. A reply's checks share one `session` id, so a
+decision server that keeps prefills reads only the reasoning that is new since the last check. Checks run on background threads, one at a time per reply, and decoding never waits for
 one: a paragraph that ends while a check runs replaces any paragraph still waiting. Once a check returns a
 probability at the threshold or above (`--thinking-guard-threshold`, default 0.8), the next paragraph end
 becomes the closing think marker and a blank line, and the reply goes on as its answer. A failed or slow check

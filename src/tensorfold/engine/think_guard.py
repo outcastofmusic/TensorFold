@@ -9,8 +9,11 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
-# the decision model rereads its whole state on every check, so the state keeps only the newest reasoning
-MAX_REASONING_BYTES = 24000
+# a reply's checks share a decision session, so each one prefills only the new reasoning. Past MAX_REASONING_BYTES
+# (Clef reads 16,384 tokens) the state drops its oldest reasoning in whole steps, so between two drops each state
+# still extends the last one and the session goes on resuming.
+MAX_REASONING_BYTES = 40000
+DROP_STEP = 10000
 TIMEOUT = 30.0
 QUESTION = {"enough": {
     "type": "noul",
@@ -38,14 +41,17 @@ def guard_state(request: str, reasoning: str) -> str:
 
     data = reasoning.encode()
     if len(data) > MAX_REASONING_BYTES:
-        reasoning = "[earlier reasoning left out]\n" + data[-MAX_REASONING_BYTES:].decode(errors="ignore")
+        cut = ((len(data) - MAX_REASONING_BYTES) // DROP_STEP + 1) * DROP_STEP
+        reasoning = "[earlier reasoning left out]\n" + data[cut:].decode(errors="ignore")
     return f"User's request:\n{request}\n\nReasoning so far:\n{reasoning}"
 
 
-def decide(config: GuardConfig, request: str, reasoning: str) -> float:
-    """The decision model's probability that ``reasoning`` is enough to answer ``request`` (SystemOne ``noul``)."""
+def decide(config: GuardConfig, request: str, reasoning: str, session: str | None = None) -> float:
+    """The decision model's probability that ``reasoning`` is enough to answer ``request`` (SystemOne ``noul``);
+    ``session`` lets a server that keeps prefills resume from this reply's last check."""
 
-    body = json.dumps({"model": config.model, "state": guard_state(request, reasoning), "questions": QUESTION})
+    fields = {"model": config.model, "state": guard_state(request, reasoning), "questions": QUESTION}
+    body = json.dumps({**fields, "session": session} if session else fields)
     call = urllib.request.Request(config.url.rstrip("/") + "/systemone", body.encode(),
                                   {"Content-Type": "application/json"})
     with urllib.request.urlopen(call, timeout=TIMEOUT) as reply:      # an HTTP error raises, and ends the checks
