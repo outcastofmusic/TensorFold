@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import math
+import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +22,10 @@ from tensorfold.server.decisions import (_CHOICE_FIELDS, _SCORE_FIELDS, _YES_NO_
 HEAD_FILE = "joint_head.safetensors"
 HEAD_CONFIG = "joint_head_config.json"
 MAX_LENGTH = 16384                     # the release's encode_record default
+# a session keeps its last prefill so a request whose state extends the last one prefills only what is new
+MAX_SESSIONS = 4
+SESSION_IDLE = 60.0                    # seconds unused before a session's kept prefill is dropped
+SESSION_MARGIN = 16                    # tokens before the state's end to resume from: a longer text may end in other tokens
 SYSTEM_PROMPT = ("Read the complete state and schema. Decide every field jointly. Each answer "
                  "must be exactly one of that field's allowed options.")
 QUESTION_TYPES = {"noul": 0, "choice": 1, "score": 2}
@@ -64,6 +70,7 @@ class Question:
 class Encoded:
     ids: list[int]
     questions: tuple[Question, ...]
+    state_end: int = 0                 # where the state's tokens end: the schema that follows is the same each call
 
 
 def encode(encode_text: Callable[[str], list[int]], state: Any, questions: dict[str, dict[str, Any]],
@@ -101,7 +108,7 @@ def encode(encode_text: Callable[[str], list[int]], state: Any, questions: dict[
     shift = len(prefix) + len(state_ids)
     moved = tuple(Question(q.id, q.type, (q.span[0] + shift, q.span[1] + shift),
                            tuple((a + shift, b + shift) for a, b in q.option_spans), q.option_ids) for q in found)
-    return Encoded(prefix + state_ids + schema + suffix, moved)
+    return Encoded(prefix + state_ids + schema + suffix, moved, shift)
 
 
 def _head_class():
@@ -202,6 +209,7 @@ class JointSchema:
         if not hasattr(engine, "hidden_rows"):
             raise ValueError("this checkpoint has a joint schema head, which this model's CUDA engine cannot run")
         self.head, self.engine, self.encode_text = head, engine, encode_text
+        self.sessions: OrderedDict[str, tuple[Any, float]] = OrderedDict()   # id -> (kept prefill, last use)
 
     @classmethod
     def load(cls, model_dir: Path, engine: Any, encode_text: Callable[[str], list[int]]) -> JointSchema:
@@ -217,17 +225,36 @@ class JointSchema:
         joint.logits("warm-up", {"ready": {"type": "noul", "instructions": "Is the server ready?"}})
         return joint
 
-    def logits(self, state: Any, questions: dict[str, dict[str, Any]]) -> tuple[Encoded, list[list[float]]]:
-        """One prefill, then every question's option logits in the release's option order."""
+    def logits(self, state: Any, questions: dict[str, dict[str, Any]],
+               session: str | None = None) -> tuple[Encoded, list[list[float]], int]:
+        """One prefill, then every question's option logits in the release's option order, and how many prompt tokens
+        came from the ``session``'s kept prefill."""
 
         import torch
 
         encoded = encode(self.encode_text, state, questions)
-        hidden = self.engine.hidden_rows(encoded.ids)
+        if session is None or not hasattr(self.engine, "hidden_rows_from"):
+            hidden, cached = self.engine.hidden_rows(encoded.ids), 0
+        else:
+            hidden, cached = self._resumed(session, encoded)
         ids = torch.tensor(encoded.ids, dtype=torch.int64, device=hidden.device)
         with torch.inference_mode():
             out = self.head(hidden, ids, encoded.questions, self.engine.head_rows)
-        return encoded, [row.float().tolist() for row in out]
+        return encoded, [row.float().tolist() for row in out], cached
+
+    def _resumed(self, session: str, encoded: Encoded) -> tuple[Any, int]:
+        """Every row for ``encoded``, resumed from the session's kept prefill; the session then keeps this one's."""
+
+        now = time.monotonic()
+        for name in [name for name, (_, used) in self.sessions.items() if now - used > SESSION_IDLE]:
+            del self.sessions[name]
+        kept = self.sessions.pop(session, (None, 0.0))[0]
+        keep_at = max(0, encoded.state_end - SESSION_MARGIN)
+        hidden, kept, cached = self.engine.hidden_rows_from(encoded.ids, keep_at, kept)
+        self.sessions[session] = (kept, now)
+        while len(self.sessions) > MAX_SESSIONS:
+            self.sessions.popitem(last=False)                    # the least recently used
+        return hidden, cached
 
     # -- /v1/decisions: SGLang's request and response, answered by the head ------------------
 
@@ -243,7 +270,7 @@ class JointSchema:
                 questions[item["id"]], names[item["id"]] = _as_question(item)
             except DecisionError as exc:
                 raise DecisionError(f"question {item['id']!r}: {exc}") from exc
-        encoded, logits = self.logits(state, questions)
+        encoded, logits, _ = self.logits(state, questions)
         temperature = float(body.get("temperature") or 1.0)
         answers = {}
         for question, row in zip(encoded.questions, logits):
@@ -285,11 +312,14 @@ class JointSchema:
             if question["type"] == "noul" and criteria is not None and (
                     not isinstance(criteria, dict) or set(criteria) - {"true", "false"}):
                 raise DecisionError(f"{question_id}: noul criteria may only describe true and false")
-        encoded, logits = self.logits(body["state"], questions)
+        session = body.get("session")
+        if session is not None and (not isinstance(session, str) or not 0 < len(session) <= 200):
+            raise DecisionError("session must be a string of 1 to 200 characters")
+        encoded, logits, cached = self.logits(body["state"], questions, session)
         answers = {q.id: systemone_answer(questions[q.id], dict(zip(q.option_ids, _softmax(row, 1.0))))
                    for q, row in zip(encoded.questions, logits)}
         return {"model": body["model"], "answers": answers,
-                "usage": {"input_tokens": len(encoded.ids), "output_tokens": 0}}
+                "usage": {"input_tokens": len(encoded.ids), "output_tokens": 0, "cached_tokens": cached}}
 
 
 def _as_question(item: dict[str, Any]) -> tuple[dict[str, Any], list[tuple[str, str]]]:

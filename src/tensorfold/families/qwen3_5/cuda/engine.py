@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from tensorfold.cuda import prompt_precision
 
@@ -16,6 +17,15 @@ def entry_end(prompt: Sequence[int]) -> int:
     """Where a prompt's cache entry ends: one token early, since a next turn sent back without its reasoning renders ``<think>`` and two newlines there."""
 
     return max(1, len(prompt) - 1)
+
+
+@dataclass(frozen=True)
+class KeptRows:
+    """Where a later decision prompt that starts with ``ids`` resumes: the state after them and their rows."""
+
+    ids: tuple[int, ...]
+    state: Any                          # a ``State`` clone; its attention buffers are shared and grow in place
+    rows: Any                           # (len(ids), hidden) final normed states
 
 
 class Qwen27Engine:
@@ -227,6 +237,52 @@ class Qwen27Engine:
         finally:
             DECISION_ROWS.reset(token)
         return torch.cat(rows)
+
+    def hidden_rows_from(self, prompt: list[int], keep_at: int,
+                         kept: KeptRows | None = None) -> tuple[Any, KeptRows, int]:
+        """``hidden_rows`` resumed from ``kept`` when the prompt starts with its ids (and the rows it reused), with
+        the resume point after prompt[:keep_at] for the next call. Chunk bounds never change the bits, so a resumed
+        prompt's rows are a fresh one's."""
+
+        from .decode import clone_state
+        from .forward import State
+        from .prefill import DECISION_ROWS, chunks, prefill_chunk
+
+        if self.tp != 1 or self.concurrent:
+            raise ValueError("decision heads run on one GPU without --parallel")
+        if not prompt or len(prompt) >= self.context_window:
+            raise ValueError(f"a decision prompt of {len(prompt)} tokens does not fit the {self.context_window}-token "
+                             "safe capacity")
+        if not 0 <= keep_at <= len(prompt):
+            raise ValueError(f"keep_at {keep_at} is outside the prompt's {len(prompt)} tokens")
+        torch = self.torch
+        if kept is not None and (len(kept.ids) > keep_at or tuple(prompt[:len(kept.ids)]) != kept.ids):
+            kept = None                                  # another prompt: start afresh
+        if kept is None:
+            st, start = State(self.w), 0
+            st.room = self.room                          # no limit: the buffers double as the session grows
+            before = torch.empty((0, self.w.config.hidden), dtype=torch.bfloat16, device=self.w.norm.device)
+        else:
+            st, start, before = clone_state(kept.state), len(kept.ids), kept.rows
+        ids = torch.tensor(prompt, dtype=torch.int32, device=self.w.norm.device)
+        pieces, mark = [before], None
+        token = DECISION_ROWS.set(True)
+        try:
+            with torch.no_grad():
+                # each chunk is a whole weight pass, so the kept point comes from a cut inside its chunk
+                for a, b in chunks(start, len(prompt), self.w.prompt_rows):
+                    if mark is None and a == keep_at:
+                        mark = clone_state(st)
+                    if mark is None and a < keep_at < b:
+                        normed, _, mark = prefill_chunk(self.w, ids[a:b], st, every=True, cut=keep_at - a)
+                    else:
+                        normed = prefill_chunk(self.w, ids[a:b], st, every=True)[0]
+                    pieces.append(normed)
+        finally:
+            DECISION_ROWS.reset(token)
+        rows = torch.cat(pieces)
+        mark = mark if mark is not None else clone_state(st)            # keep_at at the prompt's end
+        return rows, KeptRows(tuple(prompt[:keep_at]), mark, rows[:keep_at]), start
 
     def head_rows(self, ids):
         """The LM head's rows for token ids (a joint schema head's lexical option vectors)."""
