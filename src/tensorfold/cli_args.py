@@ -70,6 +70,14 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                                  "rule. xhigh stays xhigh, so GLM-5.3 renders it as Max")
     generation.add_argument("--thinking-budget", type=int, default=0,
                             help="most thinking tokens before the server closes the think block (0: no limit)")
+    generation.add_argument("--thinking-guard", metavar="URL", default=None,
+                            help="CUDA: a decision server's /v1 base (such as a TensorFold serving Clef). After each "
+                                 "paragraph of thinking its /systemone is asked whether the thinking is enough; a yes "
+                                 "closes the think block at the next paragraph end")
+    generation.add_argument("--thinking-guard-model", default="clef",
+                            help="the model --thinking-guard asks (default: clef)")
+    generation.add_argument("--thinking-guard-threshold", type=float, default=0.8,
+                            help="the probability of yes that closes the think block (default: 0.8)")
 
     speed = serve.add_argument_group("drafting and caches")
     speed.add_argument("--no-drafts", action="store_true",

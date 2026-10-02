@@ -22,6 +22,7 @@ from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
 from tensorfold.server.tool_policy import ToolCallPolicy
 from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
+from tensorfold.engine.think_guard import GuardConfig, ThinkGuard, decide
 from tensorfold.engine.tool_draft import ToolCallStreamer
 from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
@@ -53,6 +54,7 @@ class PreparedRequest:
     vision: Any = None
     grammar: Any = None     # (spec, compiled grammar) of the request's response_format, or None
     think_budget: int = 0   # reply tokens before the server closes a think block the reply leaves open (0: no limit)
+    guard: float = 0.0      # the thinking guard's threshold (0: no guard)
 
 
 def _native_context(model_dir: Path) -> int:
@@ -69,6 +71,7 @@ class App:
     """Serve one engine with sampling and reply-length defaults for requests that omit them."""
 
     reads_ignore_eos = False            # True where the engine reads ``ignore_eos`` itself; a ``stop_eos`` engine is given it
+    think_guard: GuardConfig | None = None   # --thinking-guard: the decision model that may close a think block
 
     def __init__(self, engine, model_dir: Path, served: str, *, default_thinking: bool = False,
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
@@ -221,6 +224,29 @@ class App:
                     raise RequestError(f"{name} must be an integer token count") from exc
         return max(1, int(body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens))
 
+    def _guard_threshold(self, body: dict[str, Any], thinking: bool) -> float:
+        """The request's thinking-guard threshold: ``thinking_guard`` false turns it off, ``{"threshold": t}`` sets it,
+        and absent takes ``--thinking-guard``'s; 0 without a guard or with the think block closed."""
+
+        asked = body.get("thinking_guard")
+        if asked is None or asked is True:
+            asked = {}
+        if asked is False:
+            return 0.0
+        if not isinstance(asked, dict) or set(asked) - {"threshold"}:
+            raise RequestError('thinking_guard must be false, true, or {"threshold": t}')
+        threshold = asked.get("threshold")
+        if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+                                      or not 0 < threshold <= 1):
+            raise RequestError("thinking_guard threshold must be above 0 and at most 1")
+        if self.think_guard is None:
+            if asked:
+                raise RequestError("thinking_guard needs a server started with --thinking-guard")
+            return 0.0
+        if not thinking or self.tok.token_to_id("</think>") is None:
+            return 0.0
+        return float(threshold if threshold is not None else self.think_guard.threshold)
+
     def _prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
         from jinja2.exceptions import TemplateError
 
@@ -304,7 +330,8 @@ class App:
                 budget = budget if thinking else 0
                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
-                                       vision=rendered.vision, grammar=compiled, think_budget=budget)
+                                       vision=rendered.vision, grammar=compiled, think_budget=budget,
+                                       guard=self._guard_threshold(body, thinking))
             text = render(body["messages"])
             prompt = self.tok.encode(text, add_special_tokens=False).ids
             thinking = thinking and not answering(text)
@@ -320,7 +347,8 @@ class App:
             raise RequestError("rendered prompt is empty")
         # sampling is resolved here, so a malformed control is refused before a stream opens
         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
-                               ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
+                               ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget,
+                               guard=self._guard_threshold(body, chat and thinking))
 
     def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
         """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the
@@ -526,7 +554,8 @@ class App:
             options["background"] = True            # the engine's scheduler orders its lanes and prompts
         # one engine at a time: a background reply yields between rounds (not on two ranks, which decode to the end)
         yielding = background and turns is not None and getattr(self.engine, "tp", 1) == 1
-        gates = [g for g in (gate, budget, Yield(turns) if yielding else None) if g is not None]
+        guard = self._thinking_guard(prepared, body)
+        gates = [g for g in (gate, budget, guard, Yield(turns) if yielding else None) if g is not None]
 
         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
 
@@ -571,6 +600,8 @@ class App:
         if stopped["client"]:                                        # as the Mac server: nothing more is written
             raise RequestCancelled("the client left during the reply")
         stats = {**(stats or {}), "token_sha": token_sha(out)}
+        if guard is not None:                         # its checks, and the paragraph its yes closed the block after
+            stats["thinking_guard"] = guard.finish()
         reasoning, answer = visible(True)
         final: dict[str, Any] = {}
         if len(reasoning) > sent["reasoning"]:
@@ -616,6 +647,17 @@ class App:
         if prepared.grammar is None:
             close += self.tok.encode("\n\n", add_special_tokens=False).ids
         return ThinkBudget(prepared.think_budget, close, think_end)
+
+    def _thinking_guard(self, prepared: PreparedRequest, body: dict[str, Any]) -> ThinkGuard | None:
+        """The gate that asks ``--thinking-guard``'s decision model about each paragraph of thinking, or None."""
+
+        if prepared.guard <= 0:
+            return None
+        config, request = self.think_guard, last_user_text(body.get("messages"))
+        return ThinkGuard(lambda reasoning: decide(config, request, reasoning), prepared.guard,
+                          think_end=self.tok.token_to_id("</think>"), model=config.model,
+                          decode=lambda ids: self.tok.decode(ids, skip_special_tokens=False),
+                          encode=lambda text: self.tok.encode(text, add_special_tokens=False).ids)
 
     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:
         """The gate a required tool call needs, from this template's call markup and the rendered prompt."""
@@ -670,3 +712,15 @@ def print_done(prompt: int, cached: int, thinking: bool, out: list[int], finish:
 
 
 from tensorfold.cuda.http import Server, make_handler, serve, usage_of  # noqa: E402,F401  (the HTTP side)
+
+
+def last_user_text(messages: Any) -> str:
+    """The text of the last user message, the request a thinking guard asks about; images and other parts left out."""
+
+    for message in reversed(messages if isinstance(messages, list) else []):
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, list):
+                return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+            return content if isinstance(content, str) else ""
+    return ""

@@ -87,6 +87,7 @@ For decisions, `chat_template_kwargs` may be omitted, null, or an object contain
 | `stop` | Stop at a string or any string in a list; omit the matched text from the response | Both |
 | `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` | Both |
 | `thinking_budget` | Token-count limit inside reasoning | Both |
+| `thinking_guard` | `false` turns the server's thinking guard off; `{"threshold": t}` sets its threshold | CUDA |
 | `priority` | `background` yields to foreground requests | Both |
 
 `n` must be 1; multiple choices receive HTTP 400.
@@ -228,6 +229,18 @@ while it is still thinking, with a newline, the closing think marker and a blank
 The cut depends on token count, so serial and drafted decoding use the same cut. A model that closes the block
 earlier is left alone. The MLX engine forces the close inside its rounds; CUDA stops the engine at the cut and
 decodes on from the reply, as for a required tool call.
+
+A CUDA server started with `--thinking-guard URL` asks a decision model whether the thinking is enough, after
+each paragraph of thinking (text followed by a blank line). The question goes to `URL/systemone`, for example a
+TensorFold serving Cloudflare's Clef, as one `noul` question about the user's last message and the newest 24,000
+bytes of reasoning. Checks run on background threads, one at a time per reply, and decoding never waits for
+one: a paragraph that ends while a check runs replaces any paragraph still waiting. Once a check returns a
+probability at the threshold or above (`--thinking-guard-threshold`, default 0.8), the next paragraph end
+becomes the closing think marker and a blank line, and the reply goes on as its answer. A failed or slow check
+(30 s) ends the checks, and the reply finishes unguarded. The reply's `tensorfold` block carries
+`thinking_guard`: each answered check (`paragraph`, `chars`, `p`, `ms`), `yes_paragraph`,
+`closed_at_paragraph`, and `error` when a check failed. A request sends `"thinking_guard": false` to turn the
+guard off, or `{"threshold": t}` to set its threshold.
 
 ## Context and errors
 

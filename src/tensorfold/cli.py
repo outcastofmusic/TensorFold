@@ -311,6 +311,12 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
                     **({"vision_image_tokens": args.vision_image_tokens}
                        if getattr(args, "vision_image_tokens", None) is not None else {}),
                     aliases=list(args.alias), background_ids=frozenset(_name_priority(args)))
+    if args.thinking_guard:
+        from tensorfold.engine.think_guard import GuardConfig
+
+        if not 0 < args.thinking_guard_threshold <= 1:
+            raise SystemExit("--thinking-guard-threshold must be above 0 and at most 1")
+        app.think_guard = GuardConfig(args.thinking_guard, args.thinking_guard_model, args.thinking_guard_threshold)
     shown = "greedy" if float(sampling.get("temperature", 1.0)) <= 0 else ", ".join(
         f"{k} {v}" for k, v in sampling.items())
     effective_context = app.effective_context_window
@@ -426,6 +432,8 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
     from tensorfold.engine.lane_engine import LaneEngine
     from tensorfold.engine.prefill_plan import PrefillPlan, message_markers
 
+    if args.thinking_guard:
+        raise SystemExit("--thinking-guard is served on CUDA only")
     started = time.perf_counter()
     drafter = "" if args.no_drafts else _drafter(family, args.drafter)
     parallel = _parallel(args.parallel)
