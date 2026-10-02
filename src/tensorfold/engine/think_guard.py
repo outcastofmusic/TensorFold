@@ -17,10 +17,9 @@ DROP_STEP = 10000
 TIMEOUT = 30.0
 QUESTION = {"enough": {
     "type": "noul",
-    "instructions": "Is the reasoning so far enough to write a correct and complete final answer to the user's "
-                    "request, so that more thinking would only repeat or re-check it?",
-    "criteria": {"true": "The reasoning already contains everything the final answer needs.",
-                 "false": "The reasoning still lacks a step, a calculation, or a decision the final answer needs."},
+    "instructions": "Does the reasoning so far contain a complete derivation of the final answer?",
+    "criteria": {"true": "A complete derivation of the final answer is present.",
+                 "false": "The derivation is missing or unfinished."},
 }}
 
 # checks wait on HTTP, never on the GPU: a few threads serve every stream's guard
