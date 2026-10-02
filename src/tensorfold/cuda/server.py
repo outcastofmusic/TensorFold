@@ -29,7 +29,7 @@ from tensorfold.cuda import health
 from tensorfold.cuda.chat_template import ChatTemplate
 from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
 from tensorfold.cuda.turns import Turns, Yield
-from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+from tensorfold.server.text import THINK_MARKERS, is_title_request, reasoning_count, split_thinking
 from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
 
 
@@ -38,6 +38,7 @@ from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
 _MADE = threading.Lock()                # guards the lazily made per-app ``Turns``
 
 _SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_p", "seed")
+_CONTINUE_MARK = "\x00tensorfold-continue\x00"   # no template trims it, and no message holds it
 
 
 @dataclass(slots=True)
@@ -262,23 +263,52 @@ class App:
                 raise RequestError("messages must be a list")
             from tensorfold.server.prompts import has_images, prepare_images
 
+            continued = body.get("continue_final_message") is True
+            if continued:
+                last = body["messages"][-1] if body["messages"] else None
+                if not (isinstance(last, dict) and last.get("role") == "assistant"
+                        and isinstance(last.get("content") or "", str)):
+                    raise RequestError("continue_final_message needs a final assistant message with text content")
+
             def render(messages: list[dict[str, Any]], **images: bool) -> str:   # text renders as it always has
+                extra = kwargs
+                if continued:   # the turn renders closed; a marker after its text finds where to cut it open again
+                    messages = [*messages[:-1], {**messages[-1], "content": (messages[-1].get("content") or "")
+                                                 + _CONTINUE_MARK}]
+                    extra = {**kwargs, "add_generation_prompt": False}
                 try:
-                    return self.template.render(messages, tools=tools, enable_thinking=thinking, extra=kwargs,
+                    text = self.template.render(messages, tools=tools, enable_thinking=thinking, extra=extra,
                                                 **images)
                 except TemplateError as exc:     # the checkpoint's template refuses the request (``raise_exception``)
                     raise RequestError(f"the chat template rejected the request: {exc}") from exc
+                if continued:
+                    cut = text.rfind(_CONTINUE_MARK)
+                    if cut < 0:
+                        raise RequestError("continue_final_message: the chat template did not render the final "
+                                           "assistant message's content")
+                    text = text[:cut]
+                return text
+
+            def answering(text: str) -> bool:
+                """Whether the reply is answer text: thinking is on but the continued turn closed its think block."""
+
+                return continued and text.rfind(THINK_MARKERS[1]) > text.rfind("<think>")
 
             if has_images(body["messages"]):
                 rendered = prepare_images(self.vision, body["messages"],
                                           lambda messages: render(messages, allow_images=True),
                                           context_limit=self._context_limit(),
                                           limits=getattr(self, "image_limits", DEFAULT_LIMITS))
+                text = self.tok.decode(rendered.tokens, skip_special_tokens=False) if continued else ""
+                thinking = thinking and not answering(text)
+                budget = budget if thinking else 0
                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
             text = render(body["messages"])
             prompt = self.tok.encode(text, add_special_tokens=False).ids
+            thinking = thinking and not answering(text)
+            budget = budget if thinking else 0
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
         else:
