@@ -182,8 +182,8 @@ def chunks(start: int, end: int, size: int = CHUNK) -> list[tuple[int, int]]:
 
 @torch.no_grad()
 def prefill_state(w: Weights, prompt: Sequence[int], st: State, *, tp: bool = False, draft=None,
-                  size: int | None = None, keep_at: int | None = None, vision=None):
-    """Commit prompt[st.pos:] into ``st``, tapping the drafter's window; ``keep_at``: ``(normed, (state, snapshot))``, the state after prompt[:keep_at] from a cut chunk."""
+                  size: int | None = None, keep_at: int | None = None, vision=None, every: bool = False):
+    """Commit prompt[st.pos:] into ``st``, tapping the drafter's window; ``keep_at``: ``(normed, (state, snapshot))``, the state after prompt[:keep_at] from a cut chunk; ``every``: normed holds every committed row's final normed state."""
 
     dev = w.norm.device
     base, n = st.pos, len(prompt)
@@ -201,13 +201,16 @@ def prefill_state(w: Weights, prompt: Sequence[int], st: State, *, tp: bool = Fa
         tap_from = end - draft.window
         draft.skip(tap_from - base)
     spans = chunks(base, n, size or getattr(w, "prompt_rows", CHUNK))       # stand-in weights take 4096
+    pieces = []                                    # every chunk's rows (``every``)
     for j, (a, b) in enumerate(spans):
         if keep_at == a:
             kept = (clone_state(st), draft.snapshot() if draft is not None else None)
         cut = keep_at - a if keep_at is not None and a < keep_at < b else 0
         want = draft is not None and b > tap_from
         normed, taps, *part = prefill_chunk(w, ids[a - base:b - base], st, tp=tp, capture_taps=want,
-                                            last=j == len(spans) - 1, cut=cut, vision=vision)
+                                            last=j == len(spans) - 1, cut=cut, vision=vision,
+                                            **({"every": True} if every else {}))
+        pieces.append(normed)
         snap = None
         if want:
             rows = taps[max(0, tap_from - a):]
@@ -219,6 +222,8 @@ def prefill_state(w: Weights, prompt: Sequence[int], st: State, *, tp: bool = Fa
             draft.add_taps(rows)
         if part:
             kept = (part[0], snap)
+    if every:
+        normed = torch.cat(pieces)
     if keep_at is None:
         return normed
     if keep_at == n:

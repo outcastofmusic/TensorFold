@@ -168,17 +168,21 @@ class KVRoom:
 
     def __init__(self, cache: PrefixCache, budget: int) -> None:
         self.cache, self.budget = cache, int(budget)
+        # states kept outside the cache (a decision model's sessions): their attention buffers, and a call that drops
+        # the least recently used of them, False once none is left
+        self.others: Callable[[], list[Any]] = list
+        self.release: Callable[[], bool] = lambda: False
 
     def __call__(self, st: Any, extra: int) -> None:
         while self.held(st) + extra > self.budget:
-            if not self.cache.evict([e for e in self.cache.entries if e[1].kv is not st.kv]):
+            if not self.cache.evict([e for e in self.cache.entries if e[1].kv is not st.kv]) and not self.release():
                 return                      # only this conversation is left: the window was admitted for it
 
     def held(self, st: Any) -> int:
-        """Bytes of every distinct attention buffer the state and the kept entries hold."""
+        """Bytes of every distinct attention buffer the state, the kept entries and the other kept states hold."""
 
         seen, total = set(), 0
-        for kv in [st.kv, *(e[1].kv for e in self.cache.entries)]:
+        for kv in [st.kv, *(e[1].kv for e in self.cache.entries), *self.others()]:
             for pair in kv:
                 for t in pair or ():
                     if t.data_ptr() not in seen:

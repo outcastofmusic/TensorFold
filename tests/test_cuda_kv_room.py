@@ -96,3 +96,17 @@ def test_one_live_window_is_admitted(gib, window, tmp_path):
     plan = capacity.make_plan(262144, None, False, int(gib * capacity.GIB),
                               capacity.Weights(weights.resident + side.resident, 0), both)
     assert plan.fitting // 1024 * 1024 == window
+
+
+def test_states_kept_outside_the_cache_count_and_go_after_the_cache():
+    """A decision model's sessions hold buffers too: a grow counts them, and drops them once the cache is empty."""
+
+    live, cached, sessions = _state(1024), _state(4096), [_state(4096), _state(4096)]
+    cache = _cache(cached)
+    room = KVRoom(cache, (1024 + 4096) * ROW)                       # the live state and one session fit
+    room.others = lambda: [st.kv for st in sessions]
+    room.release = lambda: bool(sessions) and sessions.pop(0) is not None
+    room(live, 0)
+    assert cache.entries == [] and len(sessions) == 1                # the cache went first, then the oldest session
+    room(live, 64 * 1024 * ROW)                                      # more than anything kept can free
+    assert sessions == []

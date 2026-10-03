@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import secrets
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -210,6 +211,10 @@ class JointSchema:
             raise ValueError("this checkpoint has a joint schema head, which this model's CUDA engine cannot run")
         self.head, self.engine, self.encode_text = head, engine, encode_text
         self.sessions: OrderedDict[str, tuple[Any, float]] = OrderedDict()   # id -> (kept prefill, last use)
+        room = getattr(engine, "room", None)
+        if room is not None and hasattr(room, "release"):     # a grow counts the sessions' buffers and may drop them
+            room.others = lambda: [kept.state.kv for kept, _ in self.sessions.values()]
+            room.release = lambda: bool(self.sessions) and self.sessions.popitem(last=False) is not None
 
     @classmethod
     def load(cls, model_dir: Path, engine: Any, encode_text: Callable[[str], list[int]]) -> JointSchema:
@@ -226,35 +231,45 @@ class JointSchema:
         return joint
 
     def logits(self, state: Any, questions: dict[str, dict[str, Any]],
-               session: str | None = None) -> tuple[Encoded, list[list[float]], int]:
-        """One prefill, then every question's option logits in the release's option order, and how many prompt tokens
-        came from the ``session``'s kept prefill."""
+               session: str | bool | None = None) -> tuple[Encoded, list[list[float]], str | None, int]:
+        """One prefill, then every question's option logits in the release's option order, the session the next
+        request resumes with (``session`` true opens one), and how many prompt tokens came from its kept prefill."""
 
         import torch
 
+        self._expire()
         encoded = encode(self.encode_text, state, questions)
-        if session is None or not hasattr(self.engine, "hidden_rows_from"):
-            hidden, cached = self.engine.hidden_rows(encoded.ids), 0
+        if not session or not hasattr(self.engine, "hidden_rows_from"):
+            hidden, session, cached = self.engine.hidden_rows(encoded.ids), None, 0
         else:
-            hidden, cached = self._resumed(session, encoded)
+            hidden, session, cached = self._resumed(session, encoded)
         ids = torch.tensor(encoded.ids, dtype=torch.int64, device=hidden.device)
         with torch.inference_mode():
             out = self.head(hidden, ids, encoded.questions, self.engine.head_rows)
-        return encoded, [row.float().tolist() for row in out], cached
+        return encoded, [row.float().tolist() for row in out], session, cached
 
-    def _resumed(self, session: str, encoded: Encoded) -> tuple[Any, int]:
-        """Every row for ``encoded``, resumed from the session's kept prefill; the session then keeps this one's."""
+    def _expire(self) -> None:
+        """Drop every session unused for ``SESSION_IDLE`` seconds; run on each request, with a session or without."""
 
         now = time.monotonic()
         for name in [name for name, (_, used) in self.sessions.items() if now - used > SESSION_IDLE]:
             del self.sessions[name]
-        kept = self.sessions.pop(session, (None, 0.0))[0]
+
+    def _resumed(self, session: str | bool, encoded: Encoded) -> tuple[Any, str, int]:
+        """Every row for ``encoded``, resumed from the session's kept prefill, and the session's id. The server makes
+        every id: one it does not hold (or ``True``) opens a new session, so a guessed id finds no one's prefill. The
+        old prefill stays kept until the new one is made."""
+
+        known = isinstance(session, str) and session in self.sessions
+        kept = self.sessions[session][0] if known else None
         keep_at = max(0, encoded.state_end - SESSION_MARGIN)
         hidden, kept, cached = self.engine.hidden_rows_from(encoded.ids, keep_at, kept)
-        self.sessions[session] = (kept, now)
+        name = session if known else secrets.token_hex(16)
+        self.sessions.pop(name, None)
+        self.sessions[name] = (kept, time.monotonic())
         while len(self.sessions) > MAX_SESSIONS:
             self.sessions.popitem(last=False)                    # the least recently used
-        return hidden, cached
+        return hidden, name, cached
 
     # -- /v1/decisions: SGLang's request and response, answered by the head ------------------
 
@@ -270,7 +285,7 @@ class JointSchema:
                 questions[item["id"]], names[item["id"]] = _as_question(item)
             except DecisionError as exc:
                 raise DecisionError(f"question {item['id']!r}: {exc}") from exc
-        encoded, logits, _ = self.logits(state, questions)
+        encoded, logits, _, _ = self.logits(state, questions)
         temperature = float(body.get("temperature") or 1.0)
         answers = {}
         for question, row in zip(encoded.questions, logits):
@@ -313,12 +328,12 @@ class JointSchema:
                     not isinstance(criteria, dict) or set(criteria) - {"true", "false"}):
                 raise DecisionError(f"{question_id}: noul criteria may only describe true and false")
         session = body.get("session")
-        if session is not None and (not isinstance(session, str) or not 0 < len(session) <= 200):
-            raise DecisionError("session must be a string of 1 to 200 characters")
-        encoded, logits, cached = self.logits(body["state"], questions, session)
+        if session is not None and session is not True and (not isinstance(session, str) or not 0 < len(session) <= 200):
+            raise DecisionError("session must be true (a new one) or an id this server returned")
+        encoded, logits, session, cached = self.logits(body["state"], questions, session)
         answers = {q.id: systemone_answer(questions[q.id], dict(zip(q.option_ids, _softmax(row, 1.0))))
                    for q, row in zip(encoded.questions, logits)}
-        return {"model": body["model"], "answers": answers,
+        return {"model": body["model"], "answers": answers, **({"session": session} if session else {}),
                 "usage": {"input_tokens": len(encoded.ids), "output_tokens": 0, "cached_tokens": cached}}
 
 

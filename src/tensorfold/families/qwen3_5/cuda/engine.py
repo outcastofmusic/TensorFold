@@ -19,13 +19,17 @@ def entry_end(prompt: Sequence[int]) -> int:
     return max(1, len(prompt) - 1)
 
 
+# rows a kept decision state's buffers may hold past its prompt, so the next request of its session grows into them
+SESSION_HEADROOM = 2048
+
+
 @dataclass(frozen=True)
 class KeptRows:
     """Where a later decision prompt that starts with ``ids`` resumes: the state after them and their rows."""
 
     ids: tuple[int, ...]
     state: Any                          # a ``State`` clone; its attention buffers are shared and grow in place
-    rows: Any                           # (len(ids), hidden) final normed states
+    rows: Any                           # final normed states, at least len(ids) rows; the next request writes past them
 
 
 class Qwen27Engine:
@@ -217,36 +221,18 @@ class Qwen27Engine:
     def hidden_rows(self, prompt: list[int]):
         """Every prompt row's final normed state (a joint schema head reads them), from a fresh state nothing keeps."""
 
-        from .forward import State
-        from .prefill import DECISION_ROWS, chunks, prefill_chunk
+        return self.hidden_rows_from(prompt, len(prompt), headroom=0)[0]
 
-        if self.tp != 1 or self.concurrent:
-            raise ValueError("decision heads run on one GPU without --parallel")
-        if not prompt or len(prompt) >= self.context_window:
-            raise ValueError(f"a decision prompt of {len(prompt)} tokens does not fit the {self.context_window}-token "
-                             "safe capacity")
-        torch = self.torch
-        st = State(self.w)
-        st.limit, st.room = len(prompt), self.room
-        ids = torch.tensor(prompt, dtype=torch.int32, device=self.w.norm.device)
-        token = DECISION_ROWS.set(True)
-        try:
-            with torch.no_grad():
-                rows = [prefill_chunk(self.w, ids[a:b], st, every=True)[0]
-                        for a, b in chunks(0, len(prompt), self.w.prompt_rows)]
-        finally:
-            DECISION_ROWS.reset(token)
-        return torch.cat(rows)
-
-    def hidden_rows_from(self, prompt: list[int], keep_at: int,
-                         kept: KeptRows | None = None) -> tuple[Any, KeptRows, int]:
-        """``hidden_rows`` resumed from ``kept`` when the prompt starts with its ids (and the rows it reused), with
-        the resume point after prompt[:keep_at] for the next call. Chunk bounds never change the bits, so a resumed
-        prompt's rows are a fresh one's."""
+    def hidden_rows_from(self, prompt: list[int], keep_at: int, kept: KeptRows | None = None, *,
+                         headroom: int = SESSION_HEADROOM) -> tuple[Any, KeptRows, int]:
+        """``hidden_rows`` resumed from ``kept`` when the prompt starts with its ids, with the resume point after
+        prompt[:keep_at] for the next call, and how many rows were reused. On quantized packs a resumed prompt's rows
+        are a fresh one's bit for bit (chunk bounds never change the bits); a dense checkpoint's prompts take cuBLAS
+        (``DECISION_ROWS``), whose last bits change with the row count (Clef-Flash: probabilities within 0.016)."""
 
         from .decode import clone_state
         from .forward import State
-        from .prefill import DECISION_ROWS, chunks, prefill_chunk
+        from .prefill import DECISION_ROWS, prefill_state
 
         if self.tp != 1 or self.concurrent:
             raise ValueError("decision heads run on one GPU without --parallel")
@@ -258,31 +244,23 @@ class Qwen27Engine:
         torch = self.torch
         if kept is not None and (len(kept.ids) > keep_at or tuple(prompt[:len(kept.ids)]) != kept.ids):
             kept = None                                  # another prompt: start afresh
-        if kept is None:
-            st, start = State(self.w), 0
-            st.room = self.room                          # no limit: the buffers double as the session grows
-            before = torch.empty((0, self.w.config.hidden), dtype=torch.bfloat16, device=self.w.norm.device)
-        else:
-            st, start, before = clone_state(kept.state), len(kept.ids), kept.rows
-        ids = torch.tensor(prompt, dtype=torch.int32, device=self.w.norm.device)
-        pieces, mark = [before], None
+        st = clone_state(kept.state) if kept is not None else State(self.w)
+        start = len(kept.ids) if kept is not None else 0
+        # buffers grow to the prompt and a session's headroom, never by doubling past it
+        st.limit, st.room = min(len(prompt) + headroom, self.context_window), self.room
         token = DECISION_ROWS.set(True)
         try:
             with torch.no_grad():
-                # each chunk is a whole weight pass, so the kept point comes from a cut inside its chunk
-                for a, b in chunks(start, len(prompt), self.w.prompt_rows):
-                    if mark is None and a == keep_at:
-                        mark = clone_state(st)
-                    if mark is None and a < keep_at < b:
-                        normed, _, mark = prefill_chunk(self.w, ids[a:b], st, every=True, cut=keep_at - a)
-                    else:
-                        normed = prefill_chunk(self.w, ids[a:b], st, every=True)[0]
-                    pieces.append(normed)
+                new, (mark, _) = prefill_state(self.w, prompt, st, keep_at=keep_at, every=True)
         finally:
             DECISION_ROWS.reset(token)
-        rows = torch.cat(pieces)
-        mark = mark if mark is not None else clone_state(st)            # keep_at at the prompt's end
-        return rows, KeptRows(tuple(prompt[:keep_at]), mark, rows[:keep_at]), start
+        rows = kept.rows if kept is not None and kept.rows.shape[0] >= len(prompt) else None
+        if rows is None:                                 # a buffer the session's next prompts can write into
+            rows = new.new_empty((min(len(prompt) + headroom, self.context_window), new.shape[1]))
+            if kept is not None:
+                rows[:start] = kept.rows[:start]
+        rows[start:len(prompt)] = new
+        return rows[:len(prompt)], KeptRows(tuple(prompt[:keep_at]), mark, rows), start
 
     def head_rows(self, ids):
         """The LM head's rows for token ids (a joint schema head's lexical option vectors)."""
