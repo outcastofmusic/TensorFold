@@ -82,11 +82,10 @@ def run_now(f, *args):
     return future
 
 
-def sync_guard(ask, threshold=0.8):
+def sync_guard(ask, threshold=0.8, **settings):
     """A guard whose checks answer before the next token, so cuts land where the rule says without timing."""
 
-    return ThinkGuard(ask, threshold, think_end=THINK_END_ID, decode=text, encode=ids,
-                      submit=run_now)
+    return ThinkGuard(ask, threshold, think_end=THINK_END_ID, decode=text, encode=ids, submit=run_now, **settings)
 
 
 def gated(script, guard, width=3):
@@ -135,6 +134,15 @@ def test_no_yes_leaves_the_reply_whole():
     guard = sync_guard(lambda r: 0.1)
     assert gated("One.\n\nTwo.\n\n", guard) == "One.\n\nTwo.\n\n</think>\n\nUncut.<|end|>"
     assert [c["paragraph"] for c in guard.record["checks"]] == [1, 2] and "yes_paragraph" not in guard.record
+
+
+@pytest.mark.parametrize("settings, checked", [({}, [1, 2, 3, 4]), ({"gap": 10}, [2, 3]), ({"gap": 30}, [3])])
+def test_the_gap_skips_paragraphs_that_end_too_soon_after_the_last_checked_one(settings, checked):
+    """One token a byte: paragraph ends at reasoning tokens 6, 12, 30 and 36; the gap counts from the last check."""
+
+    guard = sync_guard(lambda r: 0.1, **settings)
+    gated("One.\n\nTwo.\n\nThree is longer.\n\nFour.\n\n", guard)
+    assert [c["paragraph"] for c in guard.finish()["checks"]] == checked   # the last answered as the block closed
 
 
 def test_a_failed_check_ends_the_checks():
@@ -240,7 +248,7 @@ LONG = "One.\n\nTwo, settled.\n\n" + "".join(f"Re-check {n}.\n\n" for n in range
 
 def test_the_server_closes_thinking_after_the_yes_and_reports_the_checks(tmp_path, decisions):
     d = decisions()
-    app = app_for(tmp_path, ScriptEngine(LONG, pause=0.002), GuardConfig(d.url, "clef"))
+    app = app_for(tmp_path, ScriptEngine(LONG, pause=0.002), GuardConfig(d.url, "clef", gap=0))
     status, body = ask(app)
     assert status == 200, body
     message, guard = body["choices"][0]["message"], body["tensorfold"]["thinking_guard"]
@@ -261,7 +269,7 @@ def test_decoding_does_not_wait_for_a_check(tmp_path, decisions):
     d = decisions()
     slow = d.httpd.RequestHandlerClass.do_POST
     d.httpd.RequestHandlerClass.do_POST = lambda self: (time.sleep(2), slow(self))
-    app = app_for(tmp_path, ScriptEngine(LONG), GuardConfig(d.url, "clef"))
+    app = app_for(tmp_path, ScriptEngine(LONG), GuardConfig(d.url, "clef", gap=0))
     started = time.perf_counter()
     status, body = ask(app)
     assert status == 200 and time.perf_counter() - started < 1.5
@@ -269,11 +277,24 @@ def test_decoding_does_not_wait_for_a_check(tmp_path, decisions):
     assert body["tensorfold"]["thinking_guard"]["checks"] == []
 
 
+def test_the_server_default_gap_is_128_tokens():
+    assert GuardConfig("http://x/v1", "clef").gap == 128
+
+
+def test_the_request_sets_the_gap(tmp_path, decisions):
+    d = decisions()
+    app = app_for(tmp_path, ScriptEngine(LONG, pause=0.002), GuardConfig(d.url, "clef", gap=0))
+    status, body = ask(app, thinking_guard={"gap": 150})
+    guard = body["tensorfold"]["thinking_guard"]
+    assert status == 200 and guard["gap"] == 150
+    assert guard["checks"][0]["paragraph"] == 12            # the first paragraph end 150 tokens in (one a byte)
+
+
 @pytest.mark.parametrize("fields, want", [({"thinking_guard": False}, None), ({}, 0.8),
                                           ({"thinking_guard": {"threshold": 0.99}}, 0.99)])
 def test_the_request_turns_the_guard_off_or_sets_its_threshold(tmp_path, decisions, fields, want):
     d = decisions()
-    app = app_for(tmp_path, ScriptEngine(LONG, pause=0.002), GuardConfig(d.url, "clef"))
+    app = app_for(tmp_path, ScriptEngine(LONG, pause=0.002), GuardConfig(d.url, "clef", gap=0))
     status, body = ask(app, **fields)
     assert status == 200, body
     guard = body["tensorfold"].get("thinking_guard")
@@ -283,7 +304,7 @@ def test_the_request_turns_the_guard_off_or_sets_its_threshold(tmp_path, decisio
 
 def test_a_failing_decision_server_leaves_the_reply_whole(tmp_path, decisions):
     d = decisions(fail=True)
-    app = app_for(tmp_path, ScriptEngine(LONG, pause=0.002), GuardConfig(d.url, "clef"))
+    app = app_for(tmp_path, ScriptEngine(LONG, pause=0.002), GuardConfig(d.url, "clef", gap=0))
     status, body = ask(app)
     assert status == 200 and body["choices"][0]["message"]["content"] == "Uncut."
     assert "502" in body["tensorfold"]["thinking_guard"]["error"] and len(d.states) == 1
@@ -292,11 +313,13 @@ def test_a_failing_decision_server_leaves_the_reply_whole(tmp_path, decisions):
 @pytest.mark.parametrize("fields, words", [
     ({"thinking_guard": {"threshold": 0}}, "above 0 and at most 1"),
     ({"thinking_guard": {"threshold": True}}, "above 0 and at most 1"),
-    ({"thinking_guard": "yes"}, 'must be false, true, or {"threshold": t}'),
-    ({"thinking_guard": {"url": "http://elsewhere"}}, 'must be false, true, or {"threshold": t}'),
+    ({"thinking_guard": "yes"}, "must be false, true, or an object"),
+    ({"thinking_guard": {"url": "http://elsewhere"}}, "must be false, true, or an object"),
+    ({"thinking_guard": {"gap": -1}}, "gap must be a whole number"),
+    ({"thinking_guard": {"gap": 1.5}}, "gap must be a whole number"),
 ])
 def test_a_bad_guard_field_is_refused(tmp_path, decisions, fields, words):
-    app = app_for(tmp_path, ScriptEngine(LONG), GuardConfig(decisions().url, "clef"))
+    app = app_for(tmp_path, ScriptEngine(LONG), GuardConfig(decisions().url, "clef", gap=0))
     status, body = ask(app, **fields)
     assert status == 400 and words in body["error"]["message"]
 
@@ -311,6 +334,6 @@ def test_a_threshold_without_a_configured_guard_is_refused_and_absent_is_no_guar
 
 def test_no_guard_with_thinking_off(tmp_path, decisions):
     d = decisions()
-    app = app_for(tmp_path, ScriptEngine(LONG), GuardConfig(d.url, "clef"))
+    app = app_for(tmp_path, ScriptEngine(LONG), GuardConfig(d.url, "clef", gap=0))
     status, body = ask(app, chat_template_kwargs={"enable_thinking": False})
     assert status == 200 and "thinking_guard" not in body["tensorfold"] and d.states == []

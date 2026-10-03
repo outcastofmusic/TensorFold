@@ -7,7 +7,7 @@ import json
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -54,7 +54,7 @@ class PreparedRequest:
     vision: Any = None
     grammar: Any = None     # (spec, compiled grammar) of the request's response_format, or None
     think_budget: int = 0   # reply tokens before the server closes a think block the reply leaves open (0: no limit)
-    guard: float = 0.0      # the thinking guard's threshold (0: no guard)
+    guard: GuardConfig | None = None   # the thinking guard as this request sets it (None: no guard)
 
 
 def _native_context(model_dir: Path) -> int:
@@ -224,28 +224,32 @@ class App:
                     raise RequestError(f"{name} must be an integer token count") from exc
         return max(1, int(body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens))
 
-    def _guard_threshold(self, body: dict[str, Any], thinking: bool) -> float:
-        """The request's thinking-guard threshold: ``thinking_guard`` false turns it off, ``{"threshold": t}`` sets it,
-        and absent takes ``--thinking-guard``'s; 0 without a guard or with the think block closed."""
+    def _guard(self, body: dict[str, Any], thinking: bool) -> GuardConfig | None:
+        """The thinking guard as the request sets it: ``thinking_guard`` false turns it off, an object sets its
+        ``threshold`` or ``gap``, and absent takes ``--thinking-guard``'s; None without a guard or with the think
+        block closed."""
 
         asked = body.get("thinking_guard")
         if asked is None or asked is True:
             asked = {}
         if asked is False:
-            return 0.0
-        if not isinstance(asked, dict) or set(asked) - {"threshold"}:
-            raise RequestError('thinking_guard must be false, true, or {"threshold": t}')
+            return None
+        if not isinstance(asked, dict) or set(asked) - {"threshold", "gap"}:
+            raise RequestError("thinking_guard must be false, true, or an object of threshold and gap")
         threshold = asked.get("threshold")
         if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
                                       or not 0 < threshold <= 1):
             raise RequestError("thinking_guard threshold must be above 0 and at most 1")
+        gap = asked.get("gap")
+        if gap is not None and (isinstance(gap, bool) or not isinstance(gap, int) or gap < 0):
+            raise RequestError("thinking_guard gap must be a whole number of 0 or more")
         if self.think_guard is None:
             if asked:
                 raise RequestError("thinking_guard needs a server started with --thinking-guard")
-            return 0.0
+            return None
         if not thinking or self.tok.token_to_id("</think>") is None:
-            return 0.0
-        return float(threshold if threshold is not None else self.think_guard.threshold)
+            return None
+        return replace(self.think_guard, **{k: v for k, v in asked.items() if v is not None})
 
     def _prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
         from jinja2.exceptions import TemplateError
@@ -331,7 +335,7 @@ class App:
                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget,
-                                       guard=self._guard_threshold(body, thinking))
+                                       guard=self._guard(body, thinking))
             text = render(body["messages"])
             prompt = self.tok.encode(text, add_special_tokens=False).ids
             thinking = thinking and not answering(text)
@@ -348,7 +352,7 @@ class App:
         # sampling is resolved here, so a malformed control is refused before a stream opens
         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
                                ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget,
-                               guard=self._guard_threshold(body, chat and thinking))
+                               guard=self._guard(body, chat and thinking))
 
     def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
         """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the
@@ -651,11 +655,12 @@ class App:
     def _thinking_guard(self, prepared: PreparedRequest, body: dict[str, Any]) -> ThinkGuard | None:
         """The gate that asks ``--thinking-guard``'s decision model about each paragraph of thinking, or None."""
 
-        if prepared.guard <= 0:
+        config = prepared.guard
+        if config is None:
             return None
-        config, request, session = self.think_guard, last_user_text(body.get("messages")), uuid.uuid4().hex
-        return ThinkGuard(lambda reasoning: decide(config, request, reasoning, session), prepared.guard,
-                          think_end=self.tok.token_to_id("</think>"), model=config.model,
+        request, session = last_user_text(body.get("messages")), uuid.uuid4().hex
+        return ThinkGuard(lambda reasoning: decide(config, request, reasoning, session), config.threshold,
+                          think_end=self.tok.token_to_id("</think>"), model=config.model, gap=config.gap,
                           decode=lambda ids: self.tok.decode(ids, skip_special_tokens=False),
                           encode=lambda text: self.tok.encode(text, add_special_tokens=False).ids)
 

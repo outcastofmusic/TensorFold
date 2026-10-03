@@ -218,8 +218,8 @@ collective sequence aligned. MLX disk snapshots and cache-budget flags do not co
 caches. The CUDA CLI also does not apply `--alias`; use `--name` for the served model ID. `--thinking`,
 `--reasoning-effort` and `--thinking-budget` set the defaults a request's `chat_template_kwargs.enable_thinking`,
 `reasoning_effort` and `thinking_budget` override, as on the Mac.
-`--thinking-guard URL` (with `--thinking-guard-model`, default `clef`, and `--thinking-guard-threshold`, default
-0.8) lets a decision model close the think block once the thinking is enough; see the
+`--thinking-guard URL` (with `--thinking-guard-model`, default `clef`, `--thinking-guard-threshold`, default 0.8,
+and `--thinking-guard-gap`, default 128 tokens) lets a decision model close the think block once the thinking is enough; see the
 [API reference](../api.md) for how it checks and what each reply reports. It is served on CUDA only.
 
 ## Measuring

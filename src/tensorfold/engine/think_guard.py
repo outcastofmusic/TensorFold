@@ -28,11 +28,13 @@ _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="think-guard")
 
 @dataclass(frozen=True, slots=True)
 class GuardConfig:
-    """``--thinking-guard``: the decision server's ``/v1`` base, its model, and the default threshold."""
+    """``--thinking-guard``: the decision server's ``/v1`` base, its model, the threshold, and the fewest reasoning
+    tokens between two checked paragraphs (``gap``): each check costs decode speed on a shared GPU."""
 
     url: str
     model: str
     threshold: float = 0.8
+    gap: int = 128
 
 
 def guard_state(request: str, reasoning: str) -> str:
@@ -78,8 +80,9 @@ class ThinkGuard:
 
     def __init__(self, ask: Callable[[str], float], threshold: float, *, think_end: int,
                  decode: Callable[[list[int]], str], encode: Callable[[str], list[int]], model: str = "",
-                 submit: Callable[..., Future] | None = None) -> None:
-        self.ask, self.threshold, self.think_end = ask, float(threshold), int(think_end)
+                 gap: int = 0, submit: Callable[..., Future] | None = None) -> None:
+        self.ask, self.threshold, self.think_end, self.gap = ask, float(threshold), int(think_end), int(gap)
+        self.offered = 0                    # reasoning tokens through the last paragraph offered for a check
         self.decode, self.encode, self.submit = decode, encode, submit or _POOL.submit
         self.tokens: list[int] = []         # the reasoning so far
         self.tail = ""                      # its text since the last paragraph end
@@ -89,7 +92,7 @@ class ThinkGuard:
         self.waiting: tuple[int, int] | None = None                  # (paragraph, tokens): the newest unchecked
         self.yes = 0                        # the paragraph a check said yes to
         self.failed = False
-        self.record: dict[str, Any] = {"model": model, "threshold": self.threshold, "checks": []}
+        self.record: dict[str, Any] = {"model": model, "threshold": self.threshold, "gap": self.gap, "checks": []}
 
     def cut(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
         """(index in the next committed ``tokens`` the close replaces, the close), as ``CallGate.cut``: after a yes,
@@ -126,8 +129,8 @@ class ThinkGuard:
         ends, self.tail = _ends(self.tail, self.decode([token]))
         if ends:
             self.paragraphs += len(ends)
-            if not self.yes and not self.failed:
-                self.waiting = (self.paragraphs, len(self.tokens))
+            if not self.yes and not self.failed and len(self.tokens) - self.offered >= self.gap:
+                self.waiting, self.offered = (self.paragraphs, len(self.tokens)), len(self.tokens)
         self._collect()
 
     def _collect(self) -> None:
@@ -157,8 +160,8 @@ class ThinkGuard:
     def finish(self) -> dict[str, Any]:
         """The record of every check that answered while the reply ran. A check still running is dropped."""
 
-        if self.open and self.running is not None:
-            self._collect()
+        self.waiting = None                 # nothing new starts once the reply is done
+        self._collect()
         return self.record
 
 

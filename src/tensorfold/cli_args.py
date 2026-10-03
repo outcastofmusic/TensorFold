@@ -78,6 +78,9 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                             help="the model --thinking-guard asks (default: clef)")
     generation.add_argument("--thinking-guard-threshold", type=float, default=0.8,
                             help="the probability of yes that closes the think block (default: 0.8)")
+    generation.add_argument("--thinking-guard-gap", type=int, default=128,
+                            help="fewest reasoning tokens between two checked paragraphs (default: 128; 0 checks "
+                                 "every paragraph). Each check slows decoding while it runs on the same GPU")
 
     speed = serve.add_argument_group("drafting and caches")
     speed.add_argument("--no-drafts", action="store_true",
