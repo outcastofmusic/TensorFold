@@ -658,8 +658,13 @@ class App:
         config = prepared.guard
         if config is None:
             return None
-        request, session = last_user_text(body.get("messages")), uuid.uuid4().hex
-        return ThinkGuard(lambda reasoning: decide(config, request, reasoning, session), config.threshold,
+        request, session = last_user_text(body.get("messages")), [None]
+
+        def ask(reasoning: str) -> float:     # one check at a time, so the session needs no lock
+            p, session[0] = decide(config, request, reasoning, session[0])
+            return p
+
+        return ThinkGuard(ask, config.threshold,
                           think_end=self.tok.token_to_id("</think>"), model=config.model, gap=config.gap,
                           decode=lambda ids: self.tok.decode(ids, skip_special_tokens=False),
                           encode=lambda text: self.tok.encode(text, add_special_tokens=False).ids)

@@ -194,7 +194,8 @@ class Decisions:
                     self.end_headers()
                     return
                 p = 0.95 if "settled" in body["state"] else 0.05
-                reply = json.dumps({"answers": {"enough": {"type": "noul", "noul": p}}}).encode()
+                session = body["session"] if isinstance(body["session"], str) else f"made-{len(decisions.states)}"
+                reply = json.dumps({"session": session, "answers": {"enough": {"type": "noul", "noul": p}}}).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(reply)))
                 self.end_headers()
@@ -260,7 +261,7 @@ def test_the_server_closes_thinking_after_the_yes_and_reports_the_checks(tmp_pat
     assert 2 <= guard["yes_paragraph"] <= guard["closed_at_paragraph"] == len(paragraphs)
     assert guard["model"] == "clef" and guard["checks"][-1]["p"] == 0.95
     assert d.states[0] == "User's request:\nIs it done?\n\nReasoning so far:\nOne.\n\n"
-    assert len(set(d.sessions)) == 1 and len(d.sessions[0]) == 32          # one session for the reply's checks
+    assert d.sessions[0] is True and set(d.sessions[1:]) <= {"made-1"}     # the first opens it, the rest resume it
 
 
 def test_decoding_does_not_wait_for_a_check(tmp_path, decisions):

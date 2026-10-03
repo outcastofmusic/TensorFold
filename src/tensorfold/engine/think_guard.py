@@ -47,17 +47,18 @@ def guard_state(request: str, reasoning: str) -> str:
     return f"User's request:\n{request}\n\nReasoning so far:\n{reasoning}"
 
 
-def decide(config: GuardConfig, request: str, reasoning: str, session: str | None = None) -> float:
-    """The decision model's probability that ``reasoning`` is enough to answer ``request`` (SystemOne ``noul``);
-    ``session`` lets a server that keeps prefills resume from this reply's last check."""
+def decide(config: GuardConfig, request: str, reasoning: str, session: str | None = None) -> tuple[float, str | None]:
+    """The decision model's probability that ``reasoning`` is enough to answer ``request`` (SystemOne ``noul``), and
+    the session to send with the reply's next check: the first check opens one, and a server that keeps prefills
+    resumes from it. A server without sessions returns none, and every check opens one again."""
 
-    fields = {"model": config.model, "state": guard_state(request, reasoning), "questions": QUESTION}
-    body = json.dumps({**fields, "session": session} if session else fields)
+    body = json.dumps({"model": config.model, "state": guard_state(request, reasoning), "questions": QUESTION,
+                       "session": session or True})
     call = urllib.request.Request(config.url.rstrip("/") + "/systemone", body.encode(),
                                   {"Content-Type": "application/json"})
     with urllib.request.urlopen(call, timeout=TIMEOUT) as reply:      # an HTTP error raises, and ends the checks
-        answer = json.load(reply)["answers"]["enough"]["noul"]
-    return float(answer)
+        answer = json.load(reply)
+    return float(answer["answers"]["enough"]["noul"]), answer.get("session")
 
 
 def _ends(tail: str, piece: str) -> tuple[list[int], str]:
