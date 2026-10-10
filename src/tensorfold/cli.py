@@ -238,6 +238,15 @@ def _backend(choice: str, family: Any) -> str:
     return backend
 
 
+def _glm_modes(args, family, backend: str) -> dict:
+    modes = {key: True for key in ("target_only", "eager") if getattr(args, key, False)}
+    if modes and (backend != "cuda" or family.model_type != "glm5_next"):
+        raise ValueError("--target-only and --eager are implemented only for GLM CUDA")
+    if modes.get("target_only") and getattr(args, "vision", False):
+        raise ValueError("--target-only is text-only and cannot enable --vision")
+    return modes
+
+
 def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context: int | None = None) -> int:
     """Serve with the family's CUDA engine (``cuda_engine``) behind ``tensorfold.cuda.server``."""
 
@@ -252,9 +261,11 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     if args.tp == 4 and not getattr(family.package, "CUDA_TP4", False):
         raise ValueError(f"--tp 4: {family.title} runs on one or two GPUs on CUDA")
     started = time.perf_counter()
-    drafter = "" if args.no_drafts else _drafter(family, args.drafter, "cuda")
+    modes = _glm_modes(args, family, "cuda")
+    no_drafts = bool(args.no_drafts or modes.get("target_only"))
+    drafter = "" if no_drafts else _drafter(family, args.drafter, "cuda")
     options: dict[str, Any] = {"drafter": drafter, "tp": int(args.tp), "rank": int(args.rank), "master": args.master,
-                               "master_port": int(args.master_port), "no_drafts": bool(args.no_drafts)}
+                               "master_port": int(args.master_port), "no_drafts": no_drafts, **modes}
     if getattr(args, "kv_dtype", "bf16") != "bf16":
         options["kv_dtype"] = args.kv_dtype
     options.update(_vision_options(args))
@@ -373,6 +384,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if args.ple_on_ssd and not hasattr(family.package, "ple_bytes"):
         raise ValueError(f"--ple-on-ssd: {family.title} has no n-gram (PLE) tables to read from SSD")
     backend = _backend(args.backend, family)
+    _glm_modes(args, family, backend)
     _check_serve_options(args, family, backend, config_dir)
     families.require_readable(family, families.read_config(config_dir), backend)
     _note_untested(family, args.model)
