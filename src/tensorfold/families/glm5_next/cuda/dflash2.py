@@ -16,6 +16,7 @@ from safetensors import safe_open
 from tensorfold.engine.exact_sampling import Sampling, uniform_rows
 
 from . import glue, qmm
+from . import packed as packed_mod
 from .weights import Weights
 
 EDGE = 0.6        # the selector's edge score weight in a chain pick
@@ -267,6 +268,12 @@ class Drafter:
         self.ids_host = torch.zeros((1,), dtype=torch.int32, pin_memory=torch.cuda.is_available())
         self.ar = torch.arange(max(64, n), device=dev)
         self.tap_in = torch.zeros((64, len(self.tap_layers) * self.D), dtype=torch.bfloat16, device=dev)
+        # a packed one-GPU head (trellis, full vocabulary) scores the block through the packed projections
+        head = w.draft_head if w.draft_head is not None else w.head
+        self.head_scratch = self.head_out = None
+        if isinstance(head, (packed_mod.PlainLinear, packed_mod.ComposedLinear, packed_mod.Exl3Linear)):
+            self.head_scratch = packed_mod.ProjectionScratch([head], n, dev)
+            self.head_out = torch.empty((n - 1, head.n), dtype=torch.bfloat16, device=dev)
         self.packed: torch.Tensor | None = None       # [world, block - 1, 2 * top_k] after a pass
         self.proj: torch.Tensor | None = None         # [block - 1, selector rank] fp32
         self.pool = None
@@ -385,7 +392,9 @@ class Drafter:
         for i in range(len(self.layers)):
             x = self._layer(i, x, cos, sin, idx)
         h, hs = self._norm(x[1:], self.norm)
-        logits = _mm(h, self.w.draft_head if self.w.draft_head is not None else self.w.head, hs)
+        head = self.w.draft_head if self.w.draft_head is not None else self.w.head
+        logits = (_mm(h, head, hs) if self.head_scratch is None
+                  else packed_mod.matmul(head, h.contiguous(), self.head_out, self.head_scratch))
         vals, local = torch.topk(logits.float(), self.top_k, dim=-1)
         gids = (local + self.w.vocab_offset).to(torch.int32)
         packed = torch.cat([vals, gids.view(torch.float32)], dim=1).contiguous()
