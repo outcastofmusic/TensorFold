@@ -1,4 +1,70 @@
-# TensorFold
+# TensorFold, Python 0.6 fork
+
+This repository is a fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) that stays on the Python
+engine. Upstream rewrote TensorFold in Zig for its 1.0 line and froze the Python code on the `python-0.6` branch, 12
+commits past v0.6.6. The fork starts from that branch (`ed78d6fc`) and serves two models on one DGX Spark from one
+tree: Qwen3.8 Flash Next and GLM-5.3 Flash.
+
+Branch `fork/python-0.6-qwen-clef` is the one to use. Everything below "Upstream README" is upstream's text, unchanged.
+
+## What the fork adds
+
+| Addition | Effect, measured on one DGX Spark |
+| --- | --- |
+| Clef thinking guard (`--thinking-guard URL`) | A decision model closes the think block once the reasoning holds a complete derivation |
+| Clef decision serving (`/v1/systemone`, decision sessions) | Clef and Clef-Flash served by `tensorfold serve`, checks about 0.3 s each |
+| `continue_final_message` | A request continues the last assistant turn |
+| GLM-5.3 Flash on one GPU (`--tp 1`, packed EXL3) | The M288 Mosaic 12L checkpoint serves at 29 to 39 tok/s in a 131,072-token window |
+| Lone-stream graph slot off by default | One stream under `--parallel 4`: 70.7 to 90.5 tok/s (`TENSORFOLD_LONE_GRAPHS=1` restores it) |
+| Copy drafts at 6 drafts a round | A 2,252-token prompt's first 128 tokens: 36.5 to 89.0 tok/s; rewrite 108 to 124 |
+| EXL3 prompt experts read once for 32 rows | Prefill 780 to 828 tok/s, bit-identical output |
+
+Speeds are from 2026-10-11 on Qwen3.8 Flash Next, EXL3 3.05 bpw, `--parallel 4 --kv-dtype int8`, 262,144-token window.
+Drafted replies equal their `"draft": false` runs on both models (10/10 each).
+
+## Clef as a thinking control
+
+The idea is [@outcastofmusic](https://github.com/outcastofmusic)'s: a small decision model watches a larger model
+think and stops it when the answer is already derived. After each paragraph of reasoning, the server asks
+[Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) one question: "Does the reasoning so far contain a complete
+derivation of the final answer?" A probability of 0.8 or more closes the think block at the next paragraph end. A
+paragraph is checked only when 128 reasoning tokens have passed since the last check.
+
+Measured on spark-bench TrueScore, 76 scenarios x 2 repeats, thinking on, 2026-10-10, both runs under an 8,000-token
+thinking budget:
+
+| Run | TrueScore | Request time | Tokens generated | Reasoning text |
+| --- | --- | --- | --- | --- |
+| Clef guard on | 88.9 | 4,667 s | 291,536 | 486,948 chars |
+| Guard off | 88.4 | 6,176 s | 391,814 | 908,672 chars |
+
+The guard saves 24% of request time (1,509 s of 6,176 s) and 46% of the reasoning text. The score difference, paired
+over scenarios, is +0.9 with a 95% interval of [-0.9, +3.1], so quality holds. Pair the guard with
+`--thinking-budget`: without a budget, one coding task thought for 26,243 tokens because Clef never rated it above
+0.75.
+
+```bash
+tensorfold serve ~/models/clef-flash --port 30001 --name clef --context 16384          # the decision model
+tensorfold serve ~/models/Qwen3.8-Flash-Next-exl3-3.05bpw --port 30000 --parallel 4 --kv-dtype int8 \
+    --thinking-guard http://127.0.0.1:30001/v1 --thinking-budget 8000
+```
+
+A request turns the guard off with `"thinking_guard": false` and sets its own budget with `"thinking_budget"`. GLM-5.3
+Flash leaves 8 GiB free on a Spark, so Clef-Flash (18 GB) cannot run beside it.
+
+## Credits
+
+- **[ashhart/TensorFold](https://github.com/ashhart/TensorFold)** and its contributors wrote the engine. The fork
+  changes a small part of it.
+- **[MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)**
+  is the recipe the Qwen3.8 Flash Next setup follows. Its patch 0007 showed that copy drafts pay at 6 drafts a round,
+  which led to the copy-draft fix here.
+- **[sxuff/glm53-flash-single-gb10](https://github.com/sxuff/glm53-flash-single-gb10)** supplied the four patches
+  that run GLM-5.3 Flash on a single GB10. The fork ports them from v0.6.5 onto `python-0.6`.
+- **[Cloudflare/clef](https://huggingface.co/Cloudflare/clef)** and Clef-Flash are the decision models behind the
+  thinking guard.
+
+## Upstream README
 
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
 Each model family supplies its own kernels and draft verification.
