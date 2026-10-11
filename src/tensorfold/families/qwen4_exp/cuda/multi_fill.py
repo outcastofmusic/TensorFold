@@ -215,14 +215,19 @@ class PromptPasses:
                 capture(logits, [first], [len(s.prompt)], s.probabilities)
             if s.constraint is not None:
                 s.constraint.advance([first])
+            if s.splice is not None:                     # a gate may replace the first token too (multi._spliced)
+                _, first = self._spliced(s, [], [first], [0], first)
             head += 1
             s.context = list(s.prompt)
             s.copies = CopyIndex(list(s.prompt) + [first]) if mtp and getattr(self, "copy", False) and s.constraint is None else None
             s.drafts = []
             if mtp and s.count > 1:
                 room = min(self.depth, s.count - 1)
-                copied = s.copies.chain(room) if s.copies is not None else []
-                if copied:                               # the MTP cache absorbs the prompt's last row either way
+                copied = s.copies.chain(room) if s.copies is not None and not s.forced else []
+                if s.forced:
+                    absorb(e, last, [first])
+                    s.drafts = self._force(s, room)
+                elif copied:                             # the MTP cache absorbs the prompt's last row either way
                     absorb(e, last, [first])
                     s.drafts = copied
                 else:
