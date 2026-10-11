@@ -205,6 +205,29 @@ def test_mixed_k_rows_are_independent_and_match_the_reference(name, cb, kfun):
     assert err < 1e-2, err
 
 
+@pytest.mark.parametrize("name,cb,kfun", MIXED, ids=[m[0] + str(i) for i, m in enumerate(MIXED)])
+def test_a_prompt_window_reads_an_expert_once_for_32_rows_and_gives_the_same_bits(name, cb, kfun):
+    from tensorfold.cuda.exl3 import experts
+
+    E, D, I, TOPK, ROWS = 24, 512, 256, 6, 200
+    ex, _ = _layer(E, D, I, [kfun(e) for e in range(E)], cb, seed=21 + cb)
+    g = torch.Generator().manual_seed(5)
+    x = torch.randn((ROWS, D), generator=g).to(torch.bfloat16).cuda()
+    sel, w = _picks(E, ROWS, TOPK, g, shared=True)
+    sel[:150, 0] = 3                 # one expert with 150 members: five 32-row groups, the last partly filled
+    sel[:150, 1:TOPK] = torch.where(sel[:150, 1:TOPK] == 3, 4, sel[:150, 1:TOPK])
+    sel[150:, 1] = torch.where(sel[150:, 0] == 7, 8, 7)            # another with about 50: two groups
+    scratch = experts.Scratch(ex, ROWS, TOPK + 1)
+    assert experts.prompt_config(scratch.cfg_gu)[4] == 2 and experts.prompt_config(scratch.cfg_d)[4] == 2
+    for n in (ROWS, 65, 17, 1):
+        old = experts.routed(x[:n], sel[:n].contiguous(), w[:n].contiguous(), ex, scratch, None, n, prompt=False).clone()
+        new = experts.routed(x[:n], sel[:n].contiguous(), w[:n].contiguous(), ex, scratch, None, n, prompt=True).clone()
+        assert torch.isfinite(old).all() and torch.equal(old, new), (name, n)
+        slots_old = experts.routed(x[:n], sel[:n].contiguous(), None, ex, scratch, None, n, prompt=False).clone()
+        slots_new = experts.routed(x[:n], sel[:n].contiguous(), None, ex, scratch, None, n, prompt=True).clone()
+        assert torch.equal(slots_old, slots_new), (name, n)
+
+
 def _glm_case(E, D, NI, rows_list, seed):
     from tensorfold.cuda import experts as grouped
     from tensorfold.cuda.exl3 import experts
