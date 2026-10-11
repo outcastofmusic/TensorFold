@@ -16,7 +16,7 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 
 from tensorfold.cuda import server
 from tensorfold.engine.call_gate import generate_gated
-from tensorfold.engine.think_guard import GuardConfig, ThinkGuard, _ends, guard_state
+from tensorfold.engine.think_guard import MAX_REQUEST_BYTES, GuardConfig, ThinkGuard, _ends, guard_state
 from tests.test_cuda_admission import http_server, post
 
 END, THINK_END = "<|end|>", "</think>"
@@ -338,3 +338,12 @@ def test_no_guard_with_thinking_off(tmp_path, decisions):
     app = app_for(tmp_path, ScriptEngine(LONG), GuardConfig(d.url, "clef", gap=0))
     status, body = ask(app, chat_template_kwargs={"enable_thinking": False})
     assert status == 200 and "thinking_guard" not in body["tensorfold"] and d.states == []
+
+
+def test_a_long_request_keeps_its_start_and_end_and_states_still_extend_each_other():
+    request = "START " + "x" * 50000 + " the question itself?"
+    one, two = guard_state(request, "A paragraph.\n\n"), guard_state(request, "A paragraph.\n\nAnother.\n\n")
+    assert "START" in one and "the question itself?" in one and "[middle of the request left out]" in one
+    assert len(one.encode()) < MAX_REQUEST_BYTES + 200
+    assert two.startswith(one)                       # the session resumes: the request part is the same every check
+    assert guard_state("short", "r") == "User's request:\nshort\n\nReasoning so far:\nr"
