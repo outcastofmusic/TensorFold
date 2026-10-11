@@ -145,6 +145,8 @@ class Buffers:
         self.top_k = c.top_k
         self.projection_scratch = (packed.ProjectionScratch(list(packed.projections(w)), rows, dev, prefill)
                                    if w.meta.get("packed_exl3") else None)
+        if self.projection_scratch is not None:
+            self.projection_scratch.heads = {id(p) for p in packed.leaves(w.head)}
 
     def set_taps(self, layers: tuple[int, ...], hidden: int) -> None:
         self.tap_at = {}
@@ -262,7 +264,8 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
     """A projection: 4-bit ones of a prompt chunk on the shared prefill matmul, the rest on ``qmm.matmul``."""
 
     if isinstance(q, (packed.PlainLinear, packed.ComposedLinear, packed.Exl3Linear)):
-        return packed.matmul(q, x, out, b.projection_scratch)
+        with prof.timed("mm: packed"):
+            return packed.matmul(q, x, out, b.projection_scratch)
     if b.prefill and isinstance(q, qmm.Q4):
         return shared.prefill_matmul(x, q, f32=f32, out=out)
     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)

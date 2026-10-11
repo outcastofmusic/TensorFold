@@ -7,6 +7,7 @@ native dense arithmetic for serial and prompt rows. All calls run on one stream.
 from __future__ import annotations
 from dataclasses import dataclass
 import math
+import os
 import re
 import torch
 from tensorfold.cuda.exl3.linear import Exl3Linear
@@ -15,6 +16,8 @@ from tensorfold.cuda.exl3.linear import Exl3Linear
 # in a window, so wider windows read fewer bytes. GB10, Mosaic 12L, 20.5k-token prompt, 2026-10-11: 128 rows 247 tok/s,
 # 256 283, 512 308, 1,024 314; replies keep their bits.
 MOE_WINDOW = 1024
+# experiment: a prompt chunk's trellis projections decode W once into the shared prompt GEMM (cuda/exl3/prefill.py)
+DENSE_PROMPT = os.environ.get('TF_GLM_DENSE_PROMPT', '0') == '1'
 
 
 @dataclass
@@ -82,6 +85,10 @@ class ProjectionScratch:
                         for dt in (torch.bfloat16,torch.float16,torch.float32)}
         z = max((q.split[0]*q.n for q in mats if isinstance(q,Exl3Linear) and q.split[0]>1),default=1)
         self.z = torch.empty(self.chunk*z,dtype=torch.float32,device=device)
+        self.prompt, self.heads = None, set()             # heads: the head's leaves, set by its Buffers
+        if prefill and DENSE_PROMPT and torch.device(device).type != 'cpu':
+            from tensorfold.cuda.exl3.prefill import Workspace
+            self.prompt = Workspace()
         # Trigger native lazy counter creation BEFORE any capture.
         for q in mats:
             if isinstance(q,Exl3Linear):
@@ -111,6 +118,12 @@ def matmul(q, x, out, scratch):
         return out
     if q.k>scratch.k or q.n>scratch.n:
         raise ValueError('projection exceeds preallocated scratch dimensions')
+    # every prompt row takes the GEMM whatever its call's rows, so a resumed prompt's tail keeps a fresh prompt's bits;
+    # the head reads one row a prompt and stays on the decode linear (its decoded copy would be 1.3 GB)
+    if scratch.prompt is not None and isinstance(q,Exl3Linear) and id(q) not in scratch.heads:
+        from tensorfold.cuda.exl3.prefill import matmul as prompt_matmul
+        prompt_matmul(q,x,dst,scratch.prompt)
+        return out
     for start in range(0,m,scratch.chunk):
         r=min(scratch.chunk,m-start)
         xi=scratch.inputs[x.dtype][:r*q.k].view(r,q.k)
