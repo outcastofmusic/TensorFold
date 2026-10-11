@@ -15,7 +15,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
-from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, sparse, packed
+from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, route_log, sparse, packed
 from .prefill import routed_micro_windows
 from tensorfold.cuda.exl3 import experts as generic_exl3
 from .attention import AttnScratch, attention, kv_write
@@ -425,6 +425,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
         if m.shared is None:
             grouped.route(b.pick[:R], b.plan)
+    route_log.note(m, b.pick, b.wts, R, c.experts, c.top_k, b.prefill)
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         if w.meta.get("packed_exl3"):
