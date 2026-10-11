@@ -1,6 +1,6 @@
 """GLM packed-module composition around unchanged upstream generic EXL3.
 
-Packed matrices are NEVER sliced or concatenated. Decode uses <=128-row
+Packed matrices are NEVER sliced or concatenated. Dense projections use <=128-row
 micro-windows for prompts too: bounded scratch, no decoded-W residency, same
 native dense arithmetic for serial and prompt rows. All calls run on one stream.
 """
@@ -10,6 +10,11 @@ import math
 import re
 import torch
 from tensorfold.cuda.exl3.linear import Exl3Linear
+
+# Rows of a prompt chunk whose routed experts run as one window: an expert's weights are read once per 32 of its rows
+# in a window, so wider windows read fewer bytes. GB10, Mosaic 12L, 20.5k-token prompt, 2026-10-11: 128 rows 247 tok/s,
+# 256 283, 512 308, 1,024 314; replies keep their bits.
+MOE_WINDOW = 1024
 
 
 @dataclass
@@ -215,11 +220,12 @@ def workspace_bytes(cfg, headers, *, rows=8, prefill_rows=2048, load_mtp=True):
     gu=default_config(D,I,True)
     down=default_config(I,D,False)
     def one(r):
+        w=min(r,MOE_WINDOW)
         r=min(r,128)
         projection=r*(2*kmax+8*kmax+8*nmax+4*zmax)
-        P=r*slots
+        P=w*slots
         U=min(P,E)
-        routed=P*(4*D+2*I+4*max(2*gu[2]*I,down[2]*D)+4*D)+4*U+4+4*U*r
+        routed=P*(4*D+2*I+4*max(2*gu[2]*I,down[2]*D)+4*D)+4*U+4+4*U*w
         return projection+routed
     mtp_rows = rows if load_mtp and cfg.mtp_layers else 0
     # Existing geometry budgets BF16 x. Every Buffers instance now has FP32 x,

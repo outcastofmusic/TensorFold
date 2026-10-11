@@ -108,10 +108,10 @@ class Buffers:
         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
             sl = c.shared_width // w.world
             if w.meta.get("packed_exl3"):
-                # packed TP1: a prompt chunk's routed experts run in windows of up to 128 rows, copied into ey
+                # packed TP1: a prompt chunk's routed experts run in windows of up to MOE_WINDOW rows, copied into ey
                 ex = next((l.moe.experts for l in w.layers if l.moe is not None),
                           w.mtp.layer.moe.experts if w.mtp is not None else None)
-                self.exl3 = generic_exl3.Scratch(ex, min(rows, 128), slots, device=dev) if ex is not None else None
+                self.exl3 = generic_exl3.Scratch(ex, min(rows, packed.MOE_WINDOW), slots, device=dev) if ex is not None else None
                 self.ey = torch.empty((rows, slots, D), dtype=f32, device=dev)
             else:
                 shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
