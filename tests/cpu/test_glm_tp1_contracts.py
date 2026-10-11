@@ -113,7 +113,7 @@ class SplitContracts(unittest.TestCase):
     def test_world1_bytes_all_partition_kinds_identity(self):
         for shape, kind in (([3, 5], "row"), ([3, 5], "col"), ([3, 5, 7], "dim1"), ([3], "rep")):
             raw = np.arange(math.prod(shape) * 2, dtype=np.uint8)
-            data, out_shape = split.split_bytes(raw, shape, 2, kind, 0, world=1)
+            data, out_shape = split.split_bytes(raw, shape, 2, kind, 0, ranks=1)
             self.assertIs(data, raw)
             self.assertEqual(out_shape, shape)
 
@@ -127,17 +127,17 @@ class SplitContracts(unittest.TestCase):
     def test_invalid_world_rank_fails(self):
         for world, rank in ((1, 1), (2, 2), (0, 0), (3, 0), (2, -1)):
             with self.assertRaises(ValueError):
-                split.split_bytes(np.arange(4, dtype=np.uint8), [4], 1, "rep", rank, world=world)
+                split.split_bytes(np.arange(4, dtype=np.uint8), [4], 1, "rep", rank, ranks=world)
 
     def test_world1_device_clone_unsplit(self):
         class Raw:
             def clone(self): return "owned"
-        data, shape = split.split_device(Raw(), [3, 5], 2, "col", 0, world=1)
+        data, shape = split.split_device(Raw(), [3, 5], 2, "col", 0, ranks=1)
         self.assertEqual((data, shape), ("owned", [3, 5]))
 
     def test_world1_span_full_fused_and_packed(self):
         reader = split.RankReader.__new__(split.RankReader)
-        reader.dir, reader.rank, reader.world, reader.split = Path("unused"), 0, 1, False
+        reader.dir, reader.rank, reader.ranks, reader.split = Path("unused"), 0, 1, False
         names = ["model.language_model.layers.0.self_attn.qkv_proj.trellis",
                  "model.language_model.layers.0.self_attn.conv1d.weight",
                  "model.language_model.layers.3.mlp.experts.0.gate_proj.mul1"]
@@ -148,7 +148,7 @@ class SplitContracts(unittest.TestCase):
 
     def test_world2_span_still_reads_half_rows(self):
         reader = split.RankReader.__new__(split.RankReader)
-        reader.dir, reader.rank, reader.world, reader.split = Path("unused"), 1, 2, False
+        reader.dir, reader.rank, reader.ranks, reader.split = Path("unused"), 1, 2, False
         n = "model.language_model.layers.0.self_attn.q_proj.weight"
         reader.index = {n: "shard"}
         reader.files = {"unused/shard": ({n: {"data_offsets": [0, 64], "shape": [8, 4], "dtype": "F16"}}, 16)}
@@ -170,7 +170,7 @@ class SplitContracts(unittest.TestCase):
             module.SafeTensors = lambda *_: None
             with patch.dict(sys.modules, {"tensorfold.cuda.direct_read": module}):
                 with self.assertRaisesRegex(ValueError, "full|unsplit|rank"):
-                    split.RankReader(folder, 0, world=1)
+                    split.RankReader(folder, 0, ranks=1)
 
 
 class EngineContracts(unittest.TestCase):
@@ -401,8 +401,8 @@ class TorchCpuContracts(unittest.TestCase):
             for kind, shape in (("row", [8, 6]), ("col", [8, 6]), ("dim1", [8, 6, 4]), ("rep", [8, 6])):
                 raw = np.arange(math.prod(shape) * 2, dtype=np.uint8)
                 for rank in range(world):
-                    data, dims = split.split_device(torch.from_numpy(raw), shape, 2, kind, rank, world=world)
-                    oracle, oracle_dims = split.split_bytes(raw, shape, 2, kind, rank, world=world)
+                    data, dims = split.split_device(torch.from_numpy(raw), shape, 2, kind, rank, ranks=world)
+                    oracle, oracle_dims = split.split_bytes(raw, shape, 2, kind, rank, ranks=world)
                     self.assertEqual(dims, oracle_dims)
                     np.testing.assert_array_equal(data.numpy(), oracle)
                     self.assertNotEqual(data.data_ptr(), torch.from_numpy(raw).data_ptr())
@@ -459,7 +459,7 @@ class TorchCpuContracts(unittest.TestCase):
             raw = np.arange(30, dtype=np.uint8)
             split.write(str(Path(folder, "model.safetensors")), [(n, "I16", [3, 5], raw) for n in names], None)
             for prefetch in (False, True):
-                rd = split.RankReader(folder, 0, world=1)
+                rd = split.RankReader(folder, 0, ranks=1)
                 try:
                     if prefetch: rd.prefetch(names)
                     for n in names:
