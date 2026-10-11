@@ -34,12 +34,16 @@ def test_parallel_startup_is_admitted_before_any_load(tmp_path, fake_runtime, fa
 
 
 @pytest.mark.torch
-@pytest.mark.parametrize("streams,depth,graphs,solo", [(1, 0, False, True), (2, 0, True, False),
-                                                     (2, 3, False, False), (2, 3, True, True)])
+@pytest.mark.parametrize("streams,depth,graphs,lone,solo", [(1, 0, False, None, True), (2, 0, True, "1", False),
+                                                          (2, 3, False, "1", False), (2, 3, True, "1", True),
+                                                          (2, 3, True, None, False)])   # off unless asked for
 def test_flash_startup_prebuilds_the_lone_graph_extensions(tmp_path, monkeypatch, fake_runtime,
-                                                          streams, depth, graphs, solo):  # noqa: F811
+                                                          streams, depth, graphs, lone, solo):  # noqa: F811
     from tensorfold.families.qwen4_exp.cuda import engine
 
+    monkeypatch.delenv("TENSORFOLD_LONE_GRAPHS", raising=False)
+    if lone is not None:
+        monkeypatch.setenv("TENSORFOLD_LONE_GRAPHS", lone)
     checkpoint(tmp_path, small_config(), WEIGHTS)
     calls, _ = fake_runtime
     built = []

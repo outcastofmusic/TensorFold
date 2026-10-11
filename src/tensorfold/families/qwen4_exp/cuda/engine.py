@@ -29,6 +29,18 @@ def vision_workspace() -> int:
     return int(value) * 2**20
 
 
+def lone_graphs() -> bool:
+    """TENSORFOLD_LONE_GRAPHS=1 gives a request decoding alone under --parallel its graph slot (multi_solo.py).
+
+    Off by default on one GPU: the slot is re-pointed whenever it holds the last request's kept prompt end, and each
+    re-point records its graphs again, about 0.155 s a window size (EXL3 3.05bpw, --parallel 4, 2026-10-11: one stream
+    69 tok/s with the slot, 90 without; a 24k prompt's first 128 tokens 33 against 64)."""
+
+    import os
+
+    return os.environ.get("TENSORFOLD_LONE_GRAPHS", "0").strip().lower() in ("1", "on", "true", "yes")
+
+
 def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True) -> None:
     """Load each applicable extension after admission and before resident weights consume the pool."""
 
@@ -115,7 +127,8 @@ class FlashNextEngine:
         each, mtp, bits = self.depth + 1, self.depth > 0, BITS_OF[self.kv_dtype]
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
         rows0 = chunk or PREFILL_ROWS
-        geometry = ((lambda text: indexed_stream_geometry(text, streams + int(graphs and mtp), each, KEEP, mtp=mtp,
+        lone = bool(graphs and mtp and (tp == 2 or lone_graphs()))     # two ranks plan their lone rounds: left as is
+        geometry = ((lambda text: indexed_stream_geometry(text, streams + int(lone), each, KEEP, mtp=mtp,
                                                           kv_bits=bits, world=tp, prefill_rows=rows0))
                     if streams > 1 else
                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits,
@@ -141,7 +154,7 @@ class FlashNextEngine:
         if tp == 2:
             self._same_settings(torch, ids, vision)
         build_kernels(exl3=exl3, nvfp4=not exl3 and quant_method(read_config(model_dir)) == "modelopt",
-                      solo=streams == 1 or (graphs and mtp))
+                      solo=streams == 1 or lone)
         from concurrent.futures import wait
 
         from tensorfold.cuda.direct_read import wait_all
@@ -200,7 +213,7 @@ class FlashNextEngine:
                                       confidence=self.confidence, keep=KEEP, points=self.points,
                                       copy=getattr(self, "copy_drafts", False),
                                       kv_dtype=self.kv_dtype, share=share, vision=self.vision,
-                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=graphs)
+                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=lone)
             self.scheduler = Scheduler(self.multi, max_streams=streams)
         else:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,

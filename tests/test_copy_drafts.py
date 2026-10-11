@@ -53,3 +53,15 @@ def test_switch(monkeypatch):
         assert not enabled()
     monkeypatch.setenv("TENSORFOLD_COPY_DRAFTS", "1")
     assert enabled(False)
+
+
+def test_lone_graphs_switch(monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda.engine import lone_graphs
+
+    monkeypatch.delenv("TENSORFOLD_LONE_GRAPHS", raising=False)
+    assert not lone_graphs()
+    for on in ("1", "on", " True "):
+        monkeypatch.setenv("TENSORFOLD_LONE_GRAPHS", on)
+        assert lone_graphs()
+    monkeypatch.setenv("TENSORFOLD_LONE_GRAPHS", "0")
+    assert not lone_graphs()
