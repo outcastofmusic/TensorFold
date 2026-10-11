@@ -34,15 +34,18 @@ class CopyIndex:
         """Up to ``max_nodes`` tokens after the tail's latest earlier copy; [] without one or under ``min_match``."""
 
         ctx, m = self.ctx, self.m
-        if len(ctx) < 2 * m or max_nodes < m:
+        if len(ctx) < 2 * m or max_nodes < 1:
             return []
+        # A round with fewer than min_match slots (Flash Next drafts 6) still copies: the earlier copy must run
+        # min_match tokens on, and the round takes the first max_nodes of them.
+        want = max(max_nodes, m)
         best: list[int] = []
         for start in reversed(self.starts.get(tuple(ctx[-m:]), [])):
             if start > len(ctx) - m - 1:                 # the needle itself
                 continue
-            cont = ctx[start + m:start + m + max_nodes]
+            cont = ctx[start + m:start + m + want]
             if len(cont) > len(best):
                 best = cont
-                if len(best) == max_nodes:
+                if len(best) == want:
                     break
-        return best if len(best) >= m else []
+        return best[:max_nodes] if len(best) >= m else []

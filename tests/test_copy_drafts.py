@@ -19,10 +19,12 @@ def test_a_repeated_tail_drafts_its_continuation():
     assert CopyIndex(ctx).chain(40) == A[COPY_MATCH:] + B[:8]       # up to max_nodes, across what followed
 
 
-def test_a_round_without_room_for_a_chain_gets_none():
+def test_a_round_with_fewer_slots_than_the_match_still_copies():
     ctx = A + B + A[:COPY_MATCH]
-    assert CopyIndex(ctx).chain(COPY_MATCH - 1) == []               # the MTP chain takes such a round
+    assert CopyIndex(ctx).chain(6) == A[COPY_MATCH:COPY_MATCH + 6]  # Flash Next's 6 drafts a round
     assert CopyIndex(ctx).chain(COPY_MATCH) == A[COPY_MATCH:2 * COPY_MATCH]
+    assert CopyIndex(ctx).chain(0) == []
+    assert CopyIndex(A[:COPY_MATCH] + B[:5] + A[:COPY_MATCH]).chain(6) == B[:5] + A[:1]
 
 
 def test_the_latest_copy_wins_and_the_needle_is_not_a_copy():
