@@ -18,6 +18,7 @@
 #   QWEN_MODEL, CLEF_MODEL, GLM_MODEL   another checkpoint folder under $MODELS
 # Qwen:  CONTEXT=262144  PARALLEL=4  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
 # GLM:   CONTEXT=98304   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)
+#        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
 set -euo pipefail
 
 MODELS="${MODELS:-$HOME/models}"
@@ -54,7 +55,8 @@ stop_all() {
 }
 
 # The checkout installed into a local image, rebuilt when a source file changes. A boot from it skips pip, and the
-# CUDA extensions compiled on its first boot stay in the tensorfold-ext volume: 100 s of compiling a boot otherwise.
+# CUDA extensions and Triton kernels compiled on its first boot stay in the tensorfold-ext volume: 100 s of compiling a
+# boot otherwise.
 image() {
     local tag old
     tag="tensorfold-run:$(cd "$SRC" && find src pyproject.toml -type f -not -name '*.pyc' -print0 | sort -z | xargs -0 sha1sum | sha1sum | cut -c1-12)"
@@ -78,7 +80,7 @@ serve() {  # container name, docker flags..., --, tensorfold serve arguments
     while [ "$1" != "--" ]; do flags+=("$1"); shift; done
     shift
     docker run -d --init --name "$name" --gpus all --ipc=host --network host \
-        -v "$MODELS:$MODELS:ro" -v tensorfold-ext:/ext -e TORCH_EXTENSIONS_DIR=/ext -e HF_HUB_OFFLINE=1 "${flags[@]}" "$IMAGE" \
+        -v "$MODELS:$MODELS:ro" -v tensorfold-ext:/ext -e TORCH_EXTENSIONS_DIR=/ext -e TRITON_CACHE_DIR=/ext/triton -e HF_HUB_OFFLINE=1 "${flags[@]}" "$IMAGE" \
         tensorfold serve "$@" --no-update-check >/dev/null
 }
 
@@ -164,7 +166,8 @@ glm() {
     for try in 1 2 3 4; do
         docker rm -f tensorfold-glm >/dev/null 2>&1 || true
         # TF_GLM_DENSE_PROMPT=1: prompt rows through the dense matmul, 310 -> 362 tok/s on a 20,500-token prompt
-        serve tensorfold-glm -e TF_GLM_DENSE_PROMPT=1 -- "$model" --tp 1 --host 127.0.0.1 --port "$PORT" --name glm-5.3-flash \
+        # TF_GLM_CALIBRATE=0: no 5 s of draft timing at start; only the `auto:...` chooser reads it (TIMING=1 keeps it)
+        serve tensorfold-glm -e TF_GLM_DENSE_PROMPT=1 -e TF_GLM_CALIBRATE="${TIMING:-0}" -- "$model" --tp 1 --host 127.0.0.1 --port "$PORT" --name glm-5.3-flash \
             --context "${CONTEXT:-$context}" --max-tokens "${CONTEXT:-$context}" "${drafter[@]}" ${EXTRA:-}
         wait_ready tensorfold-glm "$PORT" && return 0
         docker logs tensorfold-glm 2>&1 | grep -q 'memory budget cannot fit' || break

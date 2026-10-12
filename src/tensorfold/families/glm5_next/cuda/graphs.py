@@ -30,11 +30,12 @@ class Graphs:
         prof.active = False
         saved = list(st.cur)
         parities = (0, 1) if st.cur else (0,)
+        self.warmed: set[str] = set()
         with torch.no_grad():
             for R in main_rows:
                 for parity in parities:
                     st.cur = [parity] * len(st.cur)
-                    for _ in range(2):
+                    for _ in range(self._warm("main")):
                         compute(w, st, e.buf, R)
                     torch.cuda.synchronize()
                     g = torch.cuda.CUDAGraph()
@@ -45,7 +46,7 @@ class Graphs:
             if self.load_mtp:
                 e.mbuf.zero_first = False
                 for n in mtp_rows:
-                    for _ in range(2):
+                    for _ in range(self._warm("mtp")):
                         mtp_compute(w, st, e.mbuf, n)
                     torch.cuda.synchronize()
                     g = torch.cuda.CUDAGraph()
@@ -56,6 +57,16 @@ class Graphs:
                 self._capture_sparse(e, main_rows, mtp_rows, parities)
         torch.cuda.synchronize()
 
+    def _warm(self, kind: str) -> int:
+        """Runs before a capture: 2 for a kind's first shape (lazy handles and workspaces), 1 for its later shapes.
+
+        Start-up captures 12 shapes a sparse bucket, and a second run of each cost 5 of GLM's 50 s load.
+        """
+
+        first = kind not in self.warmed
+        self.warmed.add(kind)
+        return 2 if first else 1
+
     def _capture_sparse(self, e, main_rows, mtp_rows, parities) -> None:
         w, st = e.w, e.st
         np_max = st.index[0][2].shape[0] - 2
@@ -64,7 +75,7 @@ class Graphs:
             for R in main_rows:
                 for parity in parities:
                     st.cur = [parity] * len(st.cur)
-                    for _ in range(2):
+                    for _ in range(self._warm("sparse")):
                         compute(w, st, e.buf, R, sparse_np=bucket)
                     torch.cuda.synchronize()
                     g = torch.cuda.CUDAGraph()
@@ -73,7 +84,7 @@ class Graphs:
                     self.sparse[(R, parity, bucket)] = g
             if self.load_mtp:
                 for n in mtp_rows:
-                    for _ in range(2):
+                    for _ in range(self._warm("sparse_mtp")):
                         mtp_compute(w, st, e.mbuf, n, sparse_np=bucket)
                     torch.cuda.synchronize()
                     g = torch.cuda.CUDAGraph()

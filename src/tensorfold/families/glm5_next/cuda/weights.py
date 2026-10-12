@@ -7,6 +7,7 @@ plain tensors retain stored dtype and norms retain their uncentered gamma.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -481,6 +482,13 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
         del parts
         return MoEW(router, bias, ex)
 
+    rest: dict[int, list[str]] = {}                      # an EXL3 layer's tensors outside its routed experts
+    if exl3:
+        for name in rd.index:
+            m = re.match(re.escape(PREFIX) + r"layers\.(\d+)\.", name)
+            if m and ".mlp.experts." not in name:
+                rest.setdefault(int(m.group(1)), []).append(name)
+
     layer_events: list = []                              # each layer's event, recorded once its work is queued
 
     def layer(i: int, plain: bool = False) -> LayerW:
@@ -491,6 +499,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
         up = None if exl3 else dev                       # MLX experts come uploaded (EXL3's are unpacked on the host)
         rd.prefetch(expert_names(i), up)                 # already queued, except for the first layer
         rd.prefetch(expert_names(i + 1), up)             # two layers in flight: reads overlap copies and packing
+        rd.prefetch(rest.get(i, []))                     # attention and the rest: read on the main thread they cost
+        rd.prefetch(rest.get(i + 1, []))                 # 4.5 of the 19.5 s an EXL3 GLM takes to load
         lw = LayerW(i, kind, None if plain else hc(i, "attn"), None if plain else hc(i, "ffn"),
                     t(f"layers.{i}.input_layernorm.weight"), t(f"layers.{i}.post_attention_layernorm.weight"))
         if kind == "kda":
@@ -506,6 +516,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
                 torch.cuda.empty_cache()
         if dev.type == "cuda":
             layer_events.append(torch.cuda.current_stream().record_event())
+        rd.reads.drop(rest.get(i, []))                   # what the layer did not read
         return lw
 
     try:                                          # a failed load still cancels the reads queued ahead

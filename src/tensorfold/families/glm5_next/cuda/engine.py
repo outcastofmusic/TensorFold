@@ -277,7 +277,10 @@ class GlmEngine:
                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
         if self.drafter is not None and not self.eager:
             self.drafter.capture()
-        self.costs = self._calibrate() if self.calibrated else None
+        # TF_GLM_CALIBRATE=0 skips the 5 s of timing: `auto` on an EXL3 pack with a draft model is a fixed policy and
+        # reads no timings, and a request for the chooser (`auto:...`) is then refused
+        timed = os.environ.get("TF_GLM_CALIBRATE", "1") != "0"
+        self.costs = self._calibrate() if self.calibrated and timed else None
         if rank == 0 and self.costs is not None:
             c = self.costs
             print(f"[tensorfold] drafter timings (ms, fastest of 7): {c['timed']}", flush=True)
