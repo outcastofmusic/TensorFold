@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Sequence
 from types import SimpleNamespace
@@ -20,6 +21,9 @@ from .prefill import routed_micro_windows
 from tensorfold.cuda.exl3 import experts as generic_exl3
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
+
+# TF_GLM_SKIP_SHARE=0.05: a routed pick under 5% of its row's routed weight is skipped (changes replies; 0: off)
+SKIP_SHARE = float(os.environ.get("TF_GLM_SKIP_SHARE", "0") or 0)
 
 
 @dataclass
@@ -426,6 +430,14 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         if m.shared is None:
             grouped.route(b.pick[:R], b.plan)
     route_log.note(m, b.pick, b.wts, R, c.experts, c.top_k, b.prefill)
+    if SKIP_SHARE > 0 and m.shared is not None and w.meta.get("packed_exl3"):
+        # a pick under SKIP_SHARE of its row's routed weight is not read (the kernels skip id >= experts); the rest keep the sum
+        wts = b.wts[:R, :c.top_k]
+        total = wts.sum(1, keepdim=True)
+        low = wts < SKIP_SHARE * total
+        b.pick[:R, :c.top_k].masked_fill_(low, c.experts)
+        wts.masked_fill_(low, 0.0)
+        wts.mul_(total / wts.sum(1, keepdim=True))
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         if w.meta.get("packed_exl3"):
