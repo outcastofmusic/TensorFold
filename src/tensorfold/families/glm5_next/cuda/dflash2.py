@@ -510,3 +510,25 @@ class Drafter:
             return []
         tokens, values, proj = self.candidates(pending, depth)
         return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence)
+
+
+def tree_probe(probe: list, drafts: list[int], sampled: list[int], keep: int) -> None:
+    """Would one sibling row have been kept? At the first rejected draft: its runner-up. After a chain the confidence
+    cut ended and the target kept whole: the cut position's best and second candidates."""
+
+    t = TREE
+    def add(key: str, x: float = 1.0) -> None:
+        t[key] = t.get(key, 0.0) + x
+    add("rounds"); add("rows", 1 + len(drafts)); add("kept", keep)
+    i = keep - 1                                   # the first draft the target refused, or len(drafts)
+    if i >= len(probe):
+        add("full")                                # every draft kept and the chain ran to its depth
+        return
+    want = sampled[i]
+    top1, p1, top2, p2 = probe[i]
+    if i < len(drafts):
+        add("reject"); add("reject_alt_hit", want == top2); add("reject_alt_p", p2)
+        add("reject_alt_p_hit", p2 if want == top2 else 0.0)
+    else:
+        add("cut"); add("cut_top1_hit", want == top1); add("cut_top2_hit", want == top2)
+        add("cut_p1", p1); add("cut_p2", p2)

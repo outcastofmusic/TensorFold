@@ -593,6 +593,8 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
     """Verify pending and DFlash2 draft rows through the first mismatch and absorb kept taps, starting from prefill's drafter state."""
 
     w, st, b = e.w, e.st, e.buf
+    from . import dflash2
+
     policy = policy or DepthPolicy(3, fixed=True)
     out = [pending]
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
@@ -618,6 +620,8 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
             if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
                 break
             keep += 1
+        if dflash2.TREE_PROBE:
+            dflash2.tree_probe(drafter.probe, drafts, sampled, keep)
         t3 = time.perf_counter()
         commit(w, st, b, R, keep)
         t4 = time.perf_counter()

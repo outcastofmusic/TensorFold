@@ -132,7 +132,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
                 break
             keep += 1
         if arm == "f" and dflash2.TREE_PROBE:
-            _tree_probe(drafter.probe, drafts, sampled, keep)
+            dflash2.tree_probe(drafter.probe, drafts, sampled, keep)
         t3 = time.perf_counter()
         commit(w, st, b, R, keep)
         t4 = time.perf_counter()
@@ -174,26 +174,3 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         drafter.add_taps(f_taps[:n_f])          # DFlash2's context ends where the committed rows end
     return DecodeResult(out[:count], seconds, rounds, drafted, accepted, stages, depths, keeps, "".join(arms),
                         m_rows[:len(m_next)])
-
-
-def _tree_probe(probe: list, drafts: list[int], sampled: list[int], keep: int) -> None:
-    """Would one sibling row have been kept? At the first rejected draft: its runner-up. After a chain the confidence
-    cut ended and the target kept whole: the cut position's best and second candidates."""
-
-    t = dflash2.TREE
-    def add(key: str, x: float = 1.0) -> None:
-        t[key] = t.get(key, 0.0) + x
-    add("rounds"); add("rows", 1 + len(drafts)); add("kept", keep)
-    i = keep - 1                                   # the first draft the target refused, or len(drafts)
-    if i >= len(probe):
-        add("full")                                # every draft kept and the chain ran to its depth
-        return
-    want = sampled[i]
-    top1, p1, top2, p2 = probe[i]
-    if i < len(drafts):
-        add("reject"); add("reject_alt_hit", want == top2); add("reject_alt_p", p2)
-        add("reject_alt_p_hit", p2 if want == top2 else 0.0)
-    else:
-        add("cut"); add("cut_top1_hit", want == top1); add("cut_top2_hit", want == top2)
-        add("cut_p1", p1); add("cut_p2", p2)
-
