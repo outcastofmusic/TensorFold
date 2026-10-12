@@ -26,12 +26,17 @@ below were measured on, and converts Qwen's image tower once. Downloads run insi
 | `qwen-flash-next` | `turboderp/Qwen3.8-Flash-Next-exl3` (3.05 bpw), `Cloudflare/clef-flash`, a converted image tower | 99 GB |
 | `glm-5.3-flash` | `0xSero/GLM-5.3-Flash-EXL3-Spark` (M288 Mosaic 12L), `cfontes/GLM-5.3-Flash-DFlash2-TR3-v3` | 93 GB |
 
-`run.sh` installs this checkout into the image at each start and serves on `http://127.0.0.1:30000/v1`, an
-OpenAI-compatible API. The two models do not fit in memory together, so starting one
-stops the other: a switch to Qwen takes about 1 minute and a switch to GLM about 1.5 minutes. The first start after a
-source change takes 4 to 5 minutes more, because `run.sh` installs the checkout into a local image and compiles the CUDA
-extensions into the `tensorfold-ext` Docker volume. Later starts reuse both. `./run.sh stop` and `./run.sh status` do what they say. The server listens on loopback and checks no
-API key.
+`run.sh` serves on `http://127.0.0.1:30000/v1`, an OpenAI-compatible API. The two models do not fit in memory
+together, so starting one stops the other: a switch to Qwen takes about 1 minute and a switch to GLM about 1.5 minutes.
+The first start after a source change takes 4 to 5 minutes more, because `run.sh` installs the checkout into a local
+image and compiles the CUDA extensions into the `tensorfold-ext` Docker volume. Later starts reuse both.
+`./run.sh stop` and `./run.sh status` do what they say. The server listens on loopback and checks no API key.
+
+`./run.sh swap` starts one endpoint for both models on the same port ([`swap.py`](swap.py), Python's standard library).
+It loads the model a request names in `"model"`, so a client switches by changing that field. A request for the model
+that is not loaded waits for the running requests to finish and for the load. A streamed request receives an SSE
+comment every 5 s while it waits, which keeps clients with a read timeout connected. `SWAP_HOLD=120` keeps each model
+loaded for at least that many seconds: with two clients on two models, each request otherwise pays a swap.
 
 | | `./run.sh qwen-flash-next` | `./run.sh glm-5.3-flash` |
 | --- | --- | --- |

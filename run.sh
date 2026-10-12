@@ -3,6 +3,7 @@
 #
 #   ./run.sh qwen-flash-next   Qwen3.8 Flash Next on 127.0.0.1:30000, with Clef-Flash beside it as the thinking guard
 #   ./run.sh glm-5.3-flash     GLM-5.3 Flash on 127.0.0.1:30000, with its DFlash2 draft model
+#   ./run.sh swap              one endpoint on 127.0.0.1:30000 that loads whichever model a request names (swap.py)
 #   ./run.sh stop              stop whatever this script started
 #   ./run.sh status            what is running and whether it answers
 #
@@ -11,7 +12,7 @@
 #
 # Settings (environment):
 #   MODELS=~/models            where prepare.sh put the checkpoints
-#   PORT=30000                 the model's port;  CLEF_PORT=30001 the guard's
+#   PORT=30000                 the model's port;  CLEF_PORT=30001 the guard's;  BACKEND_PORT=30002 the model's under swap
 #   TF_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 #   EXTRA="..."                more `tensorfold serve` flags
 #   QWEN_MODEL, CLEF_MODEL, GLM_MODEL   another checkpoint folder under $MODELS
@@ -25,6 +26,7 @@ PORT="${PORT:-30000}"
 CLEF_PORT="${CLEF_PORT:-30001}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 NAMES="tensorfold-serve clef-serve tensorfold-glm"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/tensorfold-run"
 
 die() { echo "run: $*" >&2; exit 1; }
 up() { docker ps --format '{{.Names}}' | grep -qx "$1"; }
@@ -93,6 +95,34 @@ wait_ready() {  # container name, port; returns 1 when the server exited while l
 
 failed() { docker logs "$1" 2>&1 | tail -5 >&2; die "$1 exited while loading"; }
 
+swapping() {  # the swap endpoint's process is alive
+    local pid
+    pid=$(cat "$STATE/swap.pid" 2>/dev/null) || return 1
+    [ -n "$pid" ] && grep -qs swap.py "/proc/$pid/cmdline"
+}
+
+# Under the swap endpoint a model is loaded by asking it, so the endpoint knows what is in memory.
+ask_swap() {
+    [ -z "${TF_SWAP_CHILD:-}" ] && swapping || return 1
+    echo "run: asking the swap endpoint on 127.0.0.1:$PORT for $1"
+    curl -sf -m 1200 -X POST "http://127.0.0.1:$PORT/swap/$1" || die "the swap endpoint could not load $1; see $STATE/swap.log"
+    echo
+}
+
+swap() {
+    command -v python3 >/dev/null || die "swap needs python3 on the host"
+    swapping && die "the swap endpoint is already running (pid $(cat "$STATE/swap.pid")); ./run.sh stop ends it"
+    stop_all
+    mkdir -p "$STATE"
+    rm -f "$STATE/swap.pid"
+    PORT=$PORT BACKEND_PORT="${BACKEND_PORT:-30002}" SWAP_PIDFILE="$STATE/swap.pid" \
+        setsid nohup python3 "$SRC/swap.py" >>"$STATE/swap.log" 2>&1 </dev/null &
+    sleep 2
+    swapping || { tail -3 "$STATE/swap.log" >&2; die "the swap endpoint did not start"; }
+    echo "run: swap endpoint on http://127.0.0.1:$PORT/v1 (log: $STATE/swap.log). A request's \"model\" picks qwen3.8-flash-next or glm-5.3-flash."
+    [ -z "${1:-}" ] || ask_swap "$1"
+}
+
 qwen() {
     local model="${QWEN_MODEL:-$MODELS/Qwen3.8-Flash-Next-exl3-3.05bpw}" clef="${CLEF_MODEL:-$MODELS/clef-flash}"
     local tower="$MODELS/Qwen3.8-Flash-Next-exl3-3.05bpw-vision/vision-f16-v3.safetensors"
@@ -146,6 +176,7 @@ glm() {
 
 status() {
     local n any=0
+    swapping && { any=1; echo "swap endpoint: 127.0.0.1:$PORT $(curl -s -m 3 "http://127.0.0.1:$PORT/swap")"; PORT="${BACKEND_PORT:-30002}"; }
     for n in $NAMES; do
         up "$n" || continue
         any=1
@@ -157,9 +188,11 @@ status() {
 
 command -v docker >/dev/null || die "docker is not installed"
 case "${1:-}" in
-    qwen-flash-next) qwen ;;
-    glm-5.3-flash)   glm ;;
-    stop)            stop_all ;;
+    qwen-flash-next) ask_swap "$1" || qwen ;;
+    glm-5.3-flash)   ask_swap "$1" || glm ;;
+    swap)            swap "${2:-}" ;;
+    stop)            swapping && { kill "$(cat "$STATE/swap.pid")"; rm -f "$STATE/swap.pid"; echo "run: stopped the swap endpoint"; }
+                     stop_all ;;
     status)          status ;;
-    *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
