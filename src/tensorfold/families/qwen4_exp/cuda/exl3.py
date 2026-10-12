@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
@@ -12,25 +13,57 @@ from tensorfold.cuda.exl3 import experts as x3experts
 from tensorfold.cuda.exl3 import format as fmt
 
 from .exl3_mm import Scratch, f16, stack, x3
-from .exl3_pack import _DT, NgramTable, Pack, is_exl3
+from .exl3_pack import _DT, EXTRA_FILES, NgramTable, Pack, is_exl3
 
+AHEAD_RUN = 128 << 20     # bytes of experts one read-ahead read brings in: eight in flight, each through a pinned block
 PREFILL_ROWS = 2048       # the prompt buffers' rows (``decode.PREFILL_ROWS``): the n-gram staging holds as many
 
 __all__ = ["is_exl3", "load"]
 
 
-def expert_table(pk: Pack, prefix: str, count: int, shared: str, device) -> x3experts.Exl3RoutedExperts:
-    """Experts ``prefix.{0..count-1}`` and the shared expert (as expert ``count``), trellises read in large runs into one buffer."""
+def expert_runs(pk: Pack, prefix: str, count: int, shared: str, span: int) -> tuple:
+    """The expert tensors of ``expert_table`` and the reads that bring them in: (names, parts, entries, runs of
+    (file, first byte, end byte, keys)). A run spans at most ``span`` bytes and skips at most 16 MB of other tensors."""
 
     names = [f"{prefix}.{e}" for e in range(count)] + [shared]
     projs = ("gate_proj", "up_proj", "down_proj")
+    parts = {nm + "." + p: (("suh" if pk.has(f"{nm}.{p}.suh") else "su"), ("svh" if pk.has(f"{nm}.{p}.svh") else "sv"))
+             for nm in names for p in projs}
+    entries = {f"{m}.{part}": pk.entry(f"{m}.{part}") for m, (i, o) in parts.items() for part in ("trellis", i, o)}
+    by_file: dict[str, list[str]] = {}
+    for key, (file, *_rest) in entries.items():
+        by_file.setdefault(file, []).append(key)
+    runs = []
+    for file, keys in by_file.items():
+        keys.sort(key=lambda k: entries[k][1])
+        run: list[str] = []
+        for k in keys + [None]:
+            if run and (k is None or entries[k][2] - entries[run[0]][1] > span
+                        or entries[k][1] - max(entries[j][2] for j in run[-4:]) > (16 << 20)):
+                runs.append((file, entries[run[0]][1], max(entries[j][2] for j in run), run))
+                run = []
+            if k is not None:
+                run.append(k)
+    return names, parts, entries, runs
+
+
+def queue_experts(pk: Pack, prefix: str, count: int, shared: str, device) -> None:
+    """Start reading a layer's experts to the device, for the ``expert_table`` call that follows."""
+
+    if prefix not in pk.plans and pk.has(f"{prefix}.0.gate_proj.trellis"):
+        pk.plans[prefix] = plan = expert_runs(pk, prefix, count, shared, AHEAD_RUN)
+        pk.queue([run[:3] for run in plan[3]], device)
+
+
+def expert_table(pk: Pack, prefix: str, count: int, shared: str, device) -> x3experts.Exl3RoutedExperts:
+    """Experts ``prefix.{0..count-1}`` and the shared expert (as expert ``count``), trellises read in large runs into one buffer."""
+
+    projs = ("gate_proj", "up_proj", "down_proj")
+    names, parts, entries, runs = pk.plans.pop(prefix, None) or expert_runs(pk, prefix, count, shared, 2 << 30)
     codebooks = {pk.codebook(f"{nm}.{p}") for nm in names for p in projs}
     if len(codebooks) > 1:
         raise ValueError(f"{prefix}: the experts mix EXL3 codebooks ({', '.join(sorted(codebooks))}); the grouped "
                          "expert kernel takes one codebook a layer")
-    parts = {nm + "." + p: (("suh" if pk.has(f"{nm}.{p}.suh") else "su"), ("svh" if pk.has(f"{nm}.{p}.svh") else "sv"))
-             for nm in names for p in projs}
-    entries = {f"{m}.{part}": pk.entry(f"{m}.{part}") for m, (i, o) in parts.items() for part in ("trellis", i, o)}
     place, total = {}, 0
     for k in entries:
         if k.endswith(".trellis"):
@@ -38,33 +71,21 @@ def expert_table(pk: Pack, prefix: str, count: int, shared: str, device) -> x3ex
             total += -(-(entries[k][2] - entries[k][1]) // 256) * 256
     big = torch.empty((total,), dtype=torch.uint8, device=device)
     small: dict[str, torch.Tensor] = {}
-    by_file: dict[str, list[str]] = {}
-    for key, (file, *_rest) in entries.items():
-        by_file.setdefault(file, []).append(key)
-    for file, keys in by_file.items():
-        keys.sort(key=lambda k: entries[k][1])
-        run: list[str] = []
-
-        def flush(run: list[str]) -> None:
-            if run:
-                b0, b1 = entries[run[0]][1], max(entries[k][2] for k in run)
-                host = pk.read(file, b0, b1)
-                dev = host.to(device)
-                for k in run:
-                    _, b, e, dtype, shape = entries[k]
-                    if k.endswith(".trellis"):
-                        big[place[k]:place[k] + (e - b)].copy_(dev[b - b0:e - b0])
-                    else:
-                        small[k] = host[b - b0:e - b0].clone().view(_DT[dtype]).reshape(shape)
-                del dev, host
-
-        for k in keys:                     # a run spans at most ~2 GB and skips at most 16 MB of other tensors
-            if run and (entries[k][2] - entries[run[0]][1] > (2 << 30)
-                        or entries[k][1] - max(entries[j][2] for j in run[-4:]) > (16 << 20)):
-                flush(run)
-                run = []
-            run.append(k)
-        flush(run)
+    for file, b0, b1, run in runs:
+        dev = pk.take((file, b0, b1))                # read ahead and uploaded (``queue_experts``), or read here
+        host = None
+        if dev is None:
+            host = pk.read(file, b0, b1)
+            dev = host.to(device)
+        for k in run:
+            _, b, e, dtype, shape = entries[k]
+            if k.endswith(".trellis"):
+                big[place[k]:place[k] + (e - b)].copy_(dev[b - b0:e - b0])
+            elif host is None:                       # a view of the upload, which lives until the scales are stacked
+                small[k] = dev[b - b0:e - b0].view(_DT[dtype]).reshape(shape)
+            else:
+                small[k] = host[b - b0:e - b0].clone().view(_DT[dtype]).reshape(shape)
+        del dev, host
 
     def trellis(k: str) -> torch.Tensor:
         _, b, e, dtype, shape = entries[k]
@@ -74,7 +95,7 @@ def expert_table(pk: Pack, prefix: str, count: int, shared: str, device) -> x3ex
 
     def scales(m: str, part: str) -> torch.Tensor:
         t = small[f"{m}.{part}"]
-        return (t if part in ("suh", "svh") else torch.from_numpy(fmt.unpack_signs(t.numpy()))).to(device)
+        return (t if part in ("suh", "svh") else torch.from_numpy(fmt.unpack_signs(t.cpu().numpy()))).to(device)
 
     lists = {p: [(trellis(f"{nm}.{p}.trellis"), scales(f"{nm}.{p}", parts[f"{nm}.{p}"][0]),
                   scales(f"{nm}.{p}", parts[f"{nm}.{p}"][1])) for nm in names] for p in projs}
@@ -199,8 +220,23 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     if embed.dtype not in (torch.bfloat16, torch.float16):
         embed = embed.to(torch.bfloat16)
     loaded = []
+    rest: dict[int, list[str]] = {}               # a layer's tensors in the shards outside its experts
+    for name, file in pk.where.items():
+        m = re.match(re.escape(T) + r"layers\.(\d+)\.", name)
+        if m and ".mlp.experts." not in name and ".mlp.shared_expert." not in name and file not in EXTRA_FILES:
+            rest.setdefault(int(m.group(1)), []).append(name)
+
+    def ahead(i: int) -> None:                    # two layers in flight: reads overlap the copies and packing
+        if i < cfg.layers and f"{T}layers.{i}.mlp.experts" not in pk.plans:
+            queue_experts(pk, f"{T}layers.{i}.mlp.experts", cfg.experts, f"{T}layers.{i}.mlp.shared_expert", device)
+            pk.queue_host(rest.get(i, []))
+
+    ahead(0)
     for i in range(cfg.layers):
+        ahead(i + 1)
+        ahead(i + 2)
         loaded.append(layer(i, f"{T}layers.{i}", cfg.layer_types[i], True))
+        pk.drop(rest.get(i, []))                  # what the layer did not read
         pk.release()
         if i % 8 == 7:                            # each release waits for the device; a layer leaves few temporaries
             torch.cuda.empty_cache()
@@ -225,6 +261,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         w.draft_ids = torch.from_numpy(ids).to(device)
         w.draft_head = make_q4(*requant_rows(head, w.draft_ids, device))
     pk.release()
+    pk.close()
     torch.cuda.empty_cache()
     w.meta["load_seconds"] = time.time() - t0
     return w

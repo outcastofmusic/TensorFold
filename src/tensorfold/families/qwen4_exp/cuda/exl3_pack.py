@@ -50,6 +50,8 @@ class Pack:
                     if name != "__metadata__":
                         self.where.setdefault(name, extra)
         self.touched: set[str] = set()
+        self.ahead = None                             # reads queued ahead of the loader (``queue``)
+        self.plans: dict[str, tuple] = {}             # a layer's expert reads, planned when queued
 
     def header(self, file: str) -> tuple[int, dict]:
         got = self.headers.get(file)
@@ -77,9 +79,46 @@ class Pack:
         self.touched.add(file)
         return raw
 
+    def queue(self, runs: list[tuple[str, int, int]], device) -> None:
+        """Start reading the (file, begin, end) runs on threads, each uploaded to ``device`` through a pinned block."""
+
+        from tensorfold.cuda.direct_read import ReadAhead
+
+        if torch.device(device).type != "cuda":
+            return
+        if self.ahead is None:
+            self.ahead = ReadAhead(self.io)
+        self.ahead.queue([(run, self.dir / run[0], run[1], run[2], None) for run in runs], device, lambda raw, _: raw)
+
+    def queue_host(self, names: list[str]) -> None:
+        """Start reading the named tensors on threads, for the ``get`` of each that follows (``drop`` the rest)."""
+
+        from tensorfold.cuda.direct_read import ReadAhead
+
+        if self.ahead is None:
+            self.ahead = ReadAhead(self.io)
+        entries = [(name, *self.entry(name)[:3]) for name in names]
+        self.ahead.queue([(name, self.dir / file, b, e, None) for name, file, b, e in entries if e > b])
+        self.touched.update(file for _, file, _, _ in entries)
+
+    def drop(self, names: list[str]) -> None:
+        if self.ahead is not None:
+            self.ahead.drop(names)
+
+    def take(self, run: tuple[str, int, int]) -> torch.Tensor | None:
+        """A queued run's bytes on the device, once uploaded; None when it was not queued."""
+
+        return self.ahead.take(run) if self.ahead is not None else None
+
+    def close(self) -> None:
+        if self.ahead is not None:
+            self.ahead.close()
+            self.ahead = None
+
     def get(self, name: str) -> torch.Tensor:
         file, begin, end, dtype, shape = self.entry(name)
-        return self.read(file, begin, end).view(_DT[dtype]).reshape(shape)
+        raw = self.ahead.take(name) if self.ahead is not None else None
+        return (self.read(file, begin, end) if raw is None else raw).view(_DT[dtype]).reshape(shape)
 
     def release(self) -> None:
         for file in list(self.touched):

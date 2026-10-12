@@ -496,7 +496,9 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
         mk = "moe" if plain else cfg.mlp_kinds[i]
         if len(layer_events) >= 2:                       # at most two layers queued ahead of the GPU
             layer_events.pop(0).synchronize()
-        up = None if exl3 else dev                       # MLX experts come uploaded (EXL3's are unpacked on the host)
+        # Experts come uploaded, except a rank-split EXL3's (unpacked on the host). A packed layer's 2,600 tensors read
+        # to the host cost three copies of its 2 GiB; uploaded they are views of their reads: 17 -> 12 s for the 84 GiB
+        up = dev if packed or not exl3 else None
         rd.prefetch(expert_names(i), up)                 # already queued, except for the first layer
         rd.prefetch(expert_names(i + 1), up)             # two layers in flight: reads overlap copies and packing
         rd.prefetch(rest.get(i, []))                     # attention and the rest: read on the main thread they cost

@@ -114,7 +114,7 @@ class Engine:
 
         R = stage(self.w, self.st, self.buf, tokens)
         dense = self.st.pos + R <= self.w.cfg.dense_limit
-        g, kind = None, "main"
+        g, kind, bucket = None, "main", None
         if self.graphs is not None and dense:
             g = self.graphs.main.get((R, self.st.parity))
         elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index is not None:
@@ -126,7 +126,10 @@ class Engine:
             g.replay()
             return self.buf.logits[:R]
         self.replays["eager"] += 1
-        return compute(self.w, self.st, self.buf, R, nch=chunks_for(self.st, R), host_pos=self.st.pos)
+        out = compute(self.w, self.st, self.buf, R, nch=chunks_for(self.st, R), host_pos=self.st.pos)
+        if bucket is not None:
+            self.graphs.capture_sparse(self, R, bucket)
+        return out
 
     def mtp(self, next_tokens: Sequence[int], hidden: torch.Tensor) -> torch.Tensor:
         """The MTP head on rows (hidden, next token): logits of the last row [1, V/world]."""

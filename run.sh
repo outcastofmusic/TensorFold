@@ -7,7 +7,7 @@
 #   ./run.sh stop              stop whatever this script started
 #   ./run.sh status            what is running and whether it answers
 #
-# The two models do not fit together: starting one stops the other (35 s to Qwen, 40 s to GLM). Run ./prepare.sh first.
+# The two models do not fit together: starting one stops the other (26 s to either). Run ./prepare.sh first.
 # The server listens on loopback only and checks no API key; put a gateway in front of it to reach it from elsewhere.
 #
 # Settings (environment):
@@ -34,24 +34,27 @@ up() { docker ps --format '{{.Names}}' | grep -qx "$1"; }
 avail() { awk '/MemAvailable/{printf "%d", $2 / 1048576}' /proc/meminfo; }
 avail_mib() { awk '/MemAvailable/{printf "%d", $2 / 1024}' /proc/meminfo; }
 
+uncache() {  # drop the served checkpoints' files from the page cache (they stay on disk)
+    local f
+    for f in "$MODELS"/{Qwen3.8-Flash-Next-exl3-3.05bpw,clef-flash,glm53-flash-mosaic-12l,GLM-5.3-Flash-DFlash*}/*.safetensors \
+             "${QWEN_MODEL:-}"/*.safetensors "${CLEF_MODEL:-}"/*.safetensors "${GLM_MODEL:-}"/*.safetensors; do
+        [ -f "$f" ] && dd if="$f" iflag=nocache count=0 status=none 2>/dev/null
+    done
+    return 0
+}
+
 stop_all() {
-    local was=0 n i prev now rose=0 start=$SECONDS
-    prev=$(avail_mib)
+    local was=0 n start=$SECONDS
     for n in $NAMES; do
-        up "$n" && { docker stop -t 2 "$n" >/dev/null & was=1; }
+        up "$n" && was=1
+        docker rm -f "$n" >/dev/null 2>&1 &
     done
     wait
-    docker rm -f $NAMES >/dev/null 2>&1 || true
-    [ "$was" = 1 ] || return 0
-    # The stopped servers' memory comes back within a few seconds of the stop: wait for it to start rising (10 s at
-    # most), then for a second without another 256 MiB. A GLM start that still finds too little is tried again.
-    for i in $(seq 60); do
-        now=$(avail_mib)
-        if [ $((now - prev)) -ge 256 ]; then rose=1; elif [ "$rose" = 1 ] || [ "$i" -gt 10 ]; then break; fi
-        prev=$now
-        sleep 1
-    done
-    echo "run: stopped what was running, $(avail) GiB available after $((SECONDS - start)) s"
+    # A killed server's memory is back when the kill returns (1.7 s for GLM's 104 GiB), so the next start follows at
+    # once. A GLM start that still finds too little is tried again. What the servers read through the page cache
+    # (Qwen's 30 GiB n-gram table) is dropped from it here: left in, the next model's load evicts it page by page.
+    [ "$was" = 0 ] || uncache
+    [ "$was" = 0 ] || echo "run: stopped what was running, $(avail_mib) MiB available after $((SECONDS - start)) s"
 }
 
 # The checkout installed into a local image, rebuilt when a source file changes. A boot from it skips pip, and the
@@ -87,10 +90,10 @@ serve() {  # container name, docker flags..., --, tensorfold serve arguments
 wait_ready() {  # container name, port; returns 1 when the server exited while loading
     local i
     echo "run: $1 is loading; docker logs -f $1"
-    for i in $(seq 450); do
+    for i in $(seq 3600); do
         curl -sf -m 3 "http://127.0.0.1:$2/v1/models" >/dev/null 2>&1 && { echo "run: $1 answers on http://127.0.0.1:$2/v1"; return 0; }
         up "$1" || return 1
-        sleep 2
+        sleep 0.25
     done
     die "$1 did not answer within 15 minutes"
 }
@@ -134,7 +137,6 @@ qwen() {
     local guard=() budget=() vision=() flags=()
     if [ "${GUARD:-1}" != 0 ]; then
         [ -e "$clef/joint_head.safetensors" ] || die "no Clef-Flash at $clef (run ./prepare.sh qwen-flash-next, or GUARD=0)"
-        serve clef-serve -- "$clef" --host 127.0.0.1 --port "$CLEF_PORT" --name clef --context 16384
         guard=(--thinking-guard "http://127.0.0.1:$CLEF_PORT/v1")
     fi
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
@@ -144,6 +146,8 @@ qwen() {
     serve tensorfold-serve "${flags[@]}" -- "$model" --host 127.0.0.1 --port "$PORT" --name qwen3.8-flash-next \
         --context "${CONTEXT:-262144}" --max-tokens "${CONTEXT:-262144}" --parallel "${PARALLEL:-4}" --kv-dtype "${KV:-int8}" \
         "${vision[@]}" "${guard[@]}" "${budget[@]}" ${EXTRA:-}
+    # Clef starts second: it is ready 17 s before Qwen either way, and Qwen's start is the one a switch waits for
+    [ "${GUARD:-1}" = 0 ] || serve clef-serve -- "$clef" --host 127.0.0.1 --port "$CLEF_PORT" --name clef --context 16384
     [ "${GUARD:-1}" = 0 ] || wait_ready clef-serve "$CLEF_PORT" || failed clef-serve
     wait_ready tensorfold-serve "$PORT" || failed tensorfold-serve
 }
@@ -167,12 +171,13 @@ glm() {
         docker rm -f tensorfold-glm >/dev/null 2>&1 || true
         # TF_GLM_DENSE_PROMPT=1: prompt rows through the dense matmul, 310 -> 362 tok/s on a 20,500-token prompt
         # TF_GLM_CALIBRATE=0: no 5 s of draft timing at start; only the `auto:...` chooser reads it (TIMING=1 keeps it)
-        serve tensorfold-glm -e TF_GLM_DENSE_PROMPT=1 -e TF_GLM_CALIBRATE="${TIMING:-0}" -- "$model" --tp 1 --host 127.0.0.1 --port "$PORT" --name glm-5.3-flash \
+        # TF_GLM_LAZY_SPARSE=1: the 72 long-context graphs are captured at first use (0.1 s each) where start-up took 7 s
+        serve tensorfold-glm -e TF_GLM_DENSE_PROMPT=1 -e TF_GLM_CALIBRATE="${TIMING:-0}" -e TF_GLM_LAZY_SPARSE=1 -- "$model" --tp 1 --host 127.0.0.1 --port "$PORT" --name glm-5.3-flash \
             --context "${CONTEXT:-$context}" --max-tokens "${CONTEXT:-$context}" "${drafter[@]}" ${EXTRA:-}
         wait_ready tensorfold-glm "$PORT" && return 0
         docker logs tensorfold-glm 2>&1 | grep -q 'memory budget cannot fit' || break
-        echo "run: refused for lack of memory ($(avail) GiB available), trying again in 10 s" >&2
-        sleep 10
+        echo "run: refused for lack of memory ($(avail) GiB available), trying again in 2 s" >&2
+        sleep 2
     done
     failed tensorfold-glm
 }

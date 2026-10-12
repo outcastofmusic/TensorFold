@@ -31,6 +31,12 @@ class Graphs:
         saved = list(st.cur)
         parities = (0, 1) if st.cur else (0,)
         self.warmed: set[str] = set()
+        # TF_GLM_LAZY_SPARSE=1: a long-context shape is captured after its first step, which runs eagerly. At a
+        # 98,304-token window start-up captures 72 of them in 7 s, and a reply uses the 12 of its own pool bucket.
+        import os
+
+        self.lazy = os.environ.get("TF_GLM_LAZY_SPARSE", "0") == "1"
+        self.rows = tuple(main_rows)
         with torch.no_grad():
             for R in main_rows:
                 for parity in parities:
@@ -57,6 +63,18 @@ class Graphs:
                 self._capture_sparse(e, main_rows, mtp_rows, parities)
         torch.cuda.synchronize()
 
+    def capture_sparse(self, e, R: int, bucket: int) -> None:
+        """Capture the sparse graph of the step that just ran eagerly (``lazy``), for the next step of its shape."""
+
+        if not self.lazy or R not in self.rows:
+            return
+        with torch.no_grad():
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=self.pool):
+                compute(e.w, e.st, e.buf, R, sparse_np=bucket)
+        self.sparse[(R, e.st.parity, bucket)] = g
+
     def _warm(self, kind: str) -> int:
         """Runs before a capture: 2 for a kind's first shape (lazy handles and workspaces), 1 for its later shapes.
 
@@ -72,7 +90,7 @@ class Graphs:
         np_max = st.index[0][2].shape[0] - 2
         saved = list(st.cur)
         for bucket in pool_buckets(np_max):
-            for R in main_rows:
+            for R in () if self.lazy else main_rows:
                 for parity in parities:
                     st.cur = [parity] * len(st.cur)
                     for _ in range(self._warm("sparse")):

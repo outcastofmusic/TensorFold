@@ -247,11 +247,13 @@ class RankReader:
         return self._tensor(self.io.read(span[0], span[1], span[2] - span[1]).numpy(), span, own=False)
 
     def _cut(self, raw, span: tuple):
-        """The rank's tensor from its span's bytes, a view of a shared read (so copied), on the host or the device."""
+        """The rank's tensor from its span's bytes: a copy on the host, on the device a copy or (one rank) a view of the read."""
 
         if not raw.is_cuda:
             return self._tensor(raw.numpy(), span, own=True)
         _, _, _, kind, shape, dtype = span
+        if self.ranks == 1:                               # all of it: a view, which keeps its read's block allocated
+            return raw.view(torch_dtype(dtype)).reshape(shape)
         data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, self.ranks)
         return data.view(torch_dtype(dtype)).reshape(shape)
 
