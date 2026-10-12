@@ -27,8 +27,10 @@ below were measured on, and converts Qwen's image tower once. Downloads run insi
 | `glm-5.3-flash` | `0xSero/GLM-5.3-Flash-EXL3-Spark` (M288 Mosaic 12L), `cfontes/GLM-5.3-Flash-DFlash2-TR3-v3` | 93 GB |
 
 `run.sh` installs this checkout into the image at each start and serves on `http://127.0.0.1:30000/v1`, an
-OpenAI-compatible API. A start takes about 3 minutes. The two models do not fit in memory together, so starting one
-stops the other. `./run.sh stop` and `./run.sh status` do what they say. The server listens on loopback and checks no
+OpenAI-compatible API. The two models do not fit in memory together, so starting one
+stops the other: a switch to Qwen takes about 1 minute and a switch to GLM about 1.5 minutes. The first start after a
+source change takes 4 to 5 minutes more, because `run.sh` installs the checkout into a local image and compiles the CUDA
+extensions into the `tensorfold-ext` Docker volume. Later starts reuse both. `./run.sh stop` and `./run.sh status` do what they say. The server listens on loopback and checks no
 API key.
 
 | | `./run.sh qwen-flash-next` | `./run.sh glm-5.3-flash` |
