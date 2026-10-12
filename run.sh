@@ -7,7 +7,7 @@
 #   ./run.sh stop              stop whatever this script started
 #   ./run.sh status            what is running and whether it answers
 #
-# The two models do not fit together: starting one stops the other (about 1 minute to Qwen, 1.5 to GLM). Run ./prepare.sh first.
+# The two models do not fit together: starting one stops the other (35 s to Qwen, 40 s to GLM). Run ./prepare.sh first.
 # The server listens on loopback only and checks no API key; put a gateway in front of it to reach it from elsewhere.
 #
 # Settings (environment):
@@ -35,23 +35,23 @@ avail() { awk '/MemAvailable/{printf "%d", $2 / 1048576}' /proc/meminfo; }
 avail_mib() { awk '/MemAvailable/{printf "%d", $2 / 1024}' /proc/meminfo; }
 
 stop_all() {
-    local was=0 n i prev now
-    for n in $NAMES; do
-        up "$n" && { docker stop -t 5 "$n" >/dev/null; was=1; echo "run: stopped $n"; }
-        docker rm -f "$n" >/dev/null 2>&1 || true
-    done
-    [ "$was" = 1 ] || return 0
-    # The stopped server's memory comes back a few seconds after the stop returns: wait for it to start rising (10 s at
-    # most), then for 2 s in a row without another 256 MiB.
-    local rose=0 flat=0
+    local was=0 n i prev now rose=0 start=$SECONDS
     prev=$(avail_mib)
-    for i in $(seq 60); do
-        sleep 1
-        now=$(avail_mib)
-        if [ $((now - prev)) -ge 256 ]; then rose=1; flat=0; else flat=$((flat + 1)); fi
-        prev=$now
-        { [ "$rose" = 1 ] && [ "$flat" -ge 2 ]; } || { [ "$rose" = 0 ] && [ "$i" -ge 10 ]; } && break
+    for n in $NAMES; do
+        up "$n" && { docker stop -t 2 "$n" >/dev/null & was=1; }
     done
+    wait
+    docker rm -f $NAMES >/dev/null 2>&1 || true
+    [ "$was" = 1 ] || return 0
+    # The stopped servers' memory comes back within a few seconds of the stop: wait for it to start rising (10 s at
+    # most), then for a second without another 256 MiB. A GLM start that still finds too little is tried again.
+    for i in $(seq 60); do
+        now=$(avail_mib)
+        if [ $((now - prev)) -ge 256 ]; then rose=1; elif [ "$rose" = 1 ] || [ "$i" -gt 10 ]; then break; fi
+        prev=$now
+        sleep 1
+    done
+    echo "run: stopped what was running, $(avail) GiB available after $((SECONDS - start)) s"
 }
 
 # The checkout installed into a local image, rebuilt when a source file changes. A boot from it skips pip, and the
