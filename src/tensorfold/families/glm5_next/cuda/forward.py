@@ -24,6 +24,9 @@ from .weights import LayerW, Weights
 
 # TF_GLM_SKIP_SHARE=0.05: a routed pick under 5% of its row's routed weight is skipped (changes replies; 0: off)
 SKIP_SHARE = float(os.environ.get("TF_GLM_SKIP_SHARE", "0") or 0)
+# TF_GLM_SKIP_LAYERS=A:B: only layers A <= index < B skip (default: all); TF_GLM_SKIP_RENORM=0: the kept picks keep their weights
+SKIP_LAYERS = tuple(int(x) for x in (os.environ.get("TF_GLM_SKIP_LAYERS") or "0:1000").split(":"))
+SKIP_RENORM = os.environ.get("TF_GLM_SKIP_RENORM", "1") != "0"
 
 
 @dataclass
@@ -430,14 +433,16 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         if m.shared is None:
             grouped.route(b.pick[:R], b.plan)
     route_log.note(m, b.pick, b.wts, R, c.experts, c.top_k, b.prefill)
-    if SKIP_SHARE > 0 and m.shared is not None and w.meta.get("packed_exl3"):
+    if (SKIP_SHARE > 0 and SKIP_LAYERS[0] <= layer.index < SKIP_LAYERS[1] and m.shared is not None
+            and w.meta.get("packed_exl3")):
         # a pick under SKIP_SHARE of its row's routed weight is not read (the kernels skip id >= experts); the rest keep the sum
         wts = b.wts[:R, :c.top_k]
         total = wts.sum(1, keepdim=True)
         low = wts < SKIP_SHARE * total
         b.pick[:R, :c.top_k].masked_fill_(low, c.experts)
         wts.masked_fill_(low, 0.0)
-        wts.mul_(total / wts.sum(1, keepdim=True))
+        if SKIP_RENORM:
+            wts.mul_(total / wts.sum(1, keepdim=True))
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         if w.meta.get("packed_exl3"):
