@@ -623,6 +623,9 @@ class GlmEngine:
                   int(constraint is not None)] + code
         from tensorfold.engine.grammar import pack
 
+        from .forward import skip_reload
+
+        skip_reload()
         self._ring()                                   # wakes rank 1, which idles on the store, not in the all-gather
         self._share(header)
         self._share(list(prompt))
