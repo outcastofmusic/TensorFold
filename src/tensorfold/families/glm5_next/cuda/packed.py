@@ -1,15 +1,23 @@
 """GLM packed-module composition around unchanged upstream generic EXL3.
 
-Packed matrices are NEVER sliced or concatenated. Decode uses <=128-row
+Packed matrices are NEVER sliced or concatenated. Dense projections use <=128-row
 micro-windows for prompts too: bounded scratch, no decoded-W residency, same
 native dense arithmetic for serial and prompt rows. All calls run on one stream.
 """
 from __future__ import annotations
 from dataclasses import dataclass
 import math
+import os
 import re
 import torch
 from tensorfold.cuda.exl3.linear import Exl3Linear
+
+# Rows of a prompt chunk whose routed experts run as one window: an expert's weights are read once per 32 of its rows
+# in a window, so wider windows read fewer bytes. GB10, Mosaic 12L, 20.5k-token prompt, 2026-10-11: 128 rows 247 tok/s,
+# 256 283, 512 308, 1,024 314; replies keep their bits.
+MOE_WINDOW = 1024
+# experiment: a prompt chunk's trellis projections decode W once into the shared prompt GEMM (cuda/exl3/prefill.py)
+DENSE_PROMPT = os.environ.get('TF_GLM_DENSE_PROMPT', '0') == '1'
 
 
 @dataclass
@@ -77,6 +85,10 @@ class ProjectionScratch:
                         for dt in (torch.bfloat16,torch.float16,torch.float32)}
         z = max((q.split[0]*q.n for q in mats if isinstance(q,Exl3Linear) and q.split[0]>1),default=1)
         self.z = torch.empty(self.chunk*z,dtype=torch.float32,device=device)
+        self.prompt, self.heads = None, set()             # heads: the head's leaves, set by its Buffers
+        if prefill and DENSE_PROMPT and torch.device(device).type != 'cpu':
+            from tensorfold.cuda.exl3.prefill import Workspace
+            self.prompt = Workspace()
         # Trigger native lazy counter creation BEFORE any capture.
         for q in mats:
             if isinstance(q,Exl3Linear):
@@ -106,6 +118,12 @@ def matmul(q, x, out, scratch):
         return out
     if q.k>scratch.k or q.n>scratch.n:
         raise ValueError('projection exceeds preallocated scratch dimensions')
+    # every prompt row takes the GEMM whatever its call's rows, so a resumed prompt's tail keeps a fresh prompt's bits;
+    # the head reads one row a prompt and stays on the decode linear (its decoded copy would be 1.3 GB)
+    if scratch.prompt is not None and isinstance(q,Exl3Linear) and id(q) not in scratch.heads:
+        from tensorfold.cuda.exl3.prefill import matmul as prompt_matmul
+        prompt_matmul(q,x,dst,scratch.prompt)
+        return out
     for start in range(0,m,scratch.chunk):
         r=min(scratch.chunk,m-start)
         xi=scratch.inputs[x.dtype][:r*q.k].view(r,q.k)
@@ -215,11 +233,12 @@ def workspace_bytes(cfg, headers, *, rows=8, prefill_rows=2048, load_mtp=True):
     gu=default_config(D,I,True)
     down=default_config(I,D,False)
     def one(r):
+        w=min(r,MOE_WINDOW)
         r=min(r,128)
         projection=r*(2*kmax+8*kmax+8*nmax+4*zmax)
-        P=r*slots
+        P=w*slots
         U=min(P,E)
-        routed=P*(4*D+2*I+4*max(2*gu[2]*I,down[2]*D)+4*D)+4*U+4+4*U*r
+        routed=P*(4*D+2*I+4*max(2*gu[2]*I,down[2]*D)+4*D)+4*U+4+4*U*w
         return projection+routed
     mtp_rows = rows if load_mtp and cfg.mtp_layers else 0
     # Existing geometry budgets BF16 x. Every Buffers instance now has FP32 x,

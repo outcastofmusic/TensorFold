@@ -527,6 +527,13 @@ class GlmEngine:
         finally:
             self.e.constraint = self.e.window = None
 
+    def _copies(self, prompt: list[int], first: int):
+        """The reply's copy drafts (TENSORFOLD_COPY_DRAFTS=0 turns them off), or None under a grammar."""
+
+        from tensorfold.families.qwen4_exp.cuda.copy_drafts import CopyIndex, enabled
+
+        return CopyIndex([*prompt, first]) if enabled() and self.e.constraint is None else None
+
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool) -> dict[str, Any]:
         from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
@@ -568,7 +575,7 @@ class GlmEngine:
                                        margin=margin)
             res = auto_decode(self.e, drafter, first, max_tokens, sampling, choice=choice, m_policy=m_policy,
                               f_policy=DepthPolicy(5, fixed=True, confidence=0.3), stop_eos=stop_eos,
-                              on_tokens=on_tokens)
+                              on_tokens=on_tokens, copies=self._copies(prompt, first))
         elif use_dflash:
             res = dflash_decode(self.e, self.drafter, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
                                 on_tokens=on_tokens)
@@ -618,6 +625,9 @@ class GlmEngine:
             self._share(pack(constraint))
         stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint)
         stats.update(policy=spec, drafts=draft)
+        from .route_log import flush as flush_routes
+
+        flush_routes({"prompt": len(prompt), **{k: v for k, v in stats.items() if isinstance(v, (int, float, str))}})
         return stats
 
     def score_labels(self, prompt_ids: list[int], label_ids: list[int]) -> tuple[list[float], float]:

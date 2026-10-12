@@ -12,6 +12,9 @@ from .decode import DecodeResult, DepthPolicy, Engine, _sync, absorb, draft
 from .forward import commit
 
 
+COPY_DRAFTS = 5         # a copied chain's drafts: with the pending token, the widest window captured as a graph
+
+
 def _other(arm: str) -> str:
     return "f" if arm == "m" else "m"
 
@@ -68,8 +71,12 @@ class DrafterChoice:
 @torch.no_grad()
 def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
                 choice: DrafterChoice | None,
-                m_policy: DepthPolicy, f_policy: DepthPolicy, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
-    """Drafted decoding with ``choice`` picking each round's drafter; drafts only propose, so it equals serial."""
+                m_policy: DepthPolicy, f_policy: DepthPolicy, stop_eos: bool = False, on_tokens=None,
+                copies=None) -> DecodeResult:
+    """Drafted decoding with ``choice`` picking each round's drafter; drafts only propose, so it equals serial.
+
+    ``copies`` (a ``CopyIndex`` of the prompt and reply): where the reply repeats earlier text, the round drafts the
+    earlier continuation ("c") and no drafter runs; the MTP head absorbs those rows later, as any backlog."""
 
     w, st, b = e.w, e.st, e.buf
     cap = 256                               # backlog rows a drafter may owe before it absorbs them anyway
@@ -86,14 +93,17 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
     depths: list[int] = []
     keeps: list[int] = []
     arms: list[str] = []
-    last = {"m": (0, 0), "f": (0, 0)}
+    last = {"m": (0, 0), "f": (0, 0), "c": (0, 0)}
     _sync(w)
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
-        arm = choice.pick() if choice is not None else "m"
         room = count - len(out)
         t0 = time.perf_counter()
-        if arm == "m":
+        copied = copies.chain(min(COPY_DRAFTS, room)) if copies is not None else []
+        arm = "c" if copied else choice.pick() if choice is not None else "m"
+        if arm == "c":
+            backlog, steps, drafts = 0, 0, copied
+        elif arm == "m":
             backlog = len(m_next)
             depth = max(1, min(m_policy.next(*last["m"]), room))
             drafts = draft(e, m_rows[:backlog], m_next, st.pos + 1, depth, sampling, m_policy.confidence)
@@ -136,8 +146,10 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
             f_taps[n_f:n_f + keep].copy_(e.tap_rows(keep))
             n_f += keep
         t5 = time.perf_counter()
-        if choice is not None:
+        if choice is not None and arm != "c":
             choice.record(arm, R, steps, backlog, keep)
+        if copies is not None:
+            copies.extend(sampled[:keep])
         last[arm] = (len(drafts), keep - 1)
         rounds += 1
         drafted += len(drafts)

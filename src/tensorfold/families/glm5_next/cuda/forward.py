@@ -15,7 +15,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
-from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, sparse, packed
+from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, route_log, sparse, packed
 from .prefill import routed_micro_windows
 from tensorfold.cuda.exl3 import experts as generic_exl3
 from .attention import AttnScratch, attention, kv_write
@@ -108,10 +108,10 @@ class Buffers:
         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
             sl = c.shared_width // w.world
             if w.meta.get("packed_exl3"):
-                # packed TP1: a prompt chunk's routed experts run in windows of up to 128 rows, copied into ey
+                # packed TP1: a prompt chunk's routed experts run in windows of up to MOE_WINDOW rows, copied into ey
                 ex = next((l.moe.experts for l in w.layers if l.moe is not None),
                           w.mtp.layer.moe.experts if w.mtp is not None else None)
-                self.exl3 = generic_exl3.Scratch(ex, min(rows, 128), slots, device=dev) if ex is not None else None
+                self.exl3 = generic_exl3.Scratch(ex, min(rows, packed.MOE_WINDOW), slots, device=dev) if ex is not None else None
                 self.ey = torch.empty((rows, slots, D), dtype=f32, device=dev)
             else:
                 shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
@@ -145,6 +145,8 @@ class Buffers:
         self.top_k = c.top_k
         self.projection_scratch = (packed.ProjectionScratch(list(packed.projections(w)), rows, dev, prefill)
                                    if w.meta.get("packed_exl3") else None)
+        if self.projection_scratch is not None:
+            self.projection_scratch.heads = {id(p) for p in packed.leaves(w.head)}
 
     def set_taps(self, layers: tuple[int, ...], hidden: int) -> None:
         self.tap_at = {}
@@ -262,7 +264,8 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
     """A projection: 4-bit ones of a prompt chunk on the shared prefill matmul, the rest on ``qmm.matmul``."""
 
     if isinstance(q, (packed.PlainLinear, packed.ComposedLinear, packed.Exl3Linear)):
-        return packed.matmul(q, x, out, b.projection_scratch)
+        with prof.timed("mm: packed"):
+            return packed.matmul(q, x, out, b.projection_scratch)
     if b.prefill and isinstance(q, qmm.Q4):
         return shared.prefill_matmul(x, q, f32=f32, out=out)
     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
@@ -422,6 +425,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
         if m.shared is None:
             grouped.route(b.pick[:R], b.plan)
+    route_log.note(m, b.pick, b.wts, R, c.experts, c.top_k, b.prefill)
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         if w.meta.get("packed_exl3"):
