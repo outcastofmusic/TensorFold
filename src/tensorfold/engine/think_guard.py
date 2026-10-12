@@ -13,6 +13,9 @@ from typing import Any, Callable, Sequence
 # (Clef reads 16,384 tokens) the state drops its oldest reasoning in whole steps, so between two drops each state
 # still extends the last one and the session goes on resuming.
 MAX_REASONING_BYTES = 40000
+# the request keeps its start and end: with 40,000 bytes of reasoning the state stays inside Clef's 16,384 tokens
+# (3 bytes a token at worst). A state past the window is refused, and that reply's checks end.
+MAX_REQUEST_BYTES = 6000
 DROP_STEP = 10000
 TIMEOUT = 30.0
 QUESTION = {"enough": {
@@ -40,6 +43,11 @@ class GuardConfig:
 def guard_state(request: str, reasoning: str) -> str:
     """What the decision model reads: the user's request, then the newest reasoning."""
 
+    asked = request.encode()
+    if len(asked) > MAX_REQUEST_BYTES:               # a long request would leave the reasoning no room in the window
+        head, tail = MAX_REQUEST_BYTES * 3 // 4, MAX_REQUEST_BYTES // 4
+        request = (asked[:head].decode(errors="ignore") + "\n[middle of the request left out]\n"
+                   + asked[-tail:].decode(errors="ignore"))
     data = reasoning.encode()
     if len(data) > MAX_REASONING_BYTES:
         cut = ((len(data) - MAX_REASONING_BYTES) // DROP_STEP + 1) * DROP_STEP

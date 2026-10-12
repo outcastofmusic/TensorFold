@@ -34,6 +34,10 @@ class Stream:
     owed: list[int] = field(default_factory=list)         # a replay's tokens sent before it gave way: checked, not resent
     error: Exception | None = None                        # why a stream ended without finishing
     waiting: bool = False                                 # held out of rounds until its caches can grow
+    # a gate's cut, applied before a round commits: (index in the round's new tokens, the fix) or None (call_gate.py)
+    splice: Callable[[list[int]], tuple[int, list[int]] | None] | None = None
+    forced: list[int] = field(default_factory=list)      # a fix's tokens still to write, the next windows' drafts
+    forcing: int = 0                                      # this window's leading drafts that are a fix's tokens
     done: bool = False
     rounds: int = 0
     min_rows: int = 0

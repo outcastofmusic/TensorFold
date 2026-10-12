@@ -68,12 +68,15 @@ class Scheduler:
 
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
-               constraint: Any = None, background: bool = False, probabilities: Any = None) -> dict:
-        """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats."""
+               constraint: Any = None, background: bool = False, probabilities: Any = None,
+               splice: Any = None) -> dict:
+        """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats.
+
+        ``splice`` (a decoder with ``splices``) runs on the worker with each round's new tokens before they commit."""
 
         box: queue.Queue = queue.Queue()
         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
-                        constraint=constraint, background=background, probabilities=probabilities)
+                        constraint=constraint, background=background, probabilities=probabilities, splice=splice)
         cancel = [False]
         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
         self.waiting.put((stream, box))

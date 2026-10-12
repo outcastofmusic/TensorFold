@@ -24,7 +24,7 @@ HEAD_FILE = "joint_head.safetensors"
 HEAD_CONFIG = "joint_head_config.json"
 MAX_LENGTH = 16384                     # the release's encode_record default
 # a session keeps its last prefill so a request whose state extends the last one prefills only what is new
-MAX_SESSIONS = 4
+MAX_SESSIONS = 16                      # past a main server's streams: a finished reply's session lingers SESSION_IDLE
 SESSION_IDLE = 60.0                    # seconds unused before a session's kept prefill is dropped
 SESSION_MARGIN = 16                    # tokens before the state's end to resume from: a longer text may end in other tokens
 SYSTEM_PROMPT = ("Read the complete state and schema. Decide every field jointly. Each answer "

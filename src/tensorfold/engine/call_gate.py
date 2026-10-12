@@ -137,8 +137,24 @@ class ThinkBudget:
 
 
 def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], bool]], Any], prompt: Sequence[int],
-                   max_tokens: int, gates: Sequence[Any], on_tokens: Callable[[list[int]], bool]) -> Any:
-    """Decode with ``gates``: at a cut go on from the prompt, reply and fix, or (a ``replay`` gate) run the prompt again."""
+                   max_tokens: int, gates: Sequence[Any], on_tokens: Callable[[list[int]], bool],
+                   inline: Callable[..., Any] | None = None) -> Any:
+    """Decode with ``gates``: at a cut go on from the prompt, reply and fix, or (a ``replay`` gate) run the prompt again.
+
+    ``inline(prompt, max_tokens, on_tokens, splice)`` is an engine that writes a fix into the live stream: one run, and
+    the reply before the cut is not read as a prompt again. Its worker calls ``splice`` with each round's new tokens
+    before they commit, so the gates read every token on that one thread."""
+
+    if inline is not None and gates and not any(getattr(gate, "replay", False) for gate in gates):
+        def splice(new: list[int]) -> tuple[int, list[int]] | None:
+            hits = [hit for gate in gates if (hit := gate.cut(new)) is not None]
+            at, fix = min(hits, key=lambda h: h[0]) if hits else (len(new), [])
+            for token in [*new[:at], *fix]:
+                for gate in gates:
+                    gate.observe(token)
+            return (at, list(fix)) if hits else None
+
+        return inline(list(prompt), max_tokens, on_tokens, splice)
 
     reply: list[int] = []
     owed: list[int] = []                         # a replay's tokens already sent (a ``replay`` gate's cut)

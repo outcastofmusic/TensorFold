@@ -478,10 +478,18 @@ class FlashNextEngine:
             self.scheduler.close()
             self.scheduler = None
 
+    @property
+    def splices(self) -> bool:
+        """Whether a drafted text request's gates may cut inside its live stream (one GPU, shared rounds, MTP drafts)."""
+
+        return self.scheduler is not None and bool(getattr(self.multi, "splices", False))
+
     def generate(self, prompt: list[int], max_tokens: int, sampling,
                  on_tokens: Callable[[list[int]], bool | None], draft: bool = True, constraint=None,
-                 stop_eos: bool = True, background: bool = False, probabilities=None, *, vision=None) -> dict[str, Any]:
-        """``draft=False``: one token a round, no MTP drafts; ``background``: last, yielding lanes to waiting ones."""
+                 stop_eos: bool = True, background: bool = False, probabilities=None, *, vision=None,
+                 splice=None) -> dict[str, Any]:
+        """``draft=False``: one token a round, no MTP drafts; ``background``: last, yielding lanes to waiting ones;
+        ``splice`` (only with ``splices``): a gate's cut, applied inside the live stream (``Stream.splice``)."""
 
         max_tokens = self._limit(prompt, max_tokens)
         if probabilities is not None and not self.supports_logprobs:
@@ -492,8 +500,11 @@ class FlashNextEngine:
             raise ValueError("image inputs require starting this server with --vision")
         if vision is not None and background:
             raise ValueError("image requests cannot yield a background lane")
+        if splice is not None and not self.splices:
+            raise ValueError("this engine applies a gate's cut in a new run, not inside the stream")
         if self.scheduler is not None:
             grammar = {} if constraint is None else {"constraint": constraint}
+            grammar.update({} if splice is None else {"splice": splice})
             return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, stop_eos=stop_eos,
                                          **grammar, **({"background": True} if background else {}),
                                          probabilities=probabilities,

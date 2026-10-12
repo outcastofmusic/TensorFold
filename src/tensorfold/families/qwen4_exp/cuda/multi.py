@@ -76,6 +76,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         self.solo = (solo(w, self.free[0], capacity, depth, self.pbuf)
                      if graphs and depth > 0 and self.mbuf is not None else None)
         self.solo_on = self.solo is not None
+        # a gate's cut inside a live stream (_spliced): its fix rides as drafts, which one GPU's MTP rounds carry
+        self.splices = w.comm is None and depth > 0 and self.mbuf is not None
         self.slot_bytes = sum(t.numel() * t.element_size() for t in _tensors(self.free[0]))
         self.window_bytes = self.free[0].cache_bytes(capacity)          # one stream's caches at the full window
         free = torch_live(torch, available_bytes) if torch.cuda.is_available() else None
@@ -251,6 +253,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         if room < 1:
             raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.capacity}-token context")
         s.count = max(1, min(s.count, room))
+        if s.splice is not None and not (self.splices and s.draft and s.constraint is None and s.probabilities is None):
+            raise ValueError("a gate cuts inside a stream only for drafted text without a grammar or logprobs")
         if any(x.waiting for x in self.streams.values()):
             raise NoRoom("streams already wait for memory; a new request waits until one finishes")
         if self.w.comm is not None and any(x is not None for x in (s.constraint, s.probabilities)):
@@ -334,7 +338,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             return failed + ended
         use_solo = solo_sid is not None if self.w.comm is not None else (
             self.solo_on and not ended and not self.filling and len(self.streams) == 1
-            and len(live) == 1 and live[0].draft and live[0].constraint is None
+            and len(live) == 1 and live[0].draft and live[0].constraint is None and live[0].splice is None
             and live[0].st.image_positions is None)
         if use_solo:
             s = live[0]
@@ -388,6 +392,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                        for (_, a0, a1), pos, smp in zip(segs, positions, samplings)]
         paths = [accept(tokens, list(range(-1, len(tokens) - 1)), rows, s.count - len(s.out), self._ends(s))
                  for s, (_, tokens), rows in zip(live, windows, sampled)]
+        paths = [self._spliced(s, tokens, rows, path, end)
+                 for s, (_, tokens), rows, (path, end) in zip(live, windows, sampled, paths)]
         for s, (_, tokens), (_, a0, _), (path, end), pos in zip(live, windows, segs, paths, positions):
             if s.probabilities is not None:
                 capture(logits, [tokens[r] for r in path[1:]] + [end], [pos[r] for r in path],
@@ -406,7 +412,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 except GrammarError as exc:
                     s.error = exc
             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
-            kept.append((s, a0, rows[:len(path)], new, last))
+            # a spliced stream's rows are followed by the tokens it wrote: a fix's, whatever the rows sampled
+            kept.append((s, a0, rows[:len(path)] if s.splice is None else new, new, last))
             if s.copies is not None:                     # the copy index sees the round's tokens before the next draft
                 s.copies.extend(new)
         self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
@@ -424,6 +431,43 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             self.held.pop(s.sid, None)
         return failed + done + ended
 
+    @staticmethod
+    def _force(s: Stream, room: int) -> list[int]:
+        """The next window's drafts from a fix's waiting tokens."""
+
+        drafts, s.forced = s.forced[:room], s.forced[room:]
+        s.forcing = len(drafts)
+        return drafts
+
+    @staticmethod
+    def _spliced(s: Stream, tokens: list[int], rows: list[int], path: list[int], end: int) -> tuple[list[int], int]:
+        """(path, end) after the stream's gates: a fix's drafts are kept unverified, and a cut ends the path there.
+
+        The cut's token and every later one stay uncommitted, so the fix is written into the live stream and the reply
+        goes on from it; the gates run here, on the worker, before the round commits."""
+
+        if s.splice is None:
+            return path, end
+        n, s.forcing = s.forcing, 0
+        if n:
+            kept = min(n, max(s.count - len(s.out), 1) - 1)
+            path = list(range(kept + 1))
+            if kept < n:                                 # the reply's count ends inside the fix
+                return path, tokens[kept + 1]
+            if s.forced:                                 # the fix goes on in the next window
+                return path, s.forced.pop(0)
+            end = rows[n]
+        try:
+            hit = s.splice([tokens[r] for r in path[n + 1:]] + [end])
+        except Exception as exc:                         # noqa: BLE001  (this request ends with its gate's error)
+            s.error = exc
+            return path, end
+        if hit is None or not hit[1]:
+            return path, end
+        at, fix = hit
+        s.forced = [int(t) for t in fix[1:]]
+        return path[:n + at + 1], int(fix[0])
+
     def _draft_all(self, streams: list) -> None:
         """Streams absorb kept rows and chain drafts one step a depth; a copying stream still absorbs, then sits out."""
 
@@ -435,7 +479,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             return
         copying: set[int] = set()
         for s, _, _ in todo:
-            if s.copies is not None:
+            if s.forced:                                 # a fix's tokens: drafts the next round keeps (_spliced)
+                s.drafts = self._force(s, room[s.sid])
+                copying.add(s.sid)
+            elif s.copies is not None:
                 copied = s.copies.chain(room[s.sid])
                 if copied:
                     s.drafts = copied

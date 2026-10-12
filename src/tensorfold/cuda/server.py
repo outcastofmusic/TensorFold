@@ -591,7 +591,7 @@ class App:
 
         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
 
-        def generate(ids: list[int], count: int, feed: Callable[[list[int]], bool]) -> Any:
+        def generate(ids: list[int], count: int, feed: Callable[[list[int]], bool], splice: Any = None) -> Any:
             if yielding and cached:                 # a run after a cut: foreground requests waiting go first
                 turns.give()
                 turns.take(True, cancelled)
@@ -607,11 +607,16 @@ class App:
                 same = list(ids) == list(prepared.vision.token_ids)
                 extra["vision"] = prepared.vision if same else continued(prepared.vision, ids,
                                                                        self.vision.frontend.config)
+            if splice is not None:
+                extra["splice"] = splice
             stats = self.engine.generate(ids, count, sampling, feed, **extra)
             if not cached:
                 cached.append(int((stats or {}).get("cached") or 0))
             return stats
 
+        # drafted text on an engine that can: a gate's fix goes into the live stream, and no reply is prefilled again
+        inline = generate if (getattr(self.engine, "splices", False) and draft and not background
+                              and prepared.grammar is None and probabilities is None) else None
         # an engine that decodes concurrent requests together (``concurrent``) takes them as they come
         if turns is not None:
             turns.take(background, cancelled)
@@ -621,7 +626,7 @@ class App:
             with health.of(self).running(len(prompt), out, arrived) as request:  # /health reads ``out``; rounds never call in
                 serving[0] = request
                 try:
-                    stats = request.stats = generate_gated(generate, prompt, max_tokens, gates, on_tokens)
+                    stats = request.stats = generate_gated(generate, prompt, max_tokens, gates, on_tokens, inline)
                 finally:
                     serving[0] = None
         finally:
