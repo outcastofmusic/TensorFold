@@ -199,7 +199,8 @@ class Drafter:
         self.block = int(block or dc["block_size"])
         self.top_k = int(dc["selector_top_k"])
         self.tap_layers = tuple(int(i) for i in dc["target_layer_ids"])
-        self.window = int(cfg["sliding_window"]) - 1
+        # no sliding window: every layer attends the whole context, in a flat buffer of the serving window
+        self.window = int(cfg["sliding_window"]) - 1 if cfg.get("sliding_window") else capacity
         self.causal = bool(cfg.get("is_causal", True))
         inter = int(cfg["intermediate_size"])
         if inter % self.world:
@@ -250,6 +251,15 @@ class Drafter:
                     o=quantize4(gpu(o)),
                     gu=quantize4(gpu(torch.cat((g, u)))),
                     down=quantize4(gpu(dn))))
+        # a drafter trained with its own mask row ships it beside the weights; the target's row would draft noise
+        self.mask_row = None
+        if (path / "mask_embedding.pt").exists():
+            row = torch.load(path / "mask_embedding.pt", map_location="cpu", weights_only=True)
+            if isinstance(row, dict):
+                row = next(iter(row.values()))
+            self.mask_row = gpu(row.reshape(-1))
+            if self.mask_row.numel() != self.D:
+                raise ValueError("mask_embedding.pt does not hold one hidden row")
         torch.cuda.empty_cache()
         self.inv_freq = 1.0 / theta ** (torch.arange(hd // 2, device=dev, dtype=torch.float32) * 2 / hd)
         # Block rows sit past committed context and the next context update overwrites them.
@@ -387,6 +397,8 @@ class Drafter:
         n = self.block
         x = torch.empty((n, self.D), dtype=torch.bfloat16, device=self.dev)
         glue.embed(self.ids, self.w.embed, self.D, 1, x)
+        if self.mask_row is not None:
+            x[1:] = self.mask_row
         cos, sin = self._rotary(n)
         idx = self._slots(n)
         for i in range(len(self.layers)):
