@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Sequence
 from types import SimpleNamespace
@@ -20,6 +21,53 @@ from .prefill import routed_micro_windows
 from tensorfold.cuda.exl3 import experts as generic_exl3
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
+
+# Expert skipping (changes replies; a measurement tool). TF_GLM_SKIP_SHARE=0.05: a routed pick under 5% of its row's routed
+# weight is not read. TF_GLM_SKIP_LAYERS=A:B: only layers A <= index < B. TF_GLM_SKIP_RENORM=0: the kept picks keep their weights.
+# TF_GLM_SKIP_FILE=path: a JSON file read before each request, {"share": x or [x per layer], "layers": [A, B], "renorm": bool,
+# "keep": k (picks after a row's k heaviest are not read), "prompt": bool, "decode": bool (which rows skip)}, so one boot
+# sweeps settings.
+SKIP_SHARE = float(os.environ.get("TF_GLM_SKIP_SHARE", "0") or 0)
+SKIP_LAYERS = tuple(int(x) for x in (os.environ.get("TF_GLM_SKIP_LAYERS") or "0:1000").split(":"))
+SKIP_RENORM = os.environ.get("TF_GLM_SKIP_RENORM", "1") != "0"
+SKIP_FILE = os.environ.get("TF_GLM_SKIP_FILE", "")
+SKIP_ON = SKIP_SHARE > 0 or bool(SKIP_FILE)
+_skip: dict = {}
+
+
+def skip_table(device) -> torch.Tensor:
+    """[68] on the device: a share per layer index, then the renormalize flag, the kept-pick count, and whether prompt rows
+    and decode rows skip (graphs read it live)."""
+
+    if "t" not in _skip:
+        t = torch.ones((68,), dtype=torch.float32, device=device)
+        t[:64] = 0.0
+        t[SKIP_LAYERS[0]:min(SKIP_LAYERS[1], 64)] = SKIP_SHARE
+        t[64], t[65] = float(SKIP_RENORM), 64.0
+        _skip["t"] = t
+    return _skip["t"]
+
+
+def skip_reload() -> None:
+    """Before a request: the skip file's settings into the table, when the file changed."""
+
+    if not SKIP_FILE or "t" not in _skip:
+        return
+    try:
+        stamp = os.stat(SKIP_FILE).st_mtime_ns
+        if stamp == _skip.get("stamp"):
+            return
+        with open(SKIP_FILE) as f:
+            cfg = __import__("json").load(f)
+    except (OSError, ValueError):
+        return
+    share = cfg.get("share", 0.0)
+    a, b = cfg.get("layers", [0, 64])
+    row = [float(x) for x in share] if isinstance(share, list) else [float(share) if a <= i < b else 0.0 for i in range(64)]
+    row = (row + [0.0] * 64)[:64] + [float(bool(cfg.get("renorm", True))), float(cfg.get("keep", 64)),
+                                     float(bool(cfg.get("prompt", True))), float(bool(cfg.get("decode", True)))]
+    _skip["t"].copy_(torch.tensor(row, dtype=torch.float32))
+    _skip["stamp"] = stamp
 
 
 @dataclass
@@ -426,6 +474,19 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         if m.shared is None:
             grouped.route(b.pick[:R], b.plan)
     route_log.note(m, b.pick, b.wts, R, c.experts, c.top_k, b.prefill)
+    if SKIP_ON and m.shared is not None and w.meta.get("packed_exl3"):
+        # a pick under the layer's share of its row's routed weight, or past the kept count, is not read (the kernels skip
+        # id >= experts); a zero share and a full count change nothing
+        t = skip_table(b.wts.device)
+        wts = b.wts[:R, :c.top_k]
+        total = wts.sum(1, keepdim=True)
+        on = t[66 if b.prefill else 67]
+        low = wts < t[layer.index] * on * total
+        order = wts.argsort(1, descending=True).argsort(1).float()
+        low |= (order >= t[65]) & (on > 0)
+        b.pick[:R, :c.top_k].masked_fill_(low, c.experts)
+        wts.masked_fill_(low, 0.0)
+        wts.mul_(torch.where(t[64] > 0, total / wts.sum(1, keepdim=True), torch.ones_like(total)))
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         if w.meta.get("packed_exl3"):

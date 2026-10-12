@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,9 @@ from . import glue, qmm
 from . import packed as packed_mod
 from .weights import Weights
 
+# TF_GLM_TREE_PROBE=1: count how often a draft's runner-up is the token the target wanted (no change to replies)
+TREE_PROBE = os.environ.get("TF_GLM_TREE_PROBE", "0") == "1"
+TREE: dict[str, float] = {}
 EDGE = 0.6        # the selector's edge score weight in a chain pick
 NOISE = 0.7       # the target's keyed noise weight when sampling
 NO_LIMIT = 1e30
@@ -199,7 +203,8 @@ class Drafter:
         self.block = int(block or dc["block_size"])
         self.top_k = int(dc["selector_top_k"])
         self.tap_layers = tuple(int(i) for i in dc["target_layer_ids"])
-        self.window = int(cfg["sliding_window"]) - 1
+        # no sliding window: every layer attends the whole context, in a flat buffer of the serving window
+        self.window = int(cfg["sliding_window"]) - 1 if cfg.get("sliding_window") else capacity
         self.causal = bool(cfg.get("is_causal", True))
         inter = int(cfg["intermediate_size"])
         if inter % self.world:
@@ -250,6 +255,15 @@ class Drafter:
                     o=quantize4(gpu(o)),
                     gu=quantize4(gpu(torch.cat((g, u)))),
                     down=quantize4(gpu(dn))))
+        # a drafter trained with its own mask row ships it beside the weights; the target's row would draft noise
+        self.mask_row = None
+        if (path / "mask_embedding.pt").exists():
+            row = torch.load(path / "mask_embedding.pt", map_location="cpu", weights_only=True)
+            if isinstance(row, dict):
+                row = next(iter(row.values()))
+            self.mask_row = gpu(row.reshape(-1))
+            if self.mask_row.numel() != self.D:
+                raise ValueError("mask_embedding.pt does not hold one hidden row")
         torch.cuda.empty_cache()
         self.inv_freq = 1.0 / theta ** (torch.arange(hd // 2, device=dev, dtype=torch.float32) * 2 / hd)
         # Block rows sit past committed context and the next context update overwrites them.
@@ -387,6 +401,8 @@ class Drafter:
         n = self.block
         x = torch.empty((n, self.D), dtype=torch.bfloat16, device=self.dev)
         glue.embed(self.ids, self.w.embed, self.D, 1, x)
+        if self.mask_row is not None:
+            x[1:] = self.mask_row
         cos, sin = self._rotary(n)
         idx = self._slots(n)
         for i in range(len(self.layers)):
@@ -465,12 +481,18 @@ class Drafter:
         if sampled:
             noise = -np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(depth), tokens)))
         out: list[int] = []
+        self.probe = []
         prev, chain = anchor, 1.0
         for d in range(depth):
             edge = self.succ[tokens[d]].astype(np.float64) @ (self.pred[prev].astype(np.float64) * proj[d])
             score = (values[d] + EDGE * edge) / temp
             pick = score + NOISE * noise[d] if noise is not None else score
             j = int(np.argmax(pick))
+            if TREE_PROBE:                         # this depth's two best candidates and their shares, for the probe
+                p = np.exp(score - score.max())
+                two = np.argsort(pick)[-2:][::-1]
+                self.probe.append((int(tokens[d, two[0]]), float(p[two[0]] / p.sum()),
+                                   int(tokens[d, two[1]]), float(p[two[1]] / p.sum())))
             if confidence > 0:
                 p = np.exp(score - score.max())
                 chain *= float(p[j] / p.sum())
@@ -488,3 +510,25 @@ class Drafter:
             return []
         tokens, values, proj = self.candidates(pending, depth)
         return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence)
+
+
+def tree_probe(probe: list, drafts: list[int], sampled: list[int], keep: int) -> None:
+    """Would one sibling row have been kept? At the first rejected draft: its runner-up. After a chain the confidence
+    cut ended and the target kept whole: the cut position's best and second candidates."""
+
+    t = TREE
+    def add(key: str, x: float = 1.0) -> None:
+        t[key] = t.get(key, 0.0) + x
+    add("rounds"); add("rows", 1 + len(drafts)); add("kept", keep)
+    i = keep - 1                                   # the first draft the target refused, or len(drafts)
+    if i >= len(probe):
+        add("full")                                # every draft kept and the chain ran to its depth
+        return
+    want = sampled[i]
+    top1, p1, top2, p2 = probe[i]
+    if i < len(drafts):
+        add("reject"); add("reject_alt_hit", want == top2); add("reject_alt_p", p2)
+        add("reject_alt_p_hit", p2 if want == top2 else 0.0)
+    else:
+        add("cut"); add("cut_top1_hit", want == top1); add("cut_top2_hit", want == top2)
+        add("cut_p1", p1); add("cut_p2", p2)

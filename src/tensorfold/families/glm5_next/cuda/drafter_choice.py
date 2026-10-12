@@ -8,6 +8,7 @@ import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 
+from . import dflash2
 from .decode import DecodeResult, DepthPolicy, Engine, _sync, absorb, draft
 from .forward import commit
 
@@ -130,6 +131,8 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
             if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
                 break
             keep += 1
+        if arm == "f" and dflash2.TREE_PROBE:
+            dflash2.tree_probe(drafter.probe, drafts, sampled, keep)
         t3 = time.perf_counter()
         commit(w, st, b, R, keep)
         t4 = time.perf_counter()
