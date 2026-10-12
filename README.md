@@ -7,20 +7,81 @@ tree: Qwen3.8 Flash Next and GLM-5.3 Flash.
 
 Branch `fork/python-0.6-qwen-clef` is the one to use. Everything below "Upstream README" is upstream's text, unchanged.
 
+## Run it
+
+On a DGX Spark with Docker and the NVIDIA runtime, two scripts take a fresh clone to a running server:
+
+```bash
+git clone -b fork/python-0.6-qwen-clef https://github.com/outcastofmusic/TensorFold.git && cd TensorFold
+./prepare.sh                  # both models; or ./prepare.sh qwen-flash-next, ./prepare.sh glm-5.3-flash
+./run.sh qwen-flash-next      # or: ./run.sh glm-5.3-flash
+```
+
+`prepare.sh` downloads the checkpoints into `~/models` (set `MODELS` for another place) at the revisions the numbers
+below were measured on, and converts Qwen's image tower once. Downloads run inside the serving image
+(`nvcr.io/nvidia/pytorch:26.07-py3`), so the host needs no Python packages.
+
+| Target | Downloads | Disk |
+| --- | --- | --- |
+| `qwen-flash-next` | `turboderp/Qwen3.8-Flash-Next-exl3` (3.05 bpw), `Cloudflare/clef-flash`, a converted image tower | 99 GB |
+| `glm-5.3-flash` | `0xSero/GLM-5.3-Flash-EXL3-Spark` (M288 Mosaic 12L), `cfontes/GLM-5.3-Flash-DFlash2-TR3-v3` | 93 GB |
+
+`run.sh` installs this checkout into the image at each start and serves on `http://127.0.0.1:30000/v1`, an
+OpenAI-compatible API. A start takes about 3 minutes. The two models do not fit in memory together, so starting one
+stops the other; `./run.sh stop` and `./run.sh status` do what they say. The server listens on loopback and checks no
+API key.
+
+| | `./run.sh qwen-flash-next` | `./run.sh glm-5.3-flash` |
+| --- | --- | --- |
+| Model id | `qwen3.8-flash-next` | `glm-5.3-flash` |
+| Window | 262,144 tokens | 98,304 tokens |
+| Streams | 4 (`--parallel 4`, `--kv-dtype int8`) | 1 |
+| Drafts | MTP head, 1 to 6 a round, and copy drafts | DFlash2 draft model, up to 5 a round |
+| Thinking | Clef-Flash guard on port 30001, 8,000-token budget | No guard: 8 GiB stays free beside GLM |
+| Images | On | Off |
+| Decode, one stream | prose 60, code 98, json 118, rewrite 124 tok/s | prose 34, code 51, json 56, rewrite 60 tok/s |
+| TrueScore, 76 scenarios x 2 | 88.4 in 78 min, thinking on | 87.1 in 43 min, thinking off |
+
+Each default is the setting that measured best on one Spark; the script's header lists the environment variables that
+change them. Three choices need a word:
+
+- **GLM's draft model** raises decode from 29 / 37 / 45 / 52 to 34 / 51 / 56 / 60 tok/s with the same replies, and
+  lowers the largest window from 131,072 to 110,298 tokens. `cfontes/GLM-5.3-Flash-DFlash2-TR3-v3` is a finetune of
+  `incoai/GLM-5.3-Flash-DFlash2`, whose license is CC-BY-NC-ND-4.0. `DRAFTER=modal ./run.sh glm-5.3-flash` serves
+  `modal-labs/GLM-5.3-Flash-DFlash` (MIT) at 33 / 49 / 55 / 57 tok/s; fetch it with
+  `GLM_DRAFTER_REPO=modal-labs/GLM-5.3-Flash-DFlash ./prepare.sh glm-5.3-flash`. `DRAFTER=none` serves without one.
+- **GLM's dense prompt matmul** (`TF_GLM_DENSE_PROMPT=1`, set by `run.sh`) reads a 20,500-token prompt at 362 tok/s
+  against 310. It changes replies; TrueScore with it and the draft model is 87.1 against 87.9 before, a paired
+  difference of -0.7 with a 95% interval of [-4.0, +2.6].
+- **Qwen's thinking guard** needs Clef-Flash beside the model (18 GB). `GUARD=0` serves without it.
+
 ## What the fork adds
 
 | Addition | Effect, measured on one DGX Spark |
 | --- | --- |
 | Clef thinking guard (`--thinking-guard URL`) | A decision model closes the think block once the reasoning holds a complete derivation |
+| The close is written into the live stream | No second prompt pass on a close: 0 s against 356 s over 58 closes; TrueScore 88.2 and 88.4 against 88.9 |
 | Clef decision serving (`/v1/systemone`, decision sessions) | Clef and Clef-Flash served by `tensorfold serve`, checks about 0.3 s each |
 | `continue_final_message` | A request continues the last assistant turn |
-| GLM-5.3 Flash on one GPU (`--tp 1`, packed EXL3) | The M288 Mosaic 12L checkpoint serves at 29 to 39 tok/s in a 131,072-token window |
+| GLM-5.3 Flash on one GPU (`--tp 1`, packed EXL3) | The M288 Mosaic 12L checkpoint serves on one Spark |
+| GLM prompt experts in 1,024-row windows | Prefill of a 20,500-token prompt: 247 to 314 tok/s, bit-identical output |
+| GLM copy drafts | Without a draft model: rewrite 38.5 to 52.1, json 39.0 to 44.8 tok/s, same replies |
+| GLM DFlash2 through the packed head | A DFlash2 draft model runs beside the packed checkpoint: 34 / 51 / 56 / 60 tok/s |
 | Lone-stream graph slot off by default | One stream under `--parallel 4`: 70.7 to 90.5 tok/s (`TENSORFOLD_LONE_GRAPHS=1` restores it) |
 | Copy drafts at 6 drafts a round | A 2,252-token prompt's first 128 tokens: 36.5 to 89.0 tok/s; rewrite 108 to 124 |
 | EXL3 prompt experts read once for 32 rows | Prefill 780 to 828 tok/s, bit-identical output |
+| EXL3 image tower converted from the pack | `tensorfold.vision.exl3_convert` reads a tower stored inside the pack's shards |
 
-Speeds are from 2026-10-11 on Qwen3.8 Flash Next, EXL3 3.05 bpw, `--parallel 4 --kv-dtype int8`, 262,144-token window.
-Drafted replies equal their `"draft": false` runs on both models (10/10 each).
+Speeds are from 2026-10-11 and 2026-10-12. Qwen3.8 Flash Next: EXL3 3.05 bpw, `--parallel 4 --kv-dtype int8`,
+262,144-token window. GLM-5.3 Flash: Mosaic 12L, 65,536-token window, greedy. Drafted replies equal their
+`"draft": false` runs on both models (10/10 each).
+
+Three ideas were measured and left out, so nobody needs to repeat them. Skipping low-weight expert picks on GLM is 19
+to 27% faster at a 10% threshold, and replies then fail to stop or open with reasoning text; a sweep of 19 settings
+(thresholds, layer bands, prompt or decode rows, fixed pick counts) found no setting that keeps a gain and passes.
+Chinese-specific experts are 67 of 12,096 on GLM, too few to prune or offload. A second candidate row beside a
+DFlash2 draft would be kept in 16.8% of rounds and needs 34% to pay. The switches behind these measurements
+(`TF_GLM_SKIP_*`, `TF_GLM_TREE_PROBE`, `TF_GLM_ROUTE_LOG`) stay in the tree, off by default.
 
 ## Clef as a thinking control
 
@@ -50,7 +111,8 @@ tensorfold serve ~/models/Qwen3.8-Flash-Next-exl3-3.05bpw --port 30000 --paralle
 ```
 
 A request turns the guard off with `"thinking_guard": false` and sets its own budget with `"thinking_budget"`. GLM-5.3
-Flash leaves 8 GiB free on a Spark, so Clef-Flash (18 GB) cannot run beside it.
+Flash leaves 8 GiB free on a Spark, so Clef-Flash (18 GB) cannot run beside it. `./run.sh qwen-flash-next` starts both
+servers with these flags.
 
 ## Credits
 
@@ -63,6 +125,12 @@ Flash leaves 8 GiB free on a Spark, so Clef-Flash (18 GB) cannot run beside it.
   that run GLM-5.3 Flash on a single GB10. The fork ports them from v0.6.5 onto `python-0.6`.
 - **[Cloudflare/clef](https://huggingface.co/Cloudflare/clef)** and Clef-Flash are the decision models behind the
   thinking guard.
+- **[turboderp](https://huggingface.co/turboderp)** made the EXL3 quantizations of both models, and
+  **[0xSero/GLM-5.3-Flash-EXL3-Spark](https://huggingface.co/0xSero/GLM-5.3-Flash-EXL3-Spark)** is the Mosaic 12L
+  mix of them that fits one Spark.
+- **[cfontes/GLM-5.3-Flash-DFlash2-TR3-v3](https://huggingface.co/cfontes/GLM-5.3-Flash-DFlash2-TR3-v3)** and
+  **[modal-labs/GLM-5.3-Flash-DFlash](https://huggingface.co/modal-labs/GLM-5.3-Flash-DFlash)** are the GLM draft
+  models.
 
 ## Upstream README
 
