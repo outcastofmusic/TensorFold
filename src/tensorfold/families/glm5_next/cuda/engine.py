@@ -589,6 +589,11 @@ class GlmEngine:
                      sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
         if res.arms:
             stats.update(drafters=res.arms, keeps=res.keeps)
+        from . import dflash2
+
+        if dflash2.TREE:
+            print("[tensorfold] tree probe " + json.dumps({k: round(v, 3) for k, v in dflash2.TREE.items()}), flush=True)
+            dflash2.TREE.clear()
         if policy is not None:                   # the drafts' counts, which /health, /metrics and the reply report
             stats.update(drafted=res.drafted, accepted=res.accepted)
         if res.stages:

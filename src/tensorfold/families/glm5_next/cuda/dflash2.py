@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,9 @@ from . import glue, qmm
 from . import packed as packed_mod
 from .weights import Weights
 
+# TF_GLM_TREE_PROBE=1: count how often a draft's runner-up is the token the target wanted (no change to replies)
+TREE_PROBE = os.environ.get("TF_GLM_TREE_PROBE", "0") == "1"
+TREE: dict[str, float] = {}
 EDGE = 0.6        # the selector's edge score weight in a chain pick
 NOISE = 0.7       # the target's keyed noise weight when sampling
 NO_LIMIT = 1e30
@@ -477,12 +481,18 @@ class Drafter:
         if sampled:
             noise = -np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(depth), tokens)))
         out: list[int] = []
+        self.probe = []
         prev, chain = anchor, 1.0
         for d in range(depth):
             edge = self.succ[tokens[d]].astype(np.float64) @ (self.pred[prev].astype(np.float64) * proj[d])
             score = (values[d] + EDGE * edge) / temp
             pick = score + NOISE * noise[d] if noise is not None else score
             j = int(np.argmax(pick))
+            if TREE_PROBE:                         # this depth's two best candidates and their shares, for the probe
+                p = np.exp(score - score.max())
+                two = np.argsort(pick)[-2:][::-1]
+                self.probe.append((int(tokens[d, two[0]]), float(p[two[0]] / p.sum()),
+                                   int(tokens[d, two[1]]), float(p[two[1]] / p.sum())))
             if confidence > 0:
                 p = np.exp(score - score.max())
                 chain *= float(p[j] / p.sum())
