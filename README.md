@@ -28,7 +28,7 @@ below were measured on, and converts Qwen's image tower once. Downloads run insi
 
 `run.sh` installs this checkout into the image at each start and serves on `http://127.0.0.1:30000/v1`, an
 OpenAI-compatible API. A start takes about 3 minutes. The two models do not fit in memory together, so starting one
-stops the other; `./run.sh stop` and `./run.sh status` do what they say. The server listens on loopback and checks no
+stops the other. `./run.sh stop` and `./run.sh status` do what they say. The server listens on loopback and checks no
 API key.
 
 | | `./run.sh qwen-flash-next` | `./run.sh glm-5.3-flash` |
@@ -42,16 +42,16 @@ API key.
 | Decode, one stream | prose 60, code 98, json 118, rewrite 124 tok/s | prose 34, code 51, json 56, rewrite 60 tok/s |
 | TrueScore, 76 scenarios x 2 | 88.4 in 78 min, thinking on | 87.1 in 43 min, thinking off |
 
-Each default is the setting that measured best on one Spark; the script's header lists the environment variables that
-change them. Three choices need a word:
+Each default is the setting that measured best on one Spark. The script's header lists the environment variables
+that change them. Three choices need a word:
 
 - **GLM's draft model** raises decode from 29 / 37 / 45 / 52 to 34 / 51 / 56 / 60 tok/s with the same replies, and
   lowers the largest window from 131,072 to 110,298 tokens. `cfontes/GLM-5.3-Flash-DFlash2-TR3-v3` is a finetune of
   `incoai/GLM-5.3-Flash-DFlash2`, whose license is CC-BY-NC-ND-4.0. `DRAFTER=modal ./run.sh glm-5.3-flash` serves
-  `modal-labs/GLM-5.3-Flash-DFlash` (MIT) at 33 / 49 / 55 / 57 tok/s; fetch it with
+  `modal-labs/GLM-5.3-Flash-DFlash` (MIT) at 33 / 49 / 55 / 57 tok/s. Fetch it with
   `GLM_DRAFTER_REPO=modal-labs/GLM-5.3-Flash-DFlash ./prepare.sh glm-5.3-flash`. `DRAFTER=none` serves without one.
 - **GLM's dense prompt matmul** (`TF_GLM_DENSE_PROMPT=1`, set by `run.sh`) reads a 20,500-token prompt at 362 tok/s
-  against 310. It changes replies; TrueScore with it and the draft model is 87.1 against 87.9 before, a paired
+  against 310. It changes replies. TrueScore with it and the draft model is 87.1 against 87.9 before, a paired
   difference of -0.7 with a 95% interval of [-4.0, +2.6].
 - **Qwen's thinking guard** needs Clef-Flash beside the model (18 GB). `GUARD=0` serves without it.
 
