@@ -45,13 +45,26 @@ def slot_for(owner, prompt: list[int], reuse: bool):
     return owner.free.pop(), None, 0
 
 
+def _superseded(kept) -> int:
+    """The entry to give up over the cap: the oldest one between its slot's shortest and longest, else the oldest.
+
+    A slot's shortest entry is its system block's end, which a new conversation resumes from, and its longest is the
+    conversation's latest turn. Only a regenerated or edited earlier turn resumes from one between them.
+    """
+    for i, (ids, st, _, _) in enumerate(kept):
+        lengths = [len(k[0]) for k in kept if k[1] is st]
+        if min(lengths) < len(ids) < max(lengths):
+            return i
+    return 0
+
+
 def remember(owner, ids, st, snap, tail) -> None:
     """Keep each slot's prefix chain, returning displaced idle slots to the free list."""
 
     gone = [k[1] for k in owner.kept if k[0] == ids]
     owner.kept = [k for k in owner.kept if k[0] != ids] + [(ids, st, snap, tail)]
     while len(owner.kept) > owner.keep:
-        gone.append(owner.kept.pop(0)[1])
+        gone.append(owner.kept.pop(_superseded(owner.kept))[1])
     busy = owner._busy()
     for old in gone:
         if old is not st and id(old) not in busy and all(k[1] is not old for k in owner.kept) and \
