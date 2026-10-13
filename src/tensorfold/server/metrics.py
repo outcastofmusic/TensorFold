@@ -55,14 +55,17 @@ class Metrics:
         self.generation = 0
         self.drafted = 0
         self.accepted = 0
+        self.cached: int | None = None      # prompt tokens resumed from kept states; None until a server reports them
         self.latency = Histogram()
         self.ttft = Histogram()
         self.decode = Histogram()
         self.http_requests: dict[tuple[str, int], int] = {}
 
     def add(self, *, prompt: int, generation: int, drafted: int, accepted: int,
-            latency: float | None, ttft: float | None, decode: float | None = None) -> None:
+            latency: float | None, ttft: float | None, decode: float | None = None, cached: int | None = None) -> None:
         with self.lock:
+            if cached is not None:
+                self.cached = (self.cached or 0) + int(cached)
             self.prompt += int(prompt)
             self.generation += int(generation)
             self.drafted += int(drafted)
@@ -86,13 +89,14 @@ def of(app: Any) -> Metrics:
 
 
 def note(app: Any, *, prompt: int = 0, generation: int = 0, drafted: int = 0, accepted: int = 0,
-         latency: float | None = None, ttft: float | None = None, decode: float | None = None) -> None:
+         latency: float | None = None, ttft: float | None = None, decode: float | None = None,
+         cached: int | None = None) -> None:
     """Fold one finished request. A missing app is a no-op."""
 
     if app is None:
         return
     of(app).add(prompt=prompt, generation=generation, drafted=drafted, accepted=accepted,
-                latency=latency, ttft=ttft, decode=decode)
+                latency=latency, ttft=ttft, decode=decode, cached=cached)
 
 
 def http_request(app: Any, key: str, status: int) -> None:
@@ -157,7 +161,7 @@ def render(app: Any) -> str:
     metrics = of(app)
     with metrics.lock:
         prompt, generation = metrics.prompt, metrics.generation
-        drafted, accepted = metrics.drafted, metrics.accepted
+        drafted, accepted, cached = metrics.drafted, metrics.accepted, metrics.cached
         latency, ttft, decode = metrics.latency.copy(), metrics.ttft.copy(), metrics.decode.copy()
         requests = dict(metrics.http_requests)
     running, waiting = _requests(app)
@@ -173,6 +177,10 @@ def render(app: Any) -> str:
             [f"{PREFIX}requests_waiting {waiting}"])
     _family(lines, "prompt_tokens_total", "counter", "Prompt tokens of finished requests.",
             [f"{PREFIX}prompt_tokens_total {prompt}"])
+    if cached is not None:
+        _family(lines, "prompt_tokens_cached_total", "counter",
+                "Prompt tokens of finished requests resumed from kept prompt states instead of read again.",
+                [f"{PREFIX}prompt_tokens_cached_total {cached}"])
     _family(lines, "generation_tokens_total", "counter", "Generated tokens of finished requests.",
             [f"{PREFIX}generation_tokens_total {generation}"])
     _family(lines, "kv_cache_usage_ratio", "gauge",
@@ -209,6 +217,13 @@ def render(app: Any) -> str:
             [f"{PREFIX}spec_decode_num_draft_tokens_total {drafted}"])
     _family(lines, "spec_decode_num_accepted_tokens_total", "counter", "Draft tokens kept on finished requests.",
             [f"{PREFIX}spec_decode_num_accepted_tokens_total {accepted}"])
+    if cached is not None:
+        _family(lines, "prefix_cache_queries_total", "counter",
+                "Prompt tokens of finished requests, under vLLM's name. A mirror of tensorfold:prompt_tokens_total.",
+                [f"{PREFIX}prefix_cache_queries_total {prompt}"])
+        _family(lines, "prefix_cache_hits_total", "counter",
+                "Prompt tokens resumed from kept states, under vLLM's name. A mirror of tensorfold:prompt_tokens_cached_total.",
+                [f"{PREFIX}prefix_cache_hits_total {cached}"])
     _histogram(lines, "e2e_request_latency_seconds",
                "Seconds from arrival to the reply leaving, under vLLM's name.", latency)
     _histogram(lines, "request_decode_time_seconds",

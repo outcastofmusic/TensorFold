@@ -10,6 +10,7 @@ import pytest
 pytest.importorskip("jinja2")
 
 from tensorfold.cuda import health
+from tensorfold.server import metrics
 from tests.test_cuda_server_disconnect import MESSAGES, PacedEngine, app_for, post, serving
 
 WAIT = 10
@@ -60,6 +61,8 @@ def test_health_counts_live_tokens_and_folds_the_engine_s_stats_when_a_request_e
         worker.join(WAIT)
         assert reply["status"] == 200, reply.get("body", "")[:300]
         after = health_of(port)
+        scraped = metrics.render(app)
+    assert "tensorfold:prompt_tokens_cached_total 2\n" in scraped       # the engine's "cached", as /health sums it
     assert after["busy"] is False and after["requests_running"] == 0 and after["requests_total"] == 1
     assert after["completion_tokens_total"] == 4 and after["prompt_tokens_total"] > 0
     assert after["prefill_seconds_total"] == 0.25 and after["decode_seconds_total"] == 0.5
@@ -107,3 +110,14 @@ def test_a_concurrent_stream_reports_its_drafted_rows_and_kept_drafts():
     s.take([8])                               # a one-row round
     stats = s.stats()
     assert (stats["rounds"], stats["drafted"], stats["accepted"]) == (2, 3, 1)
+
+
+def test_metrics_count_cached_prompt_tokens_under_this_server_s_name_and_vllm_s():
+    app = SimpleNamespace()
+    bare = metrics.render(app)
+    assert "prompt_tokens_cached" not in bare and "prefix_cache" not in bare     # a server that counts none shows none
+    metrics.note(app, prompt=100, cached=60)
+    metrics.note(app, prompt=50, cached=0)
+    body = metrics.render(app)
+    assert "tensorfold:prompt_tokens_cached_total 60\n" in body
+    assert "tensorfold:prefix_cache_hits_total 60\n" in body and "tensorfold:prefix_cache_queries_total 150\n" in body

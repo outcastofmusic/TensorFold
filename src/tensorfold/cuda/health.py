@@ -72,6 +72,7 @@ class Health:
             decode = (ended - request.first) if request.first is not None else None
         metrics.note(getattr(self, "app", None), prompt=request.prompt, generation=len(request.out),
                      drafted=_stat(stats, "drafted"), accepted=_stat(stats, "accepted"),
+                     cached=_stat(stats, "cached"),
                      latency=max(0.0, ended - request.started),
                      ttft=(request.first - request.started) if request.first is not None else None,
                      decode=None if decode is None else max(0.0, float(decode)))
