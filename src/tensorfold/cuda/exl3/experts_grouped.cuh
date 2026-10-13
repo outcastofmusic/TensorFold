@@ -38,17 +38,36 @@ __device__ __forceinline__ uint32_t cb_pair(uint32_t s0, uint32_t s1) {
     }
 }
 
-// K2 half-bits a value: a tile is 4 * K2 words; a lane's eight windows fall in NG runs of GV within two words.
+// A rate code K2 is half-bits a value for the widths ExLlamaV3 writes (2..16), or RATE_WORDS + the tile's 32-bit
+// words for a rate between them, which sushi's packs use (2.25 bits is 18 words: code 118).
+constexpr int RATE_WORDS = 100;
+__host__ __device__ constexpr int tile_words(int k2) { return k2 > RATE_WORDS ? k2 - RATE_WORDS : 4 * k2; }
+// one past the last bit of value p's window: floor((p + 1) * bits), and a lane's eight values take a whole tw bits
+__host__ __device__ constexpr int stream_end(int tw, int p) { return ((p + 1) * tw) >> 3; }
+// whether every lane's runs of gv windows can be cut from two adjacent words
+__host__ __device__ constexpr bool runs_fit(int tw, int gv) {
+    for (int lane = 0; lane < 32; ++lane)
+        for (int g = 0; g < 8 / gv; ++g) {
+            const int last = lane * tw + stream_end(tw, g * gv + gv - 1) + 32 * tw;
+            const int sh = (((last - 1) >> 5) + 1) * 32 - last;
+            if (stream_end(tw, g * gv + gv - 1) - stream_end(tw, g * gv) + 16 + sh > 64) return false;
+        }
+    return true;
+}
+
+// A tile is TW words; a lane's eight windows fall in NG runs of GV within two words.
 template <int K2>
 struct Fmt {
-    static constexpr int TW = 4 * K2;
+    static constexpr int TW = tile_words(K2);
     static constexpr int LW = (TW + 31) / 32;
-    // windows sharing one 64-bit merge (tests/cuda/test_exl3_experts.py checks every K2)
-    static constexpr int GV = (K2 >= 13) ? 2 : ((K2 == 7 || (K2 >= 9 && K2 <= 12) || K2 == 16) ? 4 : 8);
+    // windows sharing one 64-bit merge (tests/cuda/test_exl3_experts.py checks every K2); a rate between
+    // ExLlamaV3's widths takes the widest run that fits
+    static constexpr int GV = K2 > RATE_WORDS ? (runs_fit(TW, 8) ? 8 : (runs_fit(TW, 4) ? 4 : 2))
+                              : (K2 >= 13) ? 2 : ((K2 == 7 || (K2 >= 9 && K2 <= 12) || K2 == 16) ? 4 : 8);
     static constexpr int NG = 8 / GV;
-    __host__ __device__ static constexpr int end(int p) { return (p >> 1) * K2 + ((p & 1) ? K2 : (K2 >> 1)); }
-    // right shift of window j of a run (run starts at an even position) relative to the run's last window
-    __host__ __device__ static constexpr int off(int j) { return end(GV - 1) - end(j); }
+    __host__ __device__ static constexpr int end(int p) { return stream_end(TW, p); }
+    // right shift of window j of a lane's run g relative to the run's last window
+    __host__ __device__ static constexpr int off(int g, int j) { return end(g * GV + GV - 1) - end(g * GV + j); }
 };
 
 template <int K2>
@@ -58,7 +77,7 @@ struct LaneMap {
         constexpr int TW = Fmt<K2>::TW, GV = Fmt<K2>::GV;
 #pragma unroll
         for (int g = 0; g < Fmt<K2>::NG; ++g) {
-            const int last_end = Fmt<K2>::end(8 * lane + g * GV + GV - 1) + 128 * K2;
+            const int last_end = Fmt<K2>::end(8 * lane + g * GV + GV - 1) + 32 * TW;
             const int hr = (last_end - 1) >> 5;
             hi[g] = hr % TW;
             lo[g] = (hr + TW - 1) % TW;
@@ -78,23 +97,24 @@ __device__ __forceinline__ uint32_t fetch(const uint32_t (&w)[LW], int idx) {
     }
 }
 
-// This lane's eight values of a tile as the B fragments of its two n8 halves.
+// This lane's eight values of a tile as the B fragments of its two n8 halves; wmask keeps the pack's codeword window
+// (0xffff for ExLlamaV3's own packs).
 template <int CB, int K2>
 __device__ __forceinline__ void decode_tile(const uint32_t (&w)[Fmt<K2>::LW], const LaneMap<K2>& m, int lane,
-                                            uint32_t (&b0)[2], uint32_t (&b1)[2]) {
+                                            uint32_t wmask, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
     uint32_t st[8];
     if constexpr (K2 == 8) {
         // 4 bits: lane L's windows are exactly words L-1 and L (the GLM kernel's decode)
         const uint32_t p = __shfl_sync(0xffffffffu, w[0], (lane + 31) & 31);
         const uint32_t s = __funnelshift_r(w[0], p, 20);
-        st[0] = (s >> 8) & 0xffffu;
-        st[1] = (s >> 4) & 0xffffu;
-        st[2] = s & 0xffffu;
-        st[3] = w[0] >> 16;
-        st[4] = (w[0] >> 12) & 0xffffu;
-        st[5] = (w[0] >> 8) & 0xffffu;
-        st[6] = (w[0] >> 4) & 0xffffu;
-        st[7] = w[0] & 0xffffu;
+        st[0] = (s >> 8) & wmask;
+        st[1] = (s >> 4) & wmask;
+        st[2] = s & wmask;
+        st[3] = (w[0] >> 16) & wmask;
+        st[4] = (w[0] >> 12) & wmask;
+        st[5] = (w[0] >> 8) & wmask;
+        st[6] = (w[0] >> 4) & wmask;
+        st[7] = w[0] & wmask;
     } else {
         constexpr int GV = Fmt<K2>::GV, NG = Fmt<K2>::NG;
 #pragma unroll
@@ -103,7 +123,7 @@ __device__ __forceinline__ void decode_tile(const uint32_t (&w)[Fmt<K2>::LW], co
             const uint32_t wlo = fetch<Fmt<K2>::LW>(w, m.lo[g]);
             const uint64_t mm = ((((uint64_t)wlo) << 32) | whi) >> m.sh[g];
 #pragma unroll
-            for (int j = 0; j < GV; ++j) st[g * GV + j] = (uint32_t)(mm >> Fmt<K2>::off(j)) & 0xffffu;
+            for (int j = 0; j < GV; ++j) st[g * GV + j] = (uint32_t)(mm >> Fmt<K2>::off(g, j)) & wmask;
         }
     }
     b0[0] = cb_pair<CB>(st[0], st[1]);
@@ -141,7 +161,7 @@ __device__ __forceinline__ void load_words(uint32_t (&dst)[Fmt<K2>::LW], const u
 template <int CB, int K2, int NT, int PF, int RT>
 __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
                                            const half* (&x0)[RT], const half* (&x1)[RT],
-                                           bool (&ok0)[RT], bool (&ok1)[RT], int nrt, int lane,
+                                           bool (&ok0)[RT], bool (&ok1)[RT], int nrt, int lane, uint32_t wmask,
                                            float (&acc)[RT][NT][2][4]) {
     constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
     const LaneMap<K2> map(lane);
@@ -182,7 +202,7 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
 #pragma unroll
                 for (int i = 0; i < NT; ++i) {
                     uint32_t b0[2], b1[2];
-                    decode_tile<CB, K2>(w[i], map, lane, b0, b1);
+                    decode_tile<CB, K2>(w[i], map, lane, wmask, b0, b1);
 #pragma unroll
                     for (int r = 0; r < RT; ++r)
                         if (r < nrt) {
@@ -195,9 +215,10 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
     }
 }
 
-// The K2 values an instance covering [LO, HI] compiles (half-bits 2..16).
+// The rate codes with a kernel instance: half-bits 2..16, and 2.25 bits (sushi's GLM and Flash Next packs).
+constexpr int K2_QUARTER = RATE_WORDS + 18;
 __host__ __device__ constexpr bool k2_supported(int k2) {
-    return k2 >= 2 && k2 <= 16;
+    return (k2 >= 2 && k2 <= 16) || k2 == K2_QUARTER;
 }
 
 // Program (expert u, n block, split and member group): up to 16 * RT members times W_q over the split's K range; warps
@@ -207,7 +228,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, uint32_t wmask) {
     const int u = blockIdx.x;
     if (u >= ucount[0]) return;
     const int MT = (maxm + 16 * RT - 1) / (16 * RT);
@@ -262,7 +283,8 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 #define TF_EXL3X_CASE(K2_)                                                                                      \
     case K2_:                                                                                                   \
         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            warp_tiles<CB, K2_, NT, PF, RT>(T, NTILES, kt0, per_warp, nt0, x0, x1, ok0, ok1, nrt, lane, acc);   \
+            warp_tiles<CB, K2_, NT, PF, RT>(T, NTILES, kt0, per_warp, nt0, x0, x1, ok0, ok1, nrt, lane, wmask,  \
+                                            acc);                                                               \
         else                                                                                                    \
             __trap();                                                                                           \
         break;
@@ -281,6 +303,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
         TF_EXL3X_CASE(14)
         TF_EXL3X_CASE(15)
         TF_EXL3X_CASE(16)
+        TF_EXL3X_CASE(K2_QUARTER)
 #undef TF_EXL3X_CASE
         default:
             __trap();
@@ -317,14 +340,14 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 
 // W_q [K, N] fp16 of one matrix through the same lane decode (tests; not on the forward path).
 template <int CB, int K2>
-__global__ void dequant_kernel(const uint32_t* __restrict__ T, half* __restrict__ out, int K, int N) {
+__global__ void dequant_kernel(const uint32_t* __restrict__ T, half* __restrict__ out, int K, int N, uint32_t wmask) {
     const int kt = blockIdx.x, nt = blockIdx.y, lane = threadIdx.x;
     const int NTILES = N >> 4;
     uint32_t w[Fmt<K2>::LW];
     load_words<K2>(w, T + ((size_t)kt * NTILES + nt) * Fmt<K2>::TW + lane, lane);
     const LaneMap<K2> map(lane);
     uint32_t b0[2], b1[2];
-    decode_tile<CB, K2>(w, map, lane, b0, b1);
+    decode_tile<CB, K2>(w, map, lane, wmask, b0, b1);
     const int g = lane >> 2, t = lane & 3;
     uint32_t v[4] = {b0[0], b0[1], b1[0], b1[1]};
 #pragma unroll
@@ -352,18 +375,21 @@ struct GroupedArgs {
     int nexp_max;        // grid.x (upper bound of distinct experts)
     int mats, nt, warps, pf, lo, hi;
     int rt = 1;          // row tiles a block (16 rows each) sharing one read of the weights
+    uint32_t wmask = 0xffffu;   // the low bits of a 16-bit window that make the codeword
 };
 
 template <int CB>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MT = (a.maxm + 16 * a.rt - 1) / (16 * a.rt);
     dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
+    TORCH_CHECK(a.hi <= 16 || a.lo == a.hi, "a rate between ExLlamaV3's widths must be its layer's only rate");
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
     grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, TF_RT><<<grid, W_ * 32, 0, stream>>>(                            \
         a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
-        a.slots)
+        a.slots, a.wmask)
 #define TF_RANGES(NT_, W_, PF_)                                                                                 \
     if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
+    else if (a.lo == K2_QUARTER && a.hi == K2_QUARTER) TF_LAUNCH(NT_, W_, PF_, K2_QUARTER, K2_QUARTER);         \
     else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10);                                           \
     else TF_LAUNCH(NT_, W_, PF_, 2, 16);
 #define TF_RT 1
@@ -380,12 +406,12 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
 }
 
 template <int CB>
-void dequant_launch(const uint32_t* t, half* o, int K, int N, int k2, cudaStream_t stream) {
+void dequant_launch(const uint32_t* t, half* o, int K, int N, int k2, uint32_t wmask, cudaStream_t stream) {
     dim3 grid((unsigned)(K / 16), (unsigned)(N / 16));
     switch (k2) {
-#define TF_DQ(K2_) case K2_: dequant_kernel<CB, K2_><<<grid, 32, 0, stream>>>(t, o, K, N); break;
+#define TF_DQ(K2_) case K2_: dequant_kernel<CB, K2_><<<grid, 32, 0, stream>>>(t, o, K, N, wmask); break;
         TF_DQ(2) TF_DQ(3) TF_DQ(4) TF_DQ(5) TF_DQ(6) TF_DQ(7) TF_DQ(8) TF_DQ(9) TF_DQ(10) TF_DQ(11)
-        TF_DQ(12) TF_DQ(13) TF_DQ(14) TF_DQ(15) TF_DQ(16)
+        TF_DQ(12) TF_DQ(13) TF_DQ(14) TF_DQ(15) TF_DQ(16) TF_DQ(K2_QUARTER)
 #undef TF_DQ
         default: TORCH_CHECK(false, "unsupported K2 ", k2);
     }

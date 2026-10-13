@@ -55,6 +55,23 @@ grouping, the two input rotations, the grouped gate/up, the SwiGLU epilogue, the
 epilogue, the combine, and with weights the epilogue and the combine fused into one launch), and `dequant`
 (a debug binding that writes the kernel's decoded weights as fp16, for the ExLlamaV3 comparison).
 
+## Rates between ExLlamaV3's widths, and codeword windows
+
+[sushi](https://github.com/beamivalice/sushi)'s packs store routed experts as the same trellises at rates ExLlamaV3
+does not write and with a narrowed codeword. Both are read here:
+
+* A rate is the tile's word count: value `p`'s window ends at `floor((p + 1) * bits)`, which is the half-bit rule
+  above for every width ExLlamaV3 writes. The kernels take a rate code, half-bits a value for those widths and
+  `100 + words a tile` otherwise. One such rate has an instance, 2.25 bits (18 words, code 118), and it must be its
+  layer's only rate. Its lane map takes the widest run of windows that fits two words, found at compile time.
+* A pack's `window` (8 to 16 bits) masks each 16-bit window before the codebook. `prepare(..., window=14)` and
+  `dequant(..., window=14)` pass it to the kernels as a mask; 16 masks nothing and gives the bits from before.
+
+`tests/cuda/test_exl3_rates_windows.py` holds the checks: sushi's own fixtures decode to its converter's weights bit
+for bit, the lane decode equals the numpy reference at 2.25 and 2.5 bits for windows of 16, 14 and 12 and every
+codebook, and a 2.25-bit, 14-bit-window layer keeps rows independent. On layer 3 of `GLM-5.3-Flash-Sushi-2.4bpw`
+(288 experts, 4096 x 2048, top 8) one call takes 0.34 ms at one row on a GB10, between 2 bits (0.26) and 3 bits (0.37).
+
 ## Bit-exactness
 
 * `dequant` equals ExLlamaV3's `ext.reconstruct` bit for bit over every codebook and every K2 in

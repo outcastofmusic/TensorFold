@@ -4,8 +4,8 @@
 void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, int64_t);
-void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+                        int64_t, int64_t, int64_t, int64_t);
+void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t);
 void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                        at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
@@ -27,7 +27,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
              const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
              int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi,
-             int64_t rt) {
+             int64_t rt, int64_t window) {
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
     check(TP0, at::kLong, "TP0");
@@ -42,19 +42,22 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
     c10::cuda::CUDAGuard guard(X0.device());
     TORCH_CHECK(rt == 1 || rt == 2, "rt: 1 or 2 row tiles a block");
+    TORCH_CHECK(window >= 8 && window <= 16, "window: a codeword of 8 to 16 bits");
     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
-                       pf, lo, hi, rt);
+                       pf, lo, hi, rt, (int64_t(1) << window) - 1);
 }
 
-void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
+void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb, int64_t window) {
     TORCH_CHECK(T.is_cuda() && T.scalar_type() == at::kShort && T.is_contiguous() && T.dim() == 3,
-                "T: int16 [K/16, N/16, 8 * k2]");
-    TORCH_CHECK(T.size(2) == 8 * k2, "trellis last dim must be 8 * k2");
+                "T: int16 [K/16, N/16, words a tile]");
+    // a rate code above 100 is 100 + the tile's 32-bit words (experts_grouped.cuh)
+    TORCH_CHECK(T.size(2) == (k2 > 100 ? 2 * (k2 - 100) : 8 * k2), "trellis last dim does not match the rate code");
+    TORCH_CHECK(window >= 8 && window <= 16, "window: a codeword of 8 to 16 bits");
     check(out, at::kHalf, "out");
     const int64_t K = T.size(0) * 16, N = T.size(1) * 16;
     TORCH_CHECK(out.numel() == K * N, "out must be [K, N]");
     c10::cuda::CUDAGuard guard(T.device());
-    exl3x_dequant_cuda(T, out, K, N, k2, cb);
+    exl3x_dequant_cuda(T, out, K, N, k2, cb, (int64_t(1) << window) - 1);
 }
 
 void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tensor members, int64_t R, int64_t slots,

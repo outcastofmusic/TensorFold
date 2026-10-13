@@ -244,16 +244,16 @@ namespace tf_exl3x {
 extern template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<1>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<2>(const GroupedArgs&, cudaStream_t);
-extern template void dequant_launch<0>(const uint32_t*, half*, int, int, int, cudaStream_t);
-extern template void dequant_launch<1>(const uint32_t*, half*, int, int, int, cudaStream_t);
-extern template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStream_t);
+extern template void dequant_launch<0>(const uint32_t*, half*, int, int, int, uint32_t, cudaStream_t);
+extern template void dequant_launch<1>(const uint32_t*, half*, int, int, int, uint32_t, cudaStream_t);
+extern template void dequant_launch<2>(const uint32_t*, half*, int, int, int, uint32_t, cudaStream_t);
 }  // namespace tf_exl3x
 
 void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
                         const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
-                        int64_t hi, int64_t rt) {
+                        int64_t hi, int64_t rt, int64_t wmask) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
@@ -270,6 +270,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.nexp_max = (int)uids.size(0);
     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
     a.rt = (int)rt;
+    a.wmask = (uint32_t)wmask;
     auto stream = at::cuda::getCurrentCUDAStream();
     if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
     else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
@@ -278,13 +279,14 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void exl3x_dequant_cuda(const at::Tensor& T, at::Tensor& out, int64_t K, int64_t N, int64_t k2, int64_t cb) {
+void exl3x_dequant_cuda(const at::Tensor& T, at::Tensor& out, int64_t K, int64_t N, int64_t k2, int64_t cb,
+                        int64_t wmask) {
     auto stream = at::cuda::getCurrentCUDAStream();
     auto t = reinterpret_cast<const uint32_t*>(T.data_ptr());
     auto o = reinterpret_cast<half*>(out.data_ptr());
-    if (cb == 0) tf_exl3x::dequant_launch<0>(t, o, (int)K, (int)N, (int)k2, stream);
-    else if (cb == 1) tf_exl3x::dequant_launch<1>(t, o, (int)K, (int)N, (int)k2, stream);
-    else tf_exl3x::dequant_launch<2>(t, o, (int)K, (int)N, (int)k2, stream);
+    if (cb == 0) tf_exl3x::dequant_launch<0>(t, o, (int)K, (int)N, (int)k2, (uint32_t)wmask, stream);
+    else if (cb == 1) tf_exl3x::dequant_launch<1>(t, o, (int)K, (int)N, (int)k2, (uint32_t)wmask, stream);
+    else tf_exl3x::dequant_launch<2>(t, o, (int)K, (int)N, (int)k2, (uint32_t)wmask, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

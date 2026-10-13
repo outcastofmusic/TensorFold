@@ -12,8 +12,10 @@ import torch
 
 CB_3INST, CB_MCG, CB_MUL1 = 0, 1, 2
 ACT_BF16, ACT_F32 = 0, 1          # SwiGLU with the GLM family's bf16 roundings / in fp32
-# Half-bits a value: 1..8 bits (2, 4, .. 16) and every half-integer rate 1.5..7.5 (3, 5, .. 15).
-K2_SUPPORTED = tuple(range(2, 17))
+# Rate codes with a kernel instance. Half-bits a value: 1..8 bits (2, 4, .. 16) and every half-integer rate
+# 1.5..7.5 (3, 5, .. 15). A rate between those is RATE_WORDS + the tile's 32-bit words: 2.25 bits, 18 words, is 118.
+RATE_WORDS = 100
+K2_SUPPORTED = (*range(2, 17), RATE_WORDS + 18)
 
 # (n tiles a block, warps, K splits, tiles in flight): GLM's settings, whose arithmetic order this keeps bit for bit
 GLM_GATEUP = (8, 4, 4, 1)
@@ -42,15 +44,27 @@ def codebook_id(name: str) -> int:
 
 
 def k2_of(trellis: torch.Tensor) -> int:
-    """Half-bits a value of a trellis int16 [K/16, N/16, 16 * K] (16 * K + 8 for the half-integer rates)."""
+    """The rate code of a trellis int16 [K/16, N/16, 16 * bits]: half-bits a value, or RATE_WORDS + words a tile."""
 
     w = trellis.shape[-1]
-    if w % 8:
-        raise ValueError(f"trellis last dim {w} is not a multiple of 8")
-    k2 = w // 8
+    if w % 2:
+        raise ValueError(f"trellis last dim {w} is not a whole count of 32-bit words")
+    k2 = w // 8 if w % 8 == 0 else RATE_WORDS + w // 2
     if k2 not in K2_SUPPORTED:
-        raise ValueError(f"unsupported EXL3 bit width {k2 / 2}")
+        raise ValueError(f"no kernel reads the EXL3 rate of {w / 16:g} bits")
     return k2
+
+
+def tile_words(k2: int) -> int:
+    """32-bit words a tile at a rate code."""
+
+    return k2 - RATE_WORDS if k2 > RATE_WORDS else 4 * k2
+
+
+def check_window(window: int) -> int:
+    if not 8 <= int(window) <= 16:
+        raise ValueError(f"an EXL3 codeword window is 8 to 16 bits, got {window}")
+    return int(window)
 
 
 @dataclass
@@ -60,7 +74,7 @@ class Exl3RoutedExperts:
     gate_ptr: torch.Tensor    # int64 [E]
     up_ptr: torch.Tensor
     down_ptr: torch.Tensor
-    gate_k2: torch.Tensor     # int32 [E], half-bits a value
+    gate_k2: torch.Tensor     # int32 [E], rate codes (K2_SUPPORTED)
     up_k2: torch.Tensor
     down_k2: torch.Tensor
     suh_g: torch.Tensor       # fp16 [E, D]
@@ -77,16 +91,18 @@ class Exl3RoutedExperts:
     k2_d: tuple[int, int]
     trellis_bytes: torch.Tensor   # int64 [E], gate + up + down trellis bytes of each expert (for GB/s)
     keep: list = field(default_factory=list, repr=False)
+    window: int = 16          # the bits of a 16-bit window that make the codeword (a sushi pack names fewer)
 
     def nbytes_read(self, ids: Sequence[int]) -> int:
         return int(self.trellis_bytes[list(ids)].sum())
 
 
 def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], codebook: int | str,
-            device="cuda") -> Exl3RoutedExperts:
+            device="cuda", window: int = 16) -> Exl3RoutedExperts:
     """A layer from per-expert (trellis, suh, svh) triples, trellises referenced in place, each at its own width."""
 
     cb = codebook_id(codebook) if isinstance(codebook, str) else int(codebook)
+    window = check_window(window)
     E = len(gate)
     if not (len(up) == len(down) == E) or E == 0:
         raise ValueError("gate, up and down need the same, non-zero number of experts")
@@ -116,23 +132,24 @@ def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], c
             out[e].copy_(m[j].reshape(-1))
         return out
 
-    tb = torch.tensor([(D * I // 256) * (gks[e] + uks[e] + dks[e]) * 16 for e in range(E)], dtype=torch.int64)
+    tb = torch.tensor([(D * I // 256) * sum(tile_words(k) for k in (gks[e], uks[e], dks[e])) * 4
+                       for e in range(E)], dtype=torch.int64)
     return Exl3RoutedExperts(gp, upp, dp, gk, uk, dk, stack(gate, 1, D), stack(up, 1, D), stack(gate, 2, I),
                              stack(up, 2, I), stack(down, 1, I), stack(down, 2, D), E, D, I, cb,
-                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep)
+                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep, window)
 
 
 def prepare_stacked(gt: torch.Tensor, ut: torch.Tensor, dt: torch.Tensor, suh_g, suh_u, svh_g, svh_u, suh_d, svh_d,
-                    codebook: int | str) -> Exl3RoutedExperts:
-    """A uniform-width layer stacked per projection: trellis [E, K/16, N/16, 16K] (int16, or GLM's int32 words), suh/svh [E, n]."""
+                    codebook: int | str, window: int = 16) -> Exl3RoutedExperts:
+    """A uniform-width layer stacked per projection: trellis [E, K/16, N/16, 16K] (int16, sushi's uint16, or GLM's int32 words), suh/svh [E, n]."""
 
     def as16(t):
-        return t.view(torch.int16) if t.dtype == torch.int32 else t
+        return t.view(torch.int16) if t.dtype in (torch.int32, torch.uint16) else t
 
     gt, ut, dt = as16(gt), as16(ut), as16(dt)
     E = gt.shape[0]
     return prepare([(gt[e], suh_g[e], svh_g[e]) for e in range(E)], [(ut[e], suh_u[e], svh_u[e]) for e in range(E)],
-                   [(dt[e], suh_d[e], svh_d[e]) for e in range(E)], codebook, device=gt.device)
+                   [(dt[e], suh_d[e], svh_d[e]) for e in range(E)], codebook, device=gt.device, window=window)
 
 
 def default_config(K: int, N: int, gateup: bool) -> tuple[int, int, int, int]:
@@ -201,11 +218,11 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     many = R > PROMPT_ROWS if prompt is None else bool(prompt)
     nt, w, sk, pf, rt = prompt_config(s.cfg_gu) if many else (*s.cfg_gu, 1)
     ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], rt)
+                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], rt, ex.window)
     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode)
     nt, w, sk, pf, rt = prompt_config(s.cfg_d) if many else (*s.cfg_d, 1)
     ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
-                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], rt)
+                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], rt, ex.window)
     if wts is None:
         ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
         return s.y[:P]
@@ -216,12 +233,12 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     return out
 
 
-def dequant(trellis: torch.Tensor, codebook: int | str) -> torch.Tensor:
+def dequant(trellis: torch.Tensor, codebook: int | str, window: int = 16) -> torch.Tensor:
     """W_q [K, N] fp16 of one matrix through the kernels' own lane decode (ExLlamaV3's ``reconstruct``); for tests."""
 
     cb = codebook_id(codebook) if isinstance(codebook, str) else int(codebook)
     k2 = k2_of(trellis)
     K, N = trellis.shape[0] * 16, trellis.shape[1] * 16
     out = torch.empty((K, N), dtype=torch.float16, device=trellis.device)
-    _ext().dequant(trellis.contiguous(), out, k2, cb)
+    _ext().dequant(trellis.contiguous(), out, k2, cb, check_window(window))
     return out
