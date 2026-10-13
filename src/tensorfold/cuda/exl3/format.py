@@ -55,15 +55,30 @@ def check_bits(bits: float) -> float:
     return b
 
 
-def stream_ends(bits: float) -> np.ndarray:
-    """E(p) for p = 0..255: where value p's 16-bit window ends in the tile's bitstream (exclusive)."""
+def check_rate(bits: float) -> float:
+    """A rate a tile's bitstream can hold: an even count of int16 words from 16 (K1) to 128 (K8), so eighths of a bit.
 
-    b = check_bits(bits)
-    p1 = np.arange(1, 257, dtype=np.int64)
-    if b.is_integer():
-        return p1 * int(b)
-    k2 = int(2 * b)
-    return (p1 * k2 - (p1 % 2)) // 2
+    ExLlamaV3 writes the widths in ``BITS``; sushi's packs also use the rates between them (2.25 is 36 words).
+    """
+
+    b = float(bits)
+    n = 16 * b
+    if not n.is_integer() or int(n) % 2 or not 16 <= n <= 128:
+        raise ValueError(f"an EXL3 rate is 1 to 8 bits in eighths, as an even count of 16-bit words a tile; got {bits}")
+    return b
+
+
+def check_window(window: int) -> int:
+    if not 8 <= int(window) <= 16:
+        raise ValueError(f"an EXL3 codeword window is 8 to 16 bits, got {window}")
+    return int(window)
+
+
+def stream_ends(bits: float) -> np.ndarray:
+    """E(p) for p = 0..255: where value p's 16-bit window ends in the tile's bitstream (exclusive), floor((p + 1) * bits)."""
+
+    n = int(16 * check_rate(bits))
+    return (np.arange(1, 257, dtype=np.int64) * n) >> 4
 
 
 @lru_cache(maxsize=1)
@@ -80,7 +95,7 @@ def tile_positions() -> tuple[np.ndarray, np.ndarray]:
 def tile_words(bits: float) -> int:
     """int16 words a tile: 16 * bits."""
 
-    return int(16 * check_bits(bits))
+    return int(16 * check_rate(bits))
 
 
 def bits_of(trellis_shape: Iterable[int]) -> float:
@@ -98,13 +113,18 @@ def _as_numpy(t: Any) -> np.ndarray:
     return np.ascontiguousarray(t)
 
 
-def states(trellis: Any, bits: float) -> np.ndarray:
-    """The 16-bit state of every value: [..., 256] uint32 in stream order, from trellis int16 [..., 16 * bits]."""
+def states(trellis: Any, bits: float, window: int = 16) -> np.ndarray:
+    """The state of every value: [..., 256] uint32 in stream order, from trellis int16 or uint16 [..., 16 * bits].
+
+    A state is the low ``window`` bits of the value's 16-bit window. The pack names its window (sushi's
+    ``expert_quant.window``); ExLlamaV3's own packs use all 16.
+    """
 
     t = _as_numpy(trellis)
     nw16 = tile_words(bits)
-    if t.dtype != np.int16 or t.shape[-1] != nw16:
-        raise ValueError(f"trellis must be int16 [..., {nw16}] for {bits} bits, got {t.dtype} {t.shape}")
+    keep = (1 << check_window(window)) - 1
+    if t.dtype not in (np.int16, np.uint16) or t.shape[-1] != nw16:
+        raise ValueError(f"trellis must be 16-bit words [..., {nw16}] for {bits} bits, got {t.dtype} {t.shape}")
     w = t.view(np.uint16).astype(np.uint64)
     words = w[..., 0::2] | (w[..., 1::2] << 16)          # little-endian pairs: 8 * bits 32-bit words a tile
     nw = nw16 // 2
@@ -113,10 +133,10 @@ def states(trellis: Any, bits: float) -> np.ndarray:
     i0, off = (first // 32) % nw, first % 32
     i1 = (i0 + 1) % nw
     pair = (words[..., i0] << 32) | words[..., i1]       # [..., 256]: the 64 bits from the window's first word
-    return ((pair >> (48 - off).astype(np.uint64)) & 0xFFFF).astype(np.uint32)
+    return ((pair >> (48 - off).astype(np.uint64)) & keep).astype(np.uint32)
 
 
-def unpack(trellis: Any, bits: float, codebook_name: str, chunk: int = 16) -> np.ndarray:
+def unpack(trellis: Any, bits: float, codebook_name: str, chunk: int = 16, window: int = 16) -> np.ndarray:
     """W_q [K, N] fp16 in the rotated domain (ExLlamaV3's ``reconstruct``) from trellis int16 [K/16, N/16, 16 * bits], ``chunk`` k tiles at a time."""
 
     t = _as_numpy(trellis)
@@ -127,7 +147,7 @@ def unpack(trellis: Any, bits: float, codebook_name: str, chunk: int = 16) -> np
     rows, cols = tile_positions()
     w = np.empty((kt, 16, nt, 16), dtype=np.float16)
     for k0 in range(0, kt, chunk):
-        vals = table[states(t[k0:k0 + chunk], bits).astype(np.int64)]       # [c, nt, 256]
+        vals = table[states(t[k0:k0 + chunk], bits, window).astype(np.int64)]       # [c, nt, 256]
         w[k0:k0 + chunk][:, rows, :, cols] = vals.transpose(2, 0, 1)
     return w.reshape(kt * 16, nt * 16)
 
@@ -163,20 +183,21 @@ def rotate(x: np.ndarray, axis: int) -> np.ndarray:
     return np.moveaxis(x, -1, axis)
 
 
-def dequantize(trellis: Any, suh: Any, svh: Any, bits: float, codebook_name: str) -> np.ndarray:
+def dequantize(trellis: Any, suh: Any, svh: Any, bits: float, codebook_name: str, window: int = 16) -> np.ndarray:
     """The layer's weight W [K, N] in float64: diag(suh) @ H_K @ W_q @ H_N @ diag(svh)."""
 
-    wq = unpack(trellis, bits, codebook_name).astype(np.float64)
+    wq = unpack(trellis, bits, codebook_name, window=window).astype(np.float64)
     w = rotate(wq, 0) * _as_numpy(suh).astype(np.float64)[:, None]
     return rotate(w, 1) * _as_numpy(svh).astype(np.float64)[None, :]
 
 
 def forward(x: Any, trellis: Any, suh: Any, svh: Any, bits: float, codebook_name: str,
-            bias: Any = None) -> np.ndarray:
+            bias: Any = None, window: int = 16) -> np.ndarray:
     """y = x @ W + bias in float64, the way the kernels order it: rotate the input, W_q, rotate the output."""
 
     xh = rotate(_as_numpy(x).astype(np.float64) * _as_numpy(suh).astype(np.float64), -1)
-    y = rotate(xh @ unpack(trellis, bits, codebook_name).astype(np.float64), -1) * _as_numpy(svh).astype(np.float64)
+    y = rotate(xh @ unpack(trellis, bits, codebook_name, window=window).astype(np.float64), -1) * \
+        _as_numpy(svh).astype(np.float64)
     return y if bias is None else y + _as_numpy(bias).astype(np.float64)
 
 
