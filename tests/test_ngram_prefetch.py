@@ -1,4 +1,6 @@
-"""N-gram prefetch: every mapped array's file bytes read once in spans; an array that maps no file is faulted in."""
+"""N-gram prefetch: every mapped array's file bytes not in the page cache read once in spans; an array that maps no file is faulted in."""
+
+import sys
 
 import numpy as np
 import pytest
@@ -34,6 +36,7 @@ def test_prefetch_reads_each_mapped_arrays_bytes_once_in_spans(tmp_path, monkeyp
             return got
 
     monkeypatch.setattr(host_table, "open", Spy, raising=False)
+    monkeypatch.setattr(host_table, "_cached", lambda address, size: False)   # the file was just written: all cached
     assert host_table._prefetch(arrays, workers=3) >= 0.0
     spans = sorted((at, n) for at, n, _ in reads)
     assert all(n <= 4096 for _, n in spans) and len(spans) == len({at for at, _ in spans})
@@ -47,3 +50,19 @@ def test_prefetch_reads_each_mapped_arrays_bytes_once_in_spans(tmp_path, monkeyp
 def test_prefetch_faults_in_an_array_that_maps_no_file(monkeypatch):
     monkeypatch.setattr(host_table, "open", lambda *a, **k: pytest.fail("no file to read"), raising=False)
     assert host_table._prefetch([np.ones((3, 5000), dtype=np.uint16)], workers=2) >= 0.0
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="asks the page cache with Linux's mincore")
+def test_prefetch_reads_only_spans_the_page_cache_lacks(tmp_path, monkeypatch):
+    monkeypatch.setattr(host_table, "PREFETCH_READ", 4096)
+    path = tmp_path / "shard.safetensors"
+    path.write_bytes(bytes(20_000))                    # just written: every page is in the page cache
+    array = np.memmap(path, dtype=np.uint8, mode="r", offset=1000, shape=(19_000,))
+    assert host_table._cached(array.ctypes.data, array.nbytes)
+    monkeypatch.setattr(host_table, "open", lambda *a, **k: pytest.fail("cached spans are not read"), raising=False)
+    assert host_table._prefetch([array], workers=2) >= 0.0
+    reads, real = [], open
+    monkeypatch.setattr(host_table, "open", lambda *a, **k: reads.append(a) or real(*a, **k), raising=False)
+    monkeypatch.setattr(host_table, "_answers_mincore", lambda path: False)   # a file mincore calls present whatever
+    host_table._prefetch([array], workers=2)
+    assert len(reads) == 5

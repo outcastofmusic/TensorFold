@@ -406,14 +406,41 @@ PREFETCH_READ = 16 << 20        # bytes a prefetch read: a page fault under MADV
 # 16 workers: a buffered reader fills the page cache at 0.54 GiB/s, so 8 took 4.3 GiB/s from an SSD that gives 9
 
 
+def _answers_mincore(path) -> bool:
+    """Whether mincore tells this process the truth about ``path``: Linux calls every page of a file it neither owns nor may write present."""
+
+    try:
+        return os.name == "posix" and os.geteuid() in (0, os.stat(path).st_uid)
+    except OSError:
+        return False
+
+
+def _cached(address: int, size: int) -> bool:
+    """Whether every page of the mapped range is in the page cache already (mincore); False where that cannot be asked."""
+
+    import ctypes
+
+    from tensorfold.cuda.ngram_pages import PAGE, libc, span
+
+    mincore = getattr(libc(), "mincore", None)
+    if mincore is None:
+        return False
+    begin, end = span(address, size)
+    pages = (ctypes.c_ubyte * ((end - begin) // PAGE))()
+    if mincore(ctypes.c_void_p(begin), ctypes.c_size_t(end - begin), pages) != 0:
+        return False
+    return bool((np.frombuffer(pages, np.uint8) & 1).all())
+
+
 def _prefetch(arrays: list[np.ndarray], workers: int = 16) -> float:
-    """Read every array's file bytes once, in PREFETCH_READ spans over ``workers`` threads, so lookups hit the page cache (seconds taken); the pages stay evictable."""
+    """Read every array's file bytes not in the page cache yet, in PREFETCH_READ spans over ``workers`` threads, so lookups hit it (seconds taken); the pages stay evictable."""
 
     import threading
     import time
 
     spans = [(arr, at) for arr in arrays for at in range(0, arr.nbytes, PREFETCH_READ)]
     local = threading.local()
+    asked = {id(arr): _answers_mincore(arr.filename) for arr in arrays if getattr(arr, "filename", None) is not None}
 
     def read(span) -> None:
         arr, at = span
@@ -421,6 +448,9 @@ def _prefetch(arrays: list[np.ndarray], workers: int = 16) -> float:
         path, offset = getattr(arr, "filename", None), getattr(arr, "offset", None)
         if path is None or offset is None:             # not a file's map: fault its pages in
             np.asarray(arr.reshape(-1).view(np.uint8)[at:at + n]).sum(dtype=np.uint64)
+            return
+        # a second pass (the engine's, after warm-up) copies 8.6 GiB/s of pages it already has: ask first
+        if asked[id(arr)] and _cached(arr.ctypes.data + at, n):
             return
         if getattr(local, "buf", None) is None:
             local.buf = memoryview(bytearray(PREFETCH_READ))
