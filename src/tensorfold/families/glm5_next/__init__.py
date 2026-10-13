@@ -224,6 +224,23 @@ def memory_fraction(ram_bytes: int) -> float | None:
 
 # the CUDA engine's kernels read MLX affine weights of this (bits, group size); EXL3 checkpoints are checked above
 CUDA_QUANTIZATION = (4, 64)
+# beside stacked EXL3 routed experts (sushi's layout) the one-GPU adapter reads the dense tensors at this format
+STACKED_DENSE_QUANTIZATION = (6, 128)
+
+
+def check_quantization(config: dict, backend: str) -> None:
+    """The affine formats the CUDA engine reads: 4-bit groups of 64 everywhere, or 6-bit groups of 128 beside stacked experts."""
+
+    from tensorfold.families import describe_quantization, quantization
+
+    if backend != "cuda":
+        return
+    stacked = (config.get("expert_quant") or {}).get("format") == "exl3"
+    want = STACKED_DENSE_QUANTIZATION if stacked else CUDA_QUANTIZATION
+    if quantization(config) != want:
+        raise ValueError(f"GLM-5.3-Flash's CUDA kernels read MLX {want[0]}-bit weights in groups of {want[1]}"
+                         f"{' beside stacked EXL3 routed experts' if stacked else ''}; this checkpoint has "
+                         f"{describe_quantization(config)}")
 
 
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
