@@ -419,8 +419,9 @@ def test_decision_between_chats_preserves_replies(engine_f, cache_bytes, policy)
         assert e.live == []
 
         immediate, stats = _generate(e, after, sampling, policy=policy, tokens=16)
-        # Saved attention rows retain MTP, but not DFlash2's unsaved draft cache.
-        assert stats["cached"] == (len(prompt) - 1 if cache_bytes and policy == "2" else 0)
+        # Saved attention rows retain MTP, and a ring drafter's window was copied with the state.
+        ring = policy == "f3" and bool(getattr(e.drafter, "ring", 0))
+        assert stats["cached"] == (len(prompt) - 1 if cache_bytes and (policy == "2" or ring) else 0)
         _generate(e, other, sampling, policy=policy, tokens=16)
         switched, _ = _generate(e, after + [33], sampling, policy=policy, tokens=16)
         _forget(e)
@@ -556,9 +557,11 @@ def test_mtp_off_resumes(engine_off):
     first = list(np.random.default_rng(12).integers(0, 1000, size=30))
     reply, _ = _generate(engine_off, first, sampling, tokens=30)
     after = first + reply + [21, 22]
-    for policy in ("auto", "2", "f3"):
+    for i, policy in enumerate(("auto", "2", "f3")):
         warm, stats = _generate(engine_off, after, sampling, policy=policy)
-        assert stats["cached"] == len(first) - 1, policy
+        # the first pass resumes from the first prompt's state; later ones from this prompt's own state, which was
+        # saved with its DFlash2 window when the first prompt took the caches again
+        assert stats["cached"] == (len(first) - 1 if i == 0 else len(after) - 1), policy
         _forget(engine_off)
         cold, stats = _generate(engine_off, after, sampling, policy=policy)
         assert stats["cached"] == 0 and warm == cold, policy
