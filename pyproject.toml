@@ -64,6 +64,7 @@ where = ["src"]
 "tensorfold.families.glm5_next.cuda" = ["*.cu", "*.cpp"]
 "tensorfold.families.nemotron_h.cuda" = ["*.cu", "*.cpp"]
 "tensorfold.cuda.exl3" = ["*.cu", "*.cuh", "*.cpp"]
+"tensorfold.cuda.affine6" = ["*.cu", "*.cpp"]
 "tensorfold.cuda.nvfp4" = ["*.cu", "*.cuh", "*.cpp"]
 "tensorfold.streaming.hostsync" = ["*.cpp", "CMakeLists.txt"]
 
