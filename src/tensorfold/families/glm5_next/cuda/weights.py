@@ -84,6 +84,9 @@ class Config:
     group_size: int
     bits: float
     quant: str = "mlx"         # "mlx" (affine 4-bit everywhere) or "exl3" (EXL3 routed experts, BF16 elsewhere)
+    # a pack whose layers stack their routed experts (sushi's layout) names their codebook and codeword window
+    expert_codebook: str = "mul1"
+    expert_window: int = 16
 
     @classmethod
     def read(cls, model_dir: str | Path) -> "Config":
@@ -96,6 +99,9 @@ class Config:
         t = dict(raw.get("text_config") or raw)
         lin = dict(t.get("linear_attn_config") or {})
         quant = raw.get("quantization") or raw.get("quantization_config") or {}
+        stacked = raw.get("expert_quant") or {}
+        if stacked and stacked.get("format") != "exl3":
+            raise ValueError(f"expert_quant format {stacked.get('format')!r}: stacked routed experts are read as exl3")
         eos = t.get("eos_token_id", raw.get("eos_token_id"))
         eos = tuple(int(e) for e in eos) if isinstance(eos, list) else (int(eos),)
         n = int(t["num_hidden_layers"])
@@ -122,6 +128,7 @@ class Config:
             limit=float(t.get("swiglu_limit", 10.0)), kinds=kinds, mlp_kinds=mlp_kinds, eos=eos,
             mtp_layers=int(t.get("num_nextn_predict_layers", 0)), group_size=int(quant.get("group_size", 64)),
             bits=bits_of(quant), quant=str(quant.get("quant_method") or "mlx").lower(),
+            expert_codebook=str(stacked.get("codebook", "mul1")), expert_window=int(stacked.get("window", 16)),
         )
 
     @property
@@ -410,6 +417,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
         if not mtp_layer and (i >= cfg.layers or cfg.mlp_kinds[i] != "moe"):
             return []
         p, parts = PREFIX + f"layers.{i}.mlp.", ("trellis", "suh", "svh") if exl3 else ("weight", "scales", "biases")
+        if p + "switch_mlp.gate_proj.trellis" in rd.index:
+            return [p + f"switch_mlp.{proj}.{x}" for proj in ("gate_proj", "up_proj", "down_proj") for x in parts]
         names = []
         for proj in ("gate_proj", "up_proj", "down_proj"):
             names += [p + f"experts.{e}.{proj}.{x}" for e in range(cfg.experts) for x in parts]
@@ -442,10 +451,29 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
             "mcg", device=dev)
         return gate
 
+    def stacked_experts(i: int, p: str) -> Exl3Experts:
+        """Layer ``i``'s routed experts from one trellis a projection (sushi's layout), read where the load put them."""
+
+        got = []
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            full = PREFIX + p + f"switch_mlp.{proj}."
+            tr = rd.get(full + "trellis").to(dev)
+            if tr.shape[0] != cfg.experts:
+                raise ValueError(f"{full}trellis stacks {tr.shape[0]} experts, the router has {cfg.experts}")
+            got.append((tr, rd.get(full + "suh").to(dev), rd.get(full + "svh").to(dev)))
+        (gt, gsu, gsv), (ut, usu, usv), (dt, dsu, dsv) = got
+        ex = generic_exl3.prepare_stacked(gt, ut, dt, gsu, usu, gsv, usv, dsu, dsv, cfg.expert_codebook,
+                                          window=cfg.expert_window)
+        for k2 in (ex.k2_gu[0], ex.k2_gu[1], ex.k2_d[0]):
+            EXPERT_K2_CENSUS[(i, k2)] = EXPERT_K2_CENSUS.get((i, k2), 0) + cfg.experts
+        return ex
+
     def moe(i: int) -> MoEW:
         p = f"layers.{i}.mlp."
         router = t(p + "gate.weight", None if packed else torch.bfloat16).contiguous()
         bias = t(p + "gate.e_score_correction_bias", torch.float32).contiguous()
+        if packed and PREFIX + p + "switch_mlp.gate_proj.trellis" in rd.index:
+            return MoEW(router, bias, stacked_experts(i, p), mlp(p + "shared_experts."))
         if packed:
             parts = []
             for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -486,7 +514,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
     if exl3:
         for name in rd.index:
             m = re.match(re.escape(PREFIX) + r"layers\.(\d+)\.", name)
-            if m and ".mlp.experts." not in name:
+            if m and ".mlp.experts." not in name and ".mlp.switch_mlp." not in name:
                 rest.setdefault(int(m.group(1)), []).append(name)
 
     layer_events: list = []                              # each layer's event, recorded once its work is queued

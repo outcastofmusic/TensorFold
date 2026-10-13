@@ -177,7 +177,7 @@ def resident_transform(cfg, *, load_mtp=True):
     no graph pool, allocator padding, or scratch; caller budgets these separately.
     No permanent decoded matrix, duplicated head or latent BF16 copies.
     """
-    sizes={'I16':2,'F16':2,'BF16':2,'F32':4,'I32':4,'I64':8,'U8':1}
+    sizes={'I16':2,'U16':2,'F16':2,'BF16':2,'F32':4,'I32':4,'I64':8,'U8':1}
     def transform(name,info):
         if name.startswith('model.visual.'):
             return 0,0
@@ -193,6 +193,8 @@ def resident_transform(cfg, *, load_mtp=True):
             if '.experts.' in name:
                 amount+=12  # one device pointer and K2 per projection
                 if '.down_proj.' in name: amount+=8 # CPU trellis-byte table
+            elif '.switch_mlp.' in name:  # a layer's experts stacked in one tensor: the same tables, an entry an expert
+                amount+=info['shape'][0]*(20 if '.down_proj.' in name else 12)
             else:
                 amount+=8*(info['shape'][1]*16//128)*4 # initialized native counters
         return amount,0
@@ -216,7 +218,7 @@ def workspace_bytes(cfg, headers, *, rows=8, prefill_rows=2048, load_mtp=True):
     filt = resident_transform(cfg, load_mtp=load_mtp)
     kmax = nmax = zmax = 1
     for name, info in headers.items():
-        if not filt(name, info)[0] or '.experts.' in name:
+        if not filt(name, info)[0] or '.experts.' in name or '.switch_mlp.' in name:
             continue
         sh = info['shape']
         if name.endswith('.trellis'):

@@ -147,9 +147,28 @@ def prepare_stacked(gt: torch.Tensor, ut: torch.Tensor, dt: torch.Tensor, suh_g,
         return t.view(torch.int16) if t.dtype in (torch.int32, torch.uint16) else t
 
     gt, ut, dt = as16(gt), as16(ut), as16(dt)
-    E = gt.shape[0]
-    return prepare([(gt[e], suh_g[e], svh_g[e]) for e in range(E)], [(ut[e], suh_u[e], svh_u[e]) for e in range(E)],
-                   [(dt[e], suh_d[e], svh_d[e]) for e in range(E)], codebook, device=gt.device, window=window)
+    dev, E = gt.device, gt.shape[0]
+    D, I = gt.shape[1] * 16, gt.shape[2] * 16
+    if tuple(ut.shape[:3]) != (E, D // 16, I // 16) or tuple(dt.shape[:3]) != (E, I // 16, D // 16):
+        raise ValueError("stacked gate, up and down trellises disagree on experts or shape")
+
+    def table(t):
+        # the stack is read where it is: expert e's tiles start e slices into it
+        if t.dtype != torch.int16 or not t.is_contiguous() or t.device.type != "cuda":
+            raise ValueError("a stacked trellis must be a contiguous CUDA tensor of 16-bit words")
+        k2 = k2_of(t)
+        ptrs = t.data_ptr() + t[0].numel() * 2 * torch.arange(E, dtype=torch.int64)
+        return ptrs.to(dev), torch.full((E,), k2, dtype=torch.int32, device=dev), k2
+
+    def scales(s, n):
+        return s.to(device=dev, dtype=torch.float16).reshape(E, n).contiguous()
+
+    (gp, gk, g2), (upp, uk, u2), (dp, dk, d2) = table(gt), table(ut), table(dt)
+    tb = torch.full((E,), (D * I // 256) * sum(tile_words(k) for k in (g2, u2, d2)) * 4, dtype=torch.int64)
+    cb = codebook_id(codebook) if isinstance(codebook, str) else int(codebook)
+    return Exl3RoutedExperts(gp, upp, dp, gk, uk, dk, scales(suh_g, D), scales(suh_u, D), scales(svh_g, I),
+                             scales(svh_u, I), scales(suh_d, I), scales(svh_d, D), E, D, I, cb,
+                             (min(g2, u2), max(g2, u2)), (d2, d2), tb, [gt, ut, dt], check_window(window))
 
 
 def default_config(K: int, N: int, gateup: bool) -> tuple[int, int, int, int]:

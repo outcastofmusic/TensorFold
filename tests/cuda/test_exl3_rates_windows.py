@@ -105,3 +105,31 @@ def test_a_quarter_bit_layer_with_a_14_bit_window_keeps_rows_independent_and_mat
     wide = experts.prepare(gate, up, down, "mcg")          # the same bits read at 16: another layer
     assert not torch.equal(experts.routed(x[:4], sel[:4].contiguous(), w[:4].contiguous(), wide, scratch, None, 4),
                            full[:4])
+
+
+def test_a_stacked_layer_read_in_place_equals_the_same_experts_given_one_by_one():
+    from tensorfold.cuda.exl3 import experts
+
+    E, D, I, TOPK, WORDS, WINDOW, ROWS = 24, 512, 256, 6, 36, 14, 17
+    g = torch.Generator().manual_seed(5)
+
+    def stack(k, n, in_scale, out_scale):
+        t = torch.randint(0, 65536, (E, k // 16, n // 16, WORDS), dtype=torch.int32, generator=g).to(torch.uint16).cuda()
+        return t, torch.stack([_scale(k, in_scale, g) for _ in range(E)]), torch.stack([_scale(n, out_scale, g) for _ in range(E)])
+
+    (gt, gsu, gsv), (ut, usu, usv) = stack(D, I, D ** -0.5, 1.0), stack(D, I, D ** -0.5, 1.0)
+    dt, dsu, dsv = stack(I, D, I ** -0.5, 0.25)
+    stacked = experts.prepare_stacked(gt, ut, dt, gsu, usu, gsv, usv, dsu, dsv, "mcg", window=WINDOW)
+    assert stacked.suh_g.data_ptr() == gsu.data_ptr() and stacked.window == WINDOW          # nothing copied
+
+    def one_by_one(t, su, sv):
+        return [(t[e].view(torch.int16), su[e], sv[e]) for e in range(E)]
+
+    single = experts.prepare(one_by_one(gt, gsu, gsv), one_by_one(ut, usu, usv), one_by_one(dt, dsu, dsv), "mcg",
+                             window=WINDOW)
+    assert torch.equal(stacked.trellis_bytes, single.trellis_bytes) and stacked.k2_gu == single.k2_gu == (118, 118)
+    x = torch.randn((ROWS, D), generator=g).to(torch.bfloat16).cuda()
+    sel, w = _picks(E, ROWS, TOPK, g, shared=True)
+    scratch = experts.Scratch(stacked, ROWS, TOPK + 1)
+    a = experts.routed(x, sel, w, stacked, scratch, None, ROWS).clone()
+    assert torch.isfinite(a).all() and torch.equal(a, experts.routed(x, sel, w, single, scratch, None, ROWS))
