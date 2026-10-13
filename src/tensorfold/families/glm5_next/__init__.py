@@ -53,6 +53,14 @@ def check(model_dir: str | Path) -> None:
         raise ValueError(f"tensorfold_activation_dtype {want!r}: bfloat16 or float32")
     if want == "float32" and sys.platform != "darwin":
         raise ValueError("tensorfold_activation_dtype float32 is the Mac engine; the CUDA engine stays bf16")
+    if (config.get("expert_quant") or {}).get("format") == "exl3":
+        # sushi's layout: routed experts stacked a layer as EXL3 trellises, dense tensors in the pack's own format
+        if sys.platform == "darwin":
+            raise ValueError(f"a pack with stacked EXL3 routed experts is read by the CUDA engine on one GPU only. "
+                             f"{OWN_MODEL_HELP}")
+        print("[tensorfold] experimental stacked-experts GLM profile: TP1 only; CUDA numerical qualification "
+              "is required before deployment", flush=True)
+        return
     method = quant_method(config)
     if method == "exl3":
         # the CUDA engine's layout; the Mac engine refuses it before this through QUANT_METHODS (require_readable)

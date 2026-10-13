@@ -216,7 +216,8 @@ class GlmEngine:
         if world == 1 and getattr(cfg, "quant", "mlx") == "exl3":
             from tensorfold.cuda.capacity import headers
             checkpoint_headers = headers(model_dir)
-            self.packed_exl3 = "lm_head.trellis" in checkpoint_headers
+            from .packed import is_packed
+            self.packed_exl3 = is_packed(checkpoint_headers)
             if self.packed_exl3:
                 from .weights import packed_residency, workspace_bytes
                 transform = packed_residency(cfg, load_mtp=self.load_mtp)

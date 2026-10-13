@@ -18,13 +18,14 @@ from tensorfold.cuda import experts as grouped
 
 from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
 from . import latent
-from .packed import PlainLinear, ComposedLinear, PlainAbsorb, resident_transform, workspace_bytes
+from .packed import Affine6, PlainLinear, ComposedLinear, PlainAbsorb, is_packed, resident_transform, workspace_bytes
 from tensorfold.cuda.exl3.linear import Exl3Linear
+from tensorfold.cuda.affine6 import affine6
 from tensorfold.cuda.exl3 import experts as generic_exl3
 from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
 
 PREFIX = "model.language_model."
-Projection = Q4 | B16 | Exl3Linear | PlainLinear | ComposedLinear
+Projection = Q4 | B16 | Exl3Linear | PlainLinear | ComposedLinear | Affine6
 
 
 # Routed-expert widths the packed mul1 path admits, in half-bits: 2-bit (the 2.05bpw base) and 3-bit (layers a
@@ -127,7 +128,8 @@ class Config:
             index_topk=int(t.get("index_topk", 2048)), kpool=int(t.get("index_kpool", 4)),
             limit=float(t.get("swiglu_limit", 10.0)), kinds=kinds, mlp_kinds=mlp_kinds, eos=eos,
             mtp_layers=int(t.get("num_nextn_predict_layers", 0)), group_size=int(quant.get("group_size", 64)),
-            bits=bits_of(quant), quant=str(quant.get("quant_method") or "mlx").lower(),
+            # stacked EXL3 experts make the checkpoint the packed adapter's, whatever its dense tensors' format
+            bits=bits_of(quant), quant="exl3" if stacked else str(quant.get("quant_method") or "mlx").lower(),
             expert_codebook=str(stacked.get("codebook", "mul1")), expert_window=int(stacked.get("window", 16)),
         )
 
@@ -266,7 +268,7 @@ class Weights:
                     seen.add(key)
                     total += storage.nbytes()
             elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, generic_exl3.Exl3RoutedExperts, Exl3Linear,
-                                PlainLinear, ComposedLinear, PlainAbsorb, latent.AbsorbW, latent.AbsorbQ4,
+                                Affine6, PlainLinear, ComposedLinear, PlainAbsorb, latent.AbsorbW, latent.AbsorbQ4,
                                 HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
                 for v in vars(t).values():
                     add(v)
@@ -310,7 +312,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
     exl3 = cfg.quant == "exl3"
     dev = torch.device(device)
     rd = RankReader(model_dir, rank, ranks=world)
-    packed = exl3 and "lm_head.trellis" in rd.index
+    packed = exl3 and is_packed(rd.index)
     if packed and world != 1:
         rd.close()
         raise ValueError("intact packed GLM requires world=1; rank-split loading remains unchanged")
@@ -336,7 +338,21 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
             # Stored layout preserves raw packed bytes, no reordered duplicate.
             return Exl3Linear.from_tensors(get("trellis"), get("suh"), get("svh"),
                                            markers[0], device=dev, layout="stored")
+        if full + ".scales" in rd.index:                 # MLX affine 6-bit, repacked into the kernel's lane order
+            return affine6.pack(*affine_parts(full))
         return PlainLinear(rd.get(full + ".weight").to(dev))
+
+    def affine_parts(full: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if cfg.bits != 6 or cfg.group_size != 128:
+            raise ValueError(f"{full}: the packed adapter reads affine dense weights at 6 bits in groups of 128, "
+                             f"not {cfg.bits:g} bits in groups of {cfg.group_size}")
+        return tuple(rd.get(full + part).to(dev) for part in (".weight", ".scales", ".biases"))
+
+    def rows_of(full: str) -> torch.Tensor:
+        """A matrix the engine reads as rows, in its stored float dtype or dequantized once from affine 6-bit."""
+        if full + ".scales" in rd.index:
+            return affine6.dequantize(*affine_parts(full), dtype=torch.bfloat16)
+        return rd.get(full + ".weight").to(dev)
 
     def q4(name: str):
         if packed:
@@ -356,7 +372,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
 
     def kda(i: int) -> KDAW:
         p = f"layers.{i}.self_attn."
-        if packed:
+        if packed and any(PREFIX + p + "qkv_proj" + part in rd.index for part in (".trellis", ".weight")):
             proj = stack([p + "qkv_proj", p + "f_a_proj", p + "g_a_proj", p + "b_proj"])
             conv = t(p + "conv1d.weight").reshape(3 * LL * 128, cfg.conv).contiguous()
             if proj.parts[0].n != 3 * LL * 128:
@@ -375,7 +391,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
         if packed:
             # Head-major K/V split AFTER ordinary plain matrix read. Keep F16
             # blocks once, alias expanded projections to the same storage.
-            w = t(p + "kv_b_proj.weight").reshape(HL, cfg.qk_dim + cfg.v_dim, cfg.kv_lora)
+            w = rows_of(PREFIX + p + "kv_b_proj").reshape(HL, cfg.qk_dim + cfg.v_dim, cfg.kv_lora)
             wk = w[:, :cfg.qk_dim].contiguous()
             wv = w[:, cfg.qk_dim:].contiguous()
             kv_k = PlainLinear(wk.view(HL * cfg.qk_dim, cfg.kv_lora))
@@ -551,7 +567,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
 
     try:                                          # a failed load still cancels the reads queued ahead
         if exl3:
-            embed = rd.get(PREFIX + "embed_tokens.weight").to(torch.bfloat16).contiguous().to(dev)
+            embed = rows_of(PREFIX + "embed_tokens").to(torch.bfloat16).contiguous()
         else:
             embed = (as_i32(rd.get(PREFIX + "embed_tokens.weight")).to(dev), rd.get(PREFIX + "embed_tokens.scales").to(dev),
                      rd.get(PREFIX + "embed_tokens.biases").to(dev))

@@ -311,7 +311,7 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
 def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tensor, f32: bool = False) -> torch.Tensor:
     """A projection: 4-bit ones of a prompt chunk on the shared prefill matmul, the rest on ``qmm.matmul``."""
 
-    if isinstance(q, (packed.PlainLinear, packed.ComposedLinear, packed.Exl3Linear)):
+    if isinstance(q, (packed.PlainLinear, packed.ComposedLinear, packed.Exl3Linear, packed.Affine6)):
         with prof.timed("mm: packed"):
             return packed.matmul(q, x, out, b.projection_scratch)
     if b.prefill and isinstance(q, qmm.Q4):

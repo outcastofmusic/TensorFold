@@ -86,6 +86,20 @@ def pack(weight: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor, rows:
     return Affine6(words, scales.to(torch.bfloat16).t().contiguous(), biases.to(torch.bfloat16).t().contiguous(), n, k)
 
 
+def dequantize(weight: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor, dtype=torch.float16,
+               rows: int = 8192) -> torch.Tensor:
+    """The weight [n, k] itself, code * scale + bias in fp32 rounded once to ``dtype``, for a matrix read as rows."""
+
+    n, groups = scales.shape
+    k = groups * GS
+    out = torch.empty((n, k), dtype=dtype, device=weight.device)
+    for start in range(0, n, rows):
+        c = codes(weight[start:start + rows], k).to(torch.float32).view(-1, groups, GS)
+        s, b = scales[start:start + rows].float()[:, :, None], biases[start:start + rows].float()[:, :, None]
+        out[start:start + rows] = (c * s + b).view(-1, k).to(dtype)
+    return out
+
+
 def tiles(q: Affine6) -> tuple[int, int]:
     """(output tiles a block, warps): set by the weight's shape, so every call adds a row's groups in one order."""
 
@@ -95,15 +109,26 @@ def tiles(q: Affine6) -> tuple[int, int]:
     return nt, warps
 
 
-def matmul(x: torch.Tensor, q: Affine6, out: torch.Tensor | None = None, f32: bool = False) -> torch.Tensor:
-    """y [M, n] = x [M, k] @ W.T + the groups' bias terms; x bf16 (rows may be strided), out bf16 or fp32."""
+def matmul(x: torch.Tensor, q: Affine6, out: torch.Tensor | None = None, f32: bool = False,
+           xs: torch.Tensor | None = None) -> torch.Tensor:
+    """y [M, n] = x [M, k] @ W.T + the groups' bias terms; x bf16 (rows may be strided), out bf16 or fp32.
 
-    from tensorfold.cuda.kernels.qmm import group_sums
+    ``xs`` is fp32 scratch for the rows' group sums (M * k / 128 values); with it and ``out`` nothing is allocated,
+    which a CUDA graph capture needs.
+    """
+
+    import triton
+
+    from tensorfold.cuda.kernels.qmm import _group_sums
 
     if x.ndim != 2 or x.shape[1] != q.k or x.dtype != torch.bfloat16:
         raise ValueError(f"x must be bf16 [M, {q.k}], got {x.dtype} {tuple(x.shape)}")
+    m, groups = x.shape[0], q.k // GS
     if out is None:
-        out = torch.empty((x.shape[0], q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+        out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+    sums = (torch.empty((m, groups), dtype=torch.float32, device=x.device) if xs is None
+            else xs[:m * groups].view(m, groups))
+    _group_sums[(m, triton.cdiv(groups, 16))](x, sums, x.stride(0), KG=groups, GS=GS, GB=16, num_warps=2)
     nt, warps = tiles(q)
-    _ext().matmul(x, group_sums(x, GS), q.words, q.scales, q.biases, out, nt, warps)
+    _ext().matmul(x, sums, q.words, q.scales, q.biases, out, nt, warps)
     return out

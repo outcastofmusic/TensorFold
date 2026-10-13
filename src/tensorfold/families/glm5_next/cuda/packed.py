@@ -10,6 +10,7 @@ import math
 import os
 import re
 import torch
+from tensorfold.cuda.affine6.affine6 import Affine6
 from tensorfold.cuda.exl3.linear import Exl3Linear
 
 # Rows of a prompt chunk whose routed experts run as one window: an expert's weights are read once per 32 of its rows
@@ -85,6 +86,9 @@ class ProjectionScratch:
                         for dt in (torch.bfloat16,torch.float16,torch.float32)}
         z = max((q.split[0]*q.n for q in mats if isinstance(q,Exl3Linear) and q.split[0]>1),default=1)
         self.z = torch.empty(self.chunk*z,dtype=torch.float32,device=device)
+        # an affine 6-bit projection's group sums: a value a row and 128 inputs
+        self.xs = torch.empty(self.chunk*max((q.k//128 for q in mats if isinstance(q,Affine6)),default=1),
+                              dtype=torch.float32,device=device)
         self.prompt, self.heads = None, set()             # heads: the head's leaves, set by its Buffers
         if prefill and DENSE_PROMPT and torch.device(device).type != 'cpu':
             from tensorfold.cuda.exl3.prefill import Workspace
@@ -96,7 +100,7 @@ class ProjectionScratch:
 
     def nbytes(self):
         return sum(t.numel()*t.element_size() for t in
-                   [self.xh,self.z,*self.inputs.values(),*self.outputs.values()])
+                   [self.xh,self.z,self.xs,*self.inputs.values(),*self.outputs.values()])
 
 
 def _plain_cuda(q,x,out):
@@ -131,6 +135,18 @@ def matmul(q, x, out, scratch):
         yi=scratch.outputs[out.dtype][:r*q.n].view(r,q.n)
         if isinstance(q,Exl3Linear):
             q(xi,out=yi,xh=scratch.xh[:r*q.k].view(r,q.k),z=scratch.z)
+        elif isinstance(q,Affine6):
+            # the kernel reads bf16 rows and writes bf16 or fp32: other dtypes pass through the scratch of those
+            from tensorfold.cuda.affine6 import affine6
+            xb=xi
+            if x.dtype!=torch.bfloat16:
+                xb=scratch.inputs[torch.bfloat16][:r*q.k].view(r,q.k)
+                xb.copy_(xi)
+            direct=out.dtype in (torch.bfloat16,torch.float32)
+            yo=yi if direct else scratch.outputs[torch.float32][:r*q.n].view(r,q.n)
+            affine6.matmul(xb,q,yo,xs=scratch.xs)
+            if not direct:
+                yi.copy_(yo)
         elif isinstance(q,PlainLinear):
             if x.device.type=='cpu':
                 # Real CPU plain contract, NOT a packed/CUDA arithmetic oracle.
@@ -177,7 +193,11 @@ def resident_transform(cfg, *, load_mtp=True):
     no graph pool, allocator padding, or scratch; caller budgets these separately.
     No permanent decoded matrix, duplicated head or latent BF16 copies.
     """
-    sizes={'I16':2,'U16':2,'F16':2,'BF16':2,'F32':4,'I32':4,'I64':8,'U8':1}
+    sizes={'I16':2,'U16':2,'F16':2,'BF16':2,'F32':4,'I32':4,'U32':4,'I64':8,'U8':1}
+    # affine 6-bit matrices the engine reads as rows are held as the weights themselves, 2 bytes a value
+    rows_read=('embed_tokens.','.self_attn.kv_b_proj.')
+    def as_rows(name,info):
+        return info['dtype']=='U32' and name.endswith('.weight') and any(r in name for r in rows_read)
     def transform(name,info):
         if name.startswith('model.visual.'):
             return 0,0
@@ -189,6 +209,10 @@ def resident_transform(cfg, *, load_mtp=True):
         if not (name.startswith('model.language_model.') or name.startswith('lm_head.')):
             raise ValueError(f'uninventoried packed GLM tensor {name}')
         amount=math.prod(info['shape'])*sizes[info['dtype']]
+        if as_rows(name,info):
+            amount=info['shape'][0]*(info['shape'][1]*32//6)*2
+        elif name.endswith(('.scales','.biases')) and any(r in name for r in rows_read):
+            amount=0
         if name.endswith('.trellis'):
             if '.experts.' in name:
                 amount+=12  # one device pointer and K2 per projection
@@ -199,6 +223,11 @@ def resident_transform(cfg, *, load_mtp=True):
                 amount+=8*(info['shape'][1]*16//128)*4 # initialized native counters
         return amount,0
     return transform
+
+
+def is_packed(names) -> bool:
+    """Whether a checkpoint's tensor names are the one-GPU adapter's: a trellis head, or an affine one beside stacked experts."""
+    return 'lm_head.trellis' in names or ('lm_head.scales' in names and any('.mlp.switch_mlp.' in n for n in names))
 
 
 def fp32_residual(w):
@@ -227,6 +256,7 @@ def workspace_bytes(cfg, headers, *, rows=8, prefill_rows=2048, load_mtp=True):
             if sk>1: zmax=max(zmax,sk*n)
         elif name.endswith('.weight') and len(sh)==2:
             n,k = sh
+            if info['dtype']=='U32': k=k*32//6     # affine 6-bit words: 32 bits hold 5 1/3 inputs
         else:
             continue
         kmax,nmax=max(kmax,k),max(nmax,n)

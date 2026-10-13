@@ -287,7 +287,8 @@ class Drafter:
         # a packed one-GPU head (trellis, full vocabulary) scores the block through the packed projections
         head = w.draft_head if w.draft_head is not None else w.head
         self.head_scratch = self.head_out = None
-        if isinstance(head, (packed_mod.PlainLinear, packed_mod.ComposedLinear, packed_mod.Exl3Linear)):
+        if isinstance(head, (packed_mod.PlainLinear, packed_mod.ComposedLinear, packed_mod.Exl3Linear,
+                             packed_mod.Affine6)):
             self.head_scratch = packed_mod.ProjectionScratch([head], n, dev)
             self.head_out = torch.empty((n - 1, head.n), dtype=torch.bfloat16, device=dev)
         self.packed: torch.Tensor | None = None       # [world, block - 1, 2 * top_k] after a pass
