@@ -150,18 +150,28 @@ def test_a_restored_state_reads_the_flat_drafters_window_after_the_ring_wrapped(
     assert all((a == b).all() for a, b in zip(ring.window_rows(), flat.window_rows()))
 
 
-def test_a_saved_state_drops_the_window_and_a_ring_needs_one(allocations):  # noqa: F811
+def test_a_saved_ring_state_keeps_its_window_and_a_flat_one_drops_it(allocations):  # noqa: F811
     import torch
 
     decode = importlib.import_module("tensorfold.families.glm5_next.cuda.decode")
     e = _engine(torch)
-    ring = FakeDrafter(torch, ring=True)
-    ring.add(20, tag=1)
+    flat, ring = FakeDrafter(torch, ring=False), FakeDrafter(torch, ring=True)
+    for d in (flat, ring):
+        d.add(20, tag=1)
+    lost = decode.take_snapshot(e, list(range(20)), None, mtp=False, drafter=flat)
+    decode.save_rows(e, lost)                                # a flat drafter's rows go with the caches
+    assert lost.drafter_end == -1 and lost.drafter_rows is None
     snap = decode.take_snapshot(e, list(range(20)), None, mtp=False, drafter=ring)
     assert snap.drafter_rows is not None and snap.drafter_rows[0].shape[1] == 20      # shorter than the window
+    want = ring.window_rows()
     decode.save_rows(e, snap)                                # another conversation took the caches
-    assert snap.drafter_end == -1 and snap.drafter_rows is None
-    assert decode.snapshot_bytes(snap) == 3 * 4 + 2 * 4
+    assert snap.drafter_end == 20
+    assert decode.snapshot_bytes(snap) == 3 * 4 + 2 * 4 + 4 * ring.KV * 20 * ring.HD * 4
+    ring.reset()
+    ring.add(3 * ring.ring + 5, tag=2)                       # the other conversation, past the ring three times
+    decode.restore(e, snap, ring)                            # the first one's next prompt resumes with its drafts
+    assert ring.context_end == 20
+    assert all((a == b).all() for a, b in zip(ring.window_rows(), want))
     stale = decode.Snapshot(list(range(20)), torch.zeros(3), torch.zeros(2), None, -1, 20)
     with pytest.raises(ValueError, match="window"):
         decode.restore(e, stale, ring)

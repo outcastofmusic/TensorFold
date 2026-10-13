@@ -331,12 +331,16 @@ def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
 
 
 def save_rows(e: Engine, snap: Snapshot) -> None:
-    """Copy a snapshot's attention rows out of the live caches before another conversation overwrites them; DFlash2 caches are not kept."""
+    """Copy a snapshot's attention rows out of the live caches before another conversation overwrites them.
+
+    A ring drafter's window was copied when the snapshot was taken, so the state still resumes with DFlash2 drafts;
+    a flat drafter's rows are not copied, and such a state resumes only without them.
+    """
     views = _row_views(e.st, len(snap.ids), max(snap.mtp_len, 0))
     snap.rows = [v.clone() for v in views]
     snap.nbytes = sum(r.numel() * r.element_size() for r in snap.rows)
-    snap.drafter_end = -1
-    snap.drafter_rows = None
+    if snap.drafter_rows is None:
+        snap.drafter_end = -1
 
 
 def row_bytes(e: Engine, snap: Snapshot) -> int:
