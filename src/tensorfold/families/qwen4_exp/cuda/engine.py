@@ -168,9 +168,6 @@ class FlashNextEngine:
             wait(reads)                               # a failed load leaves no table read behind it
             raise
         tables_read = bool(reads)
-        waited = time.perf_counter()
-        wait_all(reads)                               # raises a table read's error
-        waited = time.perf_counter() - waited
         w.comm = self.comm
         if self.comm is not None:
             self.comm.ready("loading")               # a peer stuck loading is named, not waited on in NCCL
@@ -218,6 +215,10 @@ class FlashNextEngine:
         else:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
                             kv_dtype=self.kv_dtype, prefill_rows=self.prefill_rows)
+        # waited for here, the tables' reads finish while the image tower loads
+        waited = time.perf_counter()
+        wait_all(reads)                               # raises a table read's error
+        waited = time.perf_counter() - waited
         started = time.perf_counter()
         locked = False
         pinned, locks = 0, {}
@@ -230,7 +231,7 @@ class FlashNextEngine:
             room = self.capacity_plan["budget_bytes"] - self.capacity_plan["total_bytes_estimate"]
             for table in tables.values():
                 if not tables_read:
-                    table.prefetch()                  # eight readers first: mlock alone faults the pages in one by one
+                    table.prefetch()                  # sixteen readers first: mlock alone faults the pages in one by one
                 got = room >= size and table.lock()
                 locks[id(table)] = got
                 pinned += getattr(table, "pinned_bytes", lock_bytes(table) if got else 0)

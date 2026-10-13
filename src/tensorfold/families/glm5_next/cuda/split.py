@@ -83,7 +83,7 @@ def require_full_checkpoint(model_dir: str | Path, world: int) -> None:
     split = any(path.glob("*.rank*.safetensors"))
     index = path / "model.safetensors.index.json"
     if index.is_file():
-        split |= any(".rank" in Path(name).name for name in json.loads(index.read_text())["weight_map"].values())
+        split |= any(".rank" in Path(name).name for name in set(json.loads(index.read_text())["weight_map"].values()))
     if split:
         raise ValueError("TP1 requires a full unsplit checkpoint, not a half-rank folder")
 

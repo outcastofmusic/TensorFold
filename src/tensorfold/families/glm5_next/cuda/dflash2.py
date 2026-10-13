@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,8 +13,8 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from safetensors import safe_open
 
+from tensorfold.cuda.direct_read import SafeTensors
 from tensorfold.engine.exact_sampling import Sampling, uniform_rows
 
 from . import glue, qmm
@@ -218,16 +219,17 @@ class Drafter:
 
         quantize4 = _quantize4
 
-        with safe_open(str(path / "model.safetensors"), framework="pt", device="cpu") as f:
+        # read straight to the device: through a mapped file the 2.2 GiB took 4 s of page faults
+        with closing(SafeTensors([path / "model.safetensors"])) as f:
             def get(name: str) -> torch.Tensor:
-                return f.get_tensor(name)
+                return f.get(name, dev)
 
             self.fc = quantize4(gpu(get("fc.weight")))
             self.hidden_norm = gpu(get("hidden_norm.weight"))
             self.norm = gpu(get("norm.weight"))
             self.hproj = gpu(get("candidate_selector.hidden_projection.weight"))
-            self.pred = get("candidate_selector.predecessor_codebook").float().numpy().copy()
-            self.succ = get("candidate_selector.successor_codebook").float().numpy().copy()
+            self.pred = get("candidate_selector.predecessor_codebook").float().cpu().numpy()
+            self.succ = get("candidate_selector.successor_codebook").float().cpu().numpy()
             self.layers: list[DraftLayer] = []
             for i in range(int(cfg["num_hidden_layers"])):
                 p = f"layers.{i}."
@@ -239,7 +241,7 @@ class Drafter:
                 u = get(p + "mlp.up_proj.weight")[r * self.inter:(r + 1) * self.inter]
                 dn = get(p + "mlp.down_proj.weight")[:, r * self.inter:(r + 1) * self.inter]
                 for conv in ("attention_conv", "mlp_conv"):
-                    if tuple(get(p + conv + ".base_kernel").shape) != (2, 2, self.D):
+                    if tuple(f.where[p + conv + ".base_kernel"][4]) != (2, 2, self.D):
                         raise ValueError(f"unexpected {conv} base kernel shape")
                 self.layers.append(DraftLayer(
                     in_norm=gpu(get(p + "input_layernorm.weight")),

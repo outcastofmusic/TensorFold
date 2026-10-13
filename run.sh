@@ -7,7 +7,7 @@
 #   ./run.sh stop              stop whatever this script started
 #   ./run.sh status            what is running and whether it answers
 #
-# The two models do not fit together: starting one stops the other (26 s to either). Run ./prepare.sh first.
+# The two models do not fit together: starting one stops the other (21 to 24 s to either). Run ./prepare.sh first.
 # The server listens on loopback only and checks no API key; put a gateway in front of it to reach it from elsewhere.
 #
 # Settings (environment):
@@ -165,14 +165,17 @@ glm() {
     IMAGE=$(image)
     stop_all
     [ "$(avail)" -ge 100 ] || echo "run: $(avail) GiB available; GLM needs about 100 and the server refuses to start with less" >&2
-    # GLM fits with 0.5 GiB to spare, so a boot can be refused while the last of the memory returns: try again, up to 4 times.
+    # TENSORFOLD_MEMORY_RESERVE_GIB=11: the server keeps a tenth of the memory free by default (12.2 GiB), which GLM at
+    # 98,304 tokens fits under only while 119.4 of the Spark's 121.7 GiB are available; 2 of 6 loads were refused at
+    # 119.2 and 119.4 (2026-10-13). A loaded GLM leaves 14 to 16 GiB available either way.
+    # A boot can still be refused while the last of the memory returns: try again, up to 4 times.
     local try
     for try in 1 2 3 4; do
         docker rm -f tensorfold-glm >/dev/null 2>&1 || true
         # TF_GLM_DENSE_PROMPT=1: prompt rows through the dense matmul, 310 -> 362 tok/s on a 20,500-token prompt
         # TF_GLM_CALIBRATE=0: no 5 s of draft timing at start; only the `auto:...` chooser reads it (TIMING=1 keeps it)
         # TF_GLM_LAZY_SPARSE=1: the 72 long-context graphs are captured at first use (0.1 s each) where start-up took 7 s
-        serve tensorfold-glm -e TF_GLM_DENSE_PROMPT=1 -e TF_GLM_CALIBRATE="${TIMING:-0}" -e TF_GLM_LAZY_SPARSE=1 -- "$model" --tp 1 --host 127.0.0.1 --port "$PORT" --name glm-5.3-flash \
+        serve tensorfold-glm -e TF_GLM_DENSE_PROMPT=1 -e TF_GLM_CALIBRATE="${TIMING:-0}" -e TF_GLM_LAZY_SPARSE=1 -e TENSORFOLD_MEMORY_RESERVE_GIB=11 -- "$model" --tp 1 --host 127.0.0.1 --port "$PORT" --name glm-5.3-flash \
             --context "${CONTEXT:-$context}" --max-tokens "${CONTEXT:-$context}" "${drafter[@]}" ${EXTRA:-}
         wait_ready tensorfold-glm "$PORT" && return 0
         docker logs tensorfold-glm 2>&1 | grep -q 'memory budget cannot fit' || break

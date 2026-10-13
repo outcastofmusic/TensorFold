@@ -144,7 +144,7 @@ class HostTable:
             done.append((at, size))
         return True
 
-    def prefetch(self, workers: int = 8) -> float:
+    def prefetch(self, workers: int = 16) -> float:
         """Read every shard once so the lookups hit the page cache (seconds taken); the pages stay evictable."""
 
         return _prefetch(self.words + self.scales + self.biases, workers)
@@ -211,7 +211,7 @@ class BF16Table:
             done.append((at, size))
         return True
 
-    def prefetch(self, workers: int = 8) -> float:
+    def prefetch(self, workers: int = 16) -> float:
         """Read every shard once so the lookups hit the page cache (seconds taken); the pages stay evictable."""
 
         return _prefetch(self.values, workers)
@@ -290,7 +290,7 @@ class NVFP4Table(BF16Table):
     def lock(self) -> bool:
         return False
 
-    def prefetch(self, workers: int = 8) -> float:
+    def prefetch(self, workers: int = 16) -> float:
         return _prefetch(self.values + self.scales, workers)
 
 
@@ -403,9 +403,10 @@ def _random_access(array: np.ndarray) -> None:
 
 
 PREFETCH_READ = 16 << 20        # bytes a prefetch read: a page fault under MADV_RANDOM reads one page, a read the span
+# 16 workers: a buffered reader fills the page cache at 0.54 GiB/s, so 8 took 4.3 GiB/s from an SSD that gives 9
 
 
-def _prefetch(arrays: list[np.ndarray], workers: int = 8) -> float:
+def _prefetch(arrays: list[np.ndarray], workers: int = 16) -> float:
     """Read every array's file bytes once, in PREFETCH_READ spans over ``workers`` threads, so lookups hit the page cache (seconds taken); the pages stay evictable."""
 
     import threading

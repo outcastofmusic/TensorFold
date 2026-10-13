@@ -233,7 +233,7 @@ class NgramTable:
     def pinned_bytes(self) -> int:
         return self._pins.nbytes
 
-    def prefetch(self, workers: int = 8) -> float:
+    def prefetch(self, workers: int = 16) -> float:
         from ..host_table import HostTable
 
         return HostTable.prefetch(self, workers)

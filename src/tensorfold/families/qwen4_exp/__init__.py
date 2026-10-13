@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +24,18 @@ MLX_ENV = {"MLX_MAX_OPS_PER_BUFFER": "200", "MLX_MAX_MB_PER_BUFFER": "100000"}
 def has_mtp(model_dir: Path) -> bool:
     """Whether the checkpoint kept the MTP head's weights (``mtp.*``)."""
 
-    import json
-
     index = Path(model_dir) / "model.safetensors.index.json"
     if not index.is_file():
         return False
+    return _index_has_mtp(index, index.stat().st_mtime_ns)
+
+
+@lru_cache(maxsize=1)
+def _index_has_mtp(index: Path, mtime: int) -> bool:
+    """``has_mtp`` for one index file as last written: a start-up asks twice, and an EXL3 index names 300,000 tensors."""
+
+    import json
+
     return any(".mtp." in name or name.startswith("mtp.") for name in json.loads(index.read_text())["weight_map"])
 
 

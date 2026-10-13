@@ -87,6 +87,9 @@ def config(model_dir: str | Path) -> dict:
     return text
 
 
+_HEADERS: list = []          # the files (path, mtime, size) headers() last parsed and what it returned, until an estimate
+
+
 def headers(model_dir: str | Path, *, rank: int | None = None, files: list[Path] | None = None) -> dict:
     path = Path(model_dir)
     files = list(files or []) or (sorted(path.glob(f"*.rank{rank}.safetensors")) if rank is not None else [])
@@ -99,6 +102,10 @@ def headers(model_dir: str | Path, *, rank: int | None = None, files: list[Path]
                  if index.exists() else sorted(path.glob("*.safetensors")))
     if not files:
         raise ValueError("startup memory estimate needs the checkpoint tensor headers")
+    # a start-up asks twice (the engine, then the estimate), and a 150,000-tensor checkpoint takes 0.4 s to parse
+    key = tuple((str(file), (stat := file.stat()).st_mtime_ns, stat.st_size) for file in files)
+    if _HEADERS and _HEADERS[0] == key:
+        return _HEADERS[1]
     out = {}
     for file in files:
         with file.open("rb") as stream:
@@ -106,6 +113,7 @@ def headers(model_dir: str | Path, *, rank: int | None = None, files: list[Path]
             if not 0 < size <= 64 * 1024**2:
                 raise ValueError("invalid checkpoint tensor header size")
             entries = json.loads(stream.read(size))
+        split = ".rank" in file.name
         for name, info in entries.items():
             if name == "__metadata__":
                 continue
@@ -113,9 +121,10 @@ def headers(model_dir: str | Path, *, rank: int | None = None, files: list[Path]
                 raise ValueError(f"duplicate checkpoint tensor: {name}")
             shape = info["shape"]
             item = itemsize(info, name)
-            if any(int(n) < 0 for n in shape) or math.prod(shape) * item != info["data_offsets"][1] - info["data_offsets"][0]:
+            if min(shape, default=0) < 0 or math.prod(shape) * item != info["data_offsets"][1] - info["data_offsets"][0]:
                 raise ValueError(f"invalid checkpoint tensor geometry: {name}")
-            out[name] = {**info, "split": ".rank" in file.name}
+            out[name] = {**info, "split": split}
+    _HEADERS[:] = [key, out]
     return out
 
 
@@ -134,6 +143,7 @@ def estimate_weights(model_dir: str | Path, transform: Callable, *, rank: int | 
         match = re.search(r"(?:layers|blocks)\.(\d+)\.", name)
         group = match.group(1) if match else name
         layers[group] = layers.get(group, 0) + size
+    _HEADERS.clear()                              # the estimate is a start-up's last reader: 0.1 GiB of entries go
     # CPU expert lists/stack, GPU uploads and tiled outputs can coexist during one layer load.
     staging = 3 * max([largest, *layers.values()], default=0)
     return Weights(resident, staging, mapped)
