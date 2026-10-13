@@ -380,8 +380,12 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
 # -- prefill ----------------------------------------------------------------------------------------------------
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
-            resume: Snapshot | None = None, keep_at: int | None = None, keep=None, stop=None) -> int:
+            resume: Snapshot | None = None, keep_at: int | None = None, stops: Sequence[int] = (), keep=None,
+            stop=None) -> int:
     """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state.
+
+    ``keep`` gets the state at ``keep_at`` after the last chunk, and the state at each of ``stops`` as its chunk
+    ends there.
 
     ``stop()`` is asked before each chunk: once it holds, the prompt is abandoned with ``RequestCancelled`` and
     the caller must reset the engine before its next prompt.
@@ -411,35 +415,42 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
 
         if keep is None or not max(1, begin) <= keep_at <= len(prompt):
             raise ValueError("a kept prefix needs a callback and a point in the prompt's prefill")
+    stops = sorted({p for p in stops if begin < p < len(prompt) and p != keep_at})
+    if stops and keep is None:
+        raise ValueError("kept prefixes need a callback")
     kept = resume if keep_at == begin else None
     last = None
     prof.active = True
-    for start in range(begin, len(prompt), e.prefill_rows):
+    start = begin
+    while start < len(prompt):
         if stop is not None and stop():
             from tensorfold.server.cancellation import RequestCancelled
 
             prof.active = False
             raise RequestCancelled("the client left while its prompt was filling")
-        chunk = list(prompt[start:start + e.prefill_rows])
+        end = min(start + e.prefill_rows, len(prompt), next((p for p in stops if p > start), len(prompt)))
+        chunk = list(prompt[start:end])
         R = len(chunk)
-        point = keep_at - start if keep_at is not None else 0
+        at = keep_at if keep_at is not None and start < keep_at <= end else end if end in stops else None
+        point = at - start if at is not None else 0
         cut = Cut(point, torch.empty_like(st.rec[0]), st.conv.clone()) if 0 < point < R else None
         last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cut=cut).clone()
         e.last_hidden = b.fnormed[R - 1:R].clone()
+        snap = None
         if 0 < point <= R:
             rec = cut.rec if cut is not None else st.rec[st.cur[0] if st.cur else 0].clone()
             conv = cut.conv if cut is not None else st.conv.clone()
-            kept = Snapshot(list(prompt[:keep_at]), rec, conv,
+            snap = Snapshot(list(prompt[:at]), rec, conv,
                             b.fnormed[point - 1:point].clone() if use_mtp else None,
-                            keep_at - 1 if use_mtp else -1, keep_at if drafter is not None else -1)
+                            at - 1 if use_mtp else -1, at if drafter is not None else -1)
         if drafter is not None:
             drafter.add_taps(e.tap_rows(R, b))
-            if 0 < point <= R and getattr(drafter, "ring", 0):
+            if snap is not None and getattr(drafter, "ring", 0):
                 # a ring keeps the kept point's window unless this chunk wrote past it by more than the ring's slack
                 if R - point < drafter.ring - drafter.window:
-                    kept.drafter_rows = _ring_window(drafter, keep_at)
+                    snap.drafter_rows = _ring_window(drafter, at)
                 else:
-                    kept.drafter_end = -1
+                    snap.drafter_end = -1
         if use_mtp:
             nxt = list(prompt[start + 1:start + R + 1])
             if nxt:
@@ -447,6 +458,11 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
                     _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
         with prof.timed("commit"):
             commit(w, st, b, R, R)
+        if snap is not None and at == keep_at:
+            kept = snap
+        elif snap is not None:
+            keep(snap)
+        start = end
     if kept is not None:
         keep(kept)
     prof.active = False

@@ -31,7 +31,7 @@ def kept(monkeypatch):
                              snapshot_bytes=lambda s: s.states + (s.nbytes if s.rows is not None else 0))
     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.decode", decode)
     engine = GlmEngine.__new__(GlmEngine)
-    engine.cache, engine.live, engine.cache_bytes, engine.cache_entries = [], [], 100, 8
+    engine.cache, engine.live, engine.cache_bytes, engine.cache_entries, engine.user_id = [], [], 100, 8, -1
     engine.e = engine
 
     def snap(ids, need, states=5):
@@ -73,3 +73,47 @@ def test_remember_keeps_the_newest_and_frees_what_it_drops(kept):
     again = snap(range(20, 30), 0)
     engine._remember(again)                           # the same prompt again replaces its entry
     assert engine.cache == [again] and new.rows is None
+
+
+def test_a_prompt_keeps_a_state_where_its_system_block_ends(kept):
+    engine, _, _ = kept
+    engine.user_id = 9
+    system = list(range(100, 500))
+    prompt = system + [9, 1, 2, 3]
+    assert engine._system_end(prompt, 0) == [400]     # the first user message's start
+    assert engine._system_end(prompt, 400) == []      # resumed from there already
+    assert engine._system_end(prompt, 300) == []      # resumed within MIN_GAP of it: the state would save too little
+    assert engine._system_end(system + [1, 2], 0) == []
+    assert engine._system_end([9, 1, 2, 3], 0) == []  # no system block
+
+
+def test_a_system_blocks_state_outlives_its_conversations_turns(kept):
+    engine, snap, _ = kept
+    engine.user_id = 9
+    system = list(range(100, 500))
+    shared = snap(system, 0)
+    engine._remember(shared)
+    prompt = system + [9]
+    for turn in range(2 * engine.cache_entries):      # each turn keeps its prompt end
+        prompt = prompt + [1, 2]
+        engine._touch_system_end(prompt)
+        engine._remember(snap(prompt[:-1], 0))
+    assert shared in engine.cache and len(engine.cache) == engine.cache_entries
+
+
+def test_earlier_turn_ends_go_before_another_conversations_states(kept):
+    engine, snap, _ = kept
+    engine.user_id = 9
+    newest = []
+    for base in (100, 1000, 2000):                    # three conversations, six turns each, eight entries
+        system = list(range(base, base + 400))
+        shared = snap(system, 0)
+        engine._remember(shared)
+        prompt = system + [9]
+        for turn in range(6):
+            prompt = prompt + [1, 2]
+            engine._touch_system_end(prompt)
+            end = snap(prompt[:-1], 0)
+            engine._remember(end)
+        newest += [shared, end]
+    assert all(s in engine.cache for s in newest) and len(engine.cache) == engine.cache_entries

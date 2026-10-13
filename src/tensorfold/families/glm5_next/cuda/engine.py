@@ -23,6 +23,16 @@ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays de
 DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
 
 
+def _token_id(model_dir: Path, text: str) -> int:
+    """An added token's id from the checkpoint's tokenizer, or -1 when it has none."""
+
+    path = model_dir / "tokenizer.json"
+    if not path.is_file():
+        return -1
+    added = json.loads(path.read_text()).get("added_tokens", [])
+    return next((int(t["id"]) for t in added if t.get("content") == text), -1)
+
+
 def encode_policy(spec: str) -> list[int]:
     """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2."""
 
@@ -295,6 +305,7 @@ class GlmEngine:
         self.cache: list = []
         self.live: list[int] = []
         self.cache_entries = 0 if self.target_only else int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
+        self.user_id = _token_id(self.model_dir, "<|user|>")
 
     def _calibrate(self) -> dict:
         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""
@@ -463,6 +474,24 @@ class GlmEngine:
                 best = snap
         return best
 
+    def _system_end(self, prompt: list[int], cut: int) -> list[int]:
+        """Where the prompt's system block ends, its first user message's start, when this prefill passes it.
+
+        The template renders instructions and tools before the first user message, so another conversation with the
+        same ones resumes from a state kept there. The shared ``markers.resume_points`` finds only GLM's assistant
+        starts, which lie after the first user message.
+        """
+        from tensorfold.cuda.markers import MIN_GAP
+
+        point = prompt.index(self.user_id) if self.user_id in prompt else 0
+        return [point] if max(cut, 0) + MIN_GAP <= point < len(prompt) - 1 else []
+
+    def _touch_system_end(self, prompt: list[int]) -> None:
+        """Count this prompt as a use of its system block's kept state, so a long conversation's turns do not age it out."""
+        point = prompt.index(self.user_id) if self.user_id in prompt else 0
+        used = [c for c in self.cache if len(c.ids) == point and c.ids == prompt[:point]]
+        self.cache[:] = [c for c in self.cache if all(c is not u for u in used)] + used
+
     def _drop(self, snap) -> None:
         """Forget a kept snapshot and free its saved rows now, even while a caller still holds the object."""
         snap.rows, snap.nbytes, snap.drafter_rows = None, 0, None
@@ -476,12 +505,24 @@ class GlmEngine:
         self.cache[:] = [c for c in self.cache if c is not snap] + [snap]   # a resumed prompt kept again moves last
         dropped = False
         while len(self.cache) > 1 and (len(self.cache) > self.cache_entries or self._held_bytes() > self.cache_bytes):
-            self._drop(self.cache[0])
+            self._drop(self._superseded() or self.cache[0])
             dropped = True
         if dropped:
             import torch
 
             torch.cuda.empty_cache()
+
+    def _superseded(self):
+        """The oldest kept turn end that a later kept prompt of its conversation extends, or None.
+
+        Only a regenerated or edited turn resumes from one, so it goes before another conversation's states and
+        before a system block's end, which holds no user message.
+        """
+        for c in self.cache:
+            n = len(c.ids)
+            if self.user_id in c.ids and any(len(d.ids) > n and d.ids[:n] == c.ids for d in self.cache):
+                return c
+        return None
 
     def _take_over(self, keep: list[int]) -> None:
         """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike."""
@@ -555,9 +596,12 @@ class GlmEngine:
             load_rows(self.e, hit)
             hit.rows, hit.nbytes = None, 0            # live again
         self.live = list(prompt)
+        keeps = draft and self.cache_entries > 0 and self.cache_bytes > 0
+        if keeps:
+            self._touch_system_end(prompt)
         first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit,
-                        keep_at=max(1, len(prompt) - 1) if draft and self.cache_entries > 0 and self.cache_bytes > 0
-                        else None, keep=self._remember)
+                        keep_at=max(1, len(prompt) - 1) if keeps else None,
+                        stops=self._system_end(prompt, cut) if keeps else (), keep=self._remember)
         prefill_s = time.perf_counter() - t0
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         on_tokens([first])
