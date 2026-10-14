@@ -3,13 +3,17 @@
 #
 #   ./prepare.sh                  both models
 #   ./prepare.sh qwen-flash-next  Qwen3.8 Flash Next (80 GB), Clef-Flash (18 GB), image tower (0.9 GB)
-#   ./prepare.sh glm-5.3-flash    GLM-5.3 Flash Mosaic 12L (90 GB) and its draft model (2.3 GB)
+#   ./prepare.sh glm-5.3-flash    GLM-5.3 Flash hybrid (Sushi experts on Mosaic 12L's dense part, 182 GB of downloads)
+#                                 and its draft model (2.3 GB)
 #
 # Needs Docker with the NVIDIA runtime. Downloads run inside the serving image, so the host needs no Python packages.
 # A gated or rate-limited download reads HF_TOKEN from the environment. Reruns resume and skip what is complete.
 #
 # GLM_DRAFTER_REPO picks the GLM draft model. The default, cfontes/GLM-5.3-Flash-DFlash2-TR3-v3, is a finetune of
 # incoai/GLM-5.3-Flash-DFlash2 (CC-BY-NC-ND-4.0): personal use. modal-labs/GLM-5.3-Flash-DFlash is MIT and 3-4% slower.
+#
+# GLM_PACK=mosaic fetches Mosaic 12L alone (90 GB). The default also fetches the Sushi pack's 42 routed-expert files
+# (82 GB) and assembles the hybrid run.sh serves: TrueScore 93.6 against Mosaic's 86.5, 5-7% slower (2026-10-13).
 set -euo pipefail
 
 MODELS="${MODELS:-$HOME/models}"
@@ -21,15 +25,18 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 QWEN=(turboderp/Qwen3.8-Flash-Next-exl3 69e33439ae950f17bcbe95c98f117d80f759ab6d Qwen3.8-Flash-Next-exl3-3.05bpw)
 CLEF=(Cloudflare/clef-flash 17f0b0ad64efb65d273590632833508766b2aae6 clef-flash)
 GLM=(0xSero/GLM-5.3-Flash-EXL3-Spark 2642851741fc833764e77d03039117be559dc83e glm53-flash-mosaic-12l)
+SUSHI=(beamster/GLM-5.3-Flash-Sushi-2.4bpw 0bc3bf157723d2bb7723e31118addf48b22101b0 glm53-flash-sushi-2.4bpw)
+HYBRID=glm53-flash-sushi-experts-mosaic-dense
 
 die() { echo "prepare: $*" >&2; exit 1; }
 
-fetch() {  # repo revision folder
+fetch() {  # repo revision folder [file ...]: the whole repo, or the files named
     local repo=$1 rev=$2 dir="$MODELS/$3"
+    shift 3
     echo "prepare: $repo -> $dir"
     docker run --rm --network host --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_TOKEN="${HF_TOKEN:-}" \
         -v "$MODELS:$MODELS" "$IMAGE" \
-        hf download "$repo" ${rev:+--revision "$rev"} --local-dir "$dir" >/dev/null
+        hf download "$repo" "$@" ${rev:+--revision "$rev"} --local-dir "$dir" >/dev/null
     [ -e "$dir/config.json" ] || die "$dir has no config.json after the download"
 }
 
@@ -52,6 +59,20 @@ qwen() {
 glm() {
     fetch "${GLM[@]}"
     fetch "$GLM_DRAFTER_REPO" "" "$(basename "$GLM_DRAFTER_REPO")"
+    [ "${GLM_PACK:-hybrid}" = mosaic ] && return
+    # Only the routed experts of MoE layers 3-44: the pack's dense part, MTP layer (L45) and vision tower go unused
+    local i experts=(config.json)
+    for i in $(seq -w 3 44); do experts+=("model-exl3-L$i.safetensors"); done
+    fetch "${SUSHI[@]}" "${experts[@]}"
+    if [ -e "$MODELS/$HYBRID/config.json" ]; then
+        echo "prepare: hybrid already at $MODELS/$HYBRID"
+        return
+    fi
+    # Copies Mosaic's dense tensors (6.1 GB) and links the expert files, so the Sushi folder must stay
+    echo "prepare: assembling $MODELS/$HYBRID"
+    docker run --rm --user "$(id -u):$(id -g)" -v "$MODELS:$MODELS" -v "$SRC:/tf:ro" "$IMAGE" \
+        python /tf/tools/glm5_stacked_experts_pack.py --dense "$MODELS/${GLM[2]}" --experts "$MODELS/${SUSHI[2]}" \
+        --out "$MODELS/$HYBRID"
 }
 
 command -v docker >/dev/null || die "docker is not installed"
@@ -64,8 +85,8 @@ what="${1:-all}"
 need=0
 case "$what" in
     qwen-flash-next) need=100 ;;
-    glm-5.3-flash)   need=93 ;;
-    all)             need=193 ;;
+    glm-5.3-flash)   need=$([ "${GLM_PACK:-hybrid}" = mosaic ] && echo 93 || echo 182) ;;
+    all)             need=$((100 + $([ "${GLM_PACK:-hybrid}" = mosaic ] && echo 93 || echo 182))) ;;
     *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, or nothing for both)" ;;
 esac
 free=$(df -BG --output=avail "$MODELS" | tail -1 | tr -dc 0-9)

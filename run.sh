@@ -36,7 +36,7 @@ avail_mib() { awk '/MemAvailable/{printf "%d", $2 / 1024}' /proc/meminfo; }
 
 uncache() {  # drop the served checkpoints' files from the page cache (they stay on disk)
     local f
-    for f in "$MODELS"/{Qwen3.8-Flash-Next-exl3-3.05bpw,clef-flash,glm53-flash-mosaic-12l,GLM-5.3-Flash-DFlash*}/*.safetensors \
+    for f in "$MODELS"/{Qwen3.8-Flash-Next-exl3-3.05bpw,clef-flash,glm53-flash-mosaic-12l,glm53-flash-sushi-experts-mosaic-dense,GLM-5.3-Flash-DFlash*}/*.safetensors \
              "${QWEN_MODEL:-}"/*.safetensors "${CLEF_MODEL:-}"/*.safetensors "${GLM_MODEL:-}"/*.safetensors; do
         [ -f "$f" ] && dd if="$f" iflag=nocache count=0 status=none 2>/dev/null
     done
@@ -153,8 +153,10 @@ qwen() {
 }
 
 glm() {
-    local model="${GLM_MODEL:-$MODELS/glm53-flash-mosaic-12l}" drafter=() context=98304
-    [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh glm-5.3-flash)"
+    # The hybrid (Sushi's routed experts on Mosaic 12L's dense part) over Mosaic 12L: TrueScore 93.6 against 86.5,
+    # paired difference +2.7 [-1.1, +7.3] over 76 scenarios, decode 5-7% slower (2026-10-13)
+    local model="${GLM_MODEL:-$MODELS/glm53-flash-sushi-experts-mosaic-dense}" drafter=() context=98304
+    [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh glm-5.3-flash, or GLM_MODEL=$MODELS/glm53-flash-mosaic-12l)"
     case "${DRAFTER:-cfontes}" in
         cfontes) drafter=(--drafter "$MODELS/GLM-5.3-Flash-DFlash2-TR3-v3") ;;
         modal)   drafter=(--drafter "$MODELS/GLM-5.3-Flash-DFlash") ;;

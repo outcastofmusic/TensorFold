@@ -24,7 +24,13 @@ below were measured on, and converts Qwen's image tower once. Downloads run insi
 | Target | Downloads | Disk |
 | --- | --- | --- |
 | `qwen-flash-next` | `turboderp/Qwen3.8-Flash-Next-exl3` (3.05 bpw), `Cloudflare/clef-flash`, a converted image tower | 99 GB |
-| `glm-5.3-flash` | `0xSero/GLM-5.3-Flash-EXL3-Spark` (M288 Mosaic 12L), `cfontes/GLM-5.3-Flash-DFlash2-TR3-v3` | 93 GB |
+| `glm-5.3-flash` | `0xSero/GLM-5.3-Flash-EXL3-Spark` (M288 Mosaic 12L), the routed experts of `beamster/GLM-5.3-Flash-Sushi-2.4bpw`, `cfontes/GLM-5.3-Flash-DFlash2-TR3-v3` | 182 GB |
+
+`run.sh` serves GLM as a hybrid that `prepare.sh` assembles with `tools/glm5_stacked_experts_pack.py`: Sushi's
+2.25/2.5-bit routed experts on Mosaic 12L's dense part. Over TrueScore's 76 scenarios it scored 93.6 against Mosaic's
+86.5, a paired difference of +2.7 [-1.1, +7.3], and decodes 5-7% slower (2026-10-13). `GLM_PACK=mosaic ./prepare.sh
+glm-5.3-flash` fetches Mosaic alone (93 GB), and `GLM_MODEL=~/models/glm53-flash-mosaic-12l ./run.sh glm-5.3-flash`
+serves it.
 
 `run.sh` serves on `http://127.0.0.1:30000/v1`, an OpenAI-compatible API. The two models do not fit in memory
 together, so starting one stops the other: a switch to Qwen takes 23 to 24 s and a switch to GLM 21 to 24 s
@@ -136,6 +142,8 @@ servers with these flags.
 - **[turboderp](https://huggingface.co/turboderp)** made the EXL3 quantizations of both models, and
   **[0xSero/GLM-5.3-Flash-EXL3-Spark](https://huggingface.co/0xSero/GLM-5.3-Flash-EXL3-Spark)** is the Mosaic 12L
   mix of them that fits one Spark.
+- **[beamster/GLM-5.3-Flash-Sushi-2.4bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2.4bpw)**, packed for
+  [sushi](https://github.com/beamivalice/sushi), supplies the hybrid's routed experts.
 - **[cfontes/GLM-5.3-Flash-DFlash2-TR3-v3](https://huggingface.co/cfontes/GLM-5.3-Flash-DFlash2-TR3-v3)** and
   **[modal-labs/GLM-5.3-Flash-DFlash](https://huggingface.co/modal-labs/GLM-5.3-Flash-DFlash)** are the GLM draft
   models.
