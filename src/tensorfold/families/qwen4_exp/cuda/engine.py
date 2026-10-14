@@ -168,53 +168,57 @@ class FlashNextEngine:
             wait(reads)                               # a failed load leaves no table read behind it
             raise
         tables_read = bool(reads)
-        w.comm = self.comm
-        if self.comm is not None:
-            self.comm.ready("loading")               # a peer stuck loading is named, not waited on in NCCL
-        if self.depth > 0 and w.mtp is None:
-            raise ValueError("this checkpoint has no MTP head, which Flash Next's CUDA engine drafts with: use one "
-                             "that has it, or --no-drafts for the serial reference (one token a round)")
-        self.w = w
-        from tensorfold.cuda.markers import resume_points
+        try:                                          # until wait_all below, a failure still waits the reads out
+            w.comm = self.comm
+            if self.comm is not None:
+                self.comm.ready("loading")               # a peer stuck loading is named, not waited on in NCCL
+            if self.depth > 0 and w.mtp is None:
+                raise ValueError("this checkpoint has no MTP head, which Flash Next's CUDA engine drafts with: use one "
+                                 "that has it, or --no-drafts for the serial reference (one token a round)")
+            self.w = w
+            from tensorfold.cuda.markers import resume_points
 
-        self.points = resume_points(model_dir)          # a prompt's message starts to keep states at, or None
-        if vision and rank == 0:
-            from tensorfold.vision.qwen_cuda import QwenCudaVision
+            self.points = resume_points(model_dir)          # a prompt's message starts to keep states at, or None
+            if vision and rank == 0:
+                from tensorfold.vision.qwen_cuda import QwenCudaVision
 
-            self.vision = QwenCudaVision(model_dir, torch.device("cuda", 0),
-                                         allow_urls=vision_urls)
-            torch.cuda.empty_cache()
-            ranks = "; rank 1 receives each request's image features from this rank" if tp == 2 else ""
-            print(f"[tensorfold] vision: image{' and video' if self.vision.videos else ''} input, a "
-                  f"{self.vision.weight_bytes / 2**30:.2f} GiB tower with {vision_workspace() / 2**30:.2f} GiB of "
-                  f"workspace reserved{'; https URLs allowed' if vision_urls else ''}"
-                  f"{ranks}",
-                  flush=True)
-        elif vision:                                   # rank 1: no tower; rank 0's features arrive with each admission
-            print("[tensorfold] vision: image input on two ranks; this rank attaches the features rank 0 encodes",
-                  flush=True)
-        # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
-        self.concurrent = streams > 1
-        self.refuses_structured_output = (
-            "structured output is not served by Flash Next on two ranks with --parallel yet: "
-            "send text without response_format or guided output, or start without --parallel"
-            if self.concurrent and tp == 2 else None)
-        self.multi = self.scheduler = None
-        if self.concurrent:
-            from tensorfold.cuda.scheduler import Scheduler
+                self.vision = QwenCudaVision(model_dir, torch.device("cuda", 0),
+                                             allow_urls=vision_urls)
+                torch.cuda.empty_cache()
+                ranks = "; rank 1 receives each request's image features from this rank" if tp == 2 else ""
+                print(f"[tensorfold] vision: image{' and video' if self.vision.videos else ''} input, a "
+                      f"{self.vision.weight_bytes / 2**30:.2f} GiB tower with {vision_workspace() / 2**30:.2f} GiB of "
+                      f"workspace reserved{'; https URLs allowed' if vision_urls else ''}"
+                      f"{ranks}",
+                      flush=True)
+            elif vision:                               # rank 1: no tower; rank 0's features arrive with each admission
+                print("[tensorfold] vision: image input on two ranks; this rank attaches the features rank 0 encodes",
+                      flush=True)
+            # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
+            self.concurrent = streams > 1
+            self.refuses_structured_output = (
+                "structured output is not served by Flash Next on two ranks with --parallel yet: "
+                "send text without response_format or guided output, or start without --parallel"
+                if self.concurrent and tp == 2 else None)
+            self.multi = self.scheduler = None
+            if self.concurrent:
+                from tensorfold.cuda.scheduler import Scheduler
 
-            from .multi import MultiDecoder
+                from .multi import MultiDecoder
 
-            self.e = None
-            self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
-                                      confidence=self.confidence, keep=KEEP, points=self.points,
-                                      copy=getattr(self, "copy_drafts", False),
-                                      kv_dtype=self.kv_dtype, share=share, vision=self.vision,
-                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=lone)
-            self.scheduler = Scheduler(self.multi, max_streams=streams)
-        else:
-            self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
-                            kv_dtype=self.kv_dtype, prefill_rows=self.prefill_rows)
+                self.e = None
+                self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
+                                          confidence=self.confidence, keep=KEEP, points=self.points,
+                                          copy=getattr(self, "copy_drafts", False),
+                                          kv_dtype=self.kv_dtype, share=share, vision=self.vision,
+                                          prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=lone)
+                self.scheduler = Scheduler(self.multi, max_streams=streams)
+            else:
+                self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
+                                kv_dtype=self.kv_dtype, prefill_rows=self.prefill_rows)
+        except BaseException:
+            wait(reads)
+            raise
         # waited for here, the tables' reads finish while the image tower loads
         waited = time.perf_counter()
         wait_all(reads)                               # raises a table read's error
