@@ -11,6 +11,7 @@
 #
 # GLM_DRAFTER_REPO picks the GLM draft model. The default, cfontes/GLM-5.3-Flash-DFlash2-TR3-v3, is a finetune of
 # incoai/GLM-5.3-Flash-DFlash2 (CC-BY-NC-ND-4.0): personal use. modal-labs/GLM-5.3-Flash-DFlash is MIT and 3-4% slower.
+# Both download at a pinned revision; another repo needs GLM_DRAFTER_REV.
 #
 # GLM_PACK=mosaic fetches Mosaic 12L alone (90 GB). The default also fetches the Sushi pack's 42 routed-expert files
 # (82 GB) and assembles the hybrid run.sh serves: TrueScore 93.6 against Mosaic's 86.5, 5-7% slower (2026-10-13).
@@ -19,6 +20,11 @@ set -euo pipefail
 MODELS="${MODELS:-$HOME/models}"
 IMAGE="${TF_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 GLM_DRAFTER_REPO="${GLM_DRAFTER_REPO:-cfontes/GLM-5.3-Flash-DFlash2-TR3-v3}"
+declare -A DRAFTER_REV=(
+    [cfontes/GLM-5.3-Flash-DFlash2-TR3-v3]=45f7e139584e299f9850c9f92df2c4563a470432
+    [modal-labs/GLM-5.3-Flash-DFlash]=dae6d319510889a7f1ac5242d5b7fb2d5d95eb05
+)
+GLM_DRAFTER_REV="${GLM_DRAFTER_REV:-${DRAFTER_REV[$GLM_DRAFTER_REPO]:-}}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
 # repo, revision, folder under $MODELS: the revisions the fork's numbers were measured on
@@ -34,7 +40,8 @@ fetch() {  # repo revision folder [file ...]: the whole repo, or the files named
     local repo=$1 rev=$2 dir="$MODELS/$3"
     shift 3
     echo "prepare: $repo -> $dir"
-    docker run --rm --network host --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_TOKEN="${HF_TOKEN:-}" \
+    # -e HF_TOKEN with no value copies it from this environment, so the token stays out of the command line
+    docker run --rm --network host --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_TOKEN \
         -v "$MODELS:$MODELS" "$IMAGE" \
         hf download "$repo" "$@" ${rev:+--revision "$rev"} --local-dir "$dir" >/dev/null
     [ -e "$dir/config.json" ] || die "$dir has no config.json after the download"
@@ -58,7 +65,8 @@ qwen() {
 
 glm() {
     fetch "${GLM[@]}"
-    fetch "$GLM_DRAFTER_REPO" "" "$(basename "$GLM_DRAFTER_REPO")"
+    [ -n "$GLM_DRAFTER_REV" ] || die "no pinned revision for $GLM_DRAFTER_REPO: set GLM_DRAFTER_REV to a commit"
+    fetch "$GLM_DRAFTER_REPO" "$GLM_DRAFTER_REV" "$(basename "$GLM_DRAFTER_REPO")"
     [ "${GLM_PACK:-hybrid}" = mosaic ] && return
     # Only the routed experts of MoE layers 3-44: the pack's dense part, MTP layer (L45) and vision tower go unused
     local i experts=(config.json)
@@ -82,11 +90,11 @@ mkdir -p "$MODELS"
 docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE"
 
 what="${1:-all}"
-need=0
+glm_need=$([ "${GLM_PACK:-hybrid}" = mosaic ] && echo 93 || echo 182)   # GB, the draft model included
 case "$what" in
     qwen-flash-next) need=100 ;;
-    glm-5.3-flash)   need=$([ "${GLM_PACK:-hybrid}" = mosaic ] && echo 93 || echo 182) ;;
-    all)             need=$((100 + $([ "${GLM_PACK:-hybrid}" = mosaic ] && echo 93 || echo 182))) ;;
+    glm-5.3-flash)   need=$glm_need ;;
+    all)             need=$((100 + glm_need)) ;;
     *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, or nothing for both)" ;;
 esac
 free=$(df -BG --output=avail "$MODELS" | tail -1 | tr -dc 0-9)

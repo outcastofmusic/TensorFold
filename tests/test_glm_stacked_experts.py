@@ -116,3 +116,24 @@ def test_the_tool_refuses_a_pack_with_a_missing_expert_layer_before_writing(tmp_
     with pytest.raises(SystemExit, match="lacks 1 expert files"):
         tool.main()
     assert not out.exists()
+
+
+def test_a_rerun_after_an_interrupted_assembly_finishes_it(tmp_path, monkeypatch):
+    tool = _tool()
+    dense, experts = _packs(tmp_path)
+    out = tmp_path / "out"
+    argv = ["tool", "--dense", str(dense), "--experts", str(experts), "--out", str(out)]
+    monkeypatch.setattr("sys.argv", argv)
+    real = tool.write_dense
+
+    def interrupted(*args):
+        real(*args)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tool, "write_dense", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        tool.main()
+    assert not out.exists()                          # prepare.sh reads config.json: a half-built folder is never there
+    monkeypatch.setattr(tool, "write_dense", real)
+    tool.main()
+    assert (out / "config.json").is_file() and (out / "model-exl3-L03.safetensors").is_symlink()

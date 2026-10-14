@@ -98,7 +98,12 @@ def main() -> None:
     if missing:
         raise SystemExit(f"{experts} lacks {len(missing)} expert files: {', '.join(missing[:4])} ...")
 
-    out.mkdir(parents=True, exist_ok=False)
+    if out.exists():
+        raise SystemExit(f"{out} exists: remove it to assemble again")
+    final, out = out, out.with_name(out.name + ".partial")   # renamed once whole, so a rerun finds no half-built folder
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
     tensors = dense_tensors(dense, layers)
     write_dense(out / "model-dense.safetensors", tensors)
     weight_map = {name: "model-dense.safetensors" for name, _, _, _ in tensors}
@@ -122,7 +127,8 @@ def main() -> None:
     for name in COPIED:
         if (dense / name).is_file():
             shutil.copy2(dense / name, out / name)
-    print(f"{out}: {len(tensors)} dense tensors copied, {len(files)} expert files linked, {total / 1e9:.1f} GB")
+    out.rename(final)
+    print(f"{final}: {len(tensors)} dense tensors copied, {len(files)} expert files linked, {total / 1e9:.1f} GB")
 
 
 if __name__ == "__main__":
