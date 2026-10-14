@@ -8,6 +8,8 @@ void matmul(const at::Tensor& X, const at::Tensor& XS, const at::Tensor& T, cons
             at::Tensor out, int64_t nt, int64_t warps) {
     TORCH_CHECK(X.is_cuda() && X.scalar_type() == at::kBFloat16 && X.dim() == 2, "X: CUDA bf16 [M, K]");
     const int64_t M = X.size(0), K = X.size(1);
+    TORCH_CHECK(X.stride(1) == 1 && (M <= 1 || X.stride(0) % 2 == 0) &&
+                reinterpret_cast<uintptr_t>(X.data_ptr()) % 4 == 0, "X: rows of unit stride, read in 4-byte pairs");
     TORCH_CHECK(K % 128 == 0 && (K / 128) % warps == 0, "K must hold whole groups of 128, split evenly over the warps");
     TORCH_CHECK(XS.scalar_type() == at::kFloat && XS.is_contiguous() && XS.numel() == M * (K / 128), "XS: fp32 [M, K / 128]");
     TORCH_CHECK(S.scalar_type() == at::kBFloat16 && S.is_contiguous() && S.dim() == 2 && S.size(0) == K / 128,

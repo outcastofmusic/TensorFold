@@ -123,6 +123,8 @@ def matmul(x: torch.Tensor, q: Affine6, out: torch.Tensor | None = None, f32: bo
 
     if x.ndim != 2 or x.shape[1] != q.k or x.dtype != torch.bfloat16:
         raise ValueError(f"x must be bf16 [M, {q.k}], got {x.dtype} {tuple(x.shape)}")
+    if x.stride(1) != 1 or (x.shape[0] > 1 and x.stride(0) % 2) or x.data_ptr() % 4:
+        x = x.clone(memory_format=torch.contiguous_format)     # the kernel reads a row's inputs in 4-byte pairs
     m, groups = x.shape[0], q.k // GS
     if out is None:
         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)

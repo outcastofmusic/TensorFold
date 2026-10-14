@@ -76,3 +76,17 @@ def test_the_matmul_matches_float64_and_the_generic_kernel_and_keeps_rows_indepe
     wide[:, :k] = x
     assert torch.equal(affine6.matmul(wide[:, :k], q, f32=True), full)
     assert torch.equal(affine6.matmul(x, q), full.to(torch.bfloat16))
+
+
+def test_misaligned_and_transposed_inputs_give_the_contiguous_result():
+    from tensorfold.cuda.affine6 import affine6
+
+    n, k = 256, 128
+    _, w, s, b = _weight(n, k, 4)
+    q = affine6.pack(w, s, b)
+    x = torch.randn((8, k), generator=torch.Generator().manual_seed(5)).to(torch.bfloat16).cuda()
+    want = affine6.matmul(x, q, f32=True)
+    shifted = torch.zeros((8, k + 1), dtype=torch.bfloat16, device="cuda")
+    shifted[:, 1:] = x
+    assert torch.equal(affine6.matmul(shifted[:, 1:], q, f32=True), want)          # base 2 bytes past 4-byte alignment
+    assert torch.equal(affine6.matmul(x.t().contiguous().t(), q, f32=True), want)  # column-major rows
