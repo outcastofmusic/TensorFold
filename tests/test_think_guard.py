@@ -216,12 +216,20 @@ class Decisions:
     """A SystemOne server: yes (0.95) once the state says "settled", else 0.05; ``fail`` answers 502."""
 
     def __init__(self, fail=False, cut=0):
-        self.states, self.sessions, self.fail, self.cut = [], [], fail, cut
+        self.states, self.sessions, self.fail, self.cut, self.ended = [], [], fail, cut, []
         decisions = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if "end_session" in body:
+                    decisions.ended.append(body["end_session"])
+                    reply = json.dumps({"model": body["model"], "ended": True}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(reply)))
+                    self.end_headers()
+                    self.wfile.write(reply)
+                    return
                 decisions.states.append(body["state"])
                 decisions.sessions.append(body.get("session"))
                 if decisions.fail or self.path != "/v1/systemone" or body["model"] != "clef":
@@ -411,3 +419,13 @@ def test_bad_guard_flags_are_refused_before_the_model_loads(threshold, gap, word
                            thinking_guard_gap=gap)
     with pytest.raises(ValueError, match=words):
         check(args, None, "cuda")
+
+
+def test_a_finished_reply_ends_its_decision_session(tmp_path, decisions):
+    d = decisions()
+    app = app_for(tmp_path, ScriptEngine(LONG, pause=0.002), GuardConfig(d.url, "clef", gap=0))
+    status, _ = ask(app)
+    deadline = time.monotonic() + 5
+    while not d.ended and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert status == 200 and d.ended == ["made-1"]

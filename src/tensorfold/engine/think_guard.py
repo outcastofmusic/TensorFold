@@ -70,6 +70,15 @@ def decide(config: GuardConfig, request: str, reasoning: str, session: str | Non
     return float(answer["answers"]["enough"]["noul"]), answer.get("session")
 
 
+def end_session(config: GuardConfig, session: str) -> None:
+    """Free a finished reply's session on the decision server. A server without sessions answers an error: ignored."""
+
+    body = json.dumps({"model": config.model, "end_session": session}).encode()
+    call = urllib.request.Request(config.url.rstrip("/") + "/systemone", body, {"Content-Type": "application/json"})
+    with urllib.request.urlopen(call, timeout=TIMEOUT) as reply:
+        reply.read()
+
+
 def _ends(tail: str, piece: str) -> tuple[list[int], str]:
     """(where in ``piece`` each paragraph that ``tail + piece`` finishes ends, just past its blank line; the new tail).
 
@@ -94,10 +103,12 @@ class ThinkGuard:
 
     def __init__(self, ask: Callable[[str], float], threshold: float, *, think_end: int,
                  decode: Callable[[list[int]], str], encode: Callable[[str], list[int]], model: str = "",
-                 gap: int = 0, submit: Callable[..., Future] | None = None) -> None:
+                 gap: int = 0, submit: Callable[..., Future] | None = None,
+                 release: Callable[[], None] | None = None) -> None:
         self.ask, self.threshold, self.think_end, self.gap = ask, float(threshold), int(think_end), int(gap)
         self.offered = 0                    # reasoning tokens through the last paragraph offered for a check
         self.decode, self.encode, self.submit = decode, encode, submit or _POOL.submit
+        self.release = release              # once the reply is done: frees the decision session, off this thread
         self.tokens: list[int] = []         # the reasoning so far
         self.tail = ""                      # its text since the last paragraph end
         self.paragraphs = 0
@@ -181,7 +192,10 @@ class ThinkGuard:
 
         self.waiting = None                 # nothing new starts once the reply is done
         self._collect()
+        if self.release is not None:
+            self.submit(self.release)       # its failure stays in its future: the session then expires on its own
+            self.release = None
         return self.record
 
 
-__all__ = ["GuardConfig", "ThinkGuard", "decide", "guard_state"]
+__all__ = ["GuardConfig", "ThinkGuard", "decide", "end_session", "guard_state"]

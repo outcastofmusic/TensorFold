@@ -215,7 +215,8 @@ class JointSchema:
         self.sessions: OrderedDict[str, tuple[Any, float]] = OrderedDict()   # id -> (kept prefill, last use)
         room = getattr(engine, "room", None)
         if room is not None and hasattr(room, "release"):     # a grow counts the sessions' buffers and may drop them
-            room.others = lambda: [kept.state.kv for kept, _ in self.sessions.values()]
+            # each session's attention buffers, and its rows buffer (prompt + headroom rows) as one more "kv"
+            room.others = lambda: [kv for kept, _ in self.sessions.values() for kv in (kept.state.kv, [(kept.rows,)])]
             room.release = lambda: bool(self.sessions) and self.sessions.popitem(last=False) is not None
 
     @classmethod
@@ -311,6 +312,10 @@ class JointSchema:
     # -- /v1/systemone: the release's own request and response -------------------------------
 
     def systemone(self, body: dict[str, Any]) -> dict[str, Any]:
+        if "end_session" in body:       # a caller done with a session frees its kept prefill now, not in SESSION_IDLE
+            name = body["end_session"]
+            ended = isinstance(name, str) and self.sessions.pop(name, None) is not None
+            return {"model": body.get("model"), "ended": ended}
         questions = body.get("questions")
         if not isinstance(body.get("model"), str) or "state" not in body:
             raise DecisionError("model and state are required")

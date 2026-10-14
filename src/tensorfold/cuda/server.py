@@ -22,7 +22,7 @@ from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
 from tensorfold.server.tool_policy import ToolCallPolicy
 from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
-from tensorfold.engine.think_guard import GuardConfig, ThinkGuard, decide
+from tensorfold.engine.think_guard import GuardConfig, ThinkGuard, decide, end_session
 from tensorfold.engine.tool_draft import ToolCallStreamer
 from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
@@ -697,7 +697,11 @@ class App:
             p, session[0] = decide(config, request, reasoning, session[0])
             return p
 
-        return ThinkGuard(ask, config.threshold,
+        def release() -> None:                # a check still running may open the session after this: it expires
+            if session[0]:
+                end_session(config, session[0])
+
+        return ThinkGuard(ask, config.threshold, release=release,
                           think_end=self.tok.token_to_id("</think>"), model=config.model, gap=config.gap,
                           decode=lambda ids: self.tok.decode(ids, skip_special_tokens=False),
                           encode=lambda text: self.tok.encode(text, add_special_tokens=False).ids)

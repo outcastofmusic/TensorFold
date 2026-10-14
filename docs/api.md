@@ -77,7 +77,8 @@ request and the answer fields are the same, with three differences: the prompt i
 `label_mass` is `null` because no vocabulary is scored, and `prompt_format_version` is `null`. A choice may have 2 to
 26 options and a score 2 to 10 levels, as above. `POST /v1/systemone` takes the model's own body (`state`, and
 `questions` keyed by id with `type` `noul`, `choice` or `score`) and returns its own answers. Image and video states
-return HTTP 400.
+return HTTP 400. A state past the model's window loses its end, and `usage.state_cut_tokens` counts the tokens left
+out. `{"model": ..., "end_session": id}` frees a session's kept prefill at once and returns `ended`.
 
 ## Request fields
 
@@ -244,15 +245,17 @@ decodes on from the reply, as for a required tool call.
 
 A CUDA server started with `--thinking-guard URL` asks a decision model whether the thinking is enough, after
 each paragraph of thinking (text followed by a blank line). The question goes to `URL/systemone`, for example a
-TensorFold serving Cloudflare's Clef, as one `noul` question about the user's last message and at most 40,000 bytes
-of the newest reasoning, older reasoning dropped in 10,000-byte steps. A reply's checks share one `session` id, so a
-decision server that keeps prefills reads only the reasoning that is new since the last check. Each check slows
+TensorFold serving Cloudflare's Clef, as one `noul` question about the user's last message and at most 10,000 tokens
+of the newest reasoning, older reasoning dropped in 2,500-token steps. A reply's checks share one `session` id, so a
+decision server that keeps prefills reads only the reasoning that is new since the last check, and the finished
+reply frees that session. Each check slows
 decoding while it runs on the same GPU, so a paragraph is checked only after at least `--thinking-guard-gap`
 reasoning tokens (default 128) since the last checked one. Checks run on background threads, one at a time per reply, and decoding never waits for
 one: a paragraph that ends while a check runs replaces any paragraph still waiting. Once a check returns a
 probability at the threshold or above (`--thinking-guard-threshold`, default 0.8), the next paragraph end
 becomes the closing think marker and a blank line, and the reply goes on as its answer. A failed or slow check
-(30 s) ends the checks, and the reply finishes unguarded. The reply's `tensorfold` block carries
+(30 s) leaves its paragraph unchecked. A check whose state the decision model cut counts as failed. After 3 failed
+checks in a row the checks end, and the reply finishes unguarded. The reply's `tensorfold` block carries
 `thinking_guard`: each answered check (`paragraph`, `chars`, `p`, `ms`), `yes_paragraph`,
 `closed_at_paragraph`, and `error` when a check failed. A request sends `"thinking_guard": false` to turn the
 guard off, or `{"threshold": t, "gap": n}` to set either.

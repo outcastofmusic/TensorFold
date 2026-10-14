@@ -113,7 +113,8 @@ class _SessionEngine:
             raise ValueError("a decision prompt does not fit")
         usable = kept is not None and len(kept.ids) <= keep_at and tuple(prompt[:len(kept.ids)]) == kept.ids
         self.resumed.append(len(kept.ids) if usable else 0)
-        made = SimpleNamespace(ids=tuple(prompt[:keep_at]), state=SimpleNamespace(kv=[object()]))
+        made = SimpleNamespace(ids=tuple(prompt[:keep_at]), state=SimpleNamespace(kv=[object()]),
+                               rows=torch.zeros((len(prompt), 4)))
         return torch.zeros((len(prompt), 4)), made, len(kept.ids) if usable else 0
 
     def head_rows(self, ids):
@@ -185,9 +186,19 @@ def test_the_engines_room_counts_and_releases_the_sessions():
     joint = _joint()
     first, second = ask(joint, FIRST)["session"], ask(joint, FIRST)["session"]
     room = joint.engine.room
-    assert room.others() == [joint.sessions[first][0].state.kv, joint.sessions[second][0].state.kv]
+    one, two = joint.sessions[first][0], joint.sessions[second][0]
+    # each session's attention buffers, and its rows buffer, as one more buffer the budget counts
+    assert room.others() == [one.state.kv, [(one.rows,)], two.state.kv, [(two.rows,)]]
     assert room.release() and list(joint.sessions) == [second]       # the least recently used goes first
     assert room.release() and not room.release()
+
+
+def test_a_finished_reply_ends_its_session():
+    joint = _joint()
+    first, second = ask(joint, FIRST)["session"], ask(joint, FIRST)["session"]
+    assert joint.systemone({"model": "clef", "end_session": first}) == {"model": "clef", "ended": True}
+    assert list(joint.sessions) == [second]
+    assert joint.systemone({"model": "clef", "end_session": first})["ended"] is False
 
 
 @pytest.mark.parametrize("session", ["", 7, False, "x" * 201])
