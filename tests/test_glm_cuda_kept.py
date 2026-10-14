@@ -117,3 +117,14 @@ def test_earlier_turn_ends_go_before_another_conversations_states(kept):
             engine._remember(end)
         newest += [shared, end]
     assert all(s in engine.cache for s in newest) and len(engine.cache) == engine.cache_entries
+
+
+def test_a_turn_resumed_after_its_later_turn_is_not_the_superseded_one(kept):
+    """Back to turn one after turn two: the stale turn two goes first, not the branch point just used."""
+    engine, snap, _ = kept
+    engine.user_id = 7
+    one, two = snap([1, 7, 2], 10), snap([1, 7, 2, 7, 3], 10)
+    engine.cache = [one, two]
+    assert engine._superseded() is one                   # a linear conversation: turn one is behind turn two
+    engine.cache = [two, one]                            # turn one resumed again, so it is the newest
+    assert engine._superseded() is None

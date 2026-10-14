@@ -527,11 +527,12 @@ class GlmEngine:
         """The oldest kept turn end that a later kept prompt of its conversation extends, or None.
 
         Only a regenerated or edited turn resumes from one, so it goes before another conversation's states and
-        before a system block's end, which holds no user message.
+        before a system block's end, which holds no user message. "Later" is in use order (the cache's, newest last):
+        a turn resumed after the turn that extends it is a branch point in use, and the stale branch goes first.
         """
-        for c in self.cache:
+        for i, c in enumerate(self.cache):
             n = len(c.ids)
-            if self.user_id in c.ids and any(len(d.ids) > n and d.ids[:n] == c.ids for d in self.cache):
+            if self.user_id in c.ids and any(len(d.ids) > n and d.ids[:n] == c.ids for d in self.cache[i + 1:]):
                 return c
         return None
 
