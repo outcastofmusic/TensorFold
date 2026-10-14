@@ -392,3 +392,22 @@ def test_a_long_request_keeps_its_start_and_end_and_states_still_extend_each_oth
     assert len(one.encode()) < MAX_REQUEST_BYTES + 200
     assert two.startswith(one)                       # the session resumes: the request part is the same every check
     assert guard_state("short", "r") == "User's request:\nshort\n\nReasoning so far:\nr"
+
+
+def test_the_guard_reads_only_text_parts_that_are_strings():
+    from tensorfold.cuda.server import last_user_text
+
+    content = [{"type": "text", "text": "Is it"}, {"type": "text", "text": 7}, {"type": "text", "text": "done?"}]
+    assert last_user_text([{"role": "user", "content": content}]) == "Is it\ndone?"
+
+
+@pytest.mark.parametrize("threshold, gap, words", [(0.0, 128, "threshold"), (1.5, 128, "threshold"), (0.8, -1, "gap")])
+def test_bad_guard_flags_are_refused_before_the_model_loads(threshold, gap, words):
+    from types import SimpleNamespace
+
+    from tensorfold.serve_options import check
+
+    args = SimpleNamespace(thinking_guard="http://127.0.0.1:30001/v1", thinking_guard_threshold=threshold,
+                           thinking_guard_gap=gap)
+    with pytest.raises(ValueError, match=words):
+        check(args, None, "cuda")

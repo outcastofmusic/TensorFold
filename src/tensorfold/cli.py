@@ -325,10 +325,6 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     if args.thinking_guard:
         from tensorfold.engine.think_guard import GuardConfig
 
-        if not 0 < args.thinking_guard_threshold <= 1:
-            raise SystemExit("--thinking-guard-threshold must be above 0 and at most 1")
-        if args.thinking_guard_gap < 0:
-            raise SystemExit("--thinking-guard-gap must be 0 or more")
         app.think_guard = GuardConfig(args.thinking_guard, args.thinking_guard_model, args.thinking_guard_threshold,
                                       args.thinking_guard_gap)
     shown = "greedy" if float(sampling.get("temperature", 1.0)) <= 0 else ", ".join(

@@ -34,6 +34,11 @@ def name_priority(args: argparse.Namespace) -> dict[str, str]:
 def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any = None) -> None:
     """Refuse KV cache, draft rule, image, share, slot and precision options the backend or family can't serve."""
 
+    if getattr(args, "thinking_guard", None):     # checked before the model loads, so a typo costs no load
+        if not 0 < args.thinking_guard_threshold <= 1:
+            raise ValueError("--thinking-guard-threshold must be above 0 and at most 1")
+        if args.thinking_guard_gap < 0:
+            raise ValueError("--thinking-guard-gap must be 0 or more")
     if getattr(args, "vision_urls", False) and not getattr(args, "vision", False):
         raise ValueError("--vision-urls needs --vision")
     images = getattr(args, "vision_max_images", None)

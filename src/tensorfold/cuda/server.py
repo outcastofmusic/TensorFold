@@ -764,6 +764,7 @@ def last_user_text(messages: Any) -> str:
         if isinstance(message, dict) and message.get("role") == "user":
             content = message.get("content")
             if isinstance(content, list):
-                return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+                return "\n".join(p["text"] for p in content
+                                 if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str))
             return content if isinstance(content, str) else ""
     return ""
