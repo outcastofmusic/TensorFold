@@ -226,8 +226,11 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         if m and ".mlp.experts." not in name and ".mlp.shared_expert." not in name and file not in EXTRA_FILES:
             rest.setdefault(int(m.group(1)), []).append(name)
 
+    queued: set[int] = set()                      # pk.plans alone misses a layer whose experts queue no plan
+
     def ahead(i: int) -> None:                    # two layers in flight: reads overlap the copies and packing
-        if i < cfg.layers and f"{T}layers.{i}.mlp.experts" not in pk.plans:
+        if i < cfg.layers and i not in queued:
+            queued.add(i)
             queue_experts(pk, f"{T}layers.{i}.mlp.experts", cfg.experts, f"{T}layers.{i}.mlp.shared_expert", device)
             pk.queue_host(rest.get(i, []))
 
