@@ -195,7 +195,8 @@ def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], boo
     for run in runs[1:]:
         for key, value in (run or {}).items():
             number = isinstance(value, (int, float)) and not isinstance(value, bool)
-            summed = number and isinstance(stats.get(key), (int, float))
+            # a later run resumes from the reply so far: its cached prompt is not the request's
+            summed = number and key != "cached" and isinstance(stats.get(key), (int, float))
             stats[key] = stats[key] + value if summed else stats.get(key, value)     # times and rounds of every run
     return stats
 

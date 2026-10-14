@@ -167,6 +167,45 @@ def test_cuda_health_folds_drafts_and_drops_running_when_the_request_ends():
     assert health.of(app).snapshot(app)["drafted_total"] == 4
 
 
+def test_the_prefix_cache_families_wait_for_an_engine_that_reports_cached_tokens():
+    app = SimpleNamespace()
+    with health.of(app).running(5, []) as request:
+        request.stats = {"drafted": 1}
+    assert "prefix_cache_hits_total" not in metrics.render(app)
+    with health.of(app).running(5, []) as request:
+        request.stats = {"cached": 3}
+    assert sample(metrics.render(app), f"{metrics.PREFIX}prefix_cache_hits_total") == "3"
+
+
+def test_a_gated_reply_counts_the_cached_prompt_of_its_first_run_only():
+    from tensorfold.engine.call_gate import generate_gated
+
+    class Cut:
+        """Cuts the reply once, at its first token, so the reply takes two runs."""
+
+        def __init__(self):
+            self.done = False
+
+        def cut(self, tokens):
+            if self.done:
+                return None
+            self.done = True
+            return 0, [list(tokens)[0]]
+
+        def observe(self, token):
+            pass
+
+    runs = []
+
+    def generate(prompt, max_tokens, feed):
+        runs.append(len(prompt))
+        feed([1, 2])
+        return {"cached": len(prompt) - 1, "rounds": 1}
+
+    stats = generate_gated(generate, [9] * 10, 4, [Cut()], lambda new: False)
+    assert len(runs) == 2 and stats["rounds"] == 2 and stats["cached"] == 9
+
+
 def test_decode_seconds_come_from_the_engine_on_cuda_and_from_the_first_token_on_the_mac():
     app = SimpleNamespace()
     out: list[int] = []
