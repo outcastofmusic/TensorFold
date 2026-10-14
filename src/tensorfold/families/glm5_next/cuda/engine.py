@@ -121,12 +121,14 @@ def _target_text(text: dict, load_mtp: bool) -> dict:
     return {**text, "num_nextn_predict_layers": text.get("num_nextn_predict_layers", 0) if load_mtp else 0}
 
 
-def _weight_transform(rule, world: int, layers: int, load_mtp: bool):
-    """Match loaded branches; never interpret packed singleton tile axes as TP rows."""
+def _weight_transform(rule, world: int, layers: int, load_mtp: bool, draft_head: bool | None = None):
+    """Match loaded branches; never interpret packed singleton tile axes as TP rows. ``draft_head``: a BF16 head's
+    4-bit copy, which MTP and DFlash2 drafts read (default: with MTP)."""
     from .split import DTYPE_BYTES
     from tensorfold.cuda.geometry import split_weights
 
     legacy = split_weights(rule, world=world)
+    draft_head = load_mtp if draft_head is None else draft_head
 
     def transform(name: str, info: dict) -> tuple[int, int]:
         if name.startswith("model.visual."):
@@ -143,11 +145,11 @@ def _weight_transform(rule, world: int, layers: int, load_mtp: bool):
             cast = name.endswith((".A_log", ".dt_bias", ".hc_attn_base", ".hc_attn_scale",
                                   ".hc_ffn_base", ".hc_ffn_scale", ".e_score_correction_bias"))
             amount = math.prod(shape) * (4 if cast else DTYPE_BYTES[info["dtype"]])
-            if load_mtp and name == "lm_head.weight" and info["dtype"] in ("BF16", "F16", "F32"):
+            if draft_head and name == "lm_head.weight" and info["dtype"] in ("BF16", "F16", "F32"):
                 amount += math.prod(shape) * 9 // 16
             return amount, 0
         amount, host = legacy(name, info)
-        if not load_mtp and name == "lm_head.weight" and info["dtype"] in ("BF16", "F16", "F32"):
+        if not draft_head and name == "lm_head.weight" and info["dtype"] in ("BF16", "F16", "F32"):
             amount -= math.prod(info["shape"]) // world * 9 // 16
         return amount, host
     return transform
@@ -218,7 +220,8 @@ class GlmEngine:
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         from . import LATENT
 
-        transform = _weight_transform(rule, world, cfg.layers if not self.load_mtp else 0, self.load_mtp)
+        transform = _weight_transform(rule, world, cfg.layers if not self.load_mtp else 0, self.load_mtp,
+                                      self.load_mtp or drafter is not None)
         self.packed_exl3, adapter_workspace = False, 0
         if world == 1 and getattr(cfg, "quant", "mlx") == "exl3":
             from tensorfold.cuda.capacity import headers
@@ -272,7 +275,8 @@ class GlmEngine:
             raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
                              "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
                              "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
-        w = load(model_dir, rank=rank, world=world, load_mtp=self.load_mtp)
+        w = load(model_dir, rank=rank, world=world, load_mtp=self.load_mtp,
+                 draft_head=self.load_mtp or drafter is not None)
         w.comm = self.comm
         if not self.load_mtp and w.mtp is not None:
             raise RuntimeError("loader violated load_mtp=False: refusing dormant MTP allocation/work")

@@ -294,13 +294,15 @@ def packed_residency(cfg: Config, *, load_mtp: bool = True):
 
 
 def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int = 2,
-         load_mtp: bool = True, mtp: bool | None = None) -> Weights:
-    """Load full packed TP1 or a rank's share of world ranks; MTP is explicit (``mtp`` is upstream's name for it)."""
+         load_mtp: bool = True, mtp: bool | None = None, draft_head: bool | None = None) -> Weights:
+    """Load full packed TP1 or a rank's share of world ranks; MTP is explicit (``mtp`` is upstream's name for it).
+    ``draft_head`` (default: with MTP) builds a BF16 head's 4-bit copy, which MTP and DFlash2 drafts both read."""
 
     from .split import RankReader
 
     if mtp is not None:
         load_mtp = bool(mtp)
+    drafts = load_mtp if draft_head is None else draft_head
 
     if world not in (1, 2, 4) or not 0 <= rank < world:
         raise ValueError("GLM requires world=1/rank=0 or world=2/4 with a rank below it")
@@ -581,8 +583,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
                 raise ValueError("packed head must retain the full vocabulary")
         elif exl3:
             head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
-            # Omitted MTP must not retain an unbudgeted, unused draft-head copy.
-            if load_mtp:
+            # without drafts the copy is unused, and admission did not budget it
+            if drafts:
                 draft_head = quantize4(head.weight)
         else:
             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
