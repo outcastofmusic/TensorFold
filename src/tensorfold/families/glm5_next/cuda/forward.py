@@ -51,8 +51,9 @@ def skip_table(device) -> torch.Tensor:
 def skip_reload() -> None:
     """Before a request: the skip file's settings into the table, when the file changed."""
 
-    if not SKIP_FILE or "t" not in _skip:
+    if not SKIP_FILE:
         return
+    skip_table(torch.device("cuda"))         # eager engines make it in their first forward, too late for that request
     try:
         stamp = os.stat(SKIP_FILE).st_mtime_ns
         if stamp == _skip.get("stamp"):
@@ -486,7 +487,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         low |= (order >= t[65]) & (on > 0)
         b.pick[:R, :c.top_k].masked_fill_(low, c.experts)
         wts.masked_fill_(low, 0.0)
-        wts.mul_(torch.where(t[64] > 0, total / wts.sum(1, keepdim=True), torch.ones_like(total)))
+        # a row whose every pick is skipped keeps zero weights instead of dividing by their zero sum
+        kept = wts.sum(1, keepdim=True).clamp_min(torch.finfo(wts.dtype).tiny)
+        wts.mul_(torch.where(t[64] > 0, total / kept, torch.ones_like(total)))
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         if w.meta.get("packed_exl3"):
