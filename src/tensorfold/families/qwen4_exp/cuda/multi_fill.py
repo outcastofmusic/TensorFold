@@ -234,7 +234,10 @@ class PromptPasses:
                     s.drafts = draft(e, last, [first], st.pos + 1, room, s.sampling, self.confidence)
             s.started = time.perf_counter()
             self.streams[s.sid] = s
-            s.take([first], self._ends(s))
+            if s.error is not None:                      # its gate failed on the first token: it ends with that error
+                s.done = True                            # now, as a round's failed gate does, not after one more round
+            else:
+                s.take([first], self._ends(s))
             if s.done:
                 joined.append(s)
         self._joined_ranks()
