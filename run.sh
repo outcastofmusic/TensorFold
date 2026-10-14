@@ -63,12 +63,12 @@ stop_all() {
 # boot otherwise.
 image() {
     local tag old
-    tag="tensorfold-run:$(cd "$SRC" && find src pyproject.toml -type f -not -name '*.pyc' -print0 | sort -z | xargs -0 sha1sum | sha1sum | cut -c1-12)"
+    tag="tensorfold-run:$(cd "$SRC" && find src pyproject.toml run-constraints.txt -type f -not -name '*.pyc' -print0 | sort -z | xargs -0 sha1sum | sha1sum | cut -c1-12)"
     if ! docker image inspect "$tag" >/dev/null 2>&1; then
         echo "run: installing this checkout into the image $tag (once per source change)" >&2
         docker rm -f tensorfold-build >/dev/null 2>&1 || true
         docker run --name tensorfold-build -v "$SRC:/tf:ro" "$BASE" \
-            bash -c "cp -r /tf /tmp/tf && pip install -q '/tmp/tf[vision]' && rm -rf /tmp/tf" >/dev/null
+            bash -c "cp -r /tf /tmp/tf && pip install -q -c /tmp/tf/run-constraints.txt '/tmp/tf[vision]' && rm -rf /tmp/tf" >/dev/null
         docker commit tensorfold-build "$tag" >/dev/null
         docker rm tensorfold-build >/dev/null
         for old in $(docker images --format '{{.Repository}}:{{.Tag}}' tensorfold-run); do
