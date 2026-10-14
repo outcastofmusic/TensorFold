@@ -153,6 +153,13 @@ def _weight_transform(rule, world: int, layers: int, load_mtp: bool):
     return transform
 
 
+def calibrates(calibrate: bool, *, eager: bool, serial_only: bool) -> bool:
+    """Whether startup times the drafters. TF_GLM_CALIBRATE=0 skips the 5 s of timing: `auto` on an EXL3 pack with a
+    draft model is a fixed policy and reads no timings, and a request for the chooser (`auto:...`) is then refused."""
+
+    return bool(calibrate and not eager and not serial_only and os.environ.get("TF_GLM_CALIBRATE", "1") != "0")
+
+
 class GlmEngine:
     """GLM on one local GPU or two NCCL ranks, with explicit startup/work contracts."""
 
@@ -185,7 +192,7 @@ class GlmEngine:
         self.target_only = bool(target_only)
         self.serial_only = bool(serial_only or target_only)
         self.eager = bool(eager)
-        self.calibrated = bool(calibrate and not eager and not self.serial_only)
+        self.calibrated = calibrates(calibrate, eager=self.eager, serial_only=self.serial_only)
         self.policy = "0" if self.serial_only else policy
         if self.serial_only:
             drafter = None
@@ -288,10 +295,7 @@ class GlmEngine:
                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
         if self.drafter is not None and not self.eager:
             self.drafter.capture()
-        # TF_GLM_CALIBRATE=0 skips the 5 s of timing: `auto` on an EXL3 pack with a draft model is a fixed policy and
-        # reads no timings, and a request for the chooser (`auto:...`) is then refused
-        timed = os.environ.get("TF_GLM_CALIBRATE", "1") != "0"
-        self.costs = self._calibrate() if self.calibrated and timed else None
+        self.costs = self._calibrate() if self.calibrated else None
         if rank == 0 and self.costs is not None:
             c = self.costs
             print(f"[tensorfold] drafter timings (ms, fastest of 7): {c['timed']}", flush=True)
@@ -446,12 +450,14 @@ class GlmEngine:
 
         if self.serial_only:
             return [0, 0, 0, 0]
-        if code[0] in (4, 5) and not self.calibrated:
-            raise ValueError("automatic drafting requires calibration; eager mode needs a fixed draft policy")
         if code[0] == 4 and self.drafter is not None and self.w.cfg.quant == "exl3":
             return encode_policy(EXL3_AUTO)
         if self.w.mtp is None and code[0] in (1, 2, 3, 4, 5):
             return encode_policy(DFLASH_POLICY) if code[0] in (4, 5) else [code[0] + 10] + code[1:]
+        # only the chooser between MTP and the draft model reads timings: refused here, before the prompt is read
+        if code[0] in (4, 5) and self.drafter is not None and self.costs is None:
+            raise ValueError("automatic drafting between MTP and the draft model needs calibration; with --eager or "
+                             "TF_GLM_CALIBRATE=0 use a fixed draft policy")
         return code
 
     def _drafters(self, code: list[int]) -> tuple[bool, bool, bool]:
@@ -617,8 +623,6 @@ class GlmEngine:
             _, explore, every, margin, sampled_too = policy
             choice = None
             if drafter is not None and (greedy or sampled_too):
-                if self.costs is None:
-                    raise ValueError("automatic drafting needs measured calibration costs")
                 choice = DrafterChoice(self.costs, first="f" if greedy else "m", explore=explore, every=every,
                                        margin=margin)
             res = auto_decode(self.e, drafter, first, max_tokens, sampling, choice=choice, m_policy=m_policy,

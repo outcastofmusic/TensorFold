@@ -248,12 +248,14 @@ class EngineContracts(unittest.TestCase):
         self.assertFalse(any(c[0] == "calibrate" for c in h.calls))
         self.assertFalse(next(c[1]["graphs"] for c in h.calls if c[0] == "decoder"))
 
-    def test_eager_rejects_auto_policy_without_timing(self):
+    def test_eager_serves_auto_on_mtp_alone_and_refuses_the_chooser(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as folder:
             h = ConstructorHarness(folder)
             e = h.construct(Path(folder), world=1, eager=True)
-        with self.assertRaisesRegex(ValueError, "calibrat|automatic|fixed"):
-            e._effective(engine.encode_policy("auto"))
+        self.assertEqual(e._effective(engine.encode_policy("auto")), engine.encode_policy("auto"))   # MTP reads no timings
+        e.drafter = object()
+        with self.assertRaisesRegex(ValueError, "calibration"):
+            e._effective(engine.encode_policy("auto:2:8:0.03"))
 
     def test_target_only_never_selects_absorption_or_drafts(self):
         e = engine.GlmEngine.__new__(engine.GlmEngine)
