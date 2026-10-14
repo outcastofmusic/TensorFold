@@ -125,6 +125,9 @@ def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], c
     gp, gk, gks = table(gate, D, I)
     upp, uk, uks = table(up, D, I)
     dp, dk, dks = table(down, I, D)
+    for k2s in (gks + uks, dks):            # the kernel's own check, here at load rather than at the first forward
+        if max(k2s) > 16 and min(k2s) != max(k2s):
+            raise ValueError("a rate between ExLlamaV3's widths must be its layer's only rate")
 
     def stack(mats, j, n):
         out = torch.empty((E, n), dtype=torch.float16, device=device)

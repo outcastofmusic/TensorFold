@@ -408,3 +408,20 @@ def test_lane_map_extracts_every_window():
                         off = end(p_last, k2) - end(p, k2)
                         assert off + 16 <= 64, (k2, lane, g, j, off)
                         assert (mm >> off) & 0xFFFF == state(p), (k2, lane, g, j)
+
+
+def test_a_layer_mixing_a_sushi_rate_with_another_is_refused_at_load():
+    from tensorfold.cuda.exl3 import experts
+
+    g = torch.Generator().manual_seed(7)
+    D, I = 128, 256
+
+    def triple(k, n, words):
+        t = torch.randint(-32768, 32768, (k // 16, n // 16, words), dtype=torch.int32, generator=g)
+        return t.to(torch.int16).cuda().contiguous(), _scale(k, 1.0, g), _scale(n, 1.0, g)
+
+    gate = [triple(D, I, 36), triple(D, I, 32)]          # 2.25 bits beside 2 bits
+    up = [triple(D, I, 36), triple(D, I, 36)]
+    down = [triple(I, D, 32), triple(I, D, 32)]
+    with pytest.raises(ValueError, match="only rate"):
+        experts.prepare(gate, up, down, 0)
