@@ -240,12 +240,14 @@ def workspace_bytes(cfg, headers, *, rows=8, prefill_rows=2048, load_mtp=True):
 
     Mirrors ProjectionScratch and generic Scratch; conservative plain matrices
     may include loader-only matrices. Admission adds this to existing geometry,
-    which already counts legacy buffers and cache. No decoded-W buffer exists.
+    which already counts legacy buffers and cache. With TF_GLM_DENSE_PROMPT the prompt GEMM's workspace adds the
+    largest decoded W (the head excepted: it stays on the decode linear) and its rotated input.
     """
     from tensorfold.cuda.exl3.linear import plan
     from tensorfold.cuda.exl3.experts import default_config
     filt = resident_transform(cfg, load_mtp=load_mtp)
     kmax = nmax = zmax = 1
+    decoded = prompt_k = 0                         # TF_GLM_DENSE_PROMPT: the largest k*n and k the prompt GEMM decodes
     for name, info in headers.items():
         if not filt(name, info)[0] or '.experts.' in name or '.switch_mlp.' in name:
             continue
@@ -254,6 +256,8 @@ def workspace_bytes(cfg, headers, *, rows=8, prefill_rows=2048, load_mtp=True):
             k,n = sh[0]*16,sh[1]*16
             sk,_ = plan(k,n)
             if sk>1: zmax=max(zmax,sk*n)
+            if not name.startswith('lm_head.'):
+                decoded,prompt_k=max(decoded,k*n),max(prompt_k,k)
         elif name.endswith('.weight') and len(sh)==2:
             n,k = sh
             if info['dtype']=='U32': k=k*32//6     # affine 6-bit words: 32 bits hold 5 1/3 inputs
@@ -276,4 +280,5 @@ def workspace_bytes(cfg, headers, *, rows=8, prefill_rows=2048, load_mtp=True):
     # Existing geometry budgets BF16 x. Every Buffers instance now has FP32 x,
     # including the otherwise unused MTP x. Carrier rows are NOT microchunked.
     carrier_delta = (rows + prefill_rows + mtp_rows) * cfg.streams * D * 2
-    return one(rows)+one(prefill_rows)+(one(rows) if mtp_rows else 0)+carrier_delta
+    prompt = 2*decoded+2*prefill_rows*prompt_k+2*128*128 if DENSE_PROMPT and decoded else 0   # fp16 W, x, Hadamard
+    return one(rows)+one(prefill_rows)+(one(rows) if mtp_rows else 0)+carrier_delta+prompt
