@@ -12,7 +12,8 @@ clients that time out on a silent connection stay connected. Python's standard l
 Environment: PORT=30000, BACKEND_PORT=30002, SWAP_DEFAULT=qwen3.8-flash-next (for a request that names neither),
 SWAP_DRAIN=600 (seconds a swap waits for running requests before it cuts them off), SWAP_HOLD=0 (seconds a model
 stays loaded before a request for the other one may replace it: with two clients on two models, each then gets a turn
-of that length where otherwise every request would pay a swap).
+of that length where otherwise every request would pay a swap), SWAP_TIMEOUT=3600 (seconds the backend may stay
+silent before a request is given up; a non-streamed reply is silent until it is whole).
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import select
+import socket
 import subprocess
 import threading
 import time
@@ -33,6 +36,7 @@ BACKEND = int(os.environ.get("BACKEND_PORT", "30002"))
 DEFAULT = os.environ.get("SWAP_DEFAULT", "qwen3.8-flash-next")
 DRAIN = float(os.environ.get("SWAP_DRAIN", "600"))
 HOLD = float(os.environ.get("SWAP_HOLD", "0"))
+TIMEOUT = float(os.environ.get("SWAP_TIMEOUT", "3600"))
 RUN = str(Path(__file__).resolve().parent / "run.sh")
 HOP = {"connection", "keep-alive", "transfer-encoding", "content-length", "host", "te", "upgrade", "proxy-connection"}
 
@@ -86,16 +90,21 @@ class Swapper:
             cut, before = self.running, self.current
         say(f"{before} -> {want}" + (f", cutting off {cut} running requests" if cut else ""))
         start = time.monotonic()
-        code = subprocess.run([RUN, TARGET[want]], env={**os.environ, "PORT": str(BACKEND), "TF_SWAP_CHILD": "1"},
-                              stdin=subprocess.DEVNULL, check=False).returncode
+        try:
+            code = subprocess.run([RUN, TARGET[want]], env={**os.environ, "PORT": str(BACKEND), "TF_SWAP_CHILD": "1"},
+                                  stdin=subprocess.DEVNULL, check=False).returncode
+            why = f"run.sh exited {code}"
+        except OSError as exc:                       # run.sh missing or not executable, or no memory to fork it
+            code, why = None, f"run.sh did not start: {exc}"
         say(f"{want} {'ready' if code == 0 else 'FAILED'} after {time.monotonic() - start:.0f} s")
+        now = want if code == 0 else loaded()        # an HTTP probe, kept out of the lock
         with self.cond:
-            self.current = want if code == 0 else loaded()
+            self.current = now
             self.since = time.monotonic()
             self.loading = None
             self.cond.notify_all()
             if code != 0:
-                raise RuntimeError(f"{want} did not load (run.sh exited {code}); see the swap log")
+                raise RuntimeError(f"{want} did not load ({why}); see the swap log")
             self.running += 1
             return want
 
@@ -223,11 +232,14 @@ class Handler(BaseHTTPRequestHandler):
         """Relay this request to the backend; ``sent``: the event stream's headers already went out."""
 
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
-        conn = http.client.HTTPConnection("127.0.0.1", BACKEND)
+        conn = http.client.HTTPConnection("127.0.0.1", BACKEND, timeout=TIMEOUT)
         started = sent
+        answered = threading.Event()
         try:
             conn.request(self.command, self.path, body or None, headers)
+            threading.Thread(target=self.watch, args=(conn, answered), daemon=True).start()
             resp = conn.getresponse()
+            answered.set()
             if sent and resp.status != 200:
                 return self.event({"error": {"message": resp.read().decode(errors="replace"), "code": resp.status}})
             if not sent:
@@ -248,7 +260,29 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         finally:
+            answered.set()
             conn.close()                                     # a client that left ends the generation behind it
+
+    def watch(self, conn: http.client.HTTPConnection, answered: threading.Event) -> None:
+        """Until the backend answers, close its connection once the client hangs up, so the generation ends with it."""
+
+        while not answered.is_set():
+            readable, _, _ = select.select([self.connection], [], [], 1)
+            if not readable or answered.is_set():
+                continue
+            try:
+                left = self.connection.recv(1, socket.MSG_PEEK) == b""
+            except OSError:
+                left = True
+            if not left:                                     # bytes after the body: not ours to read, so just wait
+                answered.wait(1)
+                continue
+            try:
+                if conn.sock is not None:
+                    conn.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
 
 
 def main() -> None:
