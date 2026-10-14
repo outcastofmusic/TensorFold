@@ -41,9 +41,11 @@ image and compiles the CUDA extensions and Triton kernels into the `tensorfold-e
 
 `./run.sh swap` starts one endpoint for both models on the same port ([`swap.py`](swap.py), Python's standard library).
 It loads the model a request names in `"model"`, so a client switches by changing that field. A request for the model
-that is not loaded waits for the running requests to finish and for the load. A streamed request receives an SSE
-comment every 5 s while it waits, which keeps clients with a read timeout connected. `SWAP_HOLD=120` keeps each model
-loaded for at least that many seconds: with two clients on two models, each request otherwise pays a swap.
+that is not loaded waits for the running requests to finish and for the load. After `SWAP_DRAIN` seconds (600) the swap
+cuts the requests still running off. Requests already waiting for the model just loaded run before the next swap. A
+streamed request receives an SSE comment every 5 s while it waits, which keeps clients with a read timeout connected.
+`SWAP_HOLD=120` keeps each model loaded for at least that many seconds: with two clients on two models, each request
+otherwise pays a swap.
 
 | | `./run.sh qwen-flash-next` | `./run.sh glm-5.3-flash` |
 | --- | --- | --- |

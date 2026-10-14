@@ -26,6 +26,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -37,6 +38,7 @@ DEFAULT = os.environ.get("SWAP_DEFAULT", "qwen3.8-flash-next")
 DRAIN = float(os.environ.get("SWAP_DRAIN", "600"))
 HOLD = float(os.environ.get("SWAP_HOLD", "0"))
 TIMEOUT = float(os.environ.get("SWAP_TIMEOUT", "3600"))
+MAX_BODY = 64 << 20                     # bytes: a request with images inlined fits
 RUN = str(Path(__file__).resolve().parent / "run.sh")
 HOP = {"connection", "keep-alive", "transfer-encoding", "content-length", "host", "te", "upgrade", "proxy-connection"}
 
@@ -66,6 +68,7 @@ class Swapper:
         self.loading: str | None = None
         self.running = 0
         self.since = 0.0                 # when the loaded model became ready
+        self.waiting: Counter[str | None] = Counter()   # requests in enter(), by the model they name
 
     def ready(self, model: str | None) -> bool:
         with self.cond:
@@ -75,12 +78,22 @@ class Swapper:
         """Count a request in once ``model`` (None: whatever is loaded, or the default) is in memory; RuntimeError when its load fails."""
 
         with self.cond:
-            while self.loading is not None:
-                self.cond.wait()
-            want = model or self.current or DEFAULT
-            if want == self.current:
-                self.running += 1
-                return want
+            self.waiting[model] += 1
+            try:
+                while True:
+                    while self.loading is not None:
+                        self.cond.wait()
+                    want = model or self.current or DEFAULT
+                    if want == self.current:
+                        self.running += 1
+                        return want
+                    # requests that waited out a load for the model now in memory go first: one swap serves them all
+                    if self.current is None or not self.waiting[self.current] + self.waiting[None]:
+                        break
+                    self.cond.wait()
+            finally:
+                self.waiting[model] -= 1
+                self.cond.notify_all()
             self.loading = want
             while self.current is not None and (left := self.since + HOLD - time.monotonic()) > 0:
                 self.cond.wait(left)
@@ -150,7 +163,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self.close_connection = True
-        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            return self.reply(411, {"error": {"message": "send the body with a Content-Length"}})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= MAX_BODY:
+            return self.reply(400 if length < 0 else 413,
+                              {"error": {"message": f"Content-Length must be 0 to {MAX_BODY} bytes"}})
+        body = self.rfile.read(length)
         if self.path.startswith("/swap/"):
             name = self.path[len("/swap/"):].strip("/")
             name = ALIAS.get(name, name)
@@ -170,9 +192,10 @@ class Handler(BaseHTTPRequestHandler):
         model = ALIAS.get(model, model)
         model = model if model in TARGET else None
         sent = False
-        if not SWAP.ready(model):
+        ready = SWAP.ready(model)
+        if not ready:
             say(f"{self.path} for {model or 'no named model'} from {self.headers.get('User-Agent', 'an unnamed client')} waits for a load")
-        if isinstance(request, dict) and request.get("stream") and not SWAP.ready(model):
+        if isinstance(request, dict) and request.get("stream") and not ready:
             sent = self.hold(model)
             if sent is None:
                 return

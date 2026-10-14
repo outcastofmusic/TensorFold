@@ -13,6 +13,7 @@
 # Settings (environment):
 #   MODELS=~/models            where prepare.sh put the checkpoints
 #   PORT=30000                 the model's port;  CLEF_PORT=30001 the guard's;  BACKEND_PORT=30002 the model's under swap
+#   SWAP_DRAIN=600  SWAP_HOLD=0  SWAP_TIMEOUT=3600   swap.py's waits, in seconds (its header says what each does)
 #   TF_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 #   EXTRA="..."                more `tensorfold serve` flags
 #   QWEN_MODEL, CLEF_MODEL, GLM_MODEL   another checkpoint folder under $MODELS
@@ -110,8 +111,18 @@ swapping() {  # the swap endpoint's process is alive
 ask_swap() {
     [ -z "${TF_SWAP_CHILD:-}" ] && swapping || return 1
     echo "run: asking the swap endpoint on 127.0.0.1:$PORT for $1"
-    curl -sf -m 1200 -X POST "http://127.0.0.1:$PORT/swap/$1" || die "the swap endpoint could not load $1; see $STATE/swap.log"
+    # a swap first waits up to SWAP_DRAIN for running requests, then loads (15 minutes at most, with an image build)
+    curl -sf -m $(( ${SWAP_DRAIN:-600} + 900 )) -X POST "http://127.0.0.1:$PORT/swap/$1" || die "the swap endpoint could not load $1; see $STATE/swap.log"
     echo
+}
+
+stop_swap() {  # swap.py leads its own process group (setsid): the run.sh of a load in flight goes with it
+    local pid i
+    pid=$(cat "$STATE/swap.pid")
+    kill -- -"$pid" 2>/dev/null || kill "$pid"
+    for i in $(seq 20); do [ -e "/proc/$pid" ] || break; sleep 0.5; done
+    rm -f "$STATE/swap.pid"
+    echo "run: stopped the swap endpoint"
 }
 
 swap() {
@@ -122,8 +133,13 @@ swap() {
     rm -f "$STATE/swap.pid"
     PORT=$PORT BACKEND_PORT="${BACKEND_PORT:-30002}" SWAP_PIDFILE="$STATE/swap.pid" \
         setsid nohup python3 "$SRC/swap.py" >>"$STATE/swap.log" 2>&1 </dev/null &
-    sleep 2
-    swapping || { tail -3 "$STATE/swap.log" >&2; die "the swap endpoint did not start"; }
+    local i
+    for i in $(seq 30); do                       # up to 15 s for the pidfile and the port
+        swapping && curl -sf -m 1 "http://127.0.0.1:$PORT/swap" >/dev/null 2>&1 && break
+        sleep 0.5
+    done
+    swapping && curl -sf -m 1 "http://127.0.0.1:$PORT/swap" >/dev/null 2>&1 ||
+        { tail -3 "$STATE/swap.log" >&2; die "the swap endpoint did not start"; }
     echo "run: swap endpoint on http://127.0.0.1:$PORT/v1 (log: $STATE/swap.log). A request's \"model\" picks qwen3.8-flash-next or glm-5.3-flash."
     [ -z "${1:-}" ] || ask_swap "$1"
 }
@@ -204,7 +220,7 @@ case "${1:-}" in
     qwen-flash-next) ask_swap "$1" || qwen ;;
     glm-5.3-flash)   ask_swap "$1" || glm ;;
     swap)            swap "${2:-}" ;;
-    stop)            swapping && { kill "$(cat "$STATE/swap.pid")"; rm -f "$STATE/swap.pid"; echo "run: stopped the swap endpoint"; }
+    stop)            if swapping; then stop_swap; fi
                      stop_all ;;
     status)          status ;;
     *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;

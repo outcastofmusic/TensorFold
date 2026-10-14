@@ -94,3 +94,48 @@ def test_a_client_that_leaves_a_non_streamed_request_closes_the_backend_connecti
     finally:
         front.shutdown()
         backend.shutdown()
+
+
+def test_requests_waiting_for_the_model_just_loaded_go_before_a_swap_back(swap, tmp_path):
+    log = tmp_path / "loads"
+    run = tmp_path / "run.sh"
+    run.write_text(f"#!/bin/sh\necho $1 >> {log}\nsleep 0.3\n")
+    run.chmod(0o755)
+    swap.RUN = str(run)
+    swapper = swap.Swapper()
+    swapper.current = "qwen3.8-flash-next"
+    got = []
+
+    def request(model):
+        got.append(swapper.enter(model))
+        swapper.leave()
+
+    first = threading.Thread(target=request, args=("glm-5.3-flash",))
+    first.start()
+    time.sleep(0.1)                                  # the glm load is running: these three wait for it
+    waiting = [threading.Thread(target=request, args=(m,))
+               for m in ("qwen3.8-flash-next", "glm-5.3-flash", "glm-5.3-flash")]
+    for t in waiting:
+        t.start()
+        time.sleep(0.02)
+    for t in [first, *waiting]:
+        t.join(5)
+    assert log.read_text().split() == ["glm-5.3-flash", "qwen-flash-next"]   # one swap there, one back
+    assert got[-1] == "qwen3.8-flash-next"
+
+
+@pytest.mark.parametrize("headers, status", [
+    (b"Content-Length: -1\r\n", b" 400 "),
+    (b"Content-Length: lots\r\n", b" 400 "),
+    (b"Content-Length: 999999999999\r\n", b" 413 "),
+    (b"Transfer-Encoding: chunked\r\n", b" 411 "),
+])
+def test_a_body_without_a_usable_length_is_refused(swap, headers, status):
+    swap.SWAP = swap.Swapper()
+    front = _serve(swap.Handler)
+    try:
+        client = socket.create_connection(front.server_address, timeout=5)
+        client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" + headers + b"\r\n")
+        assert status in client.recv(200).split(b"\r\n")[0] + b" "
+    finally:
+        front.shutdown()
