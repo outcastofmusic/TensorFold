@@ -192,8 +192,8 @@ def make_handler(app: App):
 
                 beat = threading.Thread(target=keepalive, name="keepalive", daemon=True) if every > 0 else None
 
-                def quiet() -> None:
-                    done.set()
+                def quiet() -> None:            # a keep-alive stuck past the 5 s join still holds ``writing``:
+                    done.set()                  # every frame after the reply takes that lock too
                     if beat is not None and beat.is_alive():
                         beat.join(timeout=5.0)
 
@@ -210,10 +210,12 @@ def make_handler(app: App):
                     self.close_connection = True
                     return
                 except RequestError as exc:
-                    return self._stream_error(error_body(exc, field))
+                    with writing:
+                        return self._stream_error(error_body(exc, field))
                 except Exception as exc:
                     _log_error(exc)
-                    return self._stream_error({"message": _error_message(exc), "type": "server_error"})
+                    with writing:
+                        return self._stream_error({"message": _error_message(exc), "type": "server_error"})
                 if result["final"]:
                     emit(result["final"])
                 if result["calls"]:
@@ -234,9 +236,10 @@ def make_handler(app: App):
                 else:
                     end["usage"] = usage_of(result)      # every stream, as the Mac server's: clients count from it
                 try:
-                    self.wfile.write("".join(f"data: {json.dumps(frame)}\n\n" for frame in frames).encode()
-                                     + b"data: [DONE]\n\n")
-                    self.wfile.flush()
+                    with writing:
+                        self.wfile.write("".join(f"data: {json.dumps(frame)}\n\n" for frame in frames).encode()
+                                         + b"data: [DONE]\n\n")
+                        self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 self.close_connection = True
