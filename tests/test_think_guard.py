@@ -1,6 +1,7 @@
 """The thinking guard: a decision model's yes closes the think block at a paragraph end, decoding never waits for a
-check, and a failed check ends the checks while the reply finishes."""
+check, and three failed checks in a row end the checks while the reply finishes."""
 
+import http.client
 import json
 import threading
 import time
@@ -16,7 +17,8 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 
 from tensorfold.cuda import server
 from tensorfold.engine.call_gate import generate_gated
-from tensorfold.engine.think_guard import MAX_REQUEST_BYTES, GuardConfig, ThinkGuard, _ends, guard_state
+from tensorfold.engine.think_guard import (DROP_TOKENS, FAILURES, MAX_REASONING_TOKENS, MAX_REQUEST_BYTES, GuardConfig,
+                                           ThinkGuard, _ends, guard_state)
 from tests.test_cuda_admission import http_server, post
 
 END, THINK_END = "<|end|>", "</think>"
@@ -77,7 +79,7 @@ def run_now(f, *args):
     future = Future()
     try:
         future.set_result(f(*args))
-    except OSError as exc:
+    except Exception as exc:  # noqa: BLE001 - the guard decides which failures it survives
         future.set_exception(exc)
     return future
 
@@ -145,7 +147,7 @@ def test_the_gap_skips_paragraphs_that_end_too_soon_after_the_last_checked_one(s
     assert [c["paragraph"] for c in guard.finish()["checks"]] == checked   # the last answered as the block closed
 
 
-def test_a_failed_check_ends_the_checks():
+def test_failed_checks_in_a_row_end_the_checks():
     calls = []
 
     def ask(reasoning):
@@ -153,26 +155,59 @@ def test_a_failed_check_ends_the_checks():
         raise OSError("HTTP Error 502: Bad Gateway")
 
     guard = sync_guard(ask)
+    assert gated("One.\n\nTwo.\n\nThree.\n\nFour.\n\nFive.\n\n", guard).endswith("Uncut.<|end|>")
+    assert len(calls) == FAILURES and guard.record["error"] == "OSError: HTTP Error 502: Bad Gateway"
+
+
+def test_a_failed_check_is_skipped_and_the_next_paragraph_is_checked():
+    answers = iter([TimeoutError("timed out"), 0.95])
+
+    def ask(reasoning):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    guard = sync_guard(ask)
+    assert gated("One.\n\nTwo.\n\nThree.\n\n", guard) == "One.\n\nTwo.\n\n</think>\n\nAnswer.<|end|>"
+    assert guard.record["error"] == "TimeoutError: timed out" and guard.record["yes_paragraph"] == 2
+
+
+def test_a_reply_cut_off_mid_body_is_a_failed_check_not_a_failed_reply():
+    def ask(reasoning):
+        raise http.client.IncompleteRead(b"{", 40)
+
+    guard = sync_guard(ask)
     assert gated("One.\n\nTwo.\n\nThree.\n\n", guard).endswith("Uncut.<|end|>")
-    assert len(calls) == 1 and guard.record["error"] == "OSError: HTTP Error 502: Bad Gateway"
+    assert guard.record["error"].startswith("IncompleteRead")
 
 
-def test_the_state_keeps_the_newest_reasoning():
-    state = guard_state("q", "é" * 25000 + "end")
-    assert state.startswith("User's request:\nq\n\nReasoning so far:\n[earlier reasoning left out]\n")
-    assert state.endswith("end") and "�" not in state
+def _checked(paragraphs):
+    """What each check reads when the reasoning is ``paragraphs`` (each ending in a blank line), checked one by one."""
+
+    seen = []
+    guard = sync_guard(lambda r: seen.append(r) or 0.0)
+    for token in ids("".join(paragraphs)):
+        guard.observe(token)
+    return seen
 
 
-def test_past_the_limit_the_state_still_extends_the_last_one_until_the_next_drop():
+def test_past_the_window_a_check_reads_the_newest_reasoning_in_tokens():
+    paragraph = "x" * 98 + "\n\n"                   # 100 tokens a paragraph with this tokenizer
+    seen = _checked([paragraph] * (MAX_REASONING_TOKENS // 100 + 5))
+    last = seen[-1]
+    assert last.startswith("[earlier reasoning left out]\n") and last.endswith(paragraph)
+    assert len(ids(last)) <= MAX_REASONING_TOKENS + len(ids("[earlier reasoning left out]\n"))
+
+
+def test_past_the_window_a_check_still_extends_the_last_one_until_the_next_drop():
     """Old reasoning goes in whole steps, so a decision session can resume between drops."""
 
-    from tensorfold.engine.think_guard import DROP_STEP, MAX_REASONING_BYTES
-
-    long = "x" * (MAX_REASONING_BYTES + 100)
-    one, two = guard_state("q", long), guard_state("q", long + "A further paragraph.\n\n")
-    assert two.startswith(one) and len(one.encode()) < MAX_REASONING_BYTES + 100
-    after_drop = guard_state("q", long + "y" * DROP_STEP)
-    assert not after_drop.startswith(one) and after_drop.endswith("y")
+    paragraph = "x" * 98 + "\n\n"
+    seen = _checked([paragraph] * ((MAX_REASONING_TOKENS + DROP_TOKENS) // 100 + 3))
+    dropped = [r for r in seen if r.startswith("[earlier")]
+    assert dropped and all(b.startswith(a) for a, b in zip(dropped, dropped[1:]) if len(b) > len(a))
+    assert any(not b.startswith(a) for a, b in zip(dropped, dropped[1:]))     # a second drop starts a new prefix
 
 
 # --- through the server: real check threads, a decision server over HTTP ---------------------------------------
@@ -180,8 +215,8 @@ def test_past_the_limit_the_state_still_extends_the_last_one_until_the_next_drop
 class Decisions:
     """A SystemOne server: yes (0.95) once the state says "settled", else 0.05; ``fail`` answers 502."""
 
-    def __init__(self, fail=False):
-        self.states, self.sessions, self.fail = [], [], fail
+    def __init__(self, fail=False, cut=0):
+        self.states, self.sessions, self.fail, self.cut = [], [], fail, cut
         decisions = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -195,7 +230,9 @@ class Decisions:
                     return
                 p = 0.95 if "settled" in body["state"] else 0.05
                 session = body["session"] if isinstance(body["session"], str) else f"made-{len(decisions.states)}"
-                reply = json.dumps({"session": session, "answers": {"enough": {"type": "noul", "noul": p}}}).encode()
+                usage = {"state_cut_tokens": decisions.cut} if decisions.cut else {}
+                reply = json.dumps({"session": session, "answers": {"enough": {"type": "noul", "noul": p}},
+                                    "usage": usage}).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(reply)))
                 self.end_headers()
@@ -308,7 +345,15 @@ def test_a_failing_decision_server_leaves_the_reply_whole(tmp_path, decisions):
     app = app_for(tmp_path, ScriptEngine(LONG, pause=0.002), GuardConfig(d.url, "clef", gap=0))
     status, body = ask(app)
     assert status == 200 and body["choices"][0]["message"]["content"] == "Uncut."
-    assert "502" in body["tensorfold"]["thinking_guard"]["error"] and len(d.states) == 1
+    assert "502" in body["tensorfold"]["thinking_guard"]["error"] and len(d.states) == FAILURES
+
+
+def test_a_state_the_decision_model_cut_is_a_failed_check(tmp_path, decisions):
+    d = decisions(cut=40)
+    app = app_for(tmp_path, ScriptEngine(LONG, pause=0.002), GuardConfig(d.url, "clef", gap=0))
+    status, body = ask(app)
+    assert status == 200 and body["choices"][0]["message"]["content"] == "Uncut."     # its yes is never taken
+    assert "cut the newest 40 tokens" in body["tensorfold"]["thinking_guard"]["error"]
 
 
 @pytest.mark.parametrize("fields, words", [

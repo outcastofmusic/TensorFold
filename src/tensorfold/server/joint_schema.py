@@ -72,6 +72,7 @@ class Encoded:
     ids: list[int]
     questions: tuple[Question, ...]
     state_end: int = 0                 # where the state's tokens end: the schema that follows is the same each call
+    state_cut: int = 0                 # the state's tokens left out past the window: they were its newest
 
 
 def encode(encode_text: Callable[[str], list[int]], state: Any, questions: dict[str, dict[str, Any]],
@@ -105,11 +106,12 @@ def encode(encode_text: Callable[[str], list[int]], state: Any, questions: dict[
     fixed = len(prefix) + len(schema) + len(suffix)
     if fixed > max_length:
         raise DecisionError(f"the schema needs {fixed} tokens before the state; the limit is {max_length}")
-    state_ids = encode_text(render(state))[:max_length - fixed]
+    whole = encode_text(render(state))
+    state_ids = whole[:max_length - fixed]
     shift = len(prefix) + len(state_ids)
     moved = tuple(Question(q.id, q.type, (q.span[0] + shift, q.span[1] + shift),
                            tuple((a + shift, b + shift) for a, b in q.option_spans), q.option_ids) for q in found)
-    return Encoded(prefix + state_ids + schema + suffix, moved, shift)
+    return Encoded(prefix + state_ids + schema + suffix, moved, shift, len(whole) - len(state_ids))
 
 
 def _head_class():
@@ -333,8 +335,11 @@ class JointSchema:
         encoded, logits, session, cached = self.logits(body["state"], questions, session)
         answers = {q.id: systemone_answer(questions[q.id], dict(zip(q.option_ids, _softmax(row, 1.0))))
                    for q, row in zip(encoded.questions, logits)}
+        usage = {"input_tokens": len(encoded.ids), "output_tokens": 0, "cached_tokens": cached}
+        if encoded.state_cut:          # the release cuts the state's end to fit: a caller that needs it whole can tell
+            usage["state_cut_tokens"] = encoded.state_cut
         return {"model": body["model"], "answers": answers, **({"session": session} if session else {}),
-                "usage": {"input_tokens": len(encoded.ids), "output_tokens": 0, "cached_tokens": cached}}
+                "usage": usage}
 
 
 def _as_question(item: dict[str, Any]) -> tuple[dict[str, Any], list[tuple[str, str]]]:

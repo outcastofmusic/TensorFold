@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.request
@@ -9,15 +10,16 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
-# a reply's checks share a decision session, so each one prefills only the new reasoning. Past MAX_REASONING_BYTES
-# (Clef reads 16,384 tokens) the state drops its oldest reasoning in whole steps, so between two drops each state
-# still extends the last one and the session goes on resuming.
-MAX_REASONING_BYTES = 40000
-# the request keeps its start and end: with 40,000 bytes of reasoning the state stays inside Clef's 16,384 tokens
-# (3 bytes a token at worst). A state past the window is refused, and that reply's checks end.
+# a reply's checks share a decision session, so each one prefills only the new reasoning. Past MAX_REASONING_TOKENS
+# (Clef reads 16,384) a check drops the oldest reasoning in whole steps, so between two drops each state still
+# extends the last one and the session goes on resuming. Counted in tokens because bytes are no bound: digits are a
+# token each. With the request's 6,000 bytes the state fits Clef's window; a state Clef still cuts is a failed check.
+MAX_REASONING_TOKENS = 10000
+DROP_TOKENS = 2500
+LEFT_OUT = "[earlier reasoning left out]\n"
 MAX_REQUEST_BYTES = 6000
-DROP_STEP = 10000
 TIMEOUT = 30.0
+FAILURES = 3                                         # failed checks in a row that end a reply's checks
 QUESTION = {"enough": {
     "type": "noul",
     "instructions": "Does the reasoning so far contain a complete derivation of the final answer?",
@@ -41,17 +43,13 @@ class GuardConfig:
 
 
 def guard_state(request: str, reasoning: str) -> str:
-    """What the decision model reads: the user's request, then the newest reasoning."""
+    """What the decision model reads: the user's request, then the reasoning a check passes (already windowed)."""
 
     asked = request.encode()
     if len(asked) > MAX_REQUEST_BYTES:               # a long request would leave the reasoning no room in the window
         head, tail = MAX_REQUEST_BYTES * 3 // 4, MAX_REQUEST_BYTES // 4
         request = (asked[:head].decode(errors="ignore") + "\n[middle of the request left out]\n"
                    + asked[-tail:].decode(errors="ignore"))
-    data = reasoning.encode()
-    if len(data) > MAX_REASONING_BYTES:
-        cut = ((len(data) - MAX_REASONING_BYTES) // DROP_STEP + 1) * DROP_STEP
-        reasoning = "[earlier reasoning left out]\n" + data[cut:].decode(errors="ignore")
     return f"User's request:\n{request}\n\nReasoning so far:\n{reasoning}"
 
 
@@ -64,21 +62,28 @@ def decide(config: GuardConfig, request: str, reasoning: str, session: str | Non
                        "session": session or True})
     call = urllib.request.Request(config.url.rstrip("/") + "/systemone", body.encode(),
                                   {"Content-Type": "application/json"})
-    with urllib.request.urlopen(call, timeout=TIMEOUT) as reply:      # an HTTP error raises, and ends the checks
+    with urllib.request.urlopen(call, timeout=TIMEOUT) as reply:      # an HTTP error raises: a failed check
         answer = json.load(reply)
+    cut = (answer.get("usage") or {}).get("state_cut_tokens")
+    if cut:                                          # the window cut the newest reasoning: the answer is about old text
+        raise ValueError(f"the decision model cut the newest {cut} tokens of the state")
     return float(answer["answers"]["enough"]["noul"]), answer.get("session")
 
 
 def _ends(tail: str, piece: str) -> tuple[list[int], str]:
     """(where in ``piece`` each paragraph that ``tail + piece`` finishes ends, just past its blank line; the new tail).
 
-    The tail is the text since the last paragraph end. A blank paragraph (blank lines in a row) is no paragraph."""
+    The tail is the text since the last paragraph end, so it holds no blank line: the search starts at its last
+    character, and a paragraph with no blank line in it costs no rescans as it grows. A blank paragraph (blank lines
+    in a row) is no paragraph."""
 
     text, start, ends = tail + piece, 0, []
-    while (at := text.find("\n\n", start)) >= 0:
+    at = text.find("\n\n", max(len(tail) - 1, 0))
+    while at >= 0:
         if text[start:at].strip():
             ends.append(at + 2 - len(tail))
         start = at + 2
+        at = text.find("\n\n", start)
     return ends, text[start:]
 
 
@@ -100,7 +105,8 @@ class ThinkGuard:
         self.running: tuple[int, int, float, Future] | None = None   # (paragraph, characters, start, check)
         self.waiting: tuple[int, int] | None = None                  # (paragraph, tokens): the newest unchecked
         self.yes = 0                        # the paragraph a check said yes to
-        self.failed = False
+        self.failures = 0                   # failed checks in a row
+        self.failed = False                 # FAILURES of them: no more checks this reply
         self.record: dict[str, Any] = {"model": model, "threshold": self.threshold, "gap": self.gap, "checks": []}
 
     def cut(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
@@ -150,11 +156,14 @@ class ThinkGuard:
             self.running = None
             try:
                 p = float(check.result())
-            # refused or unreachable (URLError), slow (TimeoutError), or an answer of another shape: no more checks
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                self.failed = True
+            # refused or unreachable (URLError), slow (TimeoutError), a reply cut off mid-body (HTTPException), or an
+            # answer of another shape: this paragraph goes unchecked, and FAILURES in a row end the checks
+            except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException) as exc:
+                self.failures += 1
+                self.failed = self.failures >= FAILURES
                 self.record["error"] = f"{type(exc).__name__}: {exc}"
                 return
+            self.failures = 0
             self.record["checks"].append({"paragraph": paragraph, "chars": chars, "p": round(p, 4),
                                           "ms": round((time.perf_counter() - start) * 1000)})
             if p >= self.threshold and not self.yes:
@@ -163,7 +172,8 @@ class ThinkGuard:
         if self.running is None and self.waiting is not None and not self.yes and not self.failed:
             paragraph, count = self.waiting
             self.waiting = None
-            reasoning = self.decode(self.tokens[:count])
+            drop = ((count - MAX_REASONING_TOKENS) // DROP_TOKENS + 1) * DROP_TOKENS if count > MAX_REASONING_TOKENS else 0
+            reasoning = (LEFT_OUT if drop else "") + self.decode(self.tokens[drop:count])
             self.running = (paragraph, len(reasoning), time.perf_counter(), self.submit(self.ask, reasoning))
 
     def finish(self) -> dict[str, Any]:

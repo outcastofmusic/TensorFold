@@ -53,7 +53,7 @@ def test_noul_descriptions_default_and_can_be_replaced():
 def test_the_state_is_cut_to_fit_and_an_oversized_schema_is_refused():
     full = encode(chars, "x" * 50, QUESTIONS)
     cut = encode(chars, "x" * 50, QUESTIONS, max_length=len(full.ids) - 20)
-    assert len(cut.ids) == len(full.ids) - 20
+    assert len(cut.ids) == len(full.ids) - 20 and cut.state_cut == 20 and full.state_cut == 0
     assert text(cut.ids[slice(*cut.questions[0].span)]) == "What is the invoice status?"
     with pytest.raises(DecisionError, match="before the state"):
         encode(chars, "x", QUESTIONS, max_length=100)
@@ -135,7 +135,14 @@ def test_systemone_answers_in_the_release_shape():
     assert status["choice"] == "paid" and list(status["probabilities"]) == ["paid", "overdue", "draft"]
     assert urgency["legend"] == {"0": "Can wait", "1": "Today"} and urgency["score"] == pytest.approx(0.7311)
     assert large == {"type": "noul", "noul": pytest.approx(0.2689)}
-    assert payload["usage"]["output_tokens"] == 0
+    assert payload["usage"]["output_tokens"] == 0 and "state_cut_tokens" not in payload["usage"]
+
+
+def test_systemone_says_how_much_of_the_state_it_cut():
+    from tensorfold.server.joint_schema import MAX_LENGTH
+
+    body = {"model": "clef", "state": "x" * (MAX_LENGTH + 100), "questions": QUESTIONS}
+    assert _joint().systemone(body)["usage"]["state_cut_tokens"] > 100
 
 
 @pytest.mark.parametrize("body, fragment", [
