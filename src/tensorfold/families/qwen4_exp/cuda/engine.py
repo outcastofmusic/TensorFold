@@ -185,10 +185,10 @@ class FlashNextEngine:
             grid = grid_env()                               # TENSORFOLD_GRID_ANCHORS: states at every grid line too
             if grid and self.depth > 0:
                 self.points = with_grid(self.points, grid)
-            import os
+            from tensorfold.env_flags import flag
 
             # TENSORFOLD_END_ANCHOR=1: a reply's end state is kept, so a next turn sending it back resumes after it
-            self.end_anchor = os.environ.get("TENSORFOLD_END_ANCHOR", "0").strip().lower() in ("1", "on", "true", "yes")
+            self.end_anchor = flag("TENSORFOLD_END_ANCHOR")
             if vision and rank == 0:
                 from tensorfold.vision.qwen_cuda import QwenCudaVision
 
@@ -330,9 +330,9 @@ class FlashNextEngine:
         graphs of the context bucket it ended in and the next one, a capture at a time, so a reply that grows into a
         new bucket does not stop to capture them; a request waits for at most the capture under way."""
 
-        import os
+        from tensorfold.env_flags import flag
 
-        if os.environ.get("TENSORFOLD_IDLE_GRAPHS", "0").strip().lower() not in ("1", "on", "true", "yes"):
+        if not flag("TENSORFOLD_IDLE_GRAPHS"):
             return None
         if self.e is None or self.e.graphs is None or self.tp != 1:
             print("[tensorfold] TENSORFOLD_IDLE_GRAPHS ignored: idle captures need one GPU, one stream and graphs",

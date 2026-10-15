@@ -11,17 +11,18 @@ The idea comes from TandemLLM's load-time self-check (AGPL-3.0); this is an inde
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Iterable
 
 import torch
+
+from tensorfold.env_flags import flag
 
 ENV = "TENSORFOLD_SELF_CHECK"
 PROMPT = [9707, 11, 1879, 13, 1096, 374, 264, 1273, 315, 279, 4479, 1849, 594, 1555, 29136, 13]
 
 
 def enabled() -> bool:
-    return os.environ.get(ENV, "0").strip().lower() in ("1", "on", "true", "yes")
+    return flag(ENV)
 
 
 @torch.no_grad()

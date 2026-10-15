@@ -423,3 +423,34 @@ def test_both_http_layers_serve_the_mirrored_and_event_families(tmp_path):
         first.join(WAIT)
         second.join(WAIT)
         assert box["first"][0] == 200 and box["second"][0] == 200, box
+
+
+def test_a_gated_reply_counts_the_drafts_of_every_run_by_drafter():
+    from tensorfold.engine.call_gate import generate_gated
+
+    class Cut:
+        """Cuts the reply once, at its first token, so the reply takes two runs."""
+
+        def __init__(self):
+            self.done = False
+
+        def cut(self, tokens):
+            if self.done:
+                return None
+            self.done = True
+            return 0, [tokens[0]]
+
+        def observe(self, token):
+            pass
+
+    first = {"drafted": 5, "drafters": {"mtp": [4, 2], "copy": [1, 1]}}
+    second = {"drafted": 7, "drafters": {"mtp": [7, 3]}}
+    outs = iter([first, second])
+
+    def generate(prompt, max_tokens, feed):
+        feed([1, 2])
+        return next(outs)
+
+    stats = generate_gated(generate, [9] * 10, 4, [Cut()], lambda new: False)
+    assert stats["drafted"] == 12 and stats["drafters"] == {"mtp": [11, 5], "copy": [1, 1]}
+    assert first["drafters"] == {"mtp": [4, 2], "copy": [1, 1]}            # the run's own stats stay as it made them

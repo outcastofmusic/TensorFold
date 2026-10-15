@@ -86,9 +86,9 @@ class Metrics:
 
 
 def drafters_enabled() -> bool:
-    import os
+    from tensorfold.env_flags import flag
 
-    return os.environ.get(DRAFTERS_ENV, "0").strip().lower() in ("1", "on", "true", "yes")
+    return flag(DRAFTERS_ENV)
 
 
 def of(app: Any) -> Metrics:

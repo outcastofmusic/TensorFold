@@ -22,16 +22,13 @@ The idea and its thresholds come from TandemLLM's StairCut (AGPL-3.0); this is a
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Sequence
+
+from tensorfold.env_flags import flag
 
 ENV_CUT = "TENSORFOLD_STAIRCUT"
 ENV_GATE = "TENSORFOLD_PLAIN_GATE"
 FIRST_CLASS = 8192        # contexts up to here are class 0; above it, the next power of two (the graphs' buckets)
-
-
-def _on(name: str) -> bool:
-    return os.environ.get(name, "0").strip().lower() in ("1", "on", "true", "yes")
 
 
 def context_class(n: int) -> int:
@@ -255,14 +252,16 @@ class PlainGate:
         got = self.plain.get(cls)
         return got if got is not None else self.plain_prior(cls)
 
-    def skip(self, cls: int) -> bool:
+    def skip(self, cls: int, measure: bool = True) -> bool:
         """True: this round takes the plain step. A class whose drafted rounds lose still drafts one round in its
-        probe interval; every probe that loses doubles the interval, and a win starts it over."""
+        probe interval; every probe that loses doubles the interval, and a win starts it over. ``measure``: the
+        round will be timed, so it may be the one that measures the plain step (a shared round never is, and forcing
+        one would leave the class plain until a stream runs alone)."""
 
         spec, plain = self.spec_ms(cls), self.plain_ms(cls)
         if spec is not None and self.spec[cls][2] >= self.FIRST:
             self.since[cls] = self.since.get(cls, 0) + 1
-            if cls not in self.plain or self.since[cls] > self.PROBE_MAX:
+            if measure and (cls not in self.plain or self.since[cls] > self.PROBE_MAX):
                 self.since[cls] = 0                # measure the plain step: once, then every PROBE_MAX rounds
                 return True
         if spec is None or plain is None or spec <= plain * (1 + self.MARGIN) or self.spec[cls][2] < self.FIRST:
@@ -314,7 +313,7 @@ class Speculation:
                  prior: dict[int, dict[int, float]] | None = None, log=print) -> Speculation | None:
         """None unless TENSORFOLD_STAIRCUT or TENSORFOLD_PLAIN_GATE is on (and the model drafts on one rank)."""
 
-        want_cut, want_gate = _on(ENV_CUT), _on(ENV_GATE)
+        want_cut, want_gate = flag(ENV_CUT), flag(ENV_GATE)
         if not (want_cut or want_gate) or depth < 1:
             return None
         if world != 1:
@@ -331,8 +330,8 @@ class Speculation:
         step = self.cut.step.get(cls, 0.0) if self.cut is not None else 0.0
         return self.prices.table(1, cls)[1] + step
 
-    def plain(self, context: int) -> bool:
-        return self.gate is not None and self.gate.skip(context_class(context))
+    def plain(self, context: int, *, measure: bool = True) -> bool:
+        return self.gate is not None and self.gate.skip(context_class(context), measure)
 
     def more(self, context: int, probs: Sequence[float]) -> bool:
         if self.cut is not None:

@@ -75,7 +75,7 @@ def grid_env() -> int:
     import os
 
     value = os.environ.get(GRID_ENV, "").strip()
-    if not value:
+    if not value or value == "0":
         return 0
     if not value.isdecimal() or int(value) < MIN_GAP:
         raise ValueError(f"{GRID_ENV}: a line spacing of at least {MIN_GAP} tokens, not {value!r}")

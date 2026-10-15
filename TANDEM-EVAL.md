@@ -262,11 +262,11 @@ tokens, about 90 forwards, which at about 25 ms a forward (TandemLLM's 1-row pri
 
 ## Test suite
 
-Full CPU-only suite after the changes (2026-10-15): 4,306 passed, 129 failed, 11 errors, 187 skipped. The 129 failures
+Full CPU-only suite after the changes (2026-10-15, after the review fixes): 4,324 passed, 129 failed, 11 errors, 187 skipped. The 129 failures
 are the baseline's 129, test for test, and the 11 errors (`tests/test_affine_rows.py`) also occur on a clean `fork/dev`
-copy. The 45 more passes are the new CPU tests.
+copy. The 63 more passes are the new CPU tests.
 
-New test files: 10 (6 CPU, 4 GPU); new tests: CPU 45, GPU 23. GPU files run, all on the tiny model (2026-10-14):
+New test files: 11 (7 CPU, 4 GPU); new tests: CPU 63, GPU 23. The review fixes' `multi.py` change (the plain gate measures only on a round one stream drafts alone) has not run on the GPU. GPU files run, all on the tiny model (2026-10-14):
 `test_flashnext_staircut_decode.py` (12 passed), `test_flashnext_tandem_checks.py` (5), `test_flashnext_idle_graphs.py`
 (2), `test_flashnext_end_anchor.py` (4), and the existing `test_flashnext_multi.py` and `test_flashnext_forward.py`
 (93 passed together with the StairCut file before the T3 to T7 changes). The final run on 2026-10-15 took 12 tiny-model

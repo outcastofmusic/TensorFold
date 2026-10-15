@@ -2,9 +2,15 @@
 
 Each arm is one server boot of this checkout with its env flags (the others off). The order runs A, B, A by default,
 so drift between boots shows up as A1 against A2. Every arm decodes the same prompts (prose, code, json, edit, copy,
-and optionally a long-context one) greedy and at T=0.7 with a fixed seed. TensorFold samples with keyed draws, so a
-speed flag must leave the text identical at both temperatures: the script compares every arm's text with A1's and
-lists each difference.
+and optionally a long-context one) greedy and at T=0.7, with seed 1234 + rep in every arm. TensorFold samples with
+keyed draws, so a repeat with the same seed replays the same text: each rep gets its own seed, and a speed flag must
+leave the text identical at both temperatures. The script compares every arm's text with A1's and lists each
+difference.
+
+The warm-up skips the long prompt, so each boot's first long request is the cold one: it crosses into a decode
+graph bucket nothing captured yet, which is what TENSORFOLD_IDLE_GRAPHS (T3) removes. The summary prints that
+request's TTFT and decode speed per boot; a cold stall is one sample a boot, so measure T3 with more boots
+(``--order A,B,A,B,A,B``).
 
 Run it only when the box is free: it boots its own server (container ``tftest-ab-<arm>``, port 30010 by default,
 the checkout mounted over the image's install) and refuses to start below ``--min-avail-gib`` of MemAvailable. Each
@@ -118,8 +124,8 @@ def metrics(base: str) -> dict:
     return out
 
 
-def run_one(base: str, prompt: str, temperature: float, tokens: int) -> dict:
-    body = {"model": "ab", "max_tokens": tokens, "temperature": temperature, "stream": True, "seed": 1234,
+def run_one(base: str, prompt: str, temperature: float, tokens: int, seed: int = 1234) -> dict:
+    body = {"model": "ab", "max_tokens": tokens, "temperature": temperature, "stream": True, "seed": seed,
             "stream_options": {"include_usage": True}, "messages": [{"role": "user", "content": prompt}],
             "chat_template_kwargs": {"enable_thinking": False}}
     if temperature > 0:
@@ -187,12 +193,13 @@ def main() -> None:
         boot(name, arms[arm], args)
         try:
             for kind, prompt in prompts.items():          # one untimed request a kind: kernels and graphs warm
-                run_one(base, prompt, 0.0, 32)
+                if kind != "long":                        # the long prompt's first request stays cold (T3)
+                    run_one(base, prompt, 0.0, 32)
             before = metrics(base)
             for rep in range(args.reps):
                 for kind, prompt in prompts.items():
                     for temp in (0.0, 0.7):
-                        r = run_one(base, prompt, temp, args.tokens)
+                        r = run_one(base, prompt, temp, args.tokens, seed=1234 + rep)
                         results.append({"boot": i, "arm": arm, "kind": kind, "temperature": temp, "rep": rep, **r})
                         print(f"[ab] {arm}{i} {kind:6} T={temp} rep {rep}: {r['decode_tps']} tok/s "
                               f"({r['tokens']} tokens)", flush=True)
@@ -218,6 +225,18 @@ def main() -> None:
                                        if r["boot"] == b and r["kind"] == kind and r["temperature"] == temp)
                      for b, _ in boots]
             print(f"{kind:8} {temp:>4} " + " ".join(f"{c:<7.1f}" for c in cells))
+    for b, a in boots[1:]:                              # boot against boot 0: A2/A1 is the drift between boots
+        ratios = [statistics.median(r["decode_tps"] for r in rows if r["boot"] == b and r["kind"] == kind
+                                    and r["temperature"] == temp)
+                  / statistics.median(r["decode_tps"] for r in rows if r["boot"] == 0 and r["kind"] == kind
+                                      and r["temperature"] == temp)
+                  for kind in prompts for temp in (0.0, 0.7)]
+        print(f"{a}{b}/{boots[0][1]}0: geometric mean of median ratios {statistics.geometric_mean(ratios):.3f}")
+    if "long" in prompts:
+        print("\nfirst long request a boot (cold graphs):")
+        for b, a in boots:
+            cold = next(r for r in rows if r["boot"] == b and r["kind"] == "long")
+            print(f"  {a}{b}: TTFT {cold['ttft_s']} s, {cold['decode_tps']} tok/s")
     first_arm = boots[0][1]
     for arm in sorted({a for _, a in boots} - {first_arm}):
         ratios = []

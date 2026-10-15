@@ -92,7 +92,6 @@ def test_the_gate_stops_watching_once_the_model_closes_the_block():
 def test_hiding_takes_the_phrase_out_and_holds_back_a_partial_one():
     assert hide("abc" + CLOSE_TEXT, CLOSE_TEXT, finished=True) == "abc"
     assert hide("abc" + CLOSE_TEXT[:20], CLOSE_TEXT, finished=False) == "abc"
-    assert hide("abc" + CLOSE_TEXT[:20], CLOSE_TEXT, finished=True) == "abc" + CLOSE_TEXT[:20]
     assert hide("abc\n", CLOSE_TEXT, finished=False) == "abc"
 
 
@@ -142,3 +141,14 @@ def test_an_inline_cut_writes_the_close_into_the_live_stream_once():
     generate_gated(None, [7], 400, [gate], lambda new: sent.extend(new) or False, _engine(rounds, runs))
     assert sent == seq[:at] + close and runs == [[7]]
     assert gate.record["at"] == at and not gate.open
+
+
+def test_hiding_takes_out_a_phrase_that_max_tokens_cut_short():
+    # streamed, the tail waited as a possible phrase start; finished, it must not appear either
+    assert hide("abc" + CLOSE_TEXT[:20], CLOSE_TEXT, finished=True) == "abc"
+
+
+def test_hiding_keeps_the_phrase_where_the_model_wrote_it_itself():
+    mine = "a" + CLOSE_TEXT + "b"                              # the model's own words, before the loop fired
+    assert hide(mine + CLOSE_TEXT, CLOSE_TEXT, finished=True) == mine
+    assert hide(mine + CLOSE_TEXT[:9], CLOSE_TEXT, finished=False) == mine

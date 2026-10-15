@@ -194,6 +194,13 @@ def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], boo
     stats = dict(runs[0] or {})
     for run in runs[1:]:
         for key, value in (run or {}).items():
+            if key == "drafters" and isinstance(value, dict):      # drafter -> [drafted, accepted], every run's
+                merged = {k: list(v) for k, v in stats.get(key, {}).items()}
+                for name, (d, a) in value.items():
+                    got = merged.setdefault(name, [0, 0])
+                    got[0], got[1] = got[0] + d, got[1] + a
+                stats[key] = merged
+                continue
             number = isinstance(value, (int, float)) and not isinstance(value, bool)
             # a later run resumes from the reply so far: its cached prompt is not the request's
             summed = number and key != "cached" and isinstance(stats.get(key), (int, float))

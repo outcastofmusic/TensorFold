@@ -19,8 +19,9 @@ implementation.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Sequence
+
+from tensorfold.env_flags import flag
 
 ENV = "TENSORFOLD_THINK_LOOP"
 CLOSE_TEXT = ("\n\nConsidering the limited time by the user, I have to give the solution based on the thinking "
@@ -33,7 +34,7 @@ NOVEL_GRAM, NOVEL_WINDOW, NOVEL_AFTER, NOVEL_BELOW = 8, 128, 320, 0.10
 
 
 def enabled() -> bool:
-    return os.environ.get(ENV, "0").strip().lower() in ("1", "on", "true", "yes")
+    return flag(ENV)
 
 
 def _need(size: int) -> int:
@@ -187,14 +188,16 @@ class LoopGate:
 
 
 def hide(reasoning: str, phrase: str = CLOSE_TEXT, *, finished: bool) -> str:
-    """The reasoning without the close's phrase; mid-stream, a tail that may be the phrase's start waits."""
+    """The reasoning without the close's phrase. The gate writes it last, so only the end is cut: the phrase, or
+    the start of it that is all a stream has sent so far or all ``max_tokens`` left room for. The same text is cut
+    whether or not the reply ``finished``, so the final reasoning is the one the stream sent."""
 
-    text = reasoning.replace(phrase, "")
-    if not finished:
-        for k in range(min(len(phrase) - 1, len(text)), 0, -1):
-            if text.endswith(phrase[:k]):
-                return text[:-k]
-    return text
+    if reasoning.endswith(phrase):
+        return reasoning[:-len(phrase)]
+    for k in range(min(len(phrase) - 1, len(reasoning)), 0, -1):
+        if reasoning.endswith(phrase[:k]):
+            return reasoning[:-k]
+    return reasoning
 
 
 __all__ = ["CLOSE_TEXT", "ENV", "LoopDetector", "LoopGate", "enabled", "hide"]

@@ -165,3 +165,21 @@ def test_plain_gate_measures_the_plain_step_itself():
     assert gate.plain_ms(0) == 25.0                            # the first measurement replaces the prior
     calls = [gate.skip(0) for _ in range(PlainGate.PROBE_MAX + 1)]
     assert calls[:-1] == [False] * PlainGate.PROBE_MAX and calls[-1]       # and again every PROBE_MAX rounds
+
+
+def test_plain_gate_measures_the_plain_step_only_on_a_round_it_can_time():
+    gate = PlainGate()                                         # no prior: drafting stands until a plain step is timed
+    for _ in range(PlainGate.FIRST):
+        gate.drafted(40.0, 2, 0)
+    # streams share every round: a forced plain round would go untimed, and the gate would force the next one too
+    assert [gate.skip(0, measure=False) for _ in range(1000)] == [False] * 1000
+    assert gate.skip(0)                                        # one stream alone: now the plain step is measured
+    gate.plain_round(25.0, 0)
+    assert not gate.skip(0, measure=False)                     # 20 ms a token drafted against 25 plain: draft
+
+
+def test_speculation_passes_the_timed_round_to_its_gate():
+    spec = Speculation(cut=False, gate=True, confidence=0.7, depth=6)
+    for _ in range(PlainGate.FIRST):
+        spec.gate.drafted(40.0, 2, 0)
+    assert not spec.plain(100, measure=False) and spec.plain(100)

@@ -595,7 +595,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                     copying.add(s.sid)
         if probs is not None:
             for s, _, _ in todo:
-                if s.sid not in copying and self.spec.plain(s.st.pos):
+                if s.sid not in copying and self.spec.plain(s.st.pos, measure=len(streams) == 1):
                     copying.add(s.sid)                   # a plain round: the head absorbs, nothing is drafted
             steps = {s.sid: 1 for s, _, _ in todo}
         for s, _, _ in todo:
