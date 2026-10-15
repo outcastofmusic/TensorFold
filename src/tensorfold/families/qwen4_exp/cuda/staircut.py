@@ -157,14 +157,17 @@ class StairCut:
             out.append(run)
         return out
 
-    def _cost(self, price: list[float], n: int, cls: int) -> float:
-        return price[n + 1] + self.step.get(cls, 0.0) * max(n, 1)
+    def _cost(self, price: list[float], n: int, cls: int, paid: int) -> float:
+        """A round verifying ``n`` drafts, ``paid`` MTP steps already run: a shorter cut gets none of them back."""
+
+        return price[n + 1] + self.step.get(cls, 0.0) * max(n, paid, 1)
 
     def _best(self, reach: list[float], price: list[float], cls: int) -> tuple[float, int]:
-        best, gain = (1.0 / max(self._cost(price, 0, cls), 1e-9), 0), 1.0
+        paid = len(reach)
+        best, gain = (1.0 / max(self._cost(price, 0, cls, paid), 1e-9), 0), 1.0
         for n in range(1, len(reach) + 1):
             gain += reach[n - 1]
-            score = gain / max(self._cost(price, n, cls), 1e-9)
+            score = gain / max(self._cost(price, n, cls, paid), 1e-9)
             if score > best[0]:
                 best = (score, n)
         return best
@@ -197,7 +200,7 @@ class StairCut:
         for m in range(1, most - k + 1):
             run *= rate
             gain += run
-            if gain / max(self._cost(price, k + m, cls), 1e-9) > best:
+            if gain / max(self._cost(price, k + m, cls, k), 1e-9) > best:
                 return True
         return False
 

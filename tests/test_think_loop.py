@@ -152,3 +152,11 @@ def test_hiding_keeps_the_phrase_where_the_model_wrote_it_itself():
     mine = "a" + CLOSE_TEXT + "b"                              # the model's own words, before the loop fired
     assert hide(mine + CLOSE_TEXT, CLOSE_TEXT, finished=True) == mine
     assert hide(mine + CLOSE_TEXT[:9], CLOSE_TEXT, finished=False) == mine
+
+
+def test_the_history_arm_lets_a_block_copied_out_once_more_pass():
+    # code written again as a final check: its 16-grams occurred once before, not a loop (3 of 7 fires on saved
+    # reasoning, 2026-10-15, were these)
+    rng = random.Random(12)
+    code = [rng.randrange(5000) for _ in range(700)]
+    assert first_fire(varied(1700, 13) + code + varied(300, 14) + code + varied(400, 15))[0] is None

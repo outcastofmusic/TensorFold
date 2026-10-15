@@ -231,10 +231,20 @@ inline path writes the close once, and the flag off leaves a looping reply alone
 | 8,192 or more | 1 | 0 |
 
 Four fires (pattern arm) are genuine degenerate runs, all in CODE-01 (`float regex accepts '0.000...'` over 128 or
-more zeros). Three (history arm) fired on code the reasoning wrote a second time, in RR-02, CODE-13 and CODE-06, which a
-person may or may not call a loop. All 7 replies scored 1.0 in their runs, and 5 of the 7 blocks ran to the 8,000-token
-thinking budget anyway. The corpus has no labelled loop set, so the catch rate is unmeasured. TandemLLM reports 3 of 3
-failed turns caught and 4 of 80 healthy long turns closed.
+more zeros). Three (history arm) fired on code the reasoning wrote a second time, in RR-02, CODE-13 and CODE-06.
+TandemLLM reports 3 of 3 failed turns caught and 4 of 80 healthy long turns closed.
+
+**Labelled (2026-10-15).** Each fire was read to the block's end. The 4 pattern fires are true loops: each block ends
+in one repeated digit to its last token. One of them (CODE-01, the uncapped run) ended as a runaway with an empty
+answer, so 6 of the 7 replies scored 1.0, and the cut would have saved the seventh. Of the 3 history fires, 2 are
+false (RR-02 and CODE-06 went on to new content after the copy) and 1 is unclear (CODE-13). The copies reach a history
+share of 0.84 to 0.91 for 2 to 4 checks. The loops hold 1.0 for 7 or more.
+
+The history arm now counts a 16-gram only once it started twice before the window (`SEEN = 2`). The rescan gives 4
+fires on the same 183 blocks, all 4 the true loops, and 0 false fires; over 1,139 blocks of any length (731,739
+tokens) it is the same 4. The cuts save 9,136 tokens. A loop longer than 128 tokens now fires one repeat later. Not
+caught: 2 loops in `ts-tn` (SA-01, CODE-11) that vary one noun a line, whose history share stays at 0.06 or below.
+The novelty arm fired on none of the 1,139 blocks.
 
 ## T7: self-check at load, and per-drafter metrics
 

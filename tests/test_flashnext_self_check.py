@@ -11,17 +11,19 @@ V = 50
 
 class Fake:
     """A model whose row for a token depends on the token and every token before it; ``bad`` = (width, row) adds
-    one ulp-sized error to that row of every window of that width."""
+    one ulp-sized error to that row of every window of that width; ``leak``: a partial commit keeps every row."""
 
-    def __init__(self, bad=None):
-        self.bad, self.seq, self.windows = bad, [], []
+    def __init__(self, bad=None, leak=False):
+        self.bad, self.leak, self.seq, self.windows, self.kept = bad, leak, [], [], []
 
     def start(self) -> int:
         self.seq = [3, 1, 4]
         return 7
 
-    def window(self, tokens):
+    def window(self, tokens, keep=None):
+        keep = len(tokens) if keep is None else keep
         self.windows.append(len(tokens))
+        self.kept.append(keep)
         rows = []
         for i, t in enumerate(tokens):
             self.seq.append(int(t))
@@ -30,6 +32,8 @@ class Fake:
             if self.bad == (len(tokens), i):
                 row[0] = torch.nextafter(row[0], torch.tensor(float("inf")))
             rows.append(row)
+        if not self.leak:
+            del self.seq[len(self.seq) - len(tokens) + keep:]
         return torch.stack(rows)
 
 
@@ -51,3 +55,15 @@ def test_the_check_is_off_unless_asked(monkeypatch):
     assert not enabled()
     monkeypatch.setenv("TENSORFOLD_SELF_CHECK", "1")
     assert enabled()
+
+
+def test_partial_commits_roll_back_every_rejected_row():
+    fake = Fake()
+    got = check_widths(fake.start, fake.window, widths=range(2, 8), steps=24)
+    assert got["ok"] and {k for w, k in zip(fake.windows, fake.kept) if k < w} == {1, 2, 3, 4, 5, 6}
+
+
+def test_a_rollback_that_keeps_a_rejected_row_fails():
+    fake = Fake(leak=True)
+    got = check_widths(fake.start, fake.window, widths=range(2, 8), steps=24)
+    assert not got["ok"] and got["first_diff"]["kept"] < got["first_diff"]["width"]

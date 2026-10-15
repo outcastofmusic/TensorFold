@@ -62,12 +62,13 @@ def test_the_cut_keeps_the_prefix_with_most_tokens_a_millisecond():
     assert cut.cut([0.95, 0.95, 0.1, 0.95, 0.95, 0.95], 0) == 2
     # a uniformly weak chain is cut early: (1 + 0.3) / 23 > (1 + 0.3 + 0.09) / 26
     assert cut.cut([0.3, 0.3, 0.3], 0) == 1
-    # an MTP step's cost moves the cut: dear steps shorten a good chain to its first draft
-    assert cut.cut([0.9] * 4, 0) == 4
+    # an MTP step's cost decides how deep the chain drafts; steps already run are spent whatever the cut keeps
+    assert cut.cut([0.9] * 4, 0) == 4 and cut.more([0.9], 0, 4)
     cut.step[0] = 30.0
-    assert cut.cut([0.9] * 4, 0) == 1
-    # an anchor-only round still absorbs (one step), so a step's price alone never makes the plain round win
-    assert cut.cut([0.3, 0.3, 0.3], 0) == 1
+    assert cut.cut([0.9] * 4, 0) == 4 and not cut.more([0.9], 0, 4)
+    # an anchor-only round still absorbs (one step), so a step's price alone never makes the plain round win; with
+    # three 30 ms steps spent, the second weak draft's 3 ms row now pays: (1.39) / 116 > (1.3) / 113
+    assert cut.cut([0.3, 0.3, 0.3], 0) == 2
 
 
 def test_the_cut_is_score_maximal_by_brute_force():
@@ -81,7 +82,7 @@ def test_the_cut_is_score_maximal_by_brute_force():
         for p in probs:
             run *= p
             reach.append(run)
-        scores = [(1 + sum(reach[:n])) / (price[n + 1] + 1.5 * max(n, 1)) for n in range(5)]
+        scores = [(1 + sum(reach[:n])) / (price[n + 1] + 1.5 * len(probs)) for n in range(5)]  # 4 steps run
         assert cut.cut(list(probs), 0) == max(range(5), key=lambda n: (scores[n], -n))
 
 
@@ -183,3 +184,9 @@ def test_speculation_passes_the_timed_round_to_its_gate():
     for _ in range(PlainGate.FIRST):
         spec.gate.drafted(40.0, 2, 0)
     assert not spec.plain(100, measure=False) and spec.plain(100)
+
+
+def test_the_cut_does_not_count_draft_steps_already_spent_as_saved():
+    cut = StairCut(Prices(PRIOR))
+    cut.step[0] = 10.0                                         # six drafts ran: 60 ms spent whatever the cut keeps
+    assert cut.cut([0.95] + [0.3] * 5, 0) == 3                 # charging only n steps a cut of n would say 1

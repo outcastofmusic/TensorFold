@@ -12,6 +12,13 @@ graph bucket nothing captured yet, which is what TENSORFOLD_IDLE_GRAPHS (T3) rem
 request's TTFT and decode speed per boot; a cold stall is one sample a boot, so measure T3 with more boots
 (``--order A,B,A,B,A,B``).
 
+``--concurrency N`` sends each rep's requests N at a time, so streams share rounds as they do under ``--parallel 4``
+in production (where TENSORFOLD_PLAIN_GATE's shared-round path runs); the summary adds each boot's batch throughput.
+
+``--turns`` measures a follow-up turn instead (TENSORFOLD_END_ANCHOR, TENSORFOLD_GRID_ANCHORS: T5): each prompt is
+answered, then asked a follow-up that sends the answer back, with thinking off and on. The summary prints the
+follow-up's TTFT and the prompt tokens the server found cached.
+
 Run it only when the box is free: it boots its own server (container ``tftest-ab-<arm>``, port 30010 by default,
 the checkout mounted over the image's install) and refuses to start below ``--min-avail-gib`` of MemAvailable. Each
 boot's server log is saved beside ``--out`` (the self-check and loop-close lines land there).
@@ -25,6 +32,7 @@ Standard library only.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import random
 import statistics
@@ -124,10 +132,12 @@ def metrics(base: str) -> dict:
     return out
 
 
-def run_one(base: str, prompt: str, temperature: float, tokens: int, seed: int = 1234) -> dict:
+def run_one(base: str, prompt: str | list, temperature: float, tokens: int, seed: int = 1234,
+            thinking: bool = False) -> dict:
+    messages = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
     body = {"model": "ab", "max_tokens": tokens, "temperature": temperature, "stream": True, "seed": seed,
-            "stream_options": {"include_usage": True}, "messages": [{"role": "user", "content": prompt}],
-            "chat_template_kwargs": {"enable_thinking": False}}
+            "stream_options": {"include_usage": True}, "messages": messages,
+            "chat_template_kwargs": {"enable_thinking": thinking}}
     if temperature > 0:
         body.update(top_k=20, top_p=0.95)
     req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
@@ -141,16 +151,35 @@ def run_one(base: str, prompt: str, temperature: float, tokens: int, seed: int =
             chunk = json.loads(line[5:])
             usage = chunk.get("usage") or usage
             for choice in chunk.get("choices", []):
-                piece = (choice.get("delta") or {}).get("content") or ""
-                if piece:
+                delta = choice.get("delta") or {}
+                piece = delta.get("content") or ""
+                if piece or delta.get("reasoning_content"):
                     now = time.perf_counter()
                     first = first if first is not None else now
                     last = now
-                    text.append(piece)
+                    if piece:
+                        text.append(piece)
     n = (usage or {}).get("completion_tokens") or 0
     tps = (n - 1) / (last - first) if first is not None and last is not None and last > first and n > 1 else 0.0
+    cached = ((usage or {}).get("prompt_tokens_details") or {}).get("cached_tokens")
     return {"text": "".join(text), "tokens": n, "decode_tps": round(tps, 2),
-            "ttft_s": round((first or start) - start, 3)}
+            "ttft_s": round((first or start) - start, 3), "prompt_tokens": (usage or {}).get("prompt_tokens"),
+            "cached_tokens": cached}
+
+
+FOLLOW_UP = "Now give the three most important points of your answer as a short bulleted list."
+
+
+def two_turns(base: str, prompt: str, tokens: int, seed: int, thinking: bool) -> dict:
+    """The prompt's answer, then a follow-up that sends it back: the follow-up's TTFT and cached prompt tokens."""
+
+    first = run_one(base, prompt, 0.0, tokens, seed=seed, thinking=thinking)
+    messages = [{"role": "user", "content": prompt}, {"role": "assistant", "content": first["text"]},
+                {"role": "user", "content": FOLLOW_UP}]
+    second = run_one(base, messages, 0.0, 64, seed=seed, thinking=thinking)
+    return {"text": first["text"] + "\n---\n" + second["text"], "tokens": second["tokens"],
+            "decode_tps": second["decode_tps"], "ttft_s": second["ttft_s"], "prompt_tokens": second["prompt_tokens"],
+            "cached_tokens": second["cached_tokens"], "first_ttft_s": first["ttft_s"]}
 
 
 def main() -> None:
@@ -169,6 +198,8 @@ def main() -> None:
     ap.add_argument("--kv-dtype", default="int8")
     ap.add_argument("--image", default=IMAGE)
     ap.add_argument("--serve-arg", action="append", default=[], help="an extra tensorfold serve argument")
+    ap.add_argument("--concurrency", type=int, default=1, help="requests in flight at once within a rep")
+    ap.add_argument("--turns", action="store_true", help="time a follow-up turn (T5) instead of decode speed")
     ap.add_argument("--min-avail-gib", type=float, default=90.0)
     ap.add_argument("--out", default="tandem-ab.json")
     args = ap.parse_args()
@@ -196,13 +227,26 @@ def main() -> None:
                 if kind != "long":                        # the long prompt's first request stays cold (T3)
                     run_one(base, prompt, 0.0, 32)
             before = metrics(base)
+            # --turns: "temperature" 0.0 is thinking off and 1.0 thinking on (both greedy), so the summary's cells hold
             for rep in range(args.reps):
-                for kind, prompt in prompts.items():
-                    for temp in (0.0, 0.7):
-                        r = run_one(base, prompt, temp, args.tokens, seed=1234 + rep)
-                        results.append({"boot": i, "arm": arm, "kind": kind, "temperature": temp, "rep": rep, **r})
-                        print(f"[ab] {arm}{i} {kind:6} T={temp} rep {rep}: {r['decode_tps']} tok/s "
-                              f"({r['tokens']} tokens)", flush=True)
+                jobs = [(kind, prompt, temp) for kind, prompt in prompts.items()
+                        for temp in ((0.0, 1.0) if args.turns else (0.0, 0.7))]
+
+                def go(job, rep=rep):
+                    _, prompt, temp = job
+                    if args.turns:
+                        return two_turns(base, prompt, args.tokens, 1234 + rep, thinking=temp == 1.0)
+                    return run_one(base, prompt, temp, args.tokens, seed=1234 + rep)
+
+                t0 = time.perf_counter()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
+                    got = list(pool.map(go, jobs))
+                wall = time.perf_counter() - t0
+                for (kind, _, temp), r in zip(jobs, got):
+                    results.append({"boot": i, "arm": arm, "kind": kind, "temperature": temp, "rep": rep, **r})
+                    print(f"[ab] {arm}{i} {kind:6} T={temp} rep {rep}: {r['decode_tps']} tok/s "
+                          f"({r['tokens']} tokens), TTFT {r['ttft_s']} s, cached {r['cached_tokens']}", flush=True)
+                results.append({"boot": i, "arm": arm, "rep": rep, "batch_tps": sum(r["tokens"] for r in got) / wall})
             after = metrics(base)
             results.append({"boot": i, "arm": arm, "metrics": {k: after[k] - before.get(k, 0.0) for k in after
                                                               if "total" in k and not k.endswith("_bucket")}})
@@ -219,8 +263,9 @@ def main() -> None:
     print("\nmedian decode tok/s by boot (arm):")
     boots = sorted({(r["boot"], r["arm"]) for r in rows})
     print(f"{'kind':8} {'T':>4} " + " ".join(f"{a}{b:<6}" for b, a in boots))
+    temps = (0.0, 1.0) if args.turns else (0.0, 0.7)
     for kind in prompts:
-        for temp in (0.0, 0.7):
+        for temp in temps:
             cells = [statistics.median(r["decode_tps"] for r in rows
                                        if r["boot"] == b and r["kind"] == kind and r["temperature"] == temp)
                      for b, _ in boots]
@@ -230,8 +275,23 @@ def main() -> None:
                                     and r["temperature"] == temp)
                   / statistics.median(r["decode_tps"] for r in rows if r["boot"] == 0 and r["kind"] == kind
                                       and r["temperature"] == temp)
-                  for kind in prompts for temp in (0.0, 0.7)]
+                  for kind in prompts for temp in temps]
         print(f"{a}{b}/{boots[0][1]}0: geometric mean of median ratios {statistics.geometric_mean(ratios):.3f}")
+    batches = [r for r in results if "batch_tps" in r]
+    print("\nbatch throughput by boot (generated tokens / wall s, median of reps):")
+    for b, a in boots:
+        print(f"  {a}{b}: {statistics.median(r['batch_tps'] for r in batches if r['boot'] == b):.1f}")
+    if args.turns:
+        print("\nfollow-up turn, median TTFT s / median cached prompt tokens (T=0 thinking off, T=1 thinking on):")
+        for kind in prompts:
+            for temp in temps:
+                cells = []
+                for b, _ in boots:
+                    got = [r for r in rows if r["boot"] == b and r["kind"] == kind and r["temperature"] == temp]
+                    cached = [r["cached_tokens"] for r in got if r["cached_tokens"] is not None]
+                    cells.append(f"{statistics.median(r['ttft_s'] for r in got):.3f}/"
+                                 f"{statistics.median(cached) if cached else '-'}")
+                print(f"  {kind:8} {temp:>4} " + " ".join(f"{c:<14}" for c in cells))
     if "long" in prompts:
         print("\nfirst long request a boot (cold graphs):")
         for b, a in boots:
@@ -241,7 +301,7 @@ def main() -> None:
     for arm in sorted({a for _, a in boots} - {first_arm}):
         ratios = []
         for kind in prompts:
-            for temp in (0.0, 0.7):
+            for temp in temps:
                 ctrl = [r["decode_tps"] for r in rows if r["arm"] == first_arm and r["kind"] == kind
                         and r["temperature"] == temp]
                 test = [r["decode_tps"] for r in rows if r["arm"] == arm and r["kind"] == kind

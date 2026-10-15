@@ -31,6 +31,10 @@ SIZES = range(1, 17)
 SPAN, MIN_COUNT = 128, 4
 GRAM, WINDOW, EVERY, AFTER, ACT, IN_A_ROW = 16, 256, 64, 2048, 0.7, 2
 NOVEL_GRAM, NOVEL_WINDOW, NOVEL_AFTER, NOVEL_BELOW = 8, 128, 320, 0.10
+# a 16-gram is history once it started this many times before the window. With one, code the model wrote out again
+# as its final check reached a 0.84 to 0.91 share and fired: 3 of 7 fires on 183 saved blocks (2026-10-15), all
+# false. With two those copies peak at 0.64 and the 4 real loops still reach 1.0, one repeat later.
+SEEN = 2
 
 
 def enabled() -> bool:
@@ -51,7 +55,7 @@ class LoopDetector:
         self.tokens: list[int] = []
         self.runs = [0] * (max(SIZES) + 1)     # size -> tokens in a row equal to the one size back
         self.grams: list[int] = []             # hash of the 16-gram starting at each index
-        self.first: dict[int, int] = {}        # 16-gram hash -> the first index it starts at
+        self.starts: dict[int, list[int]] = {}  # 16-gram hash -> the first SEEN indexes it starts at
         self.streak = 0                        # history checks in a row at ACT or more
         self.share: float | None = None        # the last history check's share
 
@@ -63,7 +67,9 @@ class LoopDetector:
         if start >= 0:
             h = hash(tuple(self.tokens[start:]))
             self.grams.append(h)
-            self.first.setdefault(h, start)
+            seen = self.starts.setdefault(h, [])
+            if len(seen) < SEEN:
+                seen.append(start)
         if share is not None:
             self.share = share
         return why
@@ -119,19 +125,17 @@ class LoopDetector:
         return why, runs, streak, share
 
     def _history(self, count: int, token: int, pending: list[int]) -> float:
-        """Share of the 16-grams starting in the last WINDOW tokens that already started at or before
-        ``count - WINDOW - GRAM`` (a gram that ended before the window)."""
+        """Share of the 16-grams starting in the last WINDOW tokens that already started SEEN times at or before
+        ``count - WINDOW - GRAM`` (grams that ended before the window). Grams not committed yet start inside the
+        window, so only committed starts can count."""
 
         seq = pending + [token]
         last = count - GRAM                        # the newest gram's start
         before = count - WINDOW - GRAM
         hits = total = 0
         for start in range(count - WINDOW, last + 1):
-            h = self._gram(start, seq)
-            first = self.first.get(h)
-            if first is None and start >= len(self.grams):     # grams not committed yet: look among them too
-                first = next((s for s in range(len(self.grams), start) if self._gram(s, seq) == h), None)
-            hits += first is not None and first <= before
+            seen = self.starts.get(self._gram(start, seq), ())
+            hits += len(seen) >= SEEN and seen[SEEN - 1] <= before
             total += 1
         return hits / total
 
