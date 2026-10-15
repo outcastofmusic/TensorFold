@@ -1,6 +1,7 @@
 """A reasoning block that repeats itself is closed: the reply's next token becomes a hidden phrase and ``</think>``.
 
-TENSORFOLD_THINK_LOOP=1 turns it on for chat replies that think. Three arms watch the block's tokens:
+On by default for chat replies that think; TENSORFOLD_THINK_LOOP=0 turns it off. Three arms watch the block's
+tokens:
 
 - a pattern: the last ``max(4, ceil(128 / s))`` blocks of ``s`` tokens are equal, for some ``s`` from 1 to 16 (each
   token then equals the one ``s`` back for ``(count - 1) * s`` tokens in a row, so a pattern must span 128 tokens);
@@ -38,7 +39,7 @@ SEEN = 2
 
 
 def enabled() -> bool:
-    return flag(ENV)
+    return flag(ENV, default=True)
 
 
 def _need(size: int) -> int:

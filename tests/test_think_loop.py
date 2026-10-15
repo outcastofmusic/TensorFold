@@ -97,6 +97,7 @@ def test_hiding_takes_the_phrase_out_and_holds_back_a_partial_one():
 
 # ---- the CUDA server: a looping reply is closed, the phrase reaches the model and not the client --------------
 
+from tensorfold.cuda import server  # noqa: E402
 from tests.test_cuda_thinking_controls import ChainEngine, after, app_for, ask  # noqa: E402
 from tests.test_cuda_tool_choice import END as THINK_END  # noqa: E402
 from tests.test_cuda_tool_choice import THINK, Tokens  # noqa: E402
@@ -106,7 +107,9 @@ from tests.test_cuda_tool_choice import THINK, Tokens  # noqa: E402
 @pytest.mark.parametrize("width", [1, 4])
 def test_the_server_closes_a_looping_think_block_with_a_hidden_phrase(tmp_path, monkeypatch, stream, width):
     monkeypatch.setenv("TENSORFOLD_THINK_LOOP", "1")
-    status, body = ask(app_for(tmp_path, ChainEngine(width)), stream, max_tokens=400)
+    app = app_for(tmp_path, ChainEngine(width))
+    app.loop_close = server.loop_close(app.tok)                      # what App.__init__ makes
+    status, body = ask(app, stream, max_tokens=400)
     assert status == 200
     ids = body["tensorfold"]["token_ids"]
     close = Tokens().encode(CLOSE_TEXT).ids + [THINK_END]
@@ -122,9 +125,21 @@ def test_the_server_closes_a_looping_think_block_with_a_hidden_phrase(tmp_path, 
     assert body["tensorfold"]["think_loop"]["at"] == at
 
 
-def test_the_server_leaves_a_looping_reply_alone_when_the_flag_is_off(tmp_path, monkeypatch):
+def test_the_detector_is_on_unless_its_flag_says_off(monkeypatch):
+    from tensorfold.engine.think_loop import enabled
+
     monkeypatch.delenv("TENSORFOLD_THINK_LOOP", raising=False)
-    status, body = ask(app_for(tmp_path, ChainEngine(4)), False, max_tokens=400)
+    assert enabled()
+    monkeypatch.setenv("TENSORFOLD_THINK_LOOP", "0")
+    assert not enabled()
+
+
+def test_the_server_leaves_a_looping_reply_alone_when_the_flag_is_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("TENSORFOLD_THINK_LOOP", "0")
+    app = app_for(tmp_path, ChainEngine(4))
+    app.loop_close = server.loop_close(app.tok)
+    assert app.loop_close is None
+    status, body = ask(app, False, max_tokens=400)
     assert status == 200 and THINK_END not in body["tensorfold"]["token_ids"]
     assert "think_loop" not in body["tensorfold"]
 

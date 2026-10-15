@@ -1,23 +1,23 @@
 # TandemLLM ideas in the TensorFold fork: evaluation
 
-Six of the seven tasks (T1, T2, T3, T5, T6, T7) are implemented on branch `feat/tandem-ideas` (off `fork/dev`,
-`9dbd143b`), uncommitted. Each sits behind an environment flag that is off by default, so the served path runs the
-same code as before unless a flag is set. T4 (a merged copy and MTP tree) is not implemented: it needs tree verify in
-five places that assume a chain, listed under T4. No speed number here was measured on the GPU. The live server held
-the GPU for the whole session (2026-10-14), so every speed figure below is simulated and says so. The exactness claims
-rest on tiny-model GPU tests, and `tools/tandem_ab.py` is ready to measure speed when the box is free.
+Six of the seven tasks (T1, T2, T3, T5, T6, T7) are implemented on `feat/tandem-ideas` (off `fork/dev`, `9dbd143b`).
+Each sits behind an environment flag. T6 is on by default since 2026-10-15; every other flag is off by default, so
+with them unset the served path differs from before only by T6. T4 (a merged copy and MTP tree) is not implemented:
+it needs tree verify in five places that assume a chain, listed under T4. The speed figures in the task sections were
+simulated on 2026-10-14, when the live server held the GPU. "Measured on the GPU" at the end has the measured ones
+(2026-10-15). The exactness claims rest on tiny-model GPU tests and on the measured runs' identical texts.
 
 Spec: the "TensorFold tasks" table in `~/workspace/tandemllm-ideas.md`. Reference code: `~/workspace/TandemLLM`
 (AGPL-3.0, commit `e2a393a9`), read for algorithms and thresholds, never run, no code copied.
 
-| task | flag (off by default) | state |
+| task | flag | state |
 |-|-|-|
 | T1 StairCut cut | `TENSORFOLD_STAIRCUT=1` | done; measured with T2, no gain beyond boot drift (below) |
 | T2 never slower than plain | `TENSORFOLD_PLAIN_GATE=1` | done; measured with T1, no gain beyond boot drift (below) |
 | T3 idle graph capture | `TENSORFOLD_IDLE_GRAPHS=1` | done; measured no effect: warm-up already captures all 21 graphs |
 | T4 copy and MTP tree | none | not done; plan below |
 | T5 end and grid anchors | `TENSORFOLD_END_ANCHOR=1`, `TENSORFOLD_GRID_ANCHORS=4096` | done; follow-up TTFT 0.76 s to 0.15 s with thinking off, none with it on; changes follow-up text |
-| T6 token loop detector | `TENSORFOLD_THINK_LOOP=1` | done; 4 of 183 saved blocks fire, all true loops |
+| T6 token loop detector | on by default; `TENSORFOLD_THINK_LOOP=0` turns it off | done; 4 of 183 saved blocks fire, all true loops |
 | T7 self-check and per-drafter metrics | `TENSORFOLD_SELF_CHECK=1`, `TENSORFOLD_DRAFTER_METRICS=1` | done; self-check passes on the tiny model |
 
 ## How the tests were run

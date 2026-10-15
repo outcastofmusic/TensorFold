@@ -68,6 +68,17 @@ def _native_context(model_dir: Path) -> int:
     return int(limit) if isinstance(limit, int) and limit > 0 else 0
 
 
+def loop_close(tok) -> tuple[list[int], list[int], int] | None:
+    """The think-loop gate's close: (phrase and ``</think>``, the blank line a reply without a grammar adds,
+    ``</think>``). None when TENSORFOLD_THINK_LOOP=0 or the model has no ``</think>``."""
+
+    think_end = tok.token_to_id("</think>") if think_loop.enabled() else None
+    if think_end is None:
+        return None
+    return ([*tok.encode(think_loop.CLOSE_TEXT, add_special_tokens=False).ids, think_end],
+            tok.encode("\n\n", add_special_tokens=False).ids, think_end)
+
+
 class App:
     """Serve one engine with sampling and reply-length defaults for requests that omit them."""
 
@@ -94,6 +105,7 @@ class App:
         self.model_dir = Path(model_dir)
         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         self.template = ChatTemplate(model_dir)
+        self.loop_close = loop_close(self.tok)       # tokenized once here, so a request still encodes once
         self.default_thinking = default_thinking
         self.reasoning_effort, self.thinking_budget = reasoning_effort, int(thinking_budget)   # the Mac's defaults
         self.sampling = {"temperature": 1.0, "top_k": 20, "top_p": 0.95, **(sampling or {})}
@@ -689,15 +701,14 @@ class App:
         return ThinkBudget(prepared.think_budget, close, think_end)
 
     def _think_loop(self, prepared: PreparedRequest, thinking: bool) -> think_loop.LoopGate | None:
-        """TENSORFOLD_THINK_LOOP=1: the gate that closes a looping think block with a hidden phrase, or None."""
+        """The gate that closes a looping think block with a hidden phrase (TENSORFOLD_THINK_LOOP=0: None)."""
 
-        think_end = self.tok.token_to_id("</think>") if thinking and think_loop.enabled() else None
-        if think_end is None:
+        made = getattr(self, "loop_close", None)
+        if not thinking or made is None:
             return None
-        close = [*self.tok.encode(think_loop.CLOSE_TEXT, add_special_tokens=False).ids, think_end]
-        if prepared.grammar is None:
-            close += self.tok.encode("\n\n", add_special_tokens=False).ids
-        return think_loop.LoopGate(close, think_end, log=lambda line: print(line, flush=True))
+        close, blank, think_end = made
+        return think_loop.LoopGate([*close, *(blank if prepared.grammar is None else [])], think_end,
+                                   log=lambda line: print(line, flush=True))
 
     def _thinking_guard(self, prepared: PreparedRequest, body: dict[str, Any]) -> ThinkGuard | None:
         """The gate that asks ``--thinking-guard``'s decision model about each paragraph of thinking, or None."""

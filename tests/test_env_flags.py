@@ -47,3 +47,12 @@ def test_grid_anchors_zero_is_off(monkeypatch):
     monkeypatch.setenv(GRID_ENV, str(MIN_GAP - 1))
     with pytest.raises(ValueError):
         grid_env()
+
+
+def test_an_unset_flag_takes_its_default(monkeypatch):
+    monkeypatch.delenv("TENSORFOLD_X", raising=False)
+    assert flag("TENSORFOLD_X", default=True)
+    monkeypatch.setenv("TENSORFOLD_X", "")
+    assert flag("TENSORFOLD_X", default=True)
+    monkeypatch.setenv("TENSORFOLD_X", "off")
+    assert not flag("TENSORFOLD_X", default=True)
