@@ -12,12 +12,12 @@ Spec: the "TensorFold tasks" table in `~/workspace/tandemllm-ideas.md`. Referenc
 
 | task | flag (off by default) | state |
 |-|-|-|
-| T1 StairCut cut | `TENSORFOLD_STAIRCUT=1` | done; simulated +0.8% to +5.5% on mixed text |
-| T2 never slower than plain | `TENSORFOLD_PLAIN_GATE=1` | done; simulated gain only on sustained hard text at long context |
-| T3 idle graph capture | `TENSORFOLD_IDLE_GRAPHS=1` | done for `--parallel 1`; production (`--parallel 4`) runs no decode graphs |
+| T1 StairCut cut | `TENSORFOLD_STAIRCUT=1` | done; measured with T2, no gain beyond boot drift (below) |
+| T2 never slower than plain | `TENSORFOLD_PLAIN_GATE=1` | done; measured with T1, no gain beyond boot drift (below) |
+| T3 idle graph capture | `TENSORFOLD_IDLE_GRAPHS=1` | done; measured no effect: warm-up already captures all 21 graphs |
 | T4 copy and MTP tree | none | not done; plan below |
-| T5 end and grid anchors | `TENSORFOLD_END_ANCHOR=1`, `TENSORFOLD_GRID_ANCHORS=4096` | done; TTFT gain unmeasured |
-| T6 token loop detector | `TENSORFOLD_THINK_LOOP=1` | done; 7 of 183 saved reasoning blocks fire |
+| T5 end and grid anchors | `TENSORFOLD_END_ANCHOR=1`, `TENSORFOLD_GRID_ANCHORS=4096` | done; follow-up TTFT 0.76 s to 0.15 s with thinking off, none with it on; changes follow-up text |
+| T6 token loop detector | `TENSORFOLD_THINK_LOOP=1` | done; 4 of 183 saved blocks fire, all true loops |
 | T7 self-check and per-drafter metrics | `TENSORFOLD_SELF_CHECK=1`, `TENSORFOLD_DRAFTER_METRICS=1` | done; self-check passes on the tiny model |
 
 ## How the tests were run
@@ -316,3 +316,38 @@ python3 tools/tandem_ab.py --model $M --arms 'A=;B=TENSORFOLD_SELF_CHECK=1,TENSO
 T5 and T6 need multi-turn and thinking-on traffic, which the A/B script does not send. For T6, run a TrueScore or
 spark-bench pass with `TENSORFOLD_THINK_LOOP=1` and grep the server log for `think loop closed`. For T5, send a tool-call
 turn and its follow-up with `return_token_ids` and read `cached` in the follow-up's `tensorfold` block.
+
+## Measured on the GPU (2026-10-15)
+
+`tools/tandem_ab.py` on Qwen3.8-Flash-Next EXL3 3.05bpw, one boot per arm, 512 tokens a request, with the engines
+stopped. Results and per-boot server logs are in `~/work/tfeval/tandem/`. Boot-to-boot drift between identical A
+boots runs 1% to 3.4%, so a gain under that is not separable from it.
+
+**T1 and T2 together, one request at a time** (`ab-t1t2.json`, A,B,A, 3 reps, 5 kinds at T=0 and 0.7): B is 0.9%
+faster than the mean of the A boots (geometric mean over 10 cells), while A2/A0 is 0.986. B drafted 13,045 tokens
+against A's 12,856 and kept 9,512 against 9,483. 60/60 texts are identical to A0's.
+
+**T1 and T2 together, four requests at a time** (`ab-t1t2-c4.json`, A,B,A,B,A,B, `--concurrency 4`, StairCut with
+the spent-steps fix): batch throughput is 138.6, 137.6 and 143.1 tok/s for the A boots and 143.3, 142.4 and 137.7
+for the B boots, means 139.8 and 141.1 (+0.9%), while A4/A0 alone is 1.034. Per-request decode B/A is 0.988; edit at
+T=0 runs 39 to 54 tok/s under B against 59 to 65 under A, and prose gains. 150/150 texts are identical to A0's.
+Neither flag gives a gain this setup can measure.
+
+**T3** (`ab-t3-idle.json`, `--parallel 1`, a 12k-token prompt kept out of the warm-up, A,B,A,B,A,B): the first long
+request of each boot has a TTFT of 9.00 to 9.06 s and decodes at 46.3 to 47.1 tok/s in both arms. Both arms log "21
+decode graphs captured" at warm-up, so no request crosses into an uncaptured bucket and idle capture has nothing to
+do. 20/20 texts identical.
+
+**T5** (`ab-t5-turns.json`, `--turns`, A,B,A,B, 2 reps): a follow-up that sends the answer back.
+
+| | follow-up TTFT, A | follow-up TTFT, B | cached prompt tokens, A | cached, B |
+|-|-|-|-|-|
+| thinking off, 5 kinds | 0.33 to 0.81 s | 0.14 to 0.16 s | 33 to 931 | 316 to 1,443 |
+| thinking on, 5 kinds | 0.14 to 0.67 s | the same | the same | the same |
+
+With thinking on the template drops the think block from history, so the next prompt never extends the end state
+and the anchor is never used. With thinking off the anchor cuts follow-up TTFT about 5 times, but it changes text:
+in 12 of 20 thinking-off follow-ups under B (prose, json and copy, every rep) the first turn is identical and the
+follow-up departs from A's within its first 220 characters. A resumed state is computed by decode steps, a
+re-prefilled one by prefill kernels, and greedy decoding reads their difference. A request's reply then depends on
+whether the anchor was still cached.
