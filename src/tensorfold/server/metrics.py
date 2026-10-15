@@ -15,6 +15,7 @@ from typing import Any
 from tensorfold.server.memory_budget import process_footprint
 
 PREFIX = "tensorfold:"
+DRAFTERS_ENV = "TENSORFOLD_DRAFTER_METRICS"     # engines count drafts by drafter (copy, MTP) for /metrics
 # Request and time-to-first-token histograms share these upper edges. +Inf is added when rendered.
 BUCKETS = (0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0)
 _MADE = threading.Lock()
@@ -56,14 +57,20 @@ class Metrics:
         self.drafted = 0
         self.accepted = 0
         self.cached: int | None = None      # prompt tokens resumed from kept states; None until a server reports them
+        self.drafters: dict[str, list[int]] = {}      # drafter -> [drafted, accepted], from engines that report them
         self.latency = Histogram()
         self.ttft = Histogram()
         self.decode = Histogram()
         self.http_requests: dict[tuple[str, int], int] = {}
 
     def add(self, *, prompt: int, generation: int, drafted: int, accepted: int,
-            latency: float | None, ttft: float | None, decode: float | None = None, cached: int | None = None) -> None:
+            latency: float | None, ttft: float | None, decode: float | None = None, cached: int | None = None,
+            drafters: dict | None = None) -> None:
         with self.lock:
+            for name, (d, a) in (drafters or {}).items():
+                got = self.drafters.setdefault(str(name), [0, 0])
+                got[0] += int(d)
+                got[1] += int(a)
             if cached is not None:
                 self.cached = (self.cached or 0) + int(cached)
             self.prompt += int(prompt)
@@ -78,6 +85,12 @@ class Metrics:
                 self.decode.observe(decode)
 
 
+def drafters_enabled() -> bool:
+    import os
+
+    return os.environ.get(DRAFTERS_ENV, "0").strip().lower() in ("1", "on", "true", "yes")
+
+
 def of(app: Any) -> Metrics:
     """The app's counters, made on first use."""
 
@@ -90,13 +103,13 @@ def of(app: Any) -> Metrics:
 
 def note(app: Any, *, prompt: int = 0, generation: int = 0, drafted: int = 0, accepted: int = 0,
          latency: float | None = None, ttft: float | None = None, decode: float | None = None,
-         cached: int | None = None) -> None:
+         cached: int | None = None, drafters: dict | None = None) -> None:
     """Fold one finished request. A missing app is a no-op."""
 
     if app is None:
         return
     of(app).add(prompt=prompt, generation=generation, drafted=drafted, accepted=accepted,
-                latency=latency, ttft=ttft, decode=decode, cached=cached)
+                latency=latency, ttft=ttft, decode=decode, cached=cached, drafters=drafters)
 
 
 def http_request(app: Any, key: str, status: int) -> None:
@@ -162,6 +175,7 @@ def render(app: Any) -> str:
     with metrics.lock:
         prompt, generation = metrics.prompt, metrics.generation
         drafted, accepted, cached = metrics.drafted, metrics.accepted, metrics.cached
+        drafters = {k: list(v) for k, v in sorted(metrics.drafters.items())}
         latency, ttft, decode = metrics.latency.copy(), metrics.ttft.copy(), metrics.decode.copy()
         requests = dict(metrics.http_requests)
     running, waiting = _requests(app)
@@ -190,6 +204,11 @@ def render(app: Any) -> str:
             [f"{PREFIX}mtp_drafted_total {drafted}"])
     _family(lines, "mtp_accepted_total", "counter", "Draft tokens kept on finished requests.",
             [f"{PREFIX}mtp_accepted_total {accepted}"])
+    if drafters:                                    # engines that count by drafter (TENSORFOLD_DRAFTER_METRICS=1)
+        _family(lines, "draft_tokens_total", "counter", "Draft tokens verified on finished requests, by drafter.",
+                [f'{PREFIX}draft_tokens_total{{drafter="{k}"}} {v[0]}' for k, v in drafters.items()])
+        _family(lines, "draft_accepted_tokens_total", "counter", "Draft tokens kept on finished requests, by drafter.",
+                [f'{PREFIX}draft_accepted_tokens_total{{drafter="{k}"}} {v[1]}' for k, v in drafters.items()])
     _histogram(lines, "request_latency_seconds", "Seconds from arrival to the reply leaving.", latency)
     _histogram(lines, "time_to_first_token_seconds", "Seconds from arrival to the first generated token.", ttft)
     _histogram(lines, "request_decode_seconds",

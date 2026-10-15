@@ -290,6 +290,32 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
     return drafts
 
 
+def draft_cut(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position: int, count: int,
+              sampling: Sampling | None, spec) -> tuple[list[int], list[float], int]:
+    """``draft`` under a ``Speculation`` (staircut.py): absorb the kept rows, then (unless the round is plain) chain
+    while ``spec.more`` and keep ``spec.keep`` drafts. Returns (drafts, their probabilities, MTP steps run)."""
+
+    st = e.st
+    logits = absorb(e, streams, next_tokens)
+    if count < 1 or spec.plain(st.pos):
+        return [], [], 1
+    drafts: list[int] = []
+    probs: list[float] = []
+    for j in range(count):
+        d, p = e.sample_draft(logits, position + j, sampling)
+        drafts.append(d)
+        probs.append(p)
+        if j + 1 >= count or not spec.more(st.pos, probs):
+            break
+        prev = e.mbuf.streams[len(next_tokens) - 1:len(next_tokens)] if j == 0 else e.mbuf.streams[:1]
+        logits = e.mtp_forward([d], prev)
+        st.set_mtp_len(st.mtp_len + 1)
+        st.mtp_drafted += 1
+        next_tokens = [d]
+    n = spec.keep(st.pos, probs)
+    return drafts[:n], probs[:n], len(drafts)
+
+
 def _absorbs(e: Engine, mtp: bool) -> bool:
     return mtp and e.w.mtp is not None and e.mbuf is not None
 
@@ -385,6 +411,23 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
     return first
 
 
+def time_windows(run, widths, reps: int = 5) -> dict[int, float]:
+    """ms of ``run(rows)`` (a verify window's forward) for each width: the median of ``reps`` after one untimed."""
+
+    out: dict[int, float] = {}
+    for rows in widths:
+        run(rows)
+        torch.cuda.synchronize()
+        times = []
+        for _ in range(reps):
+            t = time.perf_counter()
+            run(rows)
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - t) * 1e3)
+        out[int(rows)] = round(sorted(times)[reps // 2], 4)
+    return out
+
+
 WARM_TAIL = 18      # a partial chunk after a full one: neither its rows nor the MTP head's 17 divide by 16
 
 
@@ -408,6 +451,8 @@ class DecodeResult:
     keeps: list[int] = field(default_factory=list)      # tokens each round kept
     committed: list[int] = field(default_factory=list)  # the tokens now in the caches (all but the pending one)
     widths: list[int] = field(default_factory=list)     # rows each round verified
+    drafters: dict = field(default_factory=dict)        # {"mtp": [drafted, accepted], "copy": [...]}
+    end: dict | None = None                             # ``keep_end``: the state where the reply ended, to resume
 
     @property
     def tokens_per_second(self) -> float:
@@ -443,22 +488,39 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
 @torch.no_grad()
 def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, depth: int = DEPTH,
                confidence: float = CONFIDENCE, stop_eos: bool = False, on_tokens=None, constraint=None,
-               probabilities=None, copies=None) -> DecodeResult:  # copies: a CopyIndex over the prompt and pending
-    """Verify pending and drafted tokens from the prefill state, commit rows before the first mismatched draft, and call ``on_tokens(new)`` with kept tokens after pending, stopping on True."""
+               probabilities=None, copies=None, spec=None,
+               keep_end: bool = False) -> DecodeResult:  # copies: a CopyIndex over the prompt and pending
+    """Verify pending and drafted tokens from the prefill state, commit rows before the first mismatched draft, and call ``on_tokens(new)`` with kept tokens after pending, stopping on True.
+
+    ``spec`` (staircut.py's ``Speculation``, or None for the fixed confidence cut): each round's chain depth and
+    whether it drafts at all, priced by this loop's own clock. ``keep_end``: the result's ``end`` resumes a prompt
+    that extends the committed reply, as a kept prompt state does (the MTP head one row behind, the last row's
+    stream as its tail); its bits are the decode's, which a prefill of the same tokens does not reproduce."""
+
+    trace = {"probs": [], "steps": 1, "ms": 0.0, "kind": "mtp"}     # what wrote the next round's drafts
 
     def propose(streams, next_tokens, n):
         """Copy drafts when the index has a chain (the MTP cache still absorbs the kept rows), else the MTP chain."""
+        t = time.perf_counter()
         copied = copies.chain(n) if copies is not None else []
+        trace["kind"] = "copy" if copied else "mtp"
         if copied:
             absorb(e, streams, next_tokens)
+            if spec is not None:
+                trace.update(probs=[], steps=1, ms=(time.perf_counter() - t) * 1e3)
             return copied
-        return draft(e, streams, next_tokens, st.pos + 1, n, sampling, confidence)
+        if spec is None:
+            return draft(e, streams, next_tokens, st.pos + 1, n, sampling, confidence)
+        drafts, probs, steps = draft_cut(e, streams, next_tokens, st.pos + 1, n, sampling, spec)
+        trace.update(probs=probs, steps=steps, ms=(time.perf_counter() - t) * 1e3)
+        return drafts
 
     w, st, b = e.w, e.st, e.buf
     out = [pending]
     rounds = drafted = accepted = 0
     keeps: list[int] = []
     widths: list[int] = []
+    by_drafter: dict[str, list[int]] = {}
     pos0 = st.pos
     unabsorbed = None                                  # the last round's kept rows, not yet in the MTP cache
     torch.cuda.synchronize()
@@ -470,6 +532,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         if window is not None:                           # the drafts no accepted path can hold are cut first
             tokens, drafts = window.tokens, window.tokens[1:]
         R = len(tokens)
+        t0 = time.perf_counter() if spec is not None else 0.0
+        context = st.pos
         logits = e.forward(tokens)
         if window is not None:
             constraint.mask(logits[:R], window, w.meta.get("vocab_offset", 0))
@@ -483,7 +547,18 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
             n = min(keep, count - len(out))
             capture(logits[:n], sampled[:n], list(range(st.pos + 1, st.pos + 1 + n)), probabilities)
         commit(w, st, b, R, keep)
+        if spec is not None:                 # the sample's read-back synchronised: the clock covers the verify
+            ms = (time.perf_counter() - t0) * 1e3
+            if R == 1:
+                spec.plain_round(context, ms + trace["ms"], timed=True)
+            else:
+                spec.verified(context, trace["probs"], R, keep - 1, timed=True, verify_ms=ms,
+                              draft_ms=trace["ms"], steps=trace["steps"])
         unabsorbed = (keep, sampled[:keep])
+        if R > 1:
+            by = by_drafter.setdefault(trace["kind"], [0, 0])
+            by[0] += R - 1
+            by[1] += keep - 1
         rounds += 1
         drafted += len(drafts)
         accepted += keep - 1
@@ -506,7 +581,16 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
             unabsorbed = None
     torch.cuda.synchronize()
     seconds = time.perf_counter() - start
-    if unabsorbed is not None:              # the MTP cache takes the last kept rows: it then covers the sequence
+    end = None
+    if unabsorbed is not None and keep_end and st.image_positions is None:
+        n = unabsorbed[0]                    # every kept row but the last; the last row's stream is the tail
+        if n > 1:
+            absorb(e, b.streams[:n - 1], unabsorbed[1][:n - 1])
+        elif st.mtp_drafted:
+            st.set_mtp_len(st.mtp_len - st.mtp_drafted)
+            st.mtp_drafted = 0
+        end = {"state": st.snapshot(), "tail": b.streams[n - 1:n].clone()}
+    elif unabsorbed is not None:            # the MTP cache takes the last kept rows: it then covers the sequence
         absorb(e, b.streams[:unabsorbed[0]], unabsorbed[1])
     committed = out[:st.pos - pos0]
-    return DecodeResult(out[:count], seconds, rounds, drafted, accepted, keeps, committed, widths)
+    return DecodeResult(out[:count], seconds, rounds, drafted, accepted, keeps, committed, widths, by_drafter, end)

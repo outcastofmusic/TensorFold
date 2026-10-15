@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import time
+
 import torch
 
 from tensorfold.cuda.kernels import gdn
 from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.streams import Stream, accept
 
-from .decode import absorb, Engine, draft
+from .decode import absorb, Engine, draft, draft_cut
 from .forward import commit
 from .state import Buffers
 
@@ -107,6 +109,7 @@ class Alone:
         e, st = self.solo, s.st
         tokens = [s.out[-1]] + list(s.drafts)
         R = len(tokens)
+        t0, context = time.perf_counter(), st.pos
         logits = e.forward(tokens)
         rows = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], s.sampling)
         path, end = accept(tokens, list(range(-1, R - 1)), rows, s.count - len(s.out), self._ends(s))
@@ -114,21 +117,47 @@ class Alone:
             capture(logits, [tokens[r] for r in path[1:]] + [end],
                     [st.pos + 1 + r for r in path], s.probabilities, rows=path)
         commit(self.w, st, e.buf, R, len(path))
+        if self.spec is not None:            # alone on the GPU: the round's clock prices its rows
+            ms = (time.perf_counter() - t0) * 1e3
+            probs, steps, draft_ms, _ = self.traces.pop(s.sid, ([], 1, 0.0, True))
+            if R == 1:
+                self.spec.plain_round(context, ms + draft_ms, timed=True)
+            else:
+                self.spec.verified(context, probs, R, len(path) - 1, timed=True, verify_ms=ms,
+                                   draft_ms=draft_ms, steps=steps)
         s.committed.extend(tokens[:len(path)])
         s.counted(R)
+        if s.drafters is not None and R > 1:
+            s.by_drafter(s.drafter, R - 1, len(path) - 1)
         new = [tokens[r] for r in path[1:]] + [end]
         last = len(s.out) + len(new) >= s.count or end in self._ends(s)
-        s.drafts = []
+        if last and getattr(self, "end_anchor", False) and s.splice is None and st.image_positions is None:
+            n = len(path)                                # the reply's end, kept as a prompt state (multi._keep_end)
+            if st.mtp_drafted:
+                st.set_mtp_len(st.mtp_len - st.mtp_drafted)
+                st.mtp_drafted = 0
+            if n > 1:
+                absorb(e, e.buf.streams[:n - 1], rows[:n - 1])
+            if st.mtp_len == st.pos - 1:
+                self._remember(list(s.prompt) + list(s.committed), st, st.snapshot(), e.buf.streams[n - 1:n].clone())
+        s.drafts, s.drafter = [], "mtp"
         room = min(self.depth, s.count - len(s.out) - len(path))
         if s.copies is not None:                         # the copy index sees the round's tokens before the next draft
             s.copies.extend(new)
         if not last and room > 0:
             copied = s.copies.chain(room) if s.copies is not None else []
+            t = time.perf_counter()
             if copied:                                   # copy drafts; the MTP cache still absorbs the kept rows
                 absorb(e, e.buf.streams[:len(path)], rows[:len(path)])
-                s.drafts = copied
-            else:
+                s.drafts, s.drafter = copied, "copy"
+                probs, steps = [], 1
+            elif self.spec is None:
                 s.drafts = draft(e, e.buf.streams[:len(path)], rows[:len(path)], st.pos + 1, room, s.sampling,
                                  self.confidence)
+            else:
+                s.drafts, probs, steps = draft_cut(e, e.buf.streams[:len(path)], rows[:len(path)], st.pos + 1,
+                                                   room, s.sampling, self.spec)
+            if self.spec is not None:
+                self.traces[s.sid] = (probs, steps, (time.perf_counter() - t) * 1e3, True)
         s.take(new, self._ends(s))
         return [s] if s.done else []

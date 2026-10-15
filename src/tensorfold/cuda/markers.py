@@ -64,3 +64,31 @@ def resume_points(model_dir: str | Path) -> Callable[[Sequence[int]], list[int]]
     except (OSError, ValueError, KeyError):
         return None
     return snapshot_points(openers, assistant) if openers or assistant else None
+
+
+GRID_ENV = "TENSORFOLD_GRID_ANCHORS"
+
+
+def grid_env() -> int:
+    """TENSORFOLD_GRID_ANCHORS=<tokens>: keep prompt states at every multiple of this many tokens (0 or unset: off)."""
+
+    import os
+
+    value = os.environ.get(GRID_ENV, "").strip()
+    if not value:
+        return 0
+    if not value.isdecimal() or int(value) < MIN_GAP:
+        raise ValueError(f"{GRID_ENV}: a line spacing of at least {MIN_GAP} tokens, not {value!r}")
+    return int(value)
+
+
+def with_grid(points: Callable[[Sequence[int]], list[int]] | None, step: int) -> Callable[[Sequence[int]], list[int]]:
+    """``points`` plus a line every ``step`` tokens from position 0 (below the prompt's end); a line within MIN_GAP
+    of a marker gives way to the marker, so a resume finds the nearest state below wherever a prompt departs."""
+
+    def grid(ids: Sequence[int]) -> list[int]:
+        marks = sorted(points(ids)) if points is not None else []
+        lines = [p for p in range(step, len(ids), step) if all(abs(p - m) >= MIN_GAP for m in marks)]
+        return sorted(set(marks) | set(lines))
+
+    return grid

@@ -17,7 +17,7 @@ from tensorfold.cuda.streams import Stream, accept
 from tensorfold.engine.exact_sampling import MARGIN, choose_rows
 from tensorfold.engine.grammar import GrammarError
 
-from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, choose_gathered_streams,
+from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, absorb, choose_gathered_streams,
                      entry_end, prefill_begin, tp_sample_rows)
 from . import attn_multi, gdn_multi, image_rows, prefixes
 from .forward import commit, compute, compute_mixed, converges, stage
@@ -48,11 +48,20 @@ def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: in
 class MultiDecoder(TwoRanks, Alone, PromptPasses):
     """Rounds over the live streams; ``slots`` streams at most, each with ``capacity`` tokens of context."""
 
+    spec = None                  # staircut.py's Speculation, or None (the fixed confidence cut)
+    count_drafters = False       # streams count drafts by drafter
+    end_anchor = False           # a finished reply's end state is kept for a next turn that sends it back
+
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
                  share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
-                 copy: bool = True) -> None:
+                 copy: bool = True, spec=None, count_drafters: bool = False, end_anchor: bool = False) -> None:
         self.link = self.follower = None
+        # staircut.py's Speculation: each stream's chain depth and plain rounds (None: the fixed confidence cut)
+        self.spec = spec if w.comm is None else None
+        self.traces: dict[int, tuple] = {}      # stream id -> its next window's (probs, MTP steps, draft ms, alone)
+        self.count_drafters = bool(count_drafters)    # streams count drafts by drafter (Stream.drafters)
+        self.end_anchor = bool(end_anchor) and w.comm is None and depth > 0 and w.mtp is not None
         self.copy = bool(copy)                       # copy drafts (copy_drafts.py) for streams that draft
         self.planning, self.pass_plan, self.mixed_plan = False, None, None
         self.pass_index, self.pass_width = 0, prefill_rows
@@ -244,6 +253,33 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         if self.solo is not None:                    # last: the graph slot's rows are the ones requests will find
             self.solo.graphs.warm(self.depth + 1)
             self.solo.st.reset(self.w)               # the captures wrote its state
+        if self.spec is not None:
+            self._price_windows()
+
+    @torch.no_grad()
+    def _price_windows(self) -> None:
+        """``spec``'s prior: a shared round's verify of 1 to depth + 1 rows for one stream, timed on a scratch slot."""
+
+        from .decode import time_windows
+
+        if not self.free:
+            return
+        st = self.free[-1]
+        st.reset(self.w)
+
+        def run(rows: int) -> None:
+            segs = stage(self.w, self.buf, [(st, [0] * rows)])
+            self.buf.gdn_tables = gdn_multi.Tables(self.w, self.gdn, segs, [[]])
+            self.buf.attn_step = attn_multi.Step(self.w, segs, mtp=False)
+            try:
+                compute(self.w, segs, self.buf)
+            finally:
+                self.buf.gdn_tables = self.buf.attn_step = None
+
+        try:
+            self.spec.prices.prior = {0: time_windows(run, range(1, self.depth + 2))}
+        finally:
+            st.reset(self.w)
 
     @torch.no_grad()
     def admit(self, s: Stream, told=None) -> None:
@@ -401,10 +437,13 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         for s, rows in zip(live, gdn_multi.keep(tables, [len(path) for path, _ in paths])):
             self.held[s.sid] = rows                      # the next round's trees fold these rows in first
         kept = []
+        positions0 = [s.st.pos for s in live]
         for s, (_, tokens), (st, a0, a1), rows, (path, end) in zip(live, windows, segs, sampled, paths):
             commit(self.w, st, self.buf, a1 - a0, len(path), at=a0, states=False)
             s.committed.extend(tokens[:len(path)])
             s.counted(len(tokens))
+            if s.drafters is not None and len(tokens) > 1:
+                s.by_drafter(s.drafter, len(tokens) - 1, len(path) - 1)
             new = [tokens[r] for r in path[1:]] + [end]
             if s.constraint is not None:
                 try:
@@ -416,7 +455,16 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             kept.append((s, a0, rows[:len(path)] if s.splice is None else new, new, last))
             if s.copies is not None:                     # the copy index sees the round's tokens before the next draft
                 s.copies.extend(new)
-        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
+        if self.end_anchor:
+            for s, a0, keep, new, last in kept:
+                if last:
+                    self._keep_end(s, a0, keep, len(new))
+        drafting = [(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last]
+        if self.spec is None:
+            self._draft_all(drafting)
+        else:
+            self._learn(live, windows, paths, positions0, (time.perf_counter() - t0) * 1e3, alone=not pieces)
+            self._draft_cut_all(drafting)
         for s, _, _, new, _ in kept:
             if s.error is not None:
                 s.done = True
@@ -429,6 +477,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         done = [s for s in live if s.done]
         for s in done:                                   # a finished stream's state is never read again
             self.held.pop(s.sid, None)
+            if getattr(self, "spec", None) is not None:      # (host tests run this method on a bare instance)
+                self.traces.pop(s.sid, None)
         return failed + done + ended
 
     @staticmethod
@@ -468,11 +518,67 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         s.forced = [int(t) for t in fix[1:]]
         return path[:n + at + 1], int(fix[0])
 
-    def _draft_all(self, streams: list) -> None:
-        """Streams absorb kept rows and chain drafts one step a depth; a copying stream still absorbs, then sits out."""
+    def _keep_end(self, s: Stream, a0: int, keep: list[int], kept_rows: int) -> None:
+        """A finished reply's state where its committed tokens end, kept like a prompt state (the MTP head one row
+        behind, the last row's stream as the tail), so a next turn that sends the reply back resumes after it.
+
+        Its bits are the decode's, which a prefill of the same tokens does not reproduce: a resumed next turn is the
+        model's continuation of the same text, but not bit for bit a cold run's."""
+
+        st = s.st
+        if (s.error is not None or not s.draft or s.splice is not None or st.image_positions is not None
+                or len(keep) != kept_rows):
+            return
+        self._flush(s)                                   # the round's recurrent rows, held for the next round
+        if st.mtp_drafted:
+            st.set_mtp_len(st.mtp_len - st.mtp_drafted)
+            st.mtp_drafted = 0
+        if kept_rows > 1:
+            e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows)
+            absorb(e, self.buf.streams[a0:a0 + kept_rows - 1], keep[:kept_rows - 1])
+        if st.mtp_len != st.pos - 1:                     # a head that lost rows earlier: no state to resume
+            return
+        tail = self.buf.streams[a0 + kept_rows - 1:a0 + kept_rows].clone()
+        self._remember(list(s.prompt) + list(s.committed), st, st.snapshot(), tail)
+
+    def _learn(self, live: list, windows: list, paths: list, positions: list[int], ms: float, alone: bool) -> None:
+        """Each stream's verified window teaches ``spec`` its calibration; a round run by one stream alone, its prices
+        too."""
+
+        timed = alone and len(live) == 1
+        for s, (_, tokens), (path, _), context in zip(live, windows, paths, positions):
+            trace = self.traces.pop(s.sid, None)
+            if trace is None:
+                continue
+            probs, steps, draft_ms, drafted_alone = trace
+            if len(tokens) == 1:
+                self.spec.plain_round(context, ms + draft_ms, timed=timed and drafted_alone)
+            else:
+                self.spec.verified(context, probs, len(tokens), len(path) - 1, timed=timed and drafted_alone,
+                                   verify_ms=ms, draft_ms=draft_ms, steps=steps)
+
+    def _draft_cut_all(self, streams: list) -> None:
+        """``_draft_all`` under ``spec``: each MTP chain's depth by ``spec``, cut to ``spec.keep``; its trace kept."""
+
+        t = time.perf_counter()
+        probs: dict[int, list[float]] = {}
+        steps = self._draft_all(streams, probs) or {}
+        ms = (time.perf_counter() - t) * 1e3
+        for s, _, _ in streams:
+            got = probs.get(s.sid, [])
+            if got:
+                n = self.spec.keep(s.st.pos, got)
+                s.drafts, got = s.drafts[:n], got[:n]
+            self.traces[s.sid] = (got, steps.get(s.sid, 1), ms, len(streams) == 1)
+
+    def _draft_all(self, streams: list, probs: dict | None = None):
+        """Streams absorb kept rows and chain drafts one step a depth; a copying stream still absorbs, then sits out.
+
+        ``probs`` (under ``spec``): filled with each MTP chain's draft probabilities; a stream ``spec`` sends to a
+        plain round sits out as a copying one does, and the MTP steps each stream ran are returned."""
 
         for s, _, _ in streams:
-            s.drafts = []
+            s.drafts, s.drafter = [], "mtp"
         room = {s.sid: min(self.depth, s.count - len(s.out) - len(keep)) for s, _, keep in streams}
         todo = [(s, a0, keep) for s, a0, keep in streams if room[s.sid] > 0 and self.mbuf is not None]
         if not todo:
@@ -480,13 +586,18 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         copying: set[int] = set()
         for s, _, _ in todo:
             if s.forced:                                 # a fix's tokens: drafts the next round keeps (_spliced)
-                s.drafts = self._force(s, room[s.sid])
+                s.drafts, s.drafter = self._force(s, room[s.sid]), "fix"
                 copying.add(s.sid)
             elif s.copies is not None:
                 copied = s.copies.chain(room[s.sid])
                 if copied:
-                    s.drafts = copied
+                    s.drafts, s.drafter = copied, "copy"
                     copying.add(s.sid)
+        if probs is not None:
+            for s, _, _ in todo:
+                if s.sid not in copying and self.spec.plain(s.st.pos):
+                    copying.add(s.sid)                   # a plain round: the head absorbs, nothing is drafted
+            steps = {s.sid: 1 for s, _, _ in todo}
         for s, _, _ in todo:
             st = s.st
             if st.mtp_drafted:
@@ -499,13 +610,21 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             st.set_mtp_len(st.mtp_len + len(keep))
         active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
         if len(copying) == len(active):
-            return
+            return steps if probs is not None else None
         for j in range(self.depth):
             # level one picks for every absorbed stream (the two-rank gather reads them in order); copiers drop out
             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
             nxt = []
             for (s, row), (d, p) in zip(active, picks):
                 if s.sid in copying:
+                    continue
+                if probs is not None:                    # spec decides how deep each chain runs
+                    got = probs.setdefault(s.sid, [])
+                    s.drafts.append(d)
+                    got.append(p)
+                    if j + 1 < room[s.sid] and self.spec.more(s.st.pos, got):
+                        nxt.append((s, row, d))
+                        steps[s.sid] += 1
                     continue
                 low = self.confidence > 0 and p < self.confidence
                 if low and j > 0:
@@ -514,7 +633,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 if not low and j + 1 < room[s.sid]:
                     nxt.append((s, row, d))
             if not nxt:
-                return
+                return steps if probs is not None else None
             windows = [(s.st, [d], self.mbuf.streams[row:row + 1]) for s, row, d in nxt]
             segs = mtp_stage(self.w, self.mbuf, windows)
             logits = self._mtp(segs)
@@ -522,6 +641,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 s.st.set_mtp_len(s.st.mtp_len + 1)
                 s.st.mtp_drafted += 1
             active = [(s, a0) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
+        return steps if probs is not None else None
 
     def _mtp(self, segs: list) -> torch.Tensor:
         """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
@@ -582,6 +702,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             self.link.send(["finish", [s.sid for s in done]])
         for s in done:
             self.held.pop(s.sid, None)
+            if getattr(self, "spec", None) is not None:      # (host tests run this method on a bare instance)
+                self.traces.pop(s.sid, None)
             self.streams.pop(s.sid, None)
             if not any(k[1] is s.st for k in self.kept) and all(f is not s.st for f in self.free):
                 self._shrink(s.st)
@@ -595,6 +717,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         for s in live:
             self.streams.pop(s.sid, None)
             self.held.pop(s.sid, None)
+            if getattr(self, "spec", None) is not None:      # (host tests run this method on a bare instance)
+                self.traces.pop(s.sid, None)
             self._drop_kept(s.st)
             self._shrink(s.st)
             self.free.append(s.st)

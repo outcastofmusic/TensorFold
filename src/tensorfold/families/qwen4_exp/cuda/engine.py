@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -179,6 +180,15 @@ class FlashNextEngine:
             from tensorfold.cuda.markers import resume_points
 
             self.points = resume_points(model_dir)          # a prompt's message starts to keep states at, or None
+            from tensorfold.cuda.markers import grid_env, with_grid
+
+            grid = grid_env()                               # TENSORFOLD_GRID_ANCHORS: states at every grid line too
+            if grid and self.depth > 0:
+                self.points = with_grid(self.points, grid)
+            import os
+
+            # TENSORFOLD_END_ANCHOR=1: a reply's end state is kept, so a next turn sending it back resumes after it
+            self.end_anchor = os.environ.get("TENSORFOLD_END_ANCHOR", "0").strip().lower() in ("1", "on", "true", "yes")
             if vision and rank == 0:
                 from tensorfold.vision.qwen_cuda import QwenCudaVision
 
@@ -201,6 +211,14 @@ class FlashNextEngine:
                 "send text without response_format or guided output, or start without --parallel"
                 if self.concurrent and tp == 2 else None)
             self.multi = self.scheduler = None
+            from .staircut import Speculation
+
+            # TENSORFOLD_STAIRCUT / TENSORFOLD_PLAIN_GATE: each round's chain depth by tokens a ms (off: the 0.7 cut)
+            self.spec = Speculation.from_env(confidence=self.confidence, depth=self.depth, world=tp)
+            from tensorfold.server.metrics import drafters_enabled
+
+            self.count_drafters = drafters_enabled()          # TENSORFOLD_DRAFTER_METRICS: copy and MTP apart
+            self.drafts_ok = True                             # TENSORFOLD_SELF_CHECK's verdict: False serves serially
             if self.concurrent:
                 from tensorfold.cuda.scheduler import Scheduler
 
@@ -211,7 +229,9 @@ class FlashNextEngine:
                                           confidence=self.confidence, keep=KEEP, points=self.points,
                                           copy=getattr(self, "copy_drafts", False),
                                           kv_dtype=self.kv_dtype, share=share, vision=self.vision,
-                                          prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=lone)
+                                          prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=lone,
+                                          spec=self.spec, count_drafters=self.count_drafters,
+                                          end_anchor=self.end_anchor)
                 self.scheduler = Scheduler(self.multi, max_streams=streams)
             else:
                 self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
@@ -249,10 +269,14 @@ class FlashNextEngine:
             from .decode import warm
 
             warm(self.e)
+            if self.spec is not None:
+                self._price_windows()
         if self.vision is not None:
             self.vision.warm()
             torch.cuda.empty_cache()
         warm_s = time.perf_counter() - started
+        self._self_check()
+        self.idle = self._idle_graphs()
         reread_s = 0.0
         if prefetch and not ple_on_ssd and not locked:
             started = time.perf_counter()
@@ -274,6 +298,13 @@ class FlashNextEngine:
         self.serial = None                                # the serial requests' engine, made on first use
         rule = (f"1 to {self.depth} MTP drafts a round, a chain stops before a later draft under "
                 f"{self.confidence:.0%}" if self.depth else "no drafts: the serial reference, one token a round")
+        if self.spec is not None:
+            prior = self.spec.prices.prior.get(0, {})
+            rule = (f"1 to {self.depth} MTP drafts a round, "
+                    + ("StairCut's cut by tokens a ms" if self.spec.cut is not None else
+                       f"a chain stops before a later draft under {self.confidence:.0%}")
+                    + (", plain rounds where drafting loses" if self.spec.gate is not None else "")
+                    + (f" (verify ms by rows at warm-up: {prior})" if prior else ""))
         if self.copy_drafts:
             rule += f", or up to {self.depth} copy drafts where the reply repeats earlier text"
         where = (f"up to {streams} streams, each growing to {self.context_window} prompt/reply tokens while memory "
@@ -293,6 +324,69 @@ class FlashNextEngine:
         print(f"[tensorfold] Flash Next on CUDA: {rule}; {where}{kv}; n-gram tables {how}; {captured} "
               f"decode graphs captured; idle prompt pieces {self.prefill_rows} rows; "
               f"prompt kernels warmed in {warm_s:.1f}s", flush=True)
+
+    def _idle_graphs(self):
+        """TENSORFOLD_IDLE_GRAPHS=1 (one GPU, one stream, graphs on): a second after each request, capture the decode
+        graphs of the context bucket it ended in and the next one, a capture at a time, so a reply that grows into a
+        new bucket does not stop to capture them; a request waits for at most the capture under way."""
+
+        import os
+
+        if os.environ.get("TENSORFOLD_IDLE_GRAPHS", "0").strip().lower() not in ("1", "on", "true", "yes"):
+            return None
+        if self.e is None or self.e.graphs is None or self.tp != 1:
+            print("[tensorfold] TENSORFOLD_IDLE_GRAPHS ignored: idle captures need one GPU, one stream and graphs",
+                  flush=True)
+            return None
+        import torch
+
+        from tensorfold.cuda.idle_work import IdleWork
+
+        e = self.e
+        return IdleWork(lambda: e.graphs.idle_steps(e.st.pos + self.depth + 1), delay=1.0,
+                        setup=lambda: torch.cuda.set_device(0))
+
+    def _self_check(self) -> None:
+        """TENSORFOLD_SELF_CHECK=1: replay greedy one-row steps through every verify width (self_check.py); any bit
+        that differs turns drafting off, so every request takes the serial path."""
+
+        from . import self_check
+
+        if not self_check.enabled() or self.depth < 1:
+            return
+        if self.tp != 1:
+            print("[tensorfold] self-check skipped: two ranks decode in lockstep from requests", flush=True)
+            return
+        started = time.perf_counter()
+        widths = range(2, self.depth + 2)
+        if self.multi is not None:
+            start, window, release = self_check.multi_windows(self.multi)
+            try:
+                got = self_check.check_widths(start, window, widths=widths)
+            finally:
+                release()
+        else:
+            try:
+                got = self_check.check_widths(*self_check.engine_windows(self.e), widths=widths)
+            finally:
+                self.e.reset()
+        self.drafts_ok = got["ok"]
+        self.self_check = got
+        verdict = "passed" if got["ok"] else f"FAILED at {got['first_diff']}: drafting is off, every reply is serial"
+        print(f"[tensorfold] self-check: {got['rows_checked']} rows over widths 2-{self.depth + 1} {verdict} "
+              f"({time.perf_counter() - started:.1f}s)", flush=True)
+
+    def _price_windows(self) -> None:
+        """StairCut's prior on one stream: each verify window's forward, timed on an empty state."""
+
+        from .decode import time_windows
+
+        e = self.e
+        e.reset()
+        try:
+            self.spec.prices.prior = {0: time_windows(lambda rows: e.forward([0] * rows), range(1, self.depth + 2))}
+        finally:
+            e.reset()
 
     def _same_settings(self, torch, ids, vision: bool = False) -> None:
         """Both ranks must decode with the same rule, context, draft vocabulary and KV cache, or they would fall out of step: refuse to start otherwise."""
@@ -468,8 +562,13 @@ class FlashNextEngine:
             copies = CopyIndex(list(prompt) + [first]) if getattr(self, "copy_drafts", False) and constraint is None else None
             res = mtp_decode(self.e, first, max_tokens, sampling, depth=self.depth, confidence=self.confidence,
                              stop_eos=stop_eos, on_tokens=on_tokens, constraint=constraint, probabilities=probabilities,
-                             copies=copies)
+                             copies=copies, spec=getattr(self, "spec", None),
+                             keep_end=getattr(self, "end_anchor", False) and vision is None)
+            if getattr(res, "end", None) is not None:     # the reply's end: a next turn that sends it back resumes
+                self._remember(list(prompt) + list(res.committed), res.end)
             stats.update(drafted=res.drafted, accepted=res.accepted, min_rows=min(res.widths, default=0))
+            if getattr(self, "count_drafters", False):
+                stats["drafters"] = getattr(res, "drafters", {})
         else:
             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
                                 constraint=constraint, probabilities=probabilities)
@@ -487,7 +586,8 @@ class FlashNextEngine:
     def splices(self) -> bool:
         """Whether a drafted text request's gates may cut inside its live stream (one GPU, shared rounds, MTP drafts)."""
 
-        return self.scheduler is not None and bool(getattr(self.multi, "splices", False))
+        return (self.scheduler is not None and bool(getattr(self.multi, "splices", False))
+                and getattr(self, "drafts_ok", True))       # a cut rides as drafts: none after a failed self-check
 
     def generate(self, prompt: list[int], max_tokens: int, sampling,
                  on_tokens: Callable[[list[int]], bool | None], draft: bool = True, constraint=None,
@@ -507,6 +607,8 @@ class FlashNextEngine:
             raise ValueError("image requests cannot yield a background lane")
         if splice is not None and not self.splices:
             raise ValueError("this engine applies a gate's cut in a new run, not inside the stream")
+        if not getattr(self, "drafts_ok", True):         # the load-time self-check found a verify width's bits differ
+            draft = False
         if self.scheduler is not None:
             grammar = {} if constraint is None else {"constraint": constraint}
             grammar.update({} if splice is None else {"splice": splice})
@@ -514,6 +616,15 @@ class FlashNextEngine:
                                          **grammar, **({"background": True} if background else {}),
                                          probabilities=probabilities,
                                          **({"vision": vision} if vision is not None else {}))
+        idle = getattr(self, "idle", None)
+        with idle.busy() if idle is not None else nullcontext():     # idle graph captures wait for the GPU's requests
+            return self._generate_one(prompt, max_tokens, sampling, on_tokens, draft, constraint, stop_eos,
+                                      probabilities, vision)
+
+    def _generate_one(self, prompt, max_tokens, sampling, on_tokens, draft, constraint, stop_eos, probabilities,
+                      vision) -> dict[str, Any]:
+        """One request on the one-stream engine (or the two ranks' leader)."""
+
         hit = self._resume(prompt) if draft and vision is None else None
         points = None
         # rank 0 encodes before sharing (a refused image fails here alone), then sends rank 1 the same features

@@ -26,6 +26,7 @@ class Stream:
     context: list[int] = field(default_factory=list)
     committed: list[int] = field(default_factory=list)     # tokens committed after the prompt, on every rank
     drafts: list[int] = field(default_factory=list)       # an MTP family's drafts for the next round
+    drafter: str = "mtp"                                  # what wrote ``drafts``: "mtp", "copy" or "fix" (a gate's)
     stops: list[int] = field(default_factory=list)        # prompt positions whose states the prefill keeps
     constraint: Any = None                                # the reply's grammar (tensorfold.engine.grammar), or None
     background: bool = False                              # priority "background": after, and yielding to, the rest
@@ -43,6 +44,8 @@ class Stream:
     min_rows: int = 0
     drafted: int = 0                                      # drafted rows its rounds verified, and the ones kept
     accepted: int = 0
+    # the same by drafter, {"mtp": [drafted, kept], "copy": [...]}, when the engine counts them (else None)
+    drafters: dict | None = None
     cached: int = 0
     prefill_s: float = 0.0
     started: float = 0.0
@@ -70,14 +73,28 @@ class Stream:
         self.drafted += rows - 1
         self.min_rows = rows if self.min_rows == 0 else min(self.min_rows, rows)
 
+    def by_drafter(self, drafter: str, drafted: int, kept: int) -> None:
+        """Count a verified window's drafts under the drafter that wrote them (``drafters`` set: counting is on)."""
+
+        got = self.drafters.setdefault(drafter, [0, 0])
+        got[0] += drafted
+        got[1] += kept
+
     def stats(self) -> dict:
         own = {"prefill_s": round(self.prefill_s, 4), "decode_s": round(max(self.finished - self.started, 0.0), 4),
                "rounds": self.rounds, "drafts": self.draft, "cached": self.cached, "min_rows": self.min_rows,
                "drafted": self.drafted, "accepted": self.accepted}
+        if self.drafters is not None:
+            own["drafters"] = {k: list(v) for k, v in self.drafters.items()}
         if self.carry is None:
             return own
         both = {k: round(self.carry[k] + own[k], 4) for k in ("prefill_s", "decode_s")}
         both.update({k: self.carry[k] + own[k] for k in ("rounds", "drafted", "accepted")})
+        if "drafters" in self.carry or "drafters" in own:
+            merged = {k: list(v) for k, v in self.carry.get("drafters", {}).items()}
+            for k, (d, a) in own.get("drafters", {}).items():
+                merged[k] = [merged.get(k, [0, 0])[0] + d, merged.get(k, [0, 0])[1] + a]
+            both["drafters"] = merged
         rows = [r for r in (self.carry["min_rows"], own["min_rows"]) if r]
         return {**own, **both, "cached": self.carry["cached"], "min_rows": min(rows, default=0)}
 

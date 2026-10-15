@@ -22,6 +22,7 @@ from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
 from tensorfold.server.tool_policy import ToolCallPolicy
 from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
+from tensorfold.engine import think_loop
 from tensorfold.engine.think_guard import GuardConfig, ThinkGuard, decide, end_session
 from tensorfold.engine.tool_draft import ToolCallStreamer
 from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
@@ -508,6 +509,8 @@ class App:
             raw = stops.visible(raw, partial=not finished) if stops.strings else raw
             if chat and thinking:
                 reasoning, answer = split_thinking(raw, finished=finished)
+                if loop is not None and loop.fired:      # the loop close's phrase is the model's, not the client's
+                    reasoning = think_loop.hide(reasoning, finished=finished)
             else:
                 reasoning, answer = "", raw
             answer_raw[0] = answer
@@ -584,7 +587,8 @@ class App:
         # one engine at a time: a background reply yields between rounds (not on two ranks, which decode to the end)
         yielding = background and turns is not None and getattr(self.engine, "tp", 1) == 1
         guard = self._thinking_guard(prepared, body)
-        gates = [g for g in (gate, budget, guard, Yield(turns) if yielding else None) if g is not None]
+        loop = self._think_loop(prepared, chat and thinking)
+        gates = [g for g in (gate, budget, guard, loop, Yield(turns) if yielding else None) if g is not None]
 
         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
 
@@ -636,6 +640,8 @@ class App:
         stats = {**(stats or {}), "token_sha": token_sha(out)}
         if guard is not None:                         # its checks, and the paragraph its yes closed the block after
             stats["thinking_guard"] = guard.finish()
+        if loop is not None and loop.record:          # the arm that closed a looping block, and where
+            stats["think_loop"] = loop.record
         reasoning, answer = visible(True)
         final: dict[str, Any] = {}
         if len(reasoning) > sent["reasoning"]:
@@ -681,6 +687,17 @@ class App:
         if prepared.grammar is None:
             close += self.tok.encode("\n\n", add_special_tokens=False).ids
         return ThinkBudget(prepared.think_budget, close, think_end)
+
+    def _think_loop(self, prepared: PreparedRequest, thinking: bool) -> think_loop.LoopGate | None:
+        """TENSORFOLD_THINK_LOOP=1: the gate that closes a looping think block with a hidden phrase, or None."""
+
+        think_end = self.tok.token_to_id("</think>") if thinking and think_loop.enabled() else None
+        if think_end is None:
+            return None
+        close = [*self.tok.encode(think_loop.CLOSE_TEXT, add_special_tokens=False).ids, think_end]
+        if prepared.grammar is None:
+            close += self.tok.encode("\n\n", add_special_tokens=False).ids
+        return think_loop.LoopGate(close, think_end, log=lambda line: print(line, flush=True))
 
     def _thinking_guard(self, prepared: PreparedRequest, body: dict[str, Any]) -> ThinkGuard | None:
         """The gate that asks ``--thinking-guard``'s decision model about each paragraph of thinking, or None."""

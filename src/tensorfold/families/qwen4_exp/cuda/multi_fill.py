@@ -11,7 +11,7 @@ from tensorfold.cuda.streams import Stream
 
 from . import image_rows
 from .copy_drafts import CopyIndex
-from .decode import _gathered_fits, absorb, choose_gathered, entry_end, draft, tp_sample_rows
+from .decode import _gathered_fits, absorb, choose_gathered, entry_end, draft, draft_cut, tp_sample_rows
 from .forward import Cut, commit, compute, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
 from .state import CAND, ENDS
@@ -221,15 +221,20 @@ class PromptPasses:
             s.context = list(s.prompt)
             s.copies = CopyIndex(list(s.prompt) + [first]) if mtp and getattr(self, "copy", False) and s.constraint is None else None
             s.drafts = []
+            if getattr(self, "count_drafters", False) and s.drafters is None:
+                s.drafters = {}
             if mtp and s.count > 1:
                 room = min(self.depth, s.count - 1)
                 copied = s.copies.chain(room) if s.copies is not None and not s.forced else []
                 if s.forced:
                     absorb(e, last, [first])
-                    s.drafts = self._force(s, room)
+                    s.drafts, s.drafter = self._force(s, room), "fix"
                 elif copied:                             # the MTP cache absorbs the prompt's last row either way
                     absorb(e, last, [first])
-                    s.drafts = copied
+                    s.drafts, s.drafter = copied, "copy"
+                elif getattr(self, "spec", None) is not None:      # untimed: the prompt's pass shared this round
+                    s.drafts, probs, steps = draft_cut(e, last, [first], st.pos + 1, room, s.sampling, self.spec)
+                    self.traces[s.sid] = (probs, steps, 0.0, False)
                 else:
                     s.drafts = draft(e, last, [first], st.pos + 1, room, s.sampling, self.confidence)
             s.started = time.perf_counter()
