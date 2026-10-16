@@ -616,8 +616,8 @@ class GlmEngine:
                         stops=self._system_end(prompt, cut) if keeps else (), keep=self._remember)
         prefill_s = time.perf_counter() - t0
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
-        on_tokens([first])
-        if max_tokens <= 1 or (stop_eos and first in self.eos):
+        stopped = bool(on_tokens([first])) and self.comm is None      # rank 1 cannot hear a stop: two ranks decode on
+        if max_tokens <= 1 or (stop_eos and first in self.eos) or stopped:
             return stats
         policy = decode_policy(code)
         if policy is None:

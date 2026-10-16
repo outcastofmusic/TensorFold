@@ -476,6 +476,15 @@ def _sync(w: Weights) -> None:
     torch.cuda.synchronize()
 
 
+def _fed(w: Weights, on_tokens, tokens: list[int]) -> bool:
+    """Hand a round's tokens to ``on_tokens``; True when it asks to stop and this rank decodes alone.
+
+    A thinking budget's cut or a client that left asks it. Two ranks decode on to the count or an end token: rank 1
+    runs without a feed, so it cannot hear rank 0's stop and would wait in the next round's collective."""
+
+    return on_tokens is not None and bool(on_tokens(tokens)) and w.comm is None
+
+
 @torch.no_grad()
 def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *,
                   stop_eos: bool = False, on_tokens=None) -> DecodeResult:
@@ -500,8 +509,8 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
         out.append(tok)
-        if on_tokens is not None:
-            on_tokens([tok])
+        if _fed(w, on_tokens, [tok]):
+            break
     _sync(w)
     return DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
 
@@ -565,12 +574,11 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        stop = _fed(w, on_tokens, sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["forward"] += t1 - t0
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
-        if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
+        if stop or len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
             break
         t4 = time.perf_counter()
         depth = min(policy.next(len(drafts), keep - 1), count - len(out))
@@ -628,12 +636,13 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        stop = _fed(w, on_tokens, sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
         stages["forward"] += t2 - t1
         stages["sample"] += t3 - t2
         stages["commit"] += t4 - t3
+        if stop:
+            break
         depth = min(policy.next(len(drafts), keep - 1), count - len(out))
     _sync(w)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
