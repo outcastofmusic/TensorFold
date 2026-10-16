@@ -5,17 +5,29 @@ engine. Upstream rewrote TensorFold in Zig for its 1.0 line and froze the Python
 commits past v0.6.6. The fork starts from that branch (`ed78d6fc`) and serves two models on one DGX Spark from one
 tree: Qwen3.8 Flash Next and GLM-5.3 Flash.
 
-Branch `fork/python-0.6-qwen-clef` is the one to use. Everything below "Upstream README" is upstream's text, unchanged.
+Branch `fork/dev` is the one to use. Everything below "Upstream README" is upstream's text, unchanged.
 
 ## Run it
 
-On a DGX Spark with Docker and the NVIDIA runtime, two scripts take a fresh clone to a running server:
+Two scripts take a fresh clone to a running server on one DGX Spark. The host needs:
+
+- Docker with the NVIDIA container runtime (`docker run --gpus all` works).
+- `python3`, for the swap endpoint. Its standard library is enough.
+- 281 GB of free disk for both models (99 GB for Qwen alone).
+- `HF_TOKEN` in the environment if Hugging Face refuses or rate-limits a download.
 
 ```bash
-git clone -b fork/python-0.6-qwen-clef https://github.com/outcastofmusic/TensorFold.git && cd TensorFold
-./prepare.sh                  # both models; or ./prepare.sh qwen-flash-next, ./prepare.sh glm-5.3-flash
-./run.sh qwen-flash-next      # or: ./run.sh glm-5.3-flash
+git clone -b fork/dev https://github.com/outcastofmusic/TensorFold.git && cd TensorFold
+./prepare.sh      # download both models; ./prepare.sh qwen-flash-next or ./prepare.sh glm-5.3-flash fetches one
+./run.sh          # serve both on http://127.0.0.1:30000/v1, Qwen loaded first
+curl -s http://127.0.0.1:30000/swap    # {"loaded": "qwen3.8-flash-next", ...} once it is up
 ```
+
+`./run.sh` with no argument runs `./run.sh swap qwen-flash-next`, the setup the numbers below come from. One endpoint
+serves either model, picked by the request's `"model"`. `qwen3.8-flash-next` gets Qwen with Clef-Flash beside it as the
+thinking guard, and `glm-5.3-flash` gets GLM-5.3 Flash alone. Qwen loads first, and a request for the other model swaps
+it in. `./run.sh qwen-flash-next` or `./run.sh glm-5.3-flash` serves one model with
+no swap endpoint. On this branch the think-loop detector is on (`TENSORFOLD_THINK_LOOP`, [TANDEM-EVAL.md](TANDEM-EVAL.md)).
 
 `prepare.sh` downloads the checkpoints into `~/models` (set `MODELS` for another place) at the revisions the numbers
 below were measured on, and converts Qwen's image tower once. Downloads run inside the serving image

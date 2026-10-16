@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Serve one model from this checkout on a DGX Spark, with the settings the fork measured as best (README, "Run it").
 #
+#   ./run.sh                   the default: ./run.sh swap qwen-flash-next, both models on one endpoint, Qwen loaded first
 #   ./run.sh qwen-flash-next   Qwen3.8 Flash Next on 127.0.0.1:30000, with Clef-Flash beside it as the thinking guard
 #   ./run.sh glm-5.3-flash     GLM-5.3 Flash on 127.0.0.1:30000, with its DFlash2 draft model
 #   ./run.sh swap              one endpoint on 127.0.0.1:30000 that loads whichever model a request names (swap.py)
@@ -221,11 +222,12 @@ status() {
 
 command -v docker >/dev/null || die "docker is not installed"
 case "${1:-}" in
+    "")              swap qwen-flash-next ;;
     qwen-flash-next) ask_swap "$1" || qwen ;;
     glm-5.3-flash)   ask_swap "$1" || glm ;;
     swap)            swap "${2:-}" ;;
     stop)            if swapping; then stop_swap; fi
                      stop_all ;;
     status)          status ;;
-    *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
