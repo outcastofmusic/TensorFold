@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import CONTEXT, DRAFTS, RESERVE
+from . import CONTEXT, DRAFTS, WORKSPACE
 
 
 def draft_taps(drafter_dir: str | Path) -> tuple[int, ...]:
@@ -41,6 +41,8 @@ class BoltEngine:
         """``drafter``: a LiLiCorr draft folder ("" decodes serially); ``layers``: only the first layers (tests)."""
         import torch
 
+        from tensorfold.cuda.capacity import available_bytes
+
         from .engine import PREFILL_ROWS, ROWS, A, Engine
         from .weights import Config, load, weight_bytes
 
@@ -51,13 +53,13 @@ class BoltEngine:
         # the CLI passes the model's own window (or 0, which it reads from no llm_config) when --context is absent
         want = int(context) if context_explicit and context else CONTEXT
         self.max_len = -(-(want + ROWS) // A.CHUNK) * A.CHUNK
-        need = weight_bytes(self.model_dir, layers) + cache_bytes(c, self.max_len, ROWS, PREFILL_ROWS) + RESERVE
-        free, _ = torch.cuda.mem_get_info()
+        need = weight_bytes(self.model_dir, layers) + cache_bytes(c, self.max_len, ROWS, PREFILL_ROWS) + WORKSPACE
+        free = available_bytes(torch)                 # a GB10's page cache counts as free; the pool's floor is kept
         gib = 1 << 30
         if need > free:
             raise ValueError(f"Nemotron Bolt needs {need / gib:.1f} GiB on the GPU for its weights and a "
-                             f"{self.max_len}-token context; {free / gib:.1f} GiB is free. Free memory or pass a "
-                             f"smaller --context")
+                             f"{self.max_len}-token context; {free / gib:.1f} GiB is free above the memory floor. "
+                             f"Free memory or pass a smaller --context")
         started = time.perf_counter()
         self.w = load(self.model_dir, layers=layers)
         self.e = Engine(self.w, max_len=self.max_len, taps=taps)
