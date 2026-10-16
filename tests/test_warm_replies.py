@@ -187,3 +187,25 @@ def test_glm_next_turn_renders_through_the_request_path():
     assert prompt == render([*body["messages"], warm.reply_message(result)])[:-1] and born == 3
     assert all(b["tools"] == body["tools"] and b["model"] == "glm" for b in bodies) and len(bodies) == 3
     assert app._next_turn(body, {**result, "prompt_tokens": 50}) is None      # nothing past this turn's own state
+
+
+@pytest.mark.torch
+@pytest.mark.parametrize("finish, warms", [("tool_calls", True), ("length", False)])
+def test_every_glm_request_queues_its_disk_write_and_only_a_finished_chat_reply_a_pass(finish, warms):
+    app_module = importlib.import_module("tensorfold.families.glm5_next.cuda.app")
+    from tensorfold.cuda.server import App
+
+    app = app_module.GlmApp.__new__(app_module.GlmApp)
+    queued = []
+    app.engine = NS(request=NS())
+    app.warmer = NS(finished=lambda: None, queue=queued.append)
+    app.warming = True
+    app._next_turn = lambda body, result: ("pass",)
+    result = {"finish": finish}
+    original = App.run
+    try:
+        App.run = lambda self, body, chat, emit, prepared=None, cancelled=None: result
+        assert app.run({"model": "glm", "messages": [{"role": "user", "content": "hi"}]}, True, lambda d: True) is result
+    finally:
+        App.run = original
+    assert len(queued) == 1 and queued[0]() == (("pass",) if warms else None)

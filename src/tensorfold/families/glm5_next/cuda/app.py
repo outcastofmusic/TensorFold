@@ -75,9 +75,10 @@ class GlmApp(App):
         finally:
             if self.warmer is not None:
                 self.warmer.finished()
-        if self.warmer is not None and chat and result["finish"] in ("stop", "tool_calls") \
-                and body.get("priority") != "background" and not is_title_request(body["messages"], body.get("tools")):
-            self.warmer.queue(lambda: self._next_turn(body, result) if self.warming else None)
+        if self.warmer is not None:       # after every request: its states go to disk even when no pass follows
+            warms = self.warming and chat and result["finish"] in ("stop", "tool_calls") \
+                and body.get("priority") != "background" and not is_title_request(body["messages"], body.get("tools"))
+            self.warmer.queue(lambda: self._next_turn(body, result) if warms else None)
         return result
 
     def _next_turn(self, body: dict[str, Any], result: dict[str, Any]) -> tuple[list[int], int] | None:
