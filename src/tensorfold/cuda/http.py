@@ -90,8 +90,10 @@ def make_handler(app: App):
             if route in ("/metrics", "/v1/metrics"):
                 return metrics.send(self, app)
             if self.path.rstrip("/") in ("/v1/models", "/models"):
-                self._json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "tensorfold"}
-                                                            for model_id in app.model_ids]})
+                reasoning = app.reasoning_info() if hasattr(app, "reasoning_info") else None
+                self._json(200, {"object": "list", "data": [
+                    {"id": model_id, "object": "model", "owned_by": "tensorfold",
+                     **({"reasoning": reasoning} if reasoning is not None else {})} for model_id in app.model_ids]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
                 self._json(200, {"status": "ok"} if getattr(getattr(app, "auth", None), "enabled", False)
                            else health.of(app).snapshot(app))

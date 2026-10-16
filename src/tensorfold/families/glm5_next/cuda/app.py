@@ -19,6 +19,7 @@ class ThinkingOffTemplate:
     def __init__(self, inner, clear: bool | None = None) -> None:
         self.inner = inner
         self.efforts = getattr(inner, "efforts", frozenset())
+        self.thinking_switch = getattr(inner, "thinking_switch", False)
         self.clear = clear_thinking() if clear is None else clear
 
     def render(self, messages, *, tools, enable_thinking, extra=None) -> str:

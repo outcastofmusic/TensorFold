@@ -16,7 +16,7 @@ from tensorfold.server.cancellation import RequestCancelled
 from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
 from tensorfold.server.messages import validate_modalities
 from tensorfold.server.probabilities import TokenBytes, probability_options
-from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
+from tensorfold.server.request_options import _EFFORT_ORDER, heard_effort, parse_numbers, thinking_fields
 from tensorfold.server.stopping import matched_stop, stop_options
 from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
@@ -130,6 +130,23 @@ class App:
             if model_id and model_id not in ids:
                 ids.append(model_id)
         return ids
+
+    def reasoning_info(self) -> dict[str, Any] | None:
+        """``/v1/models``' OpenRouter-style ``reasoning`` for a model that thinks: the thinking default, the server's
+        default effort, and the template's levels highest first, then none where thinking can go off (upstream
+        TensorFold 1.0.12, #819). None for a model that does not think."""
+
+        levels = getattr(self.template, "efforts", frozenset())
+        switch = bool(getattr(self.template, "thinking_switch", False))
+        if not (switch or levels or self.tok.token_to_id("</think>") is not None):
+            return None
+        info: dict[str, Any] = {"default_enabled": bool(self.default_thinking)}
+        default = heard_effort(None, getattr(self, "reasoning_effort", None), levels)
+        if default:
+            info["default_effort"] = default
+        if levels:
+            info["supported_efforts"] = [e for e in _EFFORT_ORDER if e in levels] + (["none"] if switch else [])
+        return info
 
     def reply_model(self, body: Any) -> str:
         """The id a reply names: the one the request asked for when this endpoint answers to it, else ``--name``."""

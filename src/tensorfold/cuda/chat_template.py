@@ -35,6 +35,7 @@ class ChatTemplate:
         env.globals["strftime_now"] = lambda fmt: datetime.now().strftime(fmt)
         self.template = env.from_string(source)
         self.efforts = effort_levels(source)          # the reasoning efforts it names (the Mac reads the same ones)
+        self.thinking_switch = "enable_thinking" in source or "thinking_mode" in source   # thinking can go off
         self.specials = {k: (v.get("content") if isinstance(v, dict) else v)
                          for k, v in cfg.items() if k in ("bos_token", "eos_token", "pad_token", "unk_token")}
         self.late_system = late_system_role(
