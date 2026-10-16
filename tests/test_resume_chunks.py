@@ -64,6 +64,7 @@ def test_a_saved_block_ending_at_a_message_is_warmed_to_its_end(tmp_path) -> Non
     assert [e.tokens for e in app.checkpoints._entries if e.pinned] == [block]
 
 
+@pytest.mark.mlx
 def test_a_follow_up_resumes_at_its_latest_reply_start() -> None:
     from tensorfold.server.scheduler import ChatJob
 
@@ -78,6 +79,7 @@ def test_a_follow_up_resumes_at_its_latest_reply_start() -> None:
     assert sorted(len(e.tokens) for e in store._entries) == [7, 15]
 
 
+@pytest.mark.mlx
 def test_a_start_too_close_to_the_last_is_merged_and_the_checkpoint_falls_back() -> None:
     from tensorfold.server.scheduler import ChatJob
 
@@ -103,6 +105,7 @@ def test_a_stored_prefix_resumes_only_a_prompt_with_a_chunk_start_there() -> Non
     assert engine.prefill_calls[-1] == ("reply", 7)
 
 
+@pytest.mark.mlx
 def test_a_shared_system_block_is_kept_at_the_first_message_after_it() -> None:
     from tensorfold.server.scheduler import ChatJob
 

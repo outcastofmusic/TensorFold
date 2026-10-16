@@ -80,6 +80,7 @@ def scheduler_with(store, budget):
     return Scheduler(engine, lanes=1, eos_ids=frozenset(), checkpoints=store, prompt_memory=memory), engine
 
 
+@pytest.mark.mlx
 def test_admission_never_evicts_the_prefix_a_prompt_resumes():
     prompt = [3] * 64
     store = CheckpointStore(3, copier=refuse_copy, sizer=cache_nbytes)
@@ -95,6 +96,7 @@ def test_admission_never_evicts_the_prefix_a_prompt_resumes():
     assert prompt[:48] not in stored(store)
 
 
+@pytest.mark.mlx
 def test_a_resumed_prefix_is_copied_and_kept_when_memory_allows():
     prompt = [3] * 64
     copies = []
@@ -109,6 +111,7 @@ def test_a_resumed_prefix_is_copied_and_kept_when_memory_allows():
     assert prompt[:48] in stored(store)
 
 
+@pytest.mark.mlx
 def test_a_resumed_prompt_holds_no_reference_to_the_stored_prefix_it_copied():
     import gc
     import weakref
@@ -161,6 +164,7 @@ def test_prefixes_freed_by_admission_do_not_count_as_prefill_workspace():
     assert memory.observed_work == 0
 
 
+@pytest.mark.mlx
 def test_a_prompt_that_fits_only_alone_waits_for_the_running_stream_instead_of_being_refused():
     from tensorfold.engine.lane_engine import LaneStream
 

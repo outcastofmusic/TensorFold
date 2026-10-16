@@ -12,6 +12,7 @@ from tests.test_lane_server import make_app
 from tests.test_server_openai_compat import post_json, serve_fake
 
 
+@pytest.mark.mlx
 def test_http_top_k_minus_one_samples():
     app = make_app()
     server = serve_fake(app)

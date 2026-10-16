@@ -58,6 +58,7 @@ def test_invalid_effort_and_explicit_toggle_precedence():
         server.server_close()
 
 
+@pytest.mark.mlx
 def test_request_effort_reaches_template_without_changing_server_default():
     app = make_app(enable_thinking=False, reasoning_effort="medium")
     try:
@@ -80,6 +81,7 @@ def test_request_effort_reaches_template_without_changing_server_default():
 
 
 @pytest.mark.parametrize("default_effort", ["low", "medium", "xhigh"])
+@pytest.mark.mlx
 def test_explicit_thinking_overrides_none_and_preserves_default(default_effort, monkeypatch):
     app = make_app(enable_thinking=True, reasoning_effort=default_effort)
     app.tokenizer.template_calls.clear()       # the startup probe of the template's roles
@@ -151,6 +153,7 @@ def test_explicit_thinking_overrides_none_and_preserves_default(default_effort, 
     ("", "high", "xhigh"),
     ("", "max", "xhigh"),
 ])
+@pytest.mark.mlx
 def test_a_template_that_names_an_effort_is_given_that_effort(names, effort, want):
     app = make_app(enable_thinking=True)
     app.tokenizer.chat_template = names
@@ -167,6 +170,7 @@ def test_a_template_that_names_an_effort_is_given_that_effort(names, effort, wan
         app.close()
 
 
+@pytest.mark.mlx
 def test_glm_omitted_effort_stays_the_template_default_and_a_medium_default_is_high():
     jinja2 = pytest.importorskip("jinja2")
     from tensorfold.server.request_options import coerce_effort, effort_levels
@@ -208,6 +212,7 @@ def test_glm_omitted_effort_stays_the_template_default_and_a_medium_default_is_h
         plain.close()
 
 
+@pytest.mark.mlx
 def test_no_effort_leaves_the_template_its_own_default():
     app = make_app(enable_thinking=True)                  # no --reasoning-effort: as vLLM and mlx-lm render it
     try:
@@ -231,6 +236,7 @@ def test_no_effort_leaves_the_template_its_own_default():
     ("{# 'xhigh' 'medium' 'low' #}", "medium", "medium"),   # Qwen3.8 names medium: untouched
     ("", "medium", "medium"),                     # a template naming no level keeps the effort as sent
 ])
+@pytest.mark.mlx
 def test_a_medium_the_template_does_not_name_lands_on_the_nearest_named_level(names, effort, want):
     app = make_app(enable_thinking=True)
     app.tokenizer.chat_template = names
@@ -247,6 +253,7 @@ def test_a_medium_the_template_does_not_name_lands_on_the_nearest_named_level(na
         app.close()
 
 
+@pytest.mark.mlx
 def test_medium_reaches_the_template_through_chat_template_kwargs_too():
     app = make_app(enable_thinking=True)
     app.tokenizer.chat_template = "{# 'low' 'high' #}"
@@ -264,6 +271,7 @@ def test_medium_reaches_the_template_through_chat_template_kwargs_too():
         app.close()
 
 
+@pytest.mark.mlx
 def test_the_server_default_effort_uses_the_nearest_named_level():
     """``--reasoning-effort`` goes through the same nearest-level rule as a request."""
 
@@ -327,6 +335,7 @@ def test_nearest_named_effort_direct():
     assert nearest("max", frozenset({"low", "high", "max"})) == "max"
 
 
+@pytest.mark.mlx
 def test_glm_medium_with_thinking_forced_off_reaches_no_effort():
     app = make_app(enable_thinking=True)
     app.tokenizer.chat_template = "{# \x27low\x27 \x27high\x27 #}"
@@ -345,6 +354,7 @@ def test_glm_medium_with_thinking_forced_off_reaches_no_effort():
         app.close()
 
 
+@pytest.mark.mlx
 def test_a_top_level_effort_wins_over_chat_template_kwargs():
     app = make_app(enable_thinking=True)
     app.tokenizer.chat_template = ""                    # names no level: nothing maps

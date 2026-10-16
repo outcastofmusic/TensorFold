@@ -125,6 +125,7 @@ def test_legacy_health_app_keeps_metric_reset(measured_runtime):
     assert metrics["peak"] == peak and runtime.peak == runtime.get_active_memory()
 
 
+@pytest.mark.mlx
 def test_health_reports_the_budget_and_the_process_footprint(measured_runtime):
     _, _, guard = measured_runtime
     with serving(guard) as port:

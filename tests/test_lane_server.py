@@ -220,6 +220,7 @@ def test_choose_checkpoints_keeps_history_and_the_stable_same_conversation_prefi
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.mlx
 def test_chat_returns_the_serial_decode_and_telemetry() -> None:
     app = make_app()
     try:
@@ -238,6 +239,7 @@ def test_chat_returns_the_serial_decode_and_telemetry() -> None:
         app.close()
 
 
+@pytest.mark.mlx
 def test_chat_streams_visible_text_in_order() -> None:
     app = make_app()
     try:
@@ -252,6 +254,7 @@ def test_chat_streams_visible_text_in_order() -> None:
         app.close()
 
 
+@pytest.mark.mlx
 def test_concurrent_chats_share_rounds_and_each_matches_serial() -> None:
     app = make_app(lanes=2, engine_factory=SlowFakeEngine)
     try:
@@ -283,6 +286,7 @@ def test_concurrent_chats_share_rounds_and_each_matches_serial() -> None:
         app.close()
 
 
+@pytest.mark.mlx
 def test_a_title_request_steps_aside_for_the_turn_and_reruns_exactly() -> None:
     app = make_app(lanes=1, engine_factory=SlowFakeEngine)
     try:
@@ -329,6 +333,7 @@ def test_is_title_request_matches_only_short_tool_free_title_prompts() -> None:
     assert not is_title_request([{"role": "user", "content": "a title for my essay?"}], None)
 
 
+@pytest.mark.mlx
 def test_a_title_request_sent_just_before_the_turn_waits_for_it() -> None:
     app = make_app(lanes=1, engine_factory=SlowFakeEngine)
     try:
@@ -359,6 +364,7 @@ def test_a_title_request_sent_just_before_the_turn_waits_for_it() -> None:
         app.close()
 
 
+@pytest.mark.mlx
 def test_a_background_priority_request_steps_aside_like_a_title() -> None:
     app = make_app(lanes=1, engine_factory=SlowFakeEngine)
     try:
@@ -385,6 +391,7 @@ def test_a_background_priority_request_steps_aside_like_a_title() -> None:
         app.close()
 
 
+@pytest.mark.mlx
 def test_second_turn_reuses_the_history_checkpoint() -> None:
     app = make_app(lanes=1, checkpoint_slots=4)
     try:
@@ -411,6 +418,7 @@ def test_second_turn_reuses_the_history_checkpoint() -> None:
         app.close()
 
 
+@pytest.mark.mlx
 def test_finish_checkpoint_serves_a_verbatim_continuation() -> None:
     app = make_app(lanes=1, checkpoint_slots=4)
     try:
@@ -436,6 +444,7 @@ def test_finish_checkpoint_serves_a_verbatim_continuation() -> None:
         app.close()
 
 
+@pytest.mark.mlx
 def test_scheduler_survives_a_failed_round() -> None:
     app = make_app(lanes=1)
     try:
@@ -545,6 +554,7 @@ def test_scheduler_runs_its_stop_hook_in_its_own_thread() -> None:
     assert seen == ["tensorfold-engine"]
 
 
+@pytest.mark.mlx
 def test_checkpoints_and_shared_prefixes_are_taken_on_the_prefill_grid() -> None:
     from tensorfold.engine.prefill_plan import PrefillPlan
     from tensorfold.server.scheduler import ChatJob, Scheduler
@@ -613,6 +623,7 @@ def test_a_stored_state_off_the_grid_is_never_matched() -> None:
     assert engine.prefill_calls[-1] == ("j", 4)
 
 
+@pytest.mark.mlx
 def test_a_job_that_would_not_fit_waits_for_a_live_stream_to_finish() -> None:
     from tensorfold.engine.memory import Admission, StreamMemory
     from tensorfold.server.scheduler import ChatJob, Scheduler

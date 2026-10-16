@@ -9,6 +9,7 @@ TURN = [{"role": "user", "content": "abcdefgh"}, {"role": "assistant", "content"
         {"role": "user", "content": "qrstuvwx"}]
 
 
+@pytest.mark.mlx
 def test_a_prefill_stopped_after_a_checkpoint_resumes_there_on_the_retry():
     app = make_app(lanes=1)
     try:
@@ -31,6 +32,7 @@ def test_a_prefill_stopped_after_a_checkpoint_resumes_there_on_the_retry():
         app.close()
 
 
+@pytest.mark.mlx
 def test_a_stopped_resume_keeps_the_prefix_it_took():
     from tensorfold.server.checkpoints import CheckpointStore
     from tensorfold.server.memory_budget import cache_nbytes

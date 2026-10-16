@@ -7,6 +7,8 @@ import threading
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from tensorfold.engine.memory import Admission, StreamMemory
 from tensorfold.server.checkpoints import CheckpointStore
 from tensorfold.server.errors import RequestError
@@ -146,6 +148,7 @@ def jobs(count: int, prompt: int, reply: int) -> list[ChatJob]:
                     temperature=0.0) for i in range(count)]
 
 
+@pytest.mark.mlx
 def test_a_stream_beside_others_holds_its_next_horizon_not_its_whole_reply():
     scheduler = served(budget=48 * MIB)
     first, second = jobs(2, 300, 6000)
@@ -160,6 +163,7 @@ def test_a_stream_beside_others_holds_its_next_horizon_not_its_whole_reply():
     scheduler.gate = gate
 
 
+@pytest.mark.mlx
 def test_streams_admitted_by_use_take_turns_past_the_budget_and_each_equals_its_solo_run():
     work = jobs(3, 300, 3000)
     scheduler = served(budget=48 * MIB)                 # each reaches 3,300 tokens: 26 MiB; three never fit at once
@@ -170,6 +174,7 @@ def test_streams_admitted_by_use_take_turns_past_the_budget_and_each_equals_its_
     assert scheduler.gate.waits > 0 and scheduler.gate.ends == 0
 
 
+@pytest.mark.mlx
 def test_the_newest_stream_ends_with_a_clear_error_when_even_the_oldest_cannot_grow():
     work = jobs(2, 300, 6000)
     scheduler = served(budget=44 * MIB, lanes=2)        # both admitted; 6,300 tokens is 50 MiB: they can't both finish

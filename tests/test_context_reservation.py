@@ -34,6 +34,7 @@ def test_requested_reply_reserve_one_over_refuses_before_prefix_or_submission(mo
         app.close()
 
 
+@pytest.mark.mlx
 def test_exact_prompt_and_reply_reservation_keeps_requested_limit():
     app = make_app(context_window=10)
     try:
@@ -61,6 +62,7 @@ def test_template_and_thinking_tokens_count_toward_reservation(monkeypatch, thin
         app.close()
 
 
+@pytest.mark.mlx
 def test_omitted_max_tokens_uses_default_capped_by_remaining_context():
     app = make_app(context_window=10, default_max_tokens=12)
     try:
@@ -71,6 +73,7 @@ def test_omitted_max_tokens_uses_default_capped_by_remaining_context():
         app.close()
 
 
+@pytest.mark.mlx
 def test_requested_default_is_explicit_and_refusal_allows_next_request():
     app = make_app(context_window=10, default_max_tokens=12)
     try:
@@ -84,6 +87,7 @@ def test_requested_default_is_explicit_and_refusal_allows_next_request():
         app.close()
 
 
+@pytest.mark.mlx
 def test_unlimited_context_preserves_explicit_reply_limit():
     app = make_app(context_window=0)
     try:
@@ -94,6 +98,7 @@ def test_unlimited_context_preserves_explicit_reply_limit():
 
 
 @pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+@pytest.mark.mlx
 def test_http_requested_reserve_refuses_with_counts_and_next_request_recovers(field):
     app = make_app(context_window=10)
     server = serve_fake(app)

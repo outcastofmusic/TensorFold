@@ -3,6 +3,23 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## 0.7.0 (14 Oct 2026)
+
+The fork's first release: 90 commits on upstream's frozen `python-0.6` branch.
+
+- **Two scripts from a clone to a server.** `prepare.sh` downloads Qwen3.8 Flash Next, Clef-Flash and GLM-5.3 Flash at
+  pinned revisions. `run.sh` serves either model with the measured defaults, and `run.sh swap` starts `swap.py`, one
+  endpoint that loads the model a request names. A switch takes 21 to 24 s.
+- **A thinking guard on the CUDA server.** `--thinking-guard URL` asks a decision model (Clef) whether the reasoning so
+  far holds a complete derivation, at most once every 128 reasoning tokens, and its yes closes the think block. A
+  reply's checks share one decision session, which the reply frees when it ends.
+- **Clef decision models on CUDA.** `/v1/decisions` and `/v1/systemone` answer from a decision model's joint schema
+  head, from bf16 or quantized EXL3 packs.
+- **GLM-5.3 Flash serves the Sushi-experts hybrid**, which `prepare.sh` assembles: stacked routed experts at 2.25 and
+  2.5 bits beside 6-bit group-128 dense weights, with copy drafts and a DFlash2 draft model.
+- **`continue_final_message`** continues the last assistant turn.
+- The serving image installs its dependencies at pinned versions (`run-constraints.txt`).
+
 ## 0.6.6 (6 Oct 2026)
 
 - **`--name-priority ID=background` on the CUDA server.** A request that names that served id (`--name` or an

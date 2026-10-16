@@ -329,6 +329,7 @@ def _serve_to_app(monkeypatch, tmp_path, argv, capsys):
     return made, capsys.readouterr().out
 
 
+@pytest.mark.mlx
 def test_an_omitted_context_is_fitted_to_memory_and_the_banner_shows_the_window(monkeypatch, tmp_path, capsys):
     made, out = _serve_to_app(monkeypatch, tmp_path, [], capsys)
     assert made["fit_context"] is True and made["context_window"] == 262144
@@ -373,6 +374,7 @@ def test_weights_past_the_budget_are_refused_before_loading(monkeypatch, tmp_pat
 
 
 
+@pytest.mark.mlx
 def test_the_27b_draft_slot_counts_its_drafter_context_as_fixed_memory_and_a_copy_as_none():
     import copy
 

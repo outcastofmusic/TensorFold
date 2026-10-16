@@ -76,6 +76,7 @@ def app(budget: int, **kwargs: Any) -> ChatApp:
     return ChatApp(model, FakeTokenizer(), **settings)
 
 
+@pytest.mark.mlx
 def test_the_default_window_is_what_the_budget_affords_after_a_startup_probe():
     # 1 GiB of weights, a 256 MiB workspace floor; 1 KiB of KV a position, its growth and the retained prompt: 128 MiB
     served = app(int(1.375 * 2**30), context_window=262144, fit_context=True)
@@ -90,6 +91,7 @@ def test_the_default_window_is_what_the_budget_affords_after_a_startup_probe():
         served.close()
 
 
+@pytest.mark.mlx
 def test_a_window_already_inside_the_budget_is_kept():
     served = app(int(1.5 * 2**30), context_window=8192, fit_context=True)
     try:
@@ -98,11 +100,13 @@ def test_a_window_already_inside_the_budget_is_kept():
         served.close()
 
 
+@pytest.mark.mlx
 def test_an_explicit_window_past_the_budget_is_refused_at_startup_naming_one_that_fits():
     with pytest.raises(ValueError, match=r"262,144-token context window.*most one request can use is [\d,]+ tokens"):
         app(int(1.5 * 2**30), context_window=262144)
 
 
+@pytest.mark.mlx
 def test_weights_that_leave_no_room_refuse_to_start():
     with pytest.raises(ValueError, match="no room") as error:
         app(2**30 + 2**20, context_window=0, fit_context=True)
@@ -110,6 +114,7 @@ def test_weights_that_leave_no_room_refuse_to_start():
 
 
 @pytest.mark.parametrize("ceiling_gib, raise_it", [(64, True), (1, False)])
+@pytest.mark.mlx
 def test_the_refusal_names_the_budget_that_would_fit_and_this_macs_ceiling(ceiling_gib, raise_it, monkeypatch):
     from tensorfold.server import memory_budget
 
@@ -124,6 +129,7 @@ def test_the_refusal_names_the_budget_that_would_fit_and_this_macs_ceiling(ceili
     assert ("Serve it on a Mac with more memory" in message) is not raise_it
 
 
+@pytest.mark.mlx
 def test_without_prompt_retention_the_default_window_reserves_no_retained_copy():
     served = app(int(1.375 * 2**30), context_window=262144, fit_context=True, checkpoint_slots=0)
     try:
@@ -142,6 +148,7 @@ class Rows:
         LIVE.add(self)
 
 
+@pytest.mark.mlx
 def test_a_finished_rounds_rollback_rows_go_before_the_next_prompt_is_sized():
     """#95: what the engine keeps from its last round belongs to no live stream once the reply ends. The next prompt
     near the promised window is admitted and kept (the startup promise) only if those rows go first."""
@@ -167,6 +174,7 @@ def test_a_finished_rounds_rollback_rows_go_before_the_next_prompt_is_sized():
         served.close()
 
 
+@pytest.mark.mlx
 def test_every_prompt_inside_the_advertised_window_is_admitted_and_a_refusal_counts_only_what_stays():
     served = app(int(1.375 * 2**30), context_window=262144, fit_context=True)
     try:
@@ -190,6 +198,7 @@ def test_every_prompt_inside_the_advertised_window_is_admitted_and_a_refusal_cou
         served.close()
 
 
+@pytest.mark.mlx
 def test_the_default_prompt_cache_takes_what_a_whole_window_request_leaves_idle():
     served = app(2**31, context_window=65536, checkpoint_budget_bytes=2**20, grow_checkpoints=True)   # 0.625 GiB idle
     try:

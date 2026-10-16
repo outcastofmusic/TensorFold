@@ -30,6 +30,7 @@ def stream(server, text, out):
     conn.close()
 
 
+@pytest.mark.mlx
 def test_a_failed_round_is_reported_as_an_error_and_releases_the_streams():
     app = make_app(lanes=2, engine_factory=SlowFakeEngine)
     step = app.engine.step

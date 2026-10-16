@@ -4,6 +4,8 @@ import io
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from tensorfold.server import live
 from tensorfold.server.live import CLEAR, ChunkRate, LiveLine, Meter, snapshot, status
 
@@ -91,6 +93,7 @@ def test_it_stays_off_without_a_terminal_or_when_turned_off(monkeypatch):
     assert live.start(sched) is None
 
 
+@pytest.mark.mlx
 def test_the_scheduler_meters_a_served_request():
     app = make_app(lanes=2)
     try:

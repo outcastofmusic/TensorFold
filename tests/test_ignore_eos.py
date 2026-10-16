@@ -110,6 +110,7 @@ def test_ignore_eos_rejects_non_booleans_before_stream_headers(route, stream, va
 @pytest.mark.parametrize("route", ROUTES)
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("user_stop", [False, True])
+@pytest.mark.mlx
 def test_native_fake_engine_ignore_eos_matches_serial(monkeypatch, route, stream, user_stop):
     from tensorfold.server import app as app_module
 

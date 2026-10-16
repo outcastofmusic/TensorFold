@@ -42,6 +42,7 @@ def parse(*extra):
     return cli.build_parser().parse_args(["serve", "some/model", *extra])
 
 
+@pytest.mark.mlx
 def test_the_plan_takes_the_chosen_step_and_cuts_replies_256_apart(monkeypatch):
     seen = {}
 

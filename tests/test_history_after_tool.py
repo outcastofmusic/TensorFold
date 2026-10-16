@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+import pytest
+
 from tensorfold.server.checkpoints import choose_checkpoints
 from tensorfold.server.prompt_blocks import PromptBlocks
 
@@ -47,6 +49,7 @@ def test_a_prompt_continuing_after_a_tool_result_gets_a_boundary_one_short_of_it
     assert choose_checkpoints(history_len, 0, None, prompt) == [len(prompt) - 1]
 
 
+@pytest.mark.mlx
 def test_a_continued_turn_resumes_from_the_boundary_and_matches_a_fresh_reply() -> None:
     """The next step after a tool result reuses that boundary and matches a fresh decode."""
 

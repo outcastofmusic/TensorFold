@@ -223,12 +223,14 @@ def backend(mx, monkeypatch):
 @pytest.mark.parametrize("bits,gs,rows,kind", [(4, 64, 1, ("fast", 64)), (4, 32, 4, ("fast", 32)),
                                             (4, 64, 7, ("fragments",)), (4, 128, 1, ("generic", 128, 4)),
                                             (3, 32, 7, ("generic", 32, 3)), (8, 64, 16, ("generic", 64, 8))])
+@pytest.mark.mlx
 def test_existing_fast_paths_and_new_formats_dispatch_separately(backend, bits, gs, rows, kind):
     module = Linear(bits=bits, gs=gs)
     assert backend.api["project"](module, Array((1, rows, 128))).shape == (1, rows, 8)
     assert backend.calls == [kind]
 
 
+@pytest.mark.mlx
 def test_prepare_keeps_four_bit_checks_and_warms_generic_formats(backend):
     modules = [Linear(bits=4), Linear(bits=6, gs=32), Linear(bits=8, gs=128)]
     backend.api["BACKEND"].prepare([(m.weight, m.scales, m.biases, m.group_size, m.bits) for m in modules])
@@ -236,6 +238,7 @@ def test_prepare_keeps_four_bit_checks_and_warms_generic_formats(backend):
     assert backend.simd.mma_one_row == {(8, 128, 64)}
 
 
+@pytest.mark.mlx
 def test_backend_preserves_legacy_five_argument_four_bit_callbacks(backend):
     calls = []
 
@@ -249,6 +252,7 @@ def test_backend_preserves_legacy_five_argument_four_bit_callbacks(backend):
     assert calls == [("x", "w", "s", "b", 64), ("x", "w", "s", "b", 32)]
 
 
+@pytest.mark.mlx
 def test_stacks_do_not_combine_bit_widths_or_quantization_groups(backend):
     stackable, target = backend.api["_stackable"], backend.api["BACKEND"]
     assert stackable([Linear(bits=6), Linear(bits=6)], target)
@@ -257,6 +261,7 @@ def test_stacks_do_not_combine_bit_widths_or_quantization_groups(backend):
     assert not stackable([Linear(dtype="bf16"), Linear(dtype="f16")], target)
 
 
+@pytest.mark.mlx
 def test_stack_keeps_explicit_bits_and_detects_changed_member_format(backend):
     members = [Linear(bits=5), Linear(bits=5)]
     stack = backend.api["Stack"](members)
@@ -267,6 +272,7 @@ def test_stack_keeps_explicit_bits_and_detects_changed_member_format(backend):
     assert not stack.valid()
 
 
+@pytest.mark.mlx
 def test_direct_stack_construction_rejects_mixed_formats(backend):
     with pytest.raises(ValueError, match="share their bit width"):
         backend.api["Stack"]([Linear(bits=4), Linear(k=64, bits=8)])

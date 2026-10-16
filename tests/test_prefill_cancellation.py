@@ -10,6 +10,7 @@ from tensorfold.server.cancellation import Cancellation, PrefillGuard, RequestCa
 from tests.lane_fakes import FakeEngine, fake_serial
 
 
+@pytest.mark.mlx
 def test_cancellation_after_evaluated_first_chunk_prevents_next_model_chunk(monkeypatch):
     engine = FakeEngine()
     engine.prefill_step = 4
@@ -47,6 +48,7 @@ def test_guard_keeps_memory_admission_and_checkpoint_policy():
     assert calls == ["before", "after"]
 
 
+@pytest.mark.mlx
 def test_canceling_held_job_wakes_waiter_without_prefill_or_harming_active_job():
     engine = FakeEngine()
     full = SimpleNamespace(admits=lambda *args: False)      # memory for one stream only: the second is held
@@ -64,6 +66,7 @@ def test_canceling_held_job_wakes_waiter_without_prefill_or_harming_active_job()
 
 
 @pytest.mark.parametrize("joined", [False, True])
+@pytest.mark.mlx
 def test_engine_discards_only_canceled_row_and_preserves_survivor_tokens(joined):
     engine = FakeEngine()
     canceled = LaneStream("canceled", [1, 2], 8, eos_ids=frozenset({-1}))

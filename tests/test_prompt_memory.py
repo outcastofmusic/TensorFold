@@ -12,6 +12,7 @@ from tests.test_memory_budget import Array
 from tests.lane_fakes import FakeEngine
 
 
+@pytest.mark.mlx
 def test_prefill_guard_can_refuse_after_one_existing_chunk():
     engine = FakeEngine()
     engine.prefill_step = 4
@@ -451,6 +452,7 @@ def test_scheduler_refuses_before_copying_a_retained_prefix_or_running_prefill()
     assert engine.prefill_guard is None
 
 
+@pytest.mark.mlx
 def test_oversized_disk_snapshot_is_skipped_before_tensor_load(monkeypatch, tmp_path):
     from tensorfold.engine import prefix_snapshots
 
@@ -667,6 +669,7 @@ def test_sizing_releases_the_probes_last_round_before_measuring_the_model():
     assert memory.largest_window(8192) > 0
 
 
+@pytest.mark.mlx
 def test_nemotron_releases_its_last_rounds_row_states():
     from tensorfold.families.nemotron_h.model import NemotronH
 
@@ -678,6 +681,7 @@ def test_nemotron_releases_its_last_rounds_row_states():
 
 
 @pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.mlx
 def test_flash_next_sizing_releases_probe_rows_and_draft_references(fused):
     import weakref
 

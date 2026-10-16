@@ -77,6 +77,7 @@ def serve(instance):
     return server
 
 
+@pytest.mark.mlx
 def test_callback_disconnect_stops_active_generation_and_recovers():
     instance = app()
     try:
@@ -95,6 +96,7 @@ def test_callback_disconnect_stops_active_generation_and_recovers():
         instance.close()
 
 
+@pytest.mark.mlx
 def test_live_consumer_still_receives_the_complete_reply():
     instance = app()
     try:
@@ -107,6 +109,7 @@ def test_live_consumer_still_receives_the_complete_reply():
         instance.close()
 
 
+@pytest.mark.mlx
 def test_queued_socket_disconnects_are_removed_before_prefill():
     instance = app()
     instance.engine.release.clear()
@@ -136,6 +139,7 @@ def test_queued_socket_disconnects_are_removed_before_prefill():
         instance.close()
 
 
+@pytest.mark.mlx
 def test_streaming_socket_disconnect_during_decode_releases_the_active_row():
     instance = app()
     server = serve(instance)
@@ -160,6 +164,7 @@ def test_streaming_socket_disconnect_during_decode_releases_the_active_row():
 
 
 @pytest.mark.parametrize("stream", [True, False])
+@pytest.mark.mlx
 def test_socket_disconnect_in_prefill_stops_before_next_chunk(stream):
     instance = app()
     instance.engine.release.clear()

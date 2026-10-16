@@ -14,6 +14,7 @@ from tensorfold.server.scheduler import ChatJob, Scheduler
 from tests.test_lane_server import SlowFakeEngine, expected_reply, make_app
 
 
+@pytest.mark.mlx
 def test_background_job_keeps_running_when_a_lane_is_free():
     app = make_app(lanes=2, engine_factory=SlowFakeEngine)
     try:

@@ -27,8 +27,15 @@ def _tensor_units() -> bool:
         return False
 
 
+_HAS_MLX = True
+
+
 def pytest_configure(config: pytest.Config) -> None:
+    global _HAS_MLX
     config.addinivalue_line("markers", "torch: needs PyTorch (the CUDA backend's code); skipped where it isn't installed")
+    config.addinivalue_line("markers", "mlx: needs MLX (the Mac backend's code); skipped where it isn't installed")
+    # read before collection: test_affine_rows.py puts a stub mlx.core in sys.modules, which find_spec would then see
+    _HAS_MLX = importlib.util.find_spec("mlx") is not None
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -37,6 +44,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for item in items:
             if item.get_closest_marker("torch") is not None:
                 item.add_marker(no_torch)
+    if not _HAS_MLX:
+        no_mlx = pytest.mark.skip(reason="needs MLX (the Mac backend's code)")
+        for item in items:
+            if item.get_closest_marker("mlx") is not None:
+                item.add_marker(no_mlx)
     if _tensor_units():
         return
     skip = pytest.mark.skip(reason="needs Metal 4 tensor units (an M5-generation GPU)")

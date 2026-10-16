@@ -87,6 +87,7 @@ def test_choose_rows_matches_choose_row_by_row_alone_or_batched():
         assert [choose_rows(values[r:r + 1], ids[r:r + 1], positions[r:r + 1], s)[0] for r in range(rows)] == want
 
 
+@pytest.mark.mlx
 def test_nucleus_without_top_k_matches_the_whole_vocabulary_draw():
     """top_k 0: the fast nucleus (GPU candidates + normalizer) draws what sorting every logit draws."""
 

@@ -147,6 +147,7 @@ def test_native_context_and_sampling_defaults(tmp_path):
     assert _generation_config(tmp_path)["temperature"] == 0.0
 
 
+@pytest.mark.mlx
 def test_context_override_cannot_exceed_model_window(tmp_path, monkeypatch, capsys):
     model = tmp_path / "model"
     model.mkdir()
@@ -264,6 +265,7 @@ def test_models_lists_the_tested_checkpoints(capsys):
         assert f"kernels  {folder}" in out
 
 
+@pytest.mark.mlx
 def test_every_family_names_an_importable_kernel_version():
     for family in families.families().values():
         package = family.package
@@ -289,6 +291,7 @@ def test_info_reads_a_local_config(tmp_path, capsys):
     assert main(["info", str(write_checkpoint(tmp_path / "eight", 8, 64, mtp=True))]) == 0
 
 
+@pytest.mark.mlx
 def test_serve_finishes_a_config_only_cache_before_loading(tmp_path, monkeypatch, capfd):
     from tensorfold.families import qwen4_exp
 

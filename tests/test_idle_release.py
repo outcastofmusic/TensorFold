@@ -6,6 +6,8 @@ import threading
 import time
 from typing import Any
 
+import pytest
+
 from tensorfold.server.app import ChatApp
 from tests.lane_fakes import FakeEngine
 from tests.test_lane_server import FakeTokenizer
@@ -34,6 +36,7 @@ def settle(app: ChatApp, clears: list[Any], count: int) -> None:
         time.sleep(0.01)
 
 
+@pytest.mark.mlx
 def test_a_stream_finishing_beside_another_leaves_the_cache_until_the_engine_is_idle() -> None:
     clears: list[tuple[str, int]] = []
     app = served(clears)

@@ -119,7 +119,7 @@ def test_a_request_waits_while_a_stream_waits_and_starts_alone_regardless(alloca
     old.waiting = True
     dec.streams = {0: old}
     with pytest.raises(gate.NoRoom, match="wait"):
-        dec.admit(SimpleNamespace(prompt=[1] * 300, count=10, draft=False))
+        dec.admit(SimpleNamespace(prompt=[1] * 300, count=10, draft=False, splice=None))
     assert dec.free == []                                              # nothing taken
     dec.streams = {}
     st = state.State(weights(), 256, 4, "bf16", limit=65536)

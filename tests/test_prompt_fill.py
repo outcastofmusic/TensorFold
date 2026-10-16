@@ -68,6 +68,7 @@ def _solo(job: ChatJob) -> bool:
     return job.error is None and _tokens(job) == fake_serial(job.prompt_ids, job.max_tokens, {-1})
 
 
+@pytest.mark.mlx
 def test_rounds_run_between_prompt_chunks_and_every_stream_equals_its_solo_run():
     scheduler = Scheduler(GridEngine(), lanes=4, eos_ids=frozenset({-1}))
     scheduler.decode_share, scheduler.fill_rounds = 1e9, 2         # exactly two rounds between two chunks
@@ -82,6 +83,7 @@ def test_rounds_run_between_prompt_chunks_and_every_stream_equals_its_solo_run()
     assert [len(r) for r in between] == [2] * (len(marks) - 2) and all("live" in r[1] for rs in between for r in rs)
 
 
+@pytest.mark.mlx
 def test_the_rounds_take_their_share_of_the_chunks_time():
     clock = {"t": 0.0}
     engine = GridEngine()
@@ -103,6 +105,7 @@ def test_the_rounds_take_their_share_of_the_chunks_time():
     assert _tokens(live) == fake_serial([5, 6], 80, {-1}) and _tokens(long) == fake_serial(long.prompt_ids, 4, {-1})
 
 
+@pytest.mark.mlx
 def test_a_short_prompt_arriving_mid_fill_starts_at_the_next_chunk_and_answers_first():
     scheduler = Scheduler(GridEngine(), lanes=4, eos_ids=frozenset({-1}))
     scheduler.decode_share, scheduler.fill_rounds = 1e9, 1
@@ -122,6 +125,7 @@ def test_a_short_prompt_arriving_mid_fill_starts_at_the_next_chunk_and_answers_f
     assert all(_solo(job) for job in jobs)
 
 
+@pytest.mark.mlx
 def test_the_age_guard_bounds_a_long_prompts_wait_under_endless_short_prompts():
     """No starvation: between two of a prompt's chunks at most fill_guard + open prompts - 1 others run."""
 
@@ -144,6 +148,7 @@ def test_the_age_guard_bounds_a_long_prompts_wait_under_endless_short_prompts():
     assert all(_solo(job) for job in jobs[1:])
 
 
+@pytest.mark.mlx
 def test_a_cancelled_prompt_keeps_its_own_progress_while_another_fills_between_its_chunks():
     store = CheckpointStore(8, copier=GridEngine.copy_single_cache)
     engine = GridEngine()
@@ -166,6 +171,7 @@ def test_a_cancelled_prompt_keeps_its_own_progress_while_another_fills_between_i
     assert engine.prefill_calls[-1] == ("retry", 8) and _solo(retry)          # resumed there, equal to fresh
 
 
+@pytest.mark.mlx
 def test_a_prompt_waiting_for_its_first_chunk_resumes_from_what_an_earlier_prompt_stored_meanwhile():
     store = CheckpointStore(8, copier=GridEngine.copy_single_cache)
     engine = GridEngine()
@@ -185,6 +191,7 @@ def test_a_prompt_waiting_for_its_first_chunk_resumes_from_what_an_earlier_promp
     assert engine.prefill_calls == [("first", 0), ("second", 12)] and _solo(first) and _solo(second)
 
 
+@pytest.mark.mlx
 def test_a_prompt_cancelled_before_its_first_chunk_ends_without_one():
     engine = GridEngine()
     scheduler = Scheduler(engine, lanes=3, eos_ids=frozenset({-1}))
@@ -200,6 +207,7 @@ def test_a_prompt_cancelled_before_its_first_chunk_ends_without_one():
     assert [who for who, _ in engine.prefill_calls] == ["short"]
 
 
+@pytest.mark.mlx
 def test_a_prompt_cancelled_between_chunks_stops_there_and_keeps_its_progress():
     store = CheckpointStore(4, copier=lambda c: c)
     scheduler = Scheduler(GridEngine(), lanes=2, eos_ids=frozenset({-1}), checkpoints=store)
@@ -218,6 +226,7 @@ def test_a_prompt_cancelled_between_chunks_stops_there_and_keeps_its_progress():
     assert not scheduler._fills and all(s.stream_id != "long" for s, _ in scheduler.engine._live)
 
 
+@pytest.mark.mlx
 def test_a_foreground_prompt_fills_before_a_background_one_beside_it_without_stopping_it():
     scheduler = Scheduler(GridEngine(), lanes=3, eos_ids=frozenset({-1}))
     scheduler.decode_share, scheduler.fill_rounds = 1e9, 1
@@ -237,6 +246,7 @@ def test_a_foreground_prompt_fills_before_a_background_one_beside_it_without_sto
     assert all(_solo(job) for job in jobs)
 
 
+@pytest.mark.mlx
 def test_a_waiting_foreground_prompt_stops_a_background_prefill_between_chunks_when_no_lane_is_free():
     scheduler = Scheduler(GridEngine(), lanes=2, eos_ids=frozenset({-1}))
     scheduler.decode_share, scheduler.fill_rounds = 1e9, 1
@@ -258,6 +268,7 @@ def test_a_waiting_foreground_prompt_stops_a_background_prefill_between_chunks_w
     assert _tokens(live) == fake_serial([5, 6], 40, {-1})
 
 
+@pytest.mark.mlx
 def test_a_job_that_fits_only_without_an_open_prompt_waits_for_it_and_is_not_refused():
     from tensorfold.engine.memory import Admission, StreamMemory
 
@@ -281,6 +292,7 @@ def test_a_job_that_fits_only_without_an_open_prompt_waits_for_it_and_is_not_ref
     assert [f.job for f in scheduler._fills] == [waiting] and scheduler._held is None
 
 
+@pytest.mark.mlx
 def test_an_open_prompt_waits_while_streams_hold_its_memory_and_finishes_after_them_instead_of_failing():
     from tensorfold.server.prompt_memory import PromptMemory
     from tests.test_prompt_memory import Runtime
@@ -332,6 +344,7 @@ def test_a_prompt_takes_a_pass_only_while_no_other_prompt_is_open():
     assert filled([ChatJob("a", prompt, 4, 0.0), ChatJob("b", other, 4, 0.0)]) == []   # beside another: a chunk a forward
 
 
+@pytest.mark.mlx
 def test_decode_share_zero_prefills_each_prompt_whole_before_any_round_as_before():
     scheduler = Scheduler(GridEngine(), lanes=4, eos_ids=frozenset({-1}), decode_share=0)
     live = ChatJob("live", [5, 6], 30, 0.0)

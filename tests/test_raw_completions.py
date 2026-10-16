@@ -1,5 +1,7 @@
 """A text completion reads its prompt raw, as vLLM and mlx_lm do: no chat template and no think block."""
 
+import pytest
+
 from tests.test_lane_server import make_app
 from tests.test_server_openai_compat import FakeApp, post_json, serve_fake
 
@@ -35,6 +37,7 @@ def test_a_completion_that_sends_messages_stays_a_chat():
     assert app.prompt is None and app.messages == [{"role": "user", "content": "Hi"}]
 
 
+@pytest.mark.mlx
 def test_the_engine_gets_exactly_the_encoded_prompt():
     app = make_app()
     try:
