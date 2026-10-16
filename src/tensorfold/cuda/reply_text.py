@@ -9,7 +9,7 @@ from typing import Any
 
 from tensorfold.server.stopping import StopPolicy
 from tensorfold.server.tools import parse_glm_tool_call_block
-from tensorfold.tool_parameters import decode_parameter, parameter_schemas
+from tensorfold.tool_parameters import closed_json, decode_parameter, parameter_schemas
 
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
@@ -156,3 +156,39 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
 
 
 # -- chat template -------------------------------------------------------------------------
+
+
+def _arguments_close(body: str) -> str:
+    """What a call's arguments lack to close: ``</function>``, a GLM value's ``</arg_value>``, or JSON's brackets."""
+
+    if body.lower().startswith("<function="):
+        return "" if body.lower().endswith("</function>") else "</function>"
+    value = body.rfind("<arg_value>")
+    if value >= 0 and body.rfind("</arg_value>") < value:
+        return "</arg_value>"
+    if not body or body[0] not in "{[":
+        return ""
+    closed = closed_json(body)
+    return closed[len(body):] if closed is not None else ""
+
+
+def close_call(text: str, tools: list[dict[str, Any]]) -> str:
+    """What closes the call ``text`` ends inside, for a reply the model's end token ended before ``</tool_call>``:
+    "" unless the closed call parses whole, one call to an offered tool and nothing but its markup (upstream
+    TensorFold 1.0.9, #761). An opener whose closer follows is a whole call already."""
+
+    if not tools:
+        return ""
+    low, at, start = text.lower(), 0, None
+    while (opener := low.find(_CALL_OPEN, at)) >= 0:
+        closer = low.find(_CALL_CLOSE, opener + len(_CALL_OPEN))
+        if closer < 0:
+            start = opener
+            break
+        at = closer + len(_CALL_CLOSE)
+    if start is None:
+        return ""
+    block = text[start + len(_CALL_OPEN):]
+    tail = _arguments_close(block.strip())
+    content, calls = parse_tool_calls(_CALL_OPEN + block + tail + _CALL_CLOSE, tools, max_calls=1)
+    return tail + _CALL_CLOSE if calls and len(calls) == 1 and not content.strip() else ""

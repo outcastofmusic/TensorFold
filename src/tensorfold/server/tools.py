@@ -147,6 +147,32 @@ def _loose_tool_arguments(payload: dict[str, Any], explicit: Any) -> Any:
 # GLM-4.5 and later (GLM-5.3-Flash): <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>
 _GLM_ARG_RE = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
 _GLM_NAME_RE = re.compile(r"[\w.:-]+")
+_GLM_TAG_RE = re.compile(r"</?arg_(?:key|value)>")
+
+
+def repair_glm_keys(block: str) -> str:
+    """A GLM call whose ``<arg_key>`` the model wrote as whitespace gets it back before the word ahead of each lone
+    ``</arg_key>``; any other block comes back as written (upstream TensorFold 1.0.9, #761)."""
+
+    if block.count("</arg_key>") <= block.count("<arg_key>"):
+        return block
+    out: list[str] = []
+    copied, prev, prev_end = 0, None, 0
+    for tag in _GLM_TAG_RE.finditer(block):
+        if tag.group(0) == "</arg_key>" and prev in (None, "</arg_value>"):
+            end = tag.start()
+            while end > prev_end and block[end - 1].isspace():
+                end -= 1
+            word = end
+            while word > prev_end and not block[word - 1].isspace():
+                word -= 1
+            # no word, or (before any tag) no name left ahead of the word: not a key to put back
+            if word == end or (prev is None and not block[prev_end:word].strip()):
+                return block
+            out += [block[copied:word], "<arg_key>"]
+            copied = word
+        prev, prev_end = tag.group(0), tag.end()
+    return "".join(out) + block[copied:]
 
 
 def parse_glm_tool_call_block(block: str, tools: Any, *, complete: bool = False) -> tuple[str, dict[str, Any]] | None:
@@ -159,7 +185,7 @@ def _parse_glm_payload(block: str, schemas: dict[str, dict[str, Any]] | None, *,
                        complete: bool = False) -> tuple[str, dict[str, Any]] | None:
     """A GLM call (the bare name without arguments), values decoded as Qwen's so a history renders as written."""
 
-    name, found, rest = block.partition("<arg_key>")
+    name, found, rest = repair_glm_keys(block).partition("<arg_key>")
     name = name.strip()
     if _GLM_NAME_RE.fullmatch(name) is None:
         return None
