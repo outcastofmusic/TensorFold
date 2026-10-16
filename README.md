@@ -128,7 +128,7 @@ tensorfold serve ~/models/Qwen3.8-Flash-Next-exl3-3.05bpw --port 30000 --paralle
 
 A request turns the guard off with `"thinking_guard": false` and sets its own budget with `"thinking_budget"`. GLM-5.3
 Flash leaves 8 GiB free on a Spark, so Clef-Flash (18 GB) cannot run beside it. `./run.sh qwen-flash-next` starts both
-servers with these flags.
+servers with these flags. `./run.sh glm-5.3-flash` serves GLM with `--thinking-budget 8000` and no guard.
 
 ## Credits
 
