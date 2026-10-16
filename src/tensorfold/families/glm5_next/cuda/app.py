@@ -30,6 +30,7 @@ class ThinkingOffTemplate:
 
 class GlmApp(App):
     reads_ignore_eos = True             # ``run`` hands it to the engine's request
+    warmer: warm.Warmer | None = None   # the next turn's background prefill (``warm``), on one rank
 
     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
         super().__init__(engine, model_dir, served, **kwargs)

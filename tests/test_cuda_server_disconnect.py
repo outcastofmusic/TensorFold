@@ -33,6 +33,9 @@ class TextTokenizer:
     def decode(self, ids, **kwargs):
         return "".join(chr(c) for c in ids)
 
+    def token_to_id(self, text):
+        return None                                 # no added tokens, as the real tokenizer answers for one it lacks
+
 
 class PacedEngine:
     """One token a round from ``text`` (then "x"); ``hold_at`` pauses every request at that round until

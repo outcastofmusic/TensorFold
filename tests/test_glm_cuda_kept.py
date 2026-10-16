@@ -16,6 +16,7 @@ pytestmark = pytest.mark.torch
 class Snap:
     def __init__(self, ids, need, states=5):
         self.ids, self.need, self.states, self.rows, self.nbytes = list(ids), need, states, None, 0
+        self.born = -1                     # decode.Snapshot's: a request's own state
 
 
 @pytest.fixture
