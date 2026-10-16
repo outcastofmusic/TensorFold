@@ -158,6 +158,25 @@ def _format(text: Any) -> dict[str, Any] | None:
     raise RequestError("text.format must be text, json_object or json_schema")
 
 
+# OpenAI's include values: each asks for output this server has none of (reasoning comes as text, nothing is encrypted)
+INCLUDE_VALUES = ("code_interpreter_call.outputs", "computer_call_output.output.image_url", "file_search_call.results",
+                  "message.input_image.image_url", "message.output_text.logprobs", "reasoning.encrypted_content",
+                  "web_search_call.action.sources", "web_search_call.results")
+
+
+def _include(given: Any) -> None:
+    """``include`` of OpenAI's values accepted and ignored, as clients send some by habit; others refused by name
+    (upstream TensorFold 1.0.9, #759)."""
+
+    if given is None:
+        return
+    if not isinstance(given, list) or not all(isinstance(v, str) for v in given):
+        raise RequestError("include must be a list of strings")
+    unknown = [repr(v) for v in given if v not in INCLUDE_VALUES]
+    if unknown:
+        raise RequestError(f"include has no value {', '.join(unknown)}: the values are {', '.join(INCLUDE_VALUES)}")
+
+
 def translate(body: Any, store: Store) -> Request:
     """A Responses request as the chat completion that runs it; RequestError where it asks what this server lacks."""
 
@@ -167,9 +186,7 @@ def translate(body: Any, store: Store) -> Request:
     for name, reason in REFUSED.items():
         if body.get(name):
             raise RequestError(reason)
-    if body.get("include"):
-        raise RequestError(f"include is not supported ({', '.join(map(str, body['include']))}): reasoning comes as "
-                           "text in its reasoning item, and nothing is encrypted")
+    _include(body.get("include"))
     if body.get("truncation") not in (None, "disabled"):
         raise RequestError('truncation must be "disabled": a prompt too long for the context is refused')
     if body.get("top_logprobs"):

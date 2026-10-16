@@ -8,6 +8,7 @@ import threading
 import pytest
 
 from tensorfold.server import responses
+from tensorfold.server.responses_translate import INCLUDE_VALUES
 from tensorfold.server.errors import RequestError
 from tests.test_cuda_admission import http_server
 from tests.test_cuda_tool_choice import END, TOOLS, Engine, Tokens, app_for
@@ -166,7 +167,8 @@ def test_tools_choices_and_formats_as_chat_completion_fields():
     ({"tools": [{"type": "file_search", "vector_store_ids": ["v"]}]}, "tools of type 'file_search'"),
     ({"tool_choice": {"type": "web_search_preview"}}, "tool_choice must be"),
     ({"background": True}, "background responses"),
-    ({"include": ["reasoning.encrypted_content"]}, "include is not supported (reasoning.encrypted_content)"),
+    ({"include": ["reasoning.secret"]}, "include has no value 'reasoning.secret'"),
+    ({"include": "reasoning.encrypted_content"}, "include must be a list of strings"),
     ({"conversation": "conv_1"}, "conversations are not supported"),
     ({"prompt": {"id": "pmpt_1"}}, "prompt templates"),
     ({"truncation": "auto"}, "truncation"),
@@ -186,6 +188,11 @@ def test_what_this_server_lacks_is_a_clear_400(body, words):
     with pytest.raises(RequestError, match=None) as caught:
         responses.translate({"input": "hi", **body}, responses.Store())
     assert words in str(caught.value)
+
+
+def test_openai_include_values_are_accepted_and_ignored():
+    request = responses.translate({"input": "hi", "include": list(INCLUDE_VALUES)}, responses.Store())
+    assert "include" not in request.chat
 
 
 # -- replies ------------------------------------------------------------------------------------
