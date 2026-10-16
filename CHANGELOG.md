@@ -3,6 +3,13 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## Unreleased
+
+- **GLM-5.3 Flash writes a gate's cut into its live stream.** When a thinking budget or a loop gate cuts a reply,
+  the cut's tokens join the running decode as forced drafts, so the reply is not prefilled again. Each cut's prefill
+  fell from 6.5 to 6.9 s to 0.18 to 0.47 s on one DGX Spark on 17 Oct 2026. Replies with no cut keep their tokens.
+  A single rank only; two ranks keep the old path.
+
 ## 0.8.0 (16 Oct 2026)
 
 Measured on one DGX Spark on 16 Oct 2026.
