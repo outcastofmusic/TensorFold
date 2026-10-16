@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import time
+from typing import Sequence
 
 import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 
 from . import dflash2
-from .decode import DecodeResult, DepthPolicy, Engine, _fed, _sync, absorb, draft
+from .decode import DecodeResult, DepthPolicy, Engine, Splice, _fed, _sync, absorb, draft
 from .forward import commit
 
 
@@ -73,11 +74,14 @@ class DrafterChoice:
 def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
                 choice: DrafterChoice | None,
                 m_policy: DepthPolicy, f_policy: DepthPolicy, stop_eos: bool = False, on_tokens=None,
-                copies=None) -> DecodeResult:
+                copies=None, splice: Splice | None = None,
+                  lead: Sequence[int] = ()) -> DecodeResult:
     """Drafted decoding with ``choice`` picking each round's drafter; drafts only propose, so it equals serial.
 
     ``copies`` (a ``CopyIndex`` of the prompt and reply): where the reply repeats earlier text, the round drafts the
-    earlier continuation ("c") and no drafter runs; the MTP head absorbs those rows later, as any backlog."""
+    earlier continuation ("c") and no drafter runs; the MTP head absorbs those rows later, as any backlog.
+    ``splice``: a gate's cut written into the live stream (``decode.Splice``); a round that writes the fix's tokens
+    ("s") runs no drafter either, and its rows join the backlogs the same way."""
 
     w, st, b = e.w, e.st, e.buf
     cap = 256                               # backlog rows a drafter may owe before it absorbs them anyway
@@ -88,7 +92,8 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
     n_f = 0
     if drafter is not None:
         f_taps = torch.empty((cap, len(b.taps) * w.cfg.hidden), dtype=torch.bfloat16, device=w.device)
-    out = [pending]
+    sp = splice
+    out, head = list(lead) if lead else [pending], pending
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
     rounds = drafted = accepted = 0
     depths: list[int] = []
@@ -100,9 +105,12 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         room = count - len(out)
         t0 = time.perf_counter()
-        copied = copies.chain(min(COPY_DRAFTS, room)) if copies is not None else []
-        arm = "c" if copied else choice.pick() if choice is not None else "m"
-        if arm == "c":
+        forced = sp.drafts(room) if sp is not None else None
+        copied = copies.chain(min(COPY_DRAFTS, room)) if copies is not None and forced is None else []
+        arm = "s" if forced is not None else "c" if copied else choice.pick() if choice is not None else "m"
+        if arm == "s":
+            backlog, steps, drafts = 0, 0, forced
+        elif arm == "c":
             backlog, steps, drafts = 0, 0, copied
         elif arm == "m":
             backlog = len(m_next)
@@ -116,10 +124,10 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
                 drafter.add_taps(f_taps[:n_f])
                 n_f = 0
             depth = max(1, min(f_policy.next(*last["f"]), room))
-            drafts = drafter.propose(out[-1], depth, sampling, f_policy.confidence)
+            drafts = drafter.propose(head, depth, sampling, f_policy.confidence)
             steps = 0
         t1 = time.perf_counter()
-        tokens = e.verify_window([out[-1]] + drafts)
+        tokens = e.verify_window([head] + drafts)
         drafts = tokens[1:]
         R = len(tokens)
         logits = e.forward(tokens)
@@ -127,42 +135,46 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         t2 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
         keep = 1
-        for i, d in enumerate(drafts):
+        for i, d in enumerate(drafts if arm != "s" else ()):
             if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
                 break
             keep += 1
         if arm == "f" and dflash2.TREE_PROBE:
             dflash2.tree_probe(drafter.probe, drafts, sampled, keep)
         t3 = time.perf_counter()
-        commit(w, st, b, R, keep)
+        rows, new, follows = (sp.round(tokens, sampled, keep, len(forced or ())) if sp is not None
+                              else (keep, list(sampled[:keep]), list(sampled[:keep])))
+        commit(w, st, b, R, rows)
         t4 = time.perf_counter()
-        # the kept rows join both backlogs (a full backlog is taken first)
-        if len(m_next) + keep > cap:
+        # the kept rows join both backlogs (a full backlog is taken first), each with the token that follows it
+        if len(m_next) + rows > cap:
             absorb(e, m_rows[:len(m_next)], m_next)
             m_next = []
-        m_rows[len(m_next):len(m_next) + keep].copy_(e.main_hidden(slice(0, keep)))
-        m_next.extend(sampled[:keep])
+        m_rows[len(m_next):len(m_next) + rows].copy_(e.main_hidden(slice(0, rows)))
+        m_next.extend(follows)
         if drafter is not None:
-            if n_f + keep > cap:
+            if n_f + rows > cap:
                 drafter.add_taps(f_taps[:n_f])
                 n_f = 0
-            f_taps[n_f:n_f + keep].copy_(e.tap_rows(keep))
-            n_f += keep
+            f_taps[n_f:n_f + rows].copy_(e.tap_rows(rows))
+            n_f += rows
         t5 = time.perf_counter()
-        if choice is not None and arm != "c":
+        if choice is not None and arm not in ("c", "s"):
             choice.record(arm, R, steps, backlog, keep)
         if copies is not None:
-            copies.extend(sampled[:keep])
-        last[arm] = (len(drafts), keep - 1)
+            copies.extend(new)
+        if arm != "s":
+            last[arm] = (len(drafts), keep - 1)
+            drafted += len(drafts)
+            accepted += keep - 1
         rounds += 1
-        drafted += len(drafts)
-        accepted += keep - 1
         depths.append(len(drafts))
-        keeps.append(keep)
+        keeps.append(rows)
         arms.append(arm)
-        e.follow(sampled[:keep])
-        out.extend(sampled[:keep])
-        stop = _fed(w, on_tokens, sampled[:keep][:max(0, count - (len(out) - keep))])
+        e.follow(new)
+        out.extend(new)
+        head = follows[-1]
+        stop = _fed(w, on_tokens, new[:max(0, count - (len(out) - len(new)))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
         stages["forward"] += t2 - t1
         stages["sample"] += t3 - t2

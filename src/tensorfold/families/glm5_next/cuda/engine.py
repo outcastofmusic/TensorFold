@@ -317,6 +317,8 @@ class GlmEngine:
         self.cache_entries = 0 if self.target_only else int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
         self.user_id = _token_id(self.model_dir, "<|user|>")
         self.disk = self._disk_states(drafter)
+        # a gate's cut written into the live stream (decode.Splice): one rank only, as rank 1 hears no gate
+        self.splices = self.comm is None
 
     def _disk_states(self, drafter: Path | None):
         """``TENSORFOLD_GLM_STATES``: the folder kept states also go to (``disk``), on one rank; None without it.
@@ -667,10 +669,10 @@ class GlmEngine:
         return sum(snapshot_bytes(c) for c in self.cache)
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
-             code: list[int], hit, draft: bool, constraint=None, disk=None) -> dict[str, Any]:
+             code: list[int], hit, draft: bool, constraint=None, disk=None, splice=None) -> dict[str, Any]:
         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
         try:
-            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, disk)
+            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, disk, splice)
         finally:
             self.e.constraint = self.e.window = None
 
@@ -682,7 +684,8 @@ class GlmEngine:
         return CopyIndex([*prompt, first]) if enabled() and self.e.constraint is None else None
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
-                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool, disk=None) -> dict[str, Any]:
+                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool, disk=None,
+                  splice=None) -> dict[str, Any]:
         from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
         from .drafter_choice import DrafterChoice, auto_decode
 
@@ -713,12 +716,19 @@ class GlmEngine:
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         if read is not None:
             stats.update(disk_tokens=len(read.ids), disk_s=round(read_s, 3))
-        stopped = bool(on_tokens([first])) and self.comm is None      # rank 1 cannot hear a stop: two ranks decode on
-        if max_tokens <= 1 or (stop_eos and first in self.eos) or stopped:
+        sp, lead = None, [first]
+        if splice is not None:                        # the gates see the first token too
+            from .decode import lead_of
+
+            sp, lead = lead_of(splice, first)
+            first = lead[0]
+        stopped = bool(on_tokens(lead)) and self.comm is None      # rank 1 cannot hear a stop: two ranks decode on
+        if max_tokens <= len(lead) or (stop_eos and lead[-1] in self.eos) or stopped:
             return stats
         policy = decode_policy(code)
         if policy is None:
-            res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
+            res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
+                                splice=sp, lead=lead)
         elif auto:
             greedy = sampling is None or sampling.temperature <= 0
             m_policy = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
@@ -729,13 +739,13 @@ class GlmEngine:
                                        margin=margin)
             res = auto_decode(self.e, drafter, first, max_tokens, sampling, choice=choice, m_policy=m_policy,
                               f_policy=DepthPolicy(5, fixed=True, confidence=0.3), stop_eos=stop_eos,
-                              on_tokens=on_tokens, copies=self._copies(prompt, first))
+                              on_tokens=on_tokens, copies=self._copies(prompt, first), splice=sp, lead=lead)
         elif use_dflash:
             res = dflash_decode(self.e, self.drafter, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
-                                on_tokens=on_tokens)
+                                on_tokens=on_tokens, splice=sp, lead=lead)
         else:
             res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
-                             on_tokens=on_tokens)
+                             on_tokens=on_tokens, splice=sp, lead=lead)
         # the caches now hold prompt and reply; only prompts are snapshotted, since a later prompt prefills the reply again
         self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
         stats.update(decode_s=res.seconds, rounds=res.rounds, min_rows=1 + min(res.depths, default=0),
@@ -792,7 +802,7 @@ class GlmEngine:
         return len(prompt) - begin
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None) -> dict[str, Any]:
+                 constraint=None, splice=None) -> dict[str, Any]:
         """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal."""
 
         if len(prompt) >= self.limit:
@@ -827,7 +837,10 @@ class GlmEngine:
         self._share(list(prompt))
         if constraint is not None:                     # the request's grammar: rank 1 compiles the same
             self._share(pack(constraint))
-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, disk)
+        if splice is not None and not self.splices:
+            raise ValueError("a gate's cut inside the stream needs one rank: rank 1 hears no gate")
+        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, disk,
+                          splice)
         stats.update(policy=spec, drafts=draft)
         from .route_log import flush as flush_routes
 

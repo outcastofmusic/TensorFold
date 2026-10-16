@@ -480,6 +480,65 @@ def _sync(w: Weights) -> None:
     torch.cuda.synchronize()
 
 
+FORCED_ROWS = 5                          # a fix's tokens a round writes, within the widest verify window
+
+
+class Splice:
+    """A gate's cut written into the live stream (``call_gate.generate_gated``'s inline path, as Flash Next's
+    ``MultiDecoder._spliced``), so the reply is not prefilled again after a thinking budget's close or a call's fix.
+
+    The gates see each round's tokens before it commits. At a cut the round commits only the rows before the cut's
+    token, the fix's first token becomes the pending one and the rest wait as drafts that later rounds write without
+    verifying them. The fix's rows come from the verify forward, as a draft's do: text after a cut is the model's
+    continuation of the same tokens, not bit for bit the continuation a fresh prefill of them would give. A decode
+    loop's ``lead`` is the tokens the reply already has (the prompt's first token, or the fix it was cut into)."""
+
+    def __init__(self, splice) -> None:
+        self.splice = splice
+        self.forced: list[int] = []
+
+    def drafts(self, room: int) -> list[int] | None:
+        """The fix's tokens this round writes, or None when none wait."""
+
+        if not self.forced or room <= 0:
+            return None
+        take = min(room, FORCED_ROWS)
+        drafts, self.forced = self.forced[:take], self.forced[take:]
+        return drafts
+
+    def round(self, window: list[int], sampled: list[int], keep: int, forced: int) -> tuple[int, list[int], list[int]]:
+        """(rows to commit, tokens the reply gains, each committed row's next token) for a round whose window held
+        ``forced`` of a fix's tokens after its pending one: those rows are kept whatever was sampled."""
+
+        if forced:
+            keep = forced + 1
+            new = [int(sampled[forced])]
+        else:
+            new = [int(t) for t in sampled[:keep]]
+        hit = self.splice(new)
+        if hit is None or not hit[1]:
+            return keep, new, [*window[1:keep], new[-1]]
+        at, fix = hit
+        rows = keep - len(new) + 1 + int(at)             # the pending row, then every row before the cut's token
+        self.forced = [int(t) for t in fix[1:]]
+        return rows, [*new[:at], *map(int, fix)], [*window[1:rows], int(fix[0])]
+
+
+def lead_of(splice, first: int) -> tuple[Splice | None, list[int]]:
+    """The decode loops' ``Splice`` for an inline gate's ``splice`` (None without one) and the reply's first tokens:
+    the prompt's sampled token, or the fix a gate cut it into, whose first token is then the pending one."""
+
+    if splice is None:
+        return None, [int(first)]
+    sp = Splice(splice)
+    hit = sp.splice([int(first)])
+    if hit is None or not hit[1]:
+        return sp, [int(first)]
+    lead = [int(t) for t in hit[1]]
+    sp.forced = lead[1:]
+    return sp, lead
+
+
 def _fed(w: Weights, on_tokens, tokens: list[int]) -> bool:
     """Hand a round's tokens to ``on_tokens``; True when it asks to stop and this rank decodes alone.
 
@@ -491,29 +550,41 @@ def _fed(w: Weights, on_tokens, tokens: list[int]) -> bool:
 
 @torch.no_grad()
 def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *,
-                  stop_eos: bool = False, on_tokens=None) -> DecodeResult:
-    """One token a step through the same kernels and sampler; ``pending`` is the first sampled token."""
+                  stop_eos: bool = False, on_tokens=None, splice: Splice | None = None,
+                  lead: Sequence[int] = ()) -> DecodeResult:
+    """One token a step through the same kernels and sampler; ``pending`` is the first sampled token. ``splice``: a
+    gate's cut written into the live stream (``Splice``), the fix's tokens a step each without sampling."""
 
     w, st, b = e.w, e.st, e.buf
-    out = [pending]
+    sp = splice
+    out, head = list(lead) if lead else [pending], pending
     stages = dict(forward=0.0, sample=0.0, commit=0.0)
     _sync(w)
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
-        logits = e.forward(e.verify_window([out[-1]]))
+        logits = e.forward(e.verify_window([head]))
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        tok = e.sample(logits[:1], [st.pos + 1], sampling)[0]
-        e.follow([tok])
+        if sp is not None and sp.forced:
+            tok, new = sp.forced.pop(0), []               # the fix's next token: the reply has it already
+        else:
+            tok = e.sample(logits[:1], [st.pos + 1], sampling)[0]
+            new = [tok]
+            hit = sp.splice(new) if sp is not None else None
+            if hit is not None and hit[1]:
+                new, tok = [int(t) for t in hit[1]], int(hit[1][0])
+                sp.forced = new[1:]
+        e.follow(new)
         t2 = time.perf_counter()
         commit(w, st, b, 1, 1)
         t3 = time.perf_counter()
         stages["forward"] += t1 - t0
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
-        out.append(tok)
-        if _fed(w, on_tokens, [tok]):
+        out.extend(new)
+        head = tok
+        if new and _fed(w, on_tokens, new):
             break
     _sync(w)
     return DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
@@ -538,12 +609,15 @@ class DepthPolicy:
 
 @torch.no_grad()
 def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, policy: DepthPolicy | None = None,
-               stop_eos: bool = False, on_tokens=None) -> DecodeResult:
-    """Verify pending and MTP draft rows through the first mismatch, starting with every prompt position except the last in the MTP cache."""
+               stop_eos: bool = False, on_tokens=None, splice: Splice | None = None,
+                  lead: Sequence[int] = ()) -> DecodeResult:
+    """Verify pending and MTP draft rows through the first mismatch, starting with every prompt position except the
+    last in the MTP cache; ``splice``: a gate's cut written into the live stream (``Splice``)."""
 
     w, st, b = e.w, e.st, e.buf
     policy = policy or DepthPolicy()
-    out = [pending]
+    sp = splice
+    out, head = list(lead) if lead else [pending], pending
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
     rounds = drafted = accepted = 0
     depths: list[int] = []
@@ -556,7 +630,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
     stages["draft"] += time.perf_counter() - t0
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
-        tokens = e.verify_window([out[-1]] + drafts)
+        forced = sp.drafts(count - len(out)) if sp is not None else None
+        tokens = e.verify_window([head] + (forced if forced is not None else drafts))
         drafts = tokens[1:]
         R = len(tokens)
         logits = e.forward(tokens)
@@ -564,21 +639,25 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         t1 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
         keep = 1
-        for i, d in enumerate(drafts):
+        for i, d in enumerate(drafts if forced is None else ()):
             if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
                 break
             keep += 1
         t2 = time.perf_counter()
-        commit(w, st, b, R, keep)
+        rows, new, follows = (sp.round(tokens, sampled, keep, len(forced or ())) if sp is not None
+                              else (keep, list(sampled[:keep]), list(sampled[:keep])))
+        commit(w, st, b, R, rows)
         t3 = time.perf_counter()
         rounds += 1
-        drafted += len(drafts)
-        accepted += keep - 1
+        if forced is None:
+            drafted += len(drafts)
+            accepted += keep - 1
         depths.append(len(drafts))
-        keeps.append(keep)
-        e.follow(sampled[:keep])
-        out.extend(sampled[:keep])
-        stop = _fed(w, on_tokens, sampled[:keep][:max(0, count - (len(out) - keep))])
+        keeps.append(rows)
+        e.follow(new)
+        out.extend(new)
+        head = follows[-1]
+        stop = _fed(w, on_tokens, new[:max(0, count - (len(out) - len(new)))])
         stages["forward"] += t1 - t0
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
@@ -586,8 +665,9 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
             break
         t4 = time.perf_counter()
         depth = min(policy.next(len(drafts), keep - 1), count - len(out))
-        drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
-                        policy.confidence) if depth > 0 else [])
+        # the MTP head absorbs this round's rows even when the next round writes a fix's tokens instead of drafts
+        drafts = (draft(e, e.main_hidden(slice(0, rows)), follows, st.pos + 1, depth, sampling, policy.confidence)
+                  if depth > 0 else [])
         stages["draft"] += time.perf_counter() - t4
     _sync(w)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
@@ -595,14 +675,18 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
 
 @torch.no_grad()
 def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
-                  policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
-    """Verify pending and DFlash2 draft rows through the first mismatch and absorb kept taps, starting from prefill's drafter state."""
+                  policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None,
+                  splice: Splice | None = None,
+                  lead: Sequence[int] = ()) -> DecodeResult:
+    """Verify pending and DFlash2 draft rows through the first mismatch and absorb kept taps, starting from prefill's
+    drafter state; ``splice``: a gate's cut written into the live stream (``Splice``)."""
 
     w, st, b = e.w, e.st, e.buf
     from . import dflash2
 
     policy = policy or DepthPolicy(3, fixed=True)
-    out = [pending]
+    sp = splice
+    out, head = list(lead) if lead else [pending], pending
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
     rounds = drafted = accepted = 0
     depths: list[int] = []
@@ -612,9 +696,11 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
     depth = min(policy.next(0, 0), count - len(out))
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
-        drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
+        forced = sp.drafts(count - len(out)) if sp is not None else None
+        drafts = forced if forced is not None else (
+            drafter.propose(head, depth, sampling, policy.confidence) if depth > 0 else [])
         t1 = time.perf_counter()
-        tokens = e.verify_window([out[-1]] + drafts)
+        tokens = e.verify_window([head] + drafts)
         drafts = tokens[1:]
         R = len(tokens)
         logits = e.forward(tokens)
@@ -622,25 +708,29 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         t2 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
         keep = 1
-        for i, d in enumerate(drafts):
+        for i, d in enumerate(drafts if forced is None else ()):
             if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
                 break
             keep += 1
-        if dflash2.TREE_PROBE:
+        if dflash2.TREE_PROBE and forced is None:
             dflash2.tree_probe(drafter.probe, drafts, sampled, keep)
         t3 = time.perf_counter()
-        commit(w, st, b, R, keep)
+        rows, new, follows = (sp.round(tokens, sampled, keep, len(forced or ())) if sp is not None
+                              else (keep, list(sampled[:keep]), list(sampled[:keep])))
+        commit(w, st, b, R, rows)
         t4 = time.perf_counter()
-        drafter.add_taps(e.tap_rows(keep))
+        drafter.add_taps(e.tap_rows(rows))
         t5 = time.perf_counter()
         rounds += 1
-        drafted += len(drafts)
-        accepted += keep - 1
+        if forced is None:
+            drafted += len(drafts)
+            accepted += keep - 1
         depths.append(len(drafts))
-        keeps.append(keep)
-        e.follow(sampled[:keep])
-        out.extend(sampled[:keep])
-        stop = _fed(w, on_tokens, sampled[:keep][:max(0, count - (len(out) - keep))])
+        keeps.append(rows)
+        e.follow(new)
+        out.extend(new)
+        head = follows[-1]
+        stop = _fed(w, on_tokens, new[:max(0, count - (len(out) - len(new)))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
         stages["forward"] += t2 - t1
         stages["sample"] += t3 - t2
