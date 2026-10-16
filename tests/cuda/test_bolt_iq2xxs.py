@@ -128,6 +128,24 @@ def test_grouped(rows, experts, skew):
     assert (out == ref.to(torch.bfloat16)).double().mean() > 0.97
 
 
+@pytest.mark.parametrize("n,k", [(2560, 1024), (1024, 2560)])
+@pytest.mark.parametrize("rows", [9, 36, 300])
+def test_grouped_bolt_shapes(n, k, rows):
+    """Bolt's widest expert (up: N 2560, K 1024; down: N 1024, K 2560), one token, a verify window and a prompt."""
+
+    experts = 12
+    packed = random_packed((experts, n), k, seed=n + rows)
+    wq = bf16(dequant(packed))
+    g = torch.Generator().manual_seed(rows)
+    x = torch.randn((rows, k), generator=g).to(torch.bfloat16)
+    ids = torch.cat([torch.randperm(experts, generator=g)[:9] for _ in range(-(-rows // 9))])[:rows].to(torch.int32)
+    out = iq2xxs.iq2xxs_grouped(x.to(DEV), torch.from_numpy(packed).to(DEV), ids.to(DEV)).cpu()
+    for e in range(experts):
+        sel = (ids == e).nonzero().flatten()
+        if sel.numel():
+            check(out[sel], x[sel], wq[e])
+
+
 def test_decode_and_prefill_agree():
     """Rows 0..63 of a 64-row (decode) and a 65-row (prefill) call differ by at most one bf16 rounding."""
 

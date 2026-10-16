@@ -96,10 +96,11 @@ def ksigns(i: int) -> int:
 
 
 def tables() -> list[int]:
-    """The kernels' table words: two variants, each prmt selectors [256][4] then sign masks [128][4] (bits 15, 31).
+    """The kernels' selector words: two variants of [256][2], each word two 16-bit prmt selectors.
 
     Selector p of an entry builds the bf16 pair (weights 2p, 2p + 1) from the magnitudes' bytes (8: 0-1, 25: 2-3,
-    43: 4-5); variant 1 lists the pairs in the order 2, 3, 0, 1, for the prefill lanes that take a half the other way.
+    43: 4-5); word w holds pairs 2w and 2w + 1. Variant 1 lists the pairs in the order 2, 3, 0, 1, for the prefill
+    lanes that take an entry's halves the other way round.
     """
 
     sel = []
@@ -107,14 +108,10 @@ def tables() -> list[int]:
         idx = [MAGNITUDES.index((entry >> (8 * j)) & 255) for j in range(8)]
         sel.append([2 * idx[2 * p] | (2 * idx[2 * p] + 1) << 4 | (2 * idx[2 * p + 1]) << 8
                     | (2 * idx[2 * p + 1] + 1) << 12 for p in range(4)])
-    sign = []
-    for i in range(128):
-        v = ksigns(i)
-        sign.append([((v >> (2 * p)) & 1) << 15 | ((v >> (2 * p + 1)) & 1) << 31 for p in range(4)])
     words = []
     for variant in (0, 1):
-        for table in (sel, sign):
-            words += [row[p ^ 2 * variant] for row in table for p in range(4)]
+        for row in sel:
+            words += [row[(2 * w) ^ 2 * variant] | row[(2 * w + 1) ^ 2 * variant] << 16 for w in range(2)]
     return words
 
 
@@ -129,7 +126,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_bolt_iq2xxs_v3", sources=[str(here / "iq2xxs.cpp"), str(here / "iq2xxs.cu")],
+    return load(name="tensorfold_bolt_iq2xxs_v17", sources=[str(here / "iq2xxs.cpp"), str(here / "iq2xxs.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
