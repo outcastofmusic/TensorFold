@@ -175,6 +175,16 @@ def test_stream_failure_is_an_error_not_success(tmp_path):
     assert all(e["type"] != "message_stop" for e in events)
 
 
+def test_a_streamed_message_on_the_cuda_server_starts_with_the_prompts_size(tmp_path):
+    with serving("cuda", tmp_path) as (_, port):
+        counted = json.loads(call(port, "POST", "/v1/messages/count_tokens",
+                                  {k: v for k, v in BASE.items() if k != "max_tokens"})[1])["input_tokens"]
+        status, body = call(port, "POST", "/v1/messages", {**BASE, "stream": True})
+    start = stream_events(body)[0]
+    assert status == 200 and start["type"] == "message_start"
+    assert start["message"]["usage"]["input_tokens"] == counted > 0
+
+
 def test_token_count_uses_cuda_prompt_without_generation(tmp_path):
     with serving("cuda", tmp_path) as (app, port):
         body = {k: v for k, v in BASE.items() if k != "max_tokens"}

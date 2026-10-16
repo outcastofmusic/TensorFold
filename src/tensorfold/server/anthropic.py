@@ -79,6 +79,8 @@ def post(handler: Any, app: Any) -> None:
         handler.send_header("Connection", "close")
         handler.end_headers()
         handler.close_connection = True
+        if hasattr(app, "prepare"):            # the CUDA server: Anthropic's stream opens with the prompt's size
+            reply.base["usage"] = {**reply.base["usage"], "input_tokens": len(app.prepare(chat, True).prompt)}
         reply.start()
 
     wire = Wire(opened, reply.chunk)
