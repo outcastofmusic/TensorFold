@@ -1,7 +1,10 @@
 """Bolt's IQ2_XXS kernels against a numpy port of llama.cpp's dequantize_row_iq2_xxs, decode and prefill shapes."""
 
 import hashlib
+import json
+import os
 import struct
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -173,3 +176,44 @@ def test_empty_and_bad_shapes():
     assert iq2xxs.iq2xxs_linear(torch.empty((0, 256), dtype=torch.bfloat16, device=DEV), packed).shape == (0, 16)
     with pytest.raises(ValueError):
         iq2xxs.iq2xxs_linear(torch.zeros((2, 512), dtype=torch.bfloat16, device=DEV), packed)
+
+
+BOLT = Path(os.environ.get("TF_BOLT_MODEL", "/home/agis/models/Nemotron-3.5-Bolt-74B-A9B-24GB"))
+
+
+def bolt_experts(layer: int, proj: str, count: int) -> torch.Tensor:
+    """The checkpoint's first ``count`` experts of a layer's up_proj or down_proj: uint8 [count, N, K / 256, 66]."""
+
+    from safetensors import safe_open
+
+    index = json.loads((BOLT / "model.safetensors.index.json").read_text())["weight_map"]
+    names = [f"language_model.backbone.layers.{layer}.mixer.experts.{e}.{proj}.weight" for e in range(count)]
+    out = []
+    for name in names:
+        with safe_open(str(BOLT / index[name]), framework="pt") as f:
+            out.append(f.get_tensor(name))
+    return torch.stack(out)
+
+
+# layer 1: 2048-wide experts (K 1024 up, K 2048 down); layer 8: 2304 (nine blocks a down row, rows 2-byte aligned);
+# layer 48: 2560, Bolt's widest
+@pytest.mark.skipif(not (BOLT / "model.safetensors.index.json").is_file(), reason="Bolt checkpoint not present")
+@pytest.mark.parametrize("layer", [1, 8, 48])
+@pytest.mark.parametrize("proj", ["up_proj", "down_proj"])
+def test_bolt_checkpoint_experts(layer, proj):
+    """Real expert tensors: the kernels against the numpy dequantizer, one token's 9 experts and a 300-row prompt."""
+
+    packed = bolt_experts(layer, proj, 12)
+    e, _, kb, _ = packed.shape
+    k = kb * 256
+    wq = bf16(dequant(packed.flatten(-2).numpy()))
+    assert torch.isfinite(wq.float()).all() and 1e-4 < float(wq.float().std()) < 1.0
+    g = torch.Generator().manual_seed(layer)
+    for rows in (9, 300):
+        x = torch.randn((rows, k), generator=g).to(torch.bfloat16)
+        ids = torch.cat([torch.randperm(e, generator=g)[:9] for _ in range(-(-rows // 9))])[:rows].to(torch.int32)
+        out = iq2xxs.iq2xxs_grouped(x.to(DEV), packed.to(DEV), ids.to(DEV)).cpu()
+        for ex in range(e):
+            sel = (ids == ex).nonzero().flatten()
+            if sel.numel():
+                check(out[sel], x[sel], wq[ex])

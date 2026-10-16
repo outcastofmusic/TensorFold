@@ -141,11 +141,24 @@ def _rows(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return x if x.data_ptr() % 16 == 0 else x.clone()
 
 
-def iq2xxs_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """x bf16 [R, K], w uint8 [N, K / 256 * 66] -> bf16 [R, N]."""
+def _blocks(w: torch.Tensor, dims: int) -> torch.Tensor:
+    """w as [..., K / 256 * 66] with ``dims`` dims; the checkpoint's [..., K / 256, 66] is the same bytes."""
 
+    if w.dtype != torch.uint8:
+        raise ValueError(f"IQ2_XXS weights are uint8, not {w.dtype}")
+    if w.dim() == dims + 1 and w.shape[-1] == BLOCK_BYTES:
+        w = w.flatten(-2)
+    if w.dim() != dims:
+        raise ValueError(f"IQ2_XXS weights {tuple(w.shape)}: expected {dims} dims of blocks")
+    return w.contiguous()
+
+
+def iq2xxs_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """x bf16 [R, K], w uint8 [N, K / 256 * 66] (or the checkpoint's [N, K / 256, 66]) -> bf16 [R, N]."""
+
+    w = _blocks(w, 2)
     x = _rows(x, w)
-    w3 = w.contiguous().unsqueeze(0)
+    w3 = w.unsqueeze(0)
     rows, n = x.shape[0], w.shape[0]
     out = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
     tab = _tables(x.device)
@@ -157,10 +170,13 @@ def iq2xxs_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 
 def iq2xxs_grouped(x: torch.Tensor, w: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-    """x bf16 [R, K], w uint8 [E, N, K / 256 * 66], ids int32 [R] in [0, E) -> bf16 [R, N]; row r uses expert ids[r]."""
+    """x bf16 [R, K], w uint8 [E, N, K / 256 * 66] (or [E, N, K / 256, 66]), ids int32 [R] in [0, E) -> bf16 [R, N].
 
+    Row r uses expert ids[r]; an id outside [0, E) reads outside w.
+    """
+
+    w = _blocks(w, 3)
     x = _rows(x, w)
-    w = w.contiguous()
     rows, (experts, n) = x.shape[0], w.shape[:2]
     if ids.shape != (rows,):
         raise ValueError(f"ids {tuple(ids.shape)}: one expert a row of x [{rows}, K]")
