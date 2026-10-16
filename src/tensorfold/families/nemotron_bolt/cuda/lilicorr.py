@@ -589,6 +589,14 @@ class DecodeResult:
 
 
 def _sample(engine, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None) -> list[int]:
+    """The window's tokens from the sampler serial decoding uses: the engine's own when it has one.
+
+    An engine that samples inside ``verify`` (``tokens()``, like Nemotron-H's keyed GPU sampler) wins; then an
+    engine ``sample(logits, positions, sampling)``; then the shared CUDA rule.
+    """
+
+    if hasattr(engine, "tokens"):
+        return [int(t) for t in engine.tokens()[:len(positions)]]
     sample = getattr(engine, "sample", None)
     if sample is not None:
         return list(sample(logits, positions, sampling))
@@ -612,6 +620,8 @@ def lilicorr_decode(engine, drafter: Drafter, first: int, count: int, sampling: 
         raise ValueError(f"the drafter holds {drafter.context_end} positions, the engine {engine.pos}")
     depth = drafter.c.block - 1 if depth is None else max(0, min(int(depth), drafter.c.block - 1))
     eos = set(engine.eos)
+    if hasattr(engine, "set_sampling"):
+        engine.set_sampling(sampling)
     out = [int(first)]
     res = DecodeResult([], 0.0, 0)
     if torch.cuda.is_available():

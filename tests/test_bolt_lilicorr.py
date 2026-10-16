@@ -368,3 +368,30 @@ def test_drafter_must_hold_the_prompt():
     d, _ = make(target=t)
     with pytest.raises(ValueError, match="holds 0 positions"):
         lilicorr_decode(t, d, 5, 4, None)
+
+
+class SamplingTarget(FakeTarget):
+    """An engine that samples inside ``verify`` (``tokens()``), like BoltEngine and Nemotron-H's engine."""
+
+    sample = None
+
+    def set_sampling(self, sampling):
+        self.rule = sampling
+
+    def verify(self, tokens):
+        logits = super().verify(tokens)
+        self._tokens = FakeTarget.sample(self, logits, [self.pos + 1 + r for r in range(len(tokens))], self.rule)
+        return logits
+
+    def tokens(self):
+        return list(self._tokens)
+
+
+@pytest.mark.parametrize("sampling", SAMPLINGS, ids=["greedy", "topk", "nucleus"])
+def test_engine_sampler_in_verify(sampling):
+    prompt = [4, 9, 2, 6]
+    want = serial(prompt, 25, sampling)
+    t = SamplingTarget(prompt)
+    first = FakeTarget.sample(t, t.prompt_logits, [t.pos], sampling)
+    res = lilicorr_decode(t, Oracle(want, len(prompt), 2), first[0], 25, sampling)
+    assert res.tokens == want and t.rule is sampling and res.accepted > 0
