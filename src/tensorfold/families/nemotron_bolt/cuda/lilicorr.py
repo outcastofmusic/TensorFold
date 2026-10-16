@@ -50,13 +50,17 @@ def dequantize_nvfp4(weight: torch.Tensor, weight_scale: torch.Tensor, weight_sc
     n, half = weight.shape
     if weight_scale.shape != (n, 2 * half // NVFP4_GROUP):
         raise ValueError(f"NVFP4 scales {tuple(weight_scale.shape)} do not fit codes {tuple(weight.shape)}")
-    w = weight.to(torch.int64)
-    codes = torch.stack([w & 0xF, w >> 4], dim=-1).reshape(n, 2 * half)
     mags = torch.tensor(_E2M1, dtype=torch.float32, device=weight.device)
     table = torch.cat([mags, -mags])
     s2 = float(weight_scale_2.item()) if isinstance(weight_scale_2, torch.Tensor) else float(weight_scale_2)
-    scale = weight_scale.to(torch.float32).repeat_interleave(NVFP4_GROUP, dim=1) * s2
-    return (table[codes] * scale).to(dtype)
+    out = torch.empty((n, 2 * half), dtype=dtype, device=weight.device)
+    step = max(1, (1 << 24) // (2 * half))         # rows a pass: its int64 codes stay near 128 MiB
+    for r in range(0, n, step):
+        w = weight[r:r + step].to(torch.int64)
+        codes = torch.stack([w & 0xF, w >> 4], dim=-1).reshape(w.shape[0], 2 * half)
+        scale = weight_scale[r:r + step].to(torch.float32).repeat_interleave(NVFP4_GROUP, dim=1) * s2
+        out[r:r + step] = (table[codes] * scale).to(dtype)
+    return out
 
 
 # -- the checkpoint -------------------------------------------------------------------------------------------------
@@ -182,9 +186,19 @@ def dense_tensors(raw: Mapping[str, torch.Tensor], dtype: torch.dtype) -> dict[s
     return out
 
 
-def read_checkpoint(model_dir: str | Path, device: torch.device | str,
-                    dtype: torch.dtype = torch.bfloat16) -> tuple[DraftConfig, dict[str, torch.Tensor]]:
-    """config.json and model.safetensors -> the geometry and dense tensors on ``device``, one tensor at a time."""
+def fp4_kept(name: str) -> bool:
+    """The backbone's NVFP4 projections (fc and the MLPs, 0.86B of the 1.11B weights) that stay packed on CUDA."""
+
+    return name == "fc.weight" or (name.startswith("layers.") and ".mlp." in name)
+
+
+Packed = tuple[torch.Tensor, torch.Tensor, torch.Tensor]       # NVFP4 codes, e4m3 scales, the fp32 tensor scale
+
+
+def read_checkpoint(model_dir: str | Path, device: torch.device | str, dtype: torch.dtype = torch.bfloat16, *,
+                    keep: Callable[[str], bool] | None = None
+                    ) -> tuple[DraftConfig, dict[str, torch.Tensor], dict[str, Packed]]:
+    """config.json and model.safetensors -> the geometry, dense tensors and the NVFP4 ones ``keep`` names, packed."""
 
     from contextlib import closing
 
@@ -196,6 +210,7 @@ def read_checkpoint(model_dir: str | Path, device: torch.device | str,
     if not files:
         raise FileNotFoundError(f"{path}: no safetensors files")
     out: dict[str, torch.Tensor] = {}
+    packed: dict[str, Packed] = {}
     with closing(SafeTensors(files)) as f:
         names = set(f.keys())
         for name in sorted(names):
@@ -207,8 +222,11 @@ def read_checkpoint(model_dir: str | Path, device: torch.device | str,
                 for extra in (base + ".weight_scale", base + ".weight_scale_2"):
                     if extra in names:
                         group[extra] = f.get(extra, device)
+                if keep is not None and keep(name) and len(group) == 3:
+                    packed[name] = (group[name], group[base + ".weight_scale"], group[base + ".weight_scale_2"])
+                    continue
             out.update(dense_tensors(group, dtype))
-    return cfg, out
+    return cfg, out, packed
 
 
 # -- pieces ---------------------------------------------------------------------------------------------------------
@@ -257,24 +275,37 @@ class Drafter:
 
     ``embed(ids int64 [n]) -> [n, D]`` and ``lm_head(h [n, D]) -> [n, V]`` are the target's own embedding and
     output head (LiLiCorr shares both). ``source`` is the draft checkpoint directory, or (config, dense tensors).
+    ``fp4`` (CUDA, bf16, a directory): fc and the MLPs stay NVFP4 on the fork's exact W4A16 matmul, 0.45 GiB a
+    block pass reads instead of 1.6 GiB; otherwise every weight is dequantized to bf16 at load.
     """
 
     def __init__(self, source: str | Path | tuple[DraftConfig, Mapping[str, torch.Tensor]], *,
                  embed: Callable[[torch.Tensor], torch.Tensor], lm_head: Callable[[torch.Tensor], torch.Tensor],
-                 device: torch.device | str = "cuda", dtype: torch.dtype = torch.bfloat16) -> None:
+                 device: torch.device | str = "cuda", dtype: torch.dtype = torch.bfloat16, fp4: bool = True) -> None:
         self.dev, self.dt = torch.device(device), dtype
+        packed: dict[str, Packed] = {}
         if isinstance(source, (str, Path)):
-            cfg, tensors = read_checkpoint(source, self.dev, dtype)
+            fp4 = fp4 and self.dev.type == "cuda" and dtype == torch.bfloat16
+            cfg, tensors, packed = read_checkpoint(source, self.dev, dtype, keep=fp4_kept if fp4 else None)
         else:
             cfg, tensors = source[0], {k: v.to(self.dev, dtype) for k, v in source[1].items()}
         shapes = expected_shapes(cfg)
-        missing = sorted(set(shapes) - set(tensors))
+        got = {k: tuple(v.shape) for k, v in tensors.items()}
+        got.update({k: (w.shape[0], 2 * w.shape[1]) for k, (w, _, _) in packed.items()})
+        missing = sorted(set(shapes) - set(got))
         if missing:
             raise ValueError(f"the draft checkpoint lacks {missing[:5]}{' ...' if len(missing) > 5 else ''}")
         for name, shape in shapes.items():
-            if tuple(tensors[name].shape) != shape:
-                raise ValueError(f"{name}: shape {tuple(tensors[name].shape)}, expected {shape}")
-        self.c, self.p = cfg, {k: tensors[k].contiguous() for k in shapes}
+            if got[name] != shape:
+                raise ValueError(f"{name}: shape {got[name]}, expected {shape}")
+        self.c, self.p = cfg, {k: tensors[k].contiguous() for k in shapes if k in tensors}
+        self.q = {}
+        if packed:
+            from tensorfold.cuda.nvfp4.linear import Fp4Linear
+
+            self.q = {k: Fp4Linear.from_checkpoint(w, s, float(s2.item())) for k, (w, s, s2) in packed.items()}
+            del packed
+            torch.cuda.empty_cache()
         self.embed, self.lm_head = embed, lm_head
         self.tap_layers = cfg.tap_layers
         c = cfg
@@ -297,7 +328,16 @@ class Drafter:
         self.context_end = 0
 
     def nbytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in (*self.p.values(), self.kc, self.vc))
+        dense = sum(t.numel() * t.element_size() for t in (*self.p.values(), self.kc, self.vc))
+        return dense + sum(q.nbytes() for q in self.q.values())
+
+    def _lin(self, x: torch.Tensor, name: str) -> torch.Tensor:
+        """x [n, K] times the weight ``name``: a packed NVFP4 one on its matmul (prompt rows on the prompt GEMM)."""
+
+        q = self.q.get(name)
+        if q is None:
+            return F.linear(x, self.p[name])
+        return q(x.contiguous()) if x.shape[0] <= 64 else q.prefill(x.contiguous())
 
     def snapshot(self) -> dict:
         """The context state (window rows, anchor, length), copied: ``restore`` resumes a kept prompt from it."""
@@ -343,8 +383,7 @@ class Drafter:
             raise ValueError(f"taps [{n}, {taps.shape[1]}], expected {len(c.tap_layers)} rows of {c.hidden}")
         m = min(n, self.ring)
         start = self.context_end + n - m
-        ctx = _rms(F.linear(taps[n - m:].to(self.dev, self.dt), self.p["fc.weight"]), self.p["hidden_norm.weight"],
-                   c.eps)
+        ctx = _rms(self._lin(taps[n - m:].to(self.dev, self.dt), "fc.weight"), self.p["hidden_norm.weight"], c.eps)
         cos, sin = self._cos_sin(start, m)
         slots = torch.arange(start, start + m, device=self.dev) % self.ring
         for i in range(c.layers):
@@ -402,8 +441,8 @@ class Drafter:
         coef = F.linear(h, p[pre + "mlp_conv.kernel_projection.weight"]).view(n, 2, c.conv_taps, G)
         base = p[pre + "mlp_conv.base_kernel"]
         h = _conv(h, coef[:, 0], base[0], c.conv_group)
-        h = F.linear(F.silu(F.linear(h, p[pre + "mlp.gate_proj.weight"])) * F.linear(h, p[pre + "mlp.up_proj.weight"]),
-                     p[pre + "mlp.down_proj.weight"])
+        h = self._lin(F.silu(self._lin(h, pre + "mlp.gate_proj.weight")) * self._lin(h, pre + "mlp.up_proj.weight"),
+                      pre + "mlp.down_proj.weight")
         return _conv(h, coef[:, 1], base[1], c.conv_group), residual
 
     def block_hidden(self, pending: int, depth: int) -> torch.Tensor:
@@ -608,4 +647,4 @@ def lilicorr_decode(engine, drafter: Drafter, first: int, count: int, sampling: 
 
 
 __all__ = ["DecodeResult", "DraftConfig", "Drafter", "Proposal", "dense_tensors", "dequantize_nvfp4",
-           "expected_shapes", "lilicorr_decode", "read_checkpoint"]
+           "expected_shapes", "fp4_kept", "lilicorr_decode", "read_checkpoint"]
