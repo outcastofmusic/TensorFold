@@ -168,26 +168,76 @@ __device__ __forceinline__ void decode_loop(float (&acc)[MT][2][4], const __nv_b
   }
 }
 
-// Dynamic shared memory: DSTAGES slabs of 16 weight rows, then the x rows (DECODE_XS), then the partial sums.
+// A grouped call of more than MAX_ROWS rows gets its plan from plan_kernel, in global memory: plan[0] the number of
+// distinct experts U, then uexp[E] (U used), ustart[E + 1] (U + 1 used), then urow[R], the rows sorted by expert.
+__global__ void __launch_bounds__(1024) plan_kernel(const int* __restrict__ ids, int R, int E, int* __restrict__ plan) {
+  extern __shared__ int sm[];                                    // count[E], then the scan [E]
+  int* count = sm;
+  int* scan = sm + E;
+  const int tid = threadIdx.x;
+  for (int e = tid; e < E; e += blockDim.x) count[e] = 0;
+  __syncthreads();
+  for (int r = tid; r < R; r += blockDim.x) atomicAdd(count + __ldg(ids + r), 1);
+  __syncthreads();
+  // inclusive scans of the counts and of the used flags, packed as (rows << 11 | used), E <= 1024 < 2^11
+  for (int e = tid; e < E; e += blockDim.x) scan[e] = count[e] << 11 | (count[e] > 0);
+  __syncthreads();
+  for (int d = 1; d < E; d <<= 1) {
+    int v[2] = {0, 0};
+    for (int i = 0, e = tid; e < E; e += blockDim.x, ++i) v[i] = scan[e] + (e >= d ? scan[e - d] : 0);
+    __syncthreads();
+    for (int i = 0, e = tid; e < E; e += blockDim.x, ++i) scan[e] = v[i];
+    __syncthreads();
+  }
+  int* uexp = plan + 1;
+  int* ustart = plan + 1 + E;
+  int* urow = plan + 2 + 2 * E;
+  for (int e = tid; e < E; e += blockDim.x) {
+    const int incl = scan[e], used = incl & 2047, first = (incl >> 11) - count[e];
+    if (count[e] > 0) {
+      uexp[used - 1] = e;
+      ustart[used - 1] = first;
+    }
+    count[e] = first;                                            // now each expert's next free slot
+  }
+  if (tid == 0) {
+    const int u = scan[E - 1] & 2047;
+    plan[0] = u;
+    ustart[u] = R;
+  }
+  __syncthreads();
+  // an expert's rows land in any order: a row's sum does not depend on where it sits
+  for (int r = tid; r < R; r += blockDim.x) urow[atomicAdd(count + __ldg(ids + r), 1)] = r;
+}
+
+// Dynamic shared memory: DSTAGES stages (16 weight rows and DECODE_XS bytes of x rows), then the partial sums. A row's
+// sum takes the same steps whatever the call's other rows, so a verify window's rows equal serial steps' bit for bit.
+// An expert with more than 16 MT rows takes them 16 MT at a time from the same staged weight rows.
 template <int MT>
 __global__ void __launch_bounds__(DWARPS * 32)
     decode_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__ W, const int* __restrict__ ids,
-                  int R, int N, int K, const uint32_t* __restrict__ gtab, __nv_bfloat16* __restrict__ out) {
+                  const int* __restrict__ plan, int R, int E, int N, int K, const uint32_t* __restrict__ gtab,
+                  __nv_bfloat16* __restrict__ out) {
   extern __shared__ uint4 dyn[];
   __shared__ __align__(16) uint32_t tab[TABLE_WORDS];
-  __shared__ int urow[MAX_ROWS], ustart[MAX_ROWS + 1], uexp[MAX_ROWS];
+  __shared__ int s_row[MAX_ROWS], s_start[MAX_ROWS + 1], s_exp[MAX_ROWS];
   __shared__ int s_nuniq;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gq = lane >> 2, t = lane & 3;
   for (int i = tid; i < TABLE_WORDS / 4; i += DWARPS * 32) cp16(reinterpret_cast<uint4*>(tab) + i, gtab + 4 * i);
   cp_commit();
-  if (warp == 0) {                       // the call's distinct experts in order of first row, and each one's rows
-    int nuniq = 0, pos = 0;
-    if (ids == nullptr) {
-      for (int r = lane; r < R; r += 32) urow[r] = r;
-      nuniq = 1, pos = R;
-      if (lane == 0) uexp[0] = 0;
+  const int* urow = s_row;
+  const int* ustart = s_start;
+  const int* uexp = s_exp;
+  if (plan != nullptr) {
+    uexp = plan + 1, ustart = plan + 1 + E, urow = plan + 2 + 2 * E;
+    if (tid == 0) s_nuniq = __ldg(plan);
+  } else if (warp == 0) {                // the call's distinct experts in order of first row, and each one's rows
+    int nuniq = 1, pos = R;
+    if (ids == nullptr) {                // a linear call: one expert, rows in order
+      if (lane == 0) s_exp[0] = 0;
     } else {
       // R <= 64: lane l holds ids[l] and ids[l + 32]; a row leads when no earlier row has its expert
+      nuniq = 0, pos = 0;
       const int id0 = lane < R ? __ldg(ids + lane) : -1, id1 = lane + 32 < R ? __ldg(ids + lane + 32) : -1;
       for (int r0 = 0; r0 < R; ++r0) {
         const int e = __shfl_sync(0xffffffffu, r0 < 32 ? id0 : id1, r0 & 31);
@@ -195,22 +245,24 @@ __global__ void __launch_bounds__(DWARPS * 32)
         const unsigned long long same = (unsigned long long)hi << 32 | lo;
         if (__ffsll(same) - 1 != r0) continue;         // an earlier row has this expert
         if (lane == 0) {
-          uexp[nuniq] = e;
-          ustart[nuniq] = pos;
+          s_exp[nuniq] = e;
+          s_start[nuniq] = pos;
         }
-        if (id0 == e) urow[pos + __popc(lo & ((1u << lane) - 1u))] = lane;
-        if (id1 == e) urow[pos + __popc(lo) + __popc(hi & ((1u << lane) - 1u))] = lane + 32;
+        if (id0 == e) s_row[pos + __popc(lo & ((1u << lane) - 1u))] = lane;
+        if (id1 == e) s_row[pos + __popc(lo) + __popc(hi & ((1u << lane) - 1u))] = lane + 32;
         pos += __popcll(same);
         ++nuniq;
       }
     }
     if (lane == 0) {
-      ustart[0] = 0;
-      ustart[nuniq] = pos;
+      s_start[0] = 0;
+      s_start[nuniq] = pos;
       s_nuniq = nuniq;
     }
   }
   __syncthreads();
+  const bool linear = ids == nullptr;    // rows in order, any count
+  auto row = [&](int i) { return linear ? i : urow[i]; };
   // block b takes tiles b, b + G, b + 2 G, ... (G = gridDim.x): at any moment the grid reads consecutive tiles
   const int coltiles = (N + DECODE_COLS - 1) / DECODE_COLS, total = s_nuniq * coltiles, G = gridDim.x;
   if ((int)blockIdx.x >= total) return;
@@ -219,17 +271,23 @@ __global__ void __launch_bounds__(DWARPS * 32)
   float* part = reinterpret_cast<float*>(dyn + DSTAGES * stage_u4);
   const size_t rowb = (size_t)kb * 66;
   const int xstride = K + XPAD;
+  auto span = [&](int u, int& first, int& nrows) {
+    first = linear ? 0 : ustart[u];
+    nrows = linear ? R : ustart[u + 1] - first;
+  };
   auto issue = [&](int tile, int s) {    // tile's 16 rows (8 at an N tail), and its expert's x rows when they fit
     const int u = tile / coltiles, n0 = (tile - u * coltiles) * DECODE_COLS;
-    const uint4* src = reinterpret_cast<const uint4*>(W + ((size_t)uexp[u] * N + n0) * rowb);
+    const uint4* src = reinterpret_cast<const uint4*>(W + ((size_t)(linear ? 0 : uexp[u]) * N + n0) * rowb);
     const int units = min(DECODE_COLS, N - n0) * kb * 66 / 16;
     uint4* dst = dyn + s * stage_u4;
     for (int i = tid; i < units; i += DWARPS * 32) cp16(dst + i, src + i);
-    const int first = ustart[u], nrows = ustart[u + 1] - first, per_row = K / 8;
+    int first, nrows;
+    span(u, first, nrows);
+    const int per_row = K / 8;
     if (nrows * xstride * 2 > DECODE_XS) return;
     for (int q = tid; q < nrows * per_row; q += DWARPS * 32) {
       const int r = q / per_row, c = q - r * per_row;
-      cp16(dst + slab_u4 + r * (xstride / 8) + c, X + (size_t)urow[first + r] * K + 8 * c);
+      cp16(dst + slab_u4 + r * (xstride / 8) + c, X + (size_t)row(first + r) * K + 8 * c);
     }
   };
 #pragma unroll
@@ -237,6 +295,8 @@ __global__ void __launch_bounds__(DWARPS * 32)
     if ((int)blockIdx.x + p * G < total) issue(blockIdx.x + p * G, p);
     cp_commit();
   }
+  constexpr int CHUNK = 16 * MT;
+  constexpr int PART = MT * 2 * 4;       // floats a lane
   const __nv_bfloat16* xa[MT];
   const __nv_bfloat16* xb[MT];
   for (int tile = blockIdx.x, i = 0; tile < total; tile += G, ++i) {
@@ -244,63 +304,68 @@ __global__ void __launch_bounds__(DWARPS * 32)
     if (tile + (DSTAGES - 1) * G < total) issue(tile + (DSTAGES - 1) * G, (i + DSTAGES - 1) % DSTAGES);
     cp_commit();
     const int u = tile / coltiles, n0 = (tile - u * coltiles) * DECODE_COLS;
-    const int first = ustart[u], nrows = ustart[u + 1] - first, mts = (nrows + 15) >> 4;
+    int first, nrows;
+    span(u, first, nrows);
     const bool staged = nrows * xstride * 2 <= DECODE_XS;
     const __nv_bfloat16* xst = reinterpret_cast<const __nv_bfloat16*>(dyn + s * stage_u4 + slab_u4);
-#pragma unroll
-    for (int m = 0; m < MT; ++m) {
-      const int ra = 16 * m + gq, rb8 = ra + 8;
-      if (staged) {
-        xa[m] = ra < nrows ? xst + ra * xstride + 32 * t : nullptr;
-        xb[m] = rb8 < nrows ? xst + rb8 * xstride + 32 * t : nullptr;
-      } else {
-        xa[m] = ra < nrows ? X + (size_t)urow[first + ra] * K + 32 * t : nullptr;
-        xb[m] = rb8 < nrows ? X + (size_t)urow[first + rb8] * K + 32 * t : nullptr;
-      }
-    }
-    cp_wait<DSTAGES - 1>();              // this tile's stage; the next ones may still be in flight
-    __syncthreads();
     const int ncols = min(DECODE_COLS, N - n0);
     const uint16_t* col0 = reinterpret_cast<const uint16_t*>(dyn + s * stage_u4) + gq * rb;
     const uint16_t* col1 = ncols == DECODE_COLS ? col0 + 8 * rb : col0;   // an 8-column tail decodes column gq twice
-    float acc[MT][2][4];
+    cp_wait<DSTAGES - 1>();              // this tile's stage; the next ones may still be in flight
+    __syncthreads();
+    for (int c0 = 0; c0 < nrows; c0 += CHUNK) {
+      const int crows = min(CHUNK, nrows - c0), mts = (crows + 15) >> 4;
 #pragma unroll
-    for (int m = 0; m < MT; ++m)
-#pragma unroll
-      for (int j = 0; j < 2; ++j) acc[m][j][0] = acc[m][j][1] = acc[m][j][2] = acc[m][j][3] = 0.f;
-    if (staged) {
-      decode_loop<MT, true>(acc, xa, xb, mts, col0, col1, K / 128, warp, t, tab);
-    } else {
-      decode_loop<MT, false>(acc, xa, xb, mts, col0, col1, K / 128, warp, t, tab);
-    }
-    constexpr int PART = MT * 2 * 4;     // floats a lane
-    if (warp > 0) {
+      for (int m = 0; m < MT; ++m) {
+        const int ra = 16 * m + gq, rb8 = ra + 8;
+        if (staged) {
+          xa[m] = ra < crows ? xst + (c0 + ra) * xstride + 32 * t : nullptr;
+          xb[m] = rb8 < crows ? xst + (c0 + rb8) * xstride + 32 * t : nullptr;
+        } else {
+          xa[m] = ra < crows ? X + (size_t)row(first + c0 + ra) * K + 32 * t : nullptr;
+          xb[m] = rb8 < crows ? X + (size_t)row(first + c0 + rb8) * K + 32 * t : nullptr;
+        }
+      }
+      float acc[MT][2][4];
 #pragma unroll
       for (int m = 0; m < MT; ++m)
 #pragma unroll
-        for (int j = 0; j < 2; ++j)
+        for (int j = 0; j < 2; ++j) acc[m][j][0] = acc[m][j][1] = acc[m][j][2] = acc[m][j][3] = 0.f;
+      if (staged) {
+        decode_loop<MT, true>(acc, xa, xb, mts, col0, col1, K / 128, warp, t, tab);
+      } else {
+        decode_loop<MT, false>(acc, xa, xb, mts, col0, col1, K / 128, warp, t, tab);
+      }
+      if (warp > 0) {
 #pragma unroll
-          for (int q = 0; q < 4; ++q) part[((warp - 1) * PART + (m * 2 + j) * 4 + q) * 32 + lane] = acc[m][j][q];
-    }
-    __syncthreads();
-    if (warp == 0) {
+        for (int m = 0; m < MT; ++m)
 #pragma unroll
-      for (int m = 0; m < MT; ++m) {
-        if (m >= mts) break;
+          for (int j = 0; j < 2; ++j)
 #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-          if (8 * j >= ncols) break;
+            for (int q = 0; q < 4; ++q) part[((warp - 1) * PART + (m * 2 + j) * 4 + q) * 32 + lane] = acc[m][j][q];
+      }
+      __syncthreads();
+      if (warp == 0) {
 #pragma unroll
-          for (int q = 0; q < 4; ++q)
+        for (int m = 0; m < MT; ++m) {
+          if (m >= mts) break;
 #pragma unroll
-            for (int w = 1; w < DWARPS; ++w) acc[m][j][q] += part[((w - 1) * PART + (m * 2 + j) * 4 + q) * 32 + lane];
-          const int col = n0 + 8 * j + 2 * t, ra = 16 * m + gq;
-          if (ra < nrows) store2(out + (size_t)urow[first + ra] * N + col, acc[m][j][0], acc[m][j][1]);
-          if (ra + 8 < nrows) store2(out + (size_t)urow[first + ra + 8] * N + col, acc[m][j][2], acc[m][j][3]);
+          for (int j = 0; j < 2; ++j) {
+            if (8 * j >= ncols) break;
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+#pragma unroll
+              for (int w = 1; w < DWARPS; ++w)
+                acc[m][j][q] += part[((w - 1) * PART + (m * 2 + j) * 4 + q) * 32 + lane];
+            const int col = n0 + 8 * j + 2 * t, ra = 16 * m + gq;
+            if (ra < crows) store2(out + (size_t)row(first + c0 + ra) * N + col, acc[m][j][0], acc[m][j][1]);
+            if (ra + 8 < crows)
+              store2(out + (size_t)row(first + c0 + ra + 8) * N + col, acc[m][j][2], acc[m][j][3]);
+          }
         }
       }
+      __syncthreads();                   // the partial sums (and, after the last chunk, stage s) are free again
     }
-    __syncthreads();                     // slab s and the partial sums are free again
   }
 }
 
@@ -443,17 +508,23 @@ __global__ void __launch_bounds__(PWARPS * 32)
 
 }  // namespace
 
-void iq2xxs_decode_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor* ids, int64_t n, int64_t mt,
-                        const at::Tensor& tab, at::Tensor& out) {
+void iq2xxs_decode_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor* ids, at::Tensor* plan, int64_t n,
+                        int64_t mt, const at::Tensor& tab, at::Tensor& out) {
   const at::cuda::CUDAGuard guard(x.device());
-  const int R = x.size(0), K = x.size(1), N = n;
+  const int R = x.size(0), K = x.size(1), N = n, E = w.size(0);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (plan) {
+    plan_kernel<<<1, 1024, 2 * E * sizeof(int), stream>>>(ids->data_ptr<int>(), R, E, plan->data_ptr<int>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
   const size_t smem = (size_t)DSTAGES * (DECODE_COLS * (K / QK) * 66 + DECODE_XS) +
                       (size_t)(DWARPS - 1) * mt * 2 * 4 * 32 * sizeof(float);
-  const int tiles = (ids ? R : 1) * ((N + DECODE_COLS - 1) / DECODE_COLS);    // a bound: R distinct experts at most
+  const int experts = ids ? std::min(R, E) : 1;
+  const int tiles = experts * ((N + DECODE_COLS - 1) / DECODE_COLS);    // a bound: the call's distinct experts
   const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-  auto stream = at::cuda::getCurrentCUDAStream();
   const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
   const auto* ip = ids ? ids->data_ptr<int>() : nullptr;
+  const auto* pp = plan ? plan->data_ptr<int>() : nullptr;
   const auto* tp = reinterpret_cast<const uint32_t*>(tab.data_ptr<int>());
   auto* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   auto go = [&](auto kernel) {
@@ -461,7 +532,7 @@ void iq2xxs_decode_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tens
     int per_sm = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, DWARPS * 32, smem);
     const int blocks = std::max(1, std::min(tiles, sms * std::max(per_sm, 1)));
-    kernel<<<blocks, DWARPS * 32, smem, stream>>>(xp, w.data_ptr<uint8_t>(), ip, R, N, K, tp, op);
+    kernel<<<blocks, DWARPS * 32, smem, stream>>>(xp, w.data_ptr<uint8_t>(), ip, pp, R, E, N, K, tp, op);
   };
   switch (mt) {
     case 1: go(decode_kernel<1>); break;

@@ -2,7 +2,8 @@
 
 Decode: 9 rows over 9 distinct experts of 496 (one token's routed experts), up (N 2560, K 1024) and down (N 1024,
 K 2560). Every timed call picks a fresh set of experts, so the weights come from DRAM, not from the previous call's L2.
-Prefill: 4096 tokens x 9 experts = 36,864 rows over 496 experts. Run inside the serving image on the GPU:
+Verify: 4 and 16 tokens of 9 rows in one call. Prefill: 4096 tokens x 9 experts = 36,864 rows over 496 experts.
+Run inside the serving image on the GPU:
 
     python tools/bench_bolt_iq2xxs.py [--experts 496] [--tokens 4096]
 """
@@ -65,6 +66,13 @@ def bench(name: str, n: int, k: int, args: argparse.Namespace) -> float:
     read = topk * n * row_bytes
     print(f"decode {name:4s} R={topk} N={n} K={k}: {s * 1e6:7.1f} us, {read / s / 1e9:6.1f} GB/s "
           f"({read / 1e6:.2f} MB of weights; {eager * 1e6:.1f} us a call launched eagerly from Python)")
+    for tokens in (4, 16):                                         # a drafter's verify window, one call
+        vids = torch.cat([torch.randperm(e, generator=g, device="cuda")[:topk] for _ in range(tokens)]).to(torch.int32)
+        vx = torch.randn((tokens * topk, k), device="cuda").to(torch.bfloat16)
+        v = timed(lambda i, vx=vx, vids=vids: iq2xxs.iq2xxs_grouped(vx, w, vids), 50, graph=True)
+        vread = int(torch.unique(vids).numel()) * n * row_bytes
+        print(f"verify {name:4s} {tokens:2d} tokens, R={tokens * topk}: {v * 1e6:7.1f} us, {vread / v / 1e9:6.1f} GB/s "
+              f"({vread / 1e6:.1f} MB of weights)")
     xs = torch.randn((args.tokens * topk, k), device="cuda").to(torch.bfloat16)
     ids = torch.stack([torch.randperm(e, generator=g, device="cuda")[:topk] for _ in range(args.tokens)])
     ids = ids.reshape(-1).to(torch.int32)

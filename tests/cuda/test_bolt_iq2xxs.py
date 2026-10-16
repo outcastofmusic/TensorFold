@@ -87,7 +87,7 @@ def test_dequant_matches_hand_decoded_block():
     assert np.array_equal(y[8:32], np.full(24, 8 * db, dtype=np.float32))
 
 
-@pytest.mark.parametrize("rows", [1, 5, 16, 17, 33, 64, 65, 200])
+@pytest.mark.parametrize("rows", [1, 5, 16, 17, 33, 64, 65, 200, 600])
 @pytest.mark.parametrize("n,k", [(40, 256), (64, 768), (128, 1024)])
 def test_linear(rows, n, k):
     packed = random_packed((n,), k, seed=rows * 7 + n)
@@ -110,7 +110,8 @@ def test_linear_non_multiple_of_tile_columns():
 
 
 @pytest.mark.parametrize("rows,experts,skew", [(1, 3, False), (9, 9, False), (9, 4, False), (64, 5, False),
-                                               (64, 30, True), (65, 7, False), (300, 11, False), (700, 9, True)])
+                                               (64, 30, True), (65, 7, False), (300, 11, False), (300, 40, True),
+                                               (512, 3, True), (700, 9, True)])
 def test_grouped(rows, experts, skew):
     n, k = 48, 512
     packed = random_packed((experts, n), k, seed=rows + experts)
@@ -150,13 +151,38 @@ def test_grouped_bolt_shapes(n, k, rows):
 
 
 def test_decode_and_prefill_agree():
-    """Rows 0..63 of a 64-row (decode) and a 65-row (prefill) call differ by at most one bf16 rounding."""
+    """A 512-row call (decode kernel) and a 513-row call (prefill kernel) both sit within bf16 rounding of float64."""
 
-    packed = torch.from_numpy(random_packed((128,), 1024, seed=11)).to(DEV)
-    x = torch.randn((65, 1024), generator=torch.Generator().manual_seed(2)).to(torch.bfloat16).to(DEV)
-    a = iq2xxs.iq2xxs_linear(x[:64], packed).float()
-    b = iq2xxs.iq2xxs_linear(x, packed)[:64].float()
-    assert torch.all((a - b).abs() <= a.abs() * 2.0 ** -7 + 1e-6)
+    packed = random_packed((128,), 1024, seed=11)
+    wq = bf16(dequant(packed))
+    x = torch.randn((513, 1024), generator=torch.Generator().manual_seed(2)).to(torch.bfloat16)
+    a = iq2xxs.iq2xxs_linear(x[:512].to(DEV), torch.from_numpy(packed).to(DEV))
+    b = iq2xxs.iq2xxs_linear(x.to(DEV), torch.from_numpy(packed).to(DEV))
+    check(a, x[:512], wq)
+    check(b, x, wq)
+
+
+@pytest.mark.parametrize("tokens", [2, 8, 16, 56])
+def test_verify_window_equals_serial_steps(tokens):
+    """A drafter's verify window (tokens x 9 rows, one call) gives each row the bits of its one-token step."""
+
+    experts, n, k = 40, 1024, 2560
+    packed = torch.from_numpy(random_packed((experts, n), k, seed=tokens)).to(DEV)
+    g = torch.Generator().manual_seed(tokens)
+    x = torch.randn((tokens * 9, k), generator=g).to(torch.bfloat16).to(DEV)
+    ids = torch.cat([torch.randperm(experts, generator=g)[:9] for _ in range(tokens)]).to(torch.int32).to(DEV)
+    window = iq2xxs.iq2xxs_grouped(x, packed, ids)
+    for t in range(tokens):
+        step = iq2xxs.iq2xxs_grouped(x[9 * t:9 * t + 9], packed, ids[9 * t:9 * t + 9])
+        assert torch.equal(window[9 * t:9 * t + 9], step), f"token {t}"
+
+
+def test_linear_rows_bitwise_independent_of_the_call():
+    packed = torch.from_numpy(random_packed((64,), 512, seed=6)).to(DEV)
+    x = torch.randn((300, 512), generator=torch.Generator().manual_seed(8)).to(torch.bfloat16).to(DEV)
+    whole = iq2xxs.iq2xxs_linear(x, packed)
+    for r in (0, 77, 299):
+        assert torch.equal(whole[r:r + 1], iq2xxs.iq2xxs_linear(x[r:r + 1], packed))
 
 
 def test_rows_bitwise_independent_of_the_call():

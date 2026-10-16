@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 
-void iq2xxs_decode_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor* ids, int64_t n, int64_t mt,
-                        const at::Tensor& tab, at::Tensor& out);
+void iq2xxs_decode_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor* ids, at::Tensor* plan, int64_t n,
+                        int64_t mt, const at::Tensor& tab, at::Tensor& out);
 void iq2xxs_prefill_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor* order,
                          const at::Tensor* tile_end, const at::Tensor* starts, int64_t experts, int64_t tiles,
                          int64_t n, const at::Tensor& tab, at::Tensor& out);
@@ -30,19 +30,29 @@ static void check_call(const at::Tensor& x, const at::Tensor& w, int64_t n, cons
   for (const auto* t : {&w, &out, &tab}) TORCH_CHECK(t->device() == x.device(), "all tensors on x's GPU");
 }
 
-void decode(const at::Tensor& x, const at::Tensor& w, const c10::optional<at::Tensor>& ids, int64_t mt,
-            const at::Tensor& tab, at::Tensor out) {
-  const int64_t n = w.size(1);
+// plan: int32 [2 + 2 E + R] scratch for a grouped call of more than 64 rows (the kernel finds a smaller call's experts
+// itself); any number of rows per expert
+void decode(const at::Tensor& x, const at::Tensor& w, const c10::optional<at::Tensor>& ids,
+            c10::optional<at::Tensor> plan, int64_t mt, const at::Tensor& tab, at::Tensor out) {
+  const int64_t n = w.size(1), e = w.size(0);
   check_call(x, w, n, tab, out);
-  TORCH_CHECK(mt >= 1 && mt <= 4 && x.size(0) <= 16 * mt, "decode: at most 16 * mt rows, mt 1 .. 4");
+  TORCH_CHECK(mt >= 1 && mt <= 4, "decode: mt 1 .. 4");
   if (ids) {
     check(*ids, "ids", at::kInt);
     TORCH_CHECK(ids->numel() == x.size(0) && ids->device() == x.device(), "ids: one expert a row");
+    TORCH_CHECK(plan.has_value() == (x.size(0) > 64), "decode: a plan exactly when a grouped call has over 64 rows");
+    if (plan) {
+      check(*plan, "plan", at::kInt);
+      TORCH_CHECK(plan->numel() == 2 + 2 * e + x.size(0) && plan->device() == x.device(), "plan: [2 + 2 E + R]");
+      TORCH_CHECK(e <= 1024 && x.size(0) < (1 << 20), "plan: at most 1024 experts and 2^20 rows");
+    } else {
+      TORCH_CHECK(x.size(0) <= 16 * mt, "decode: at most 16 * mt rows without a plan");
+    }
   } else {
-    TORCH_CHECK(w.size(0) == 1, "a linear call has one weight matrix");
+    TORCH_CHECK(e == 1 && !plan, "a linear call has one weight matrix and no plan");
   }
   if (x.size(0) == 0) return;
-  iq2xxs_decode_cuda(x, w, ids ? &*ids : nullptr, n, mt, tab, out);
+  iq2xxs_decode_cuda(x, w, ids ? &*ids : nullptr, plan ? &*plan : nullptr, n, mt, tab, out);
 }
 
 void prefill(const at::Tensor& x, const at::Tensor& w, const c10::optional<at::Tensor>& order,
@@ -69,6 +79,6 @@ void prefill(const at::Tensor& x, const at::Tensor& w, const c10::optional<at::T
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("decode", &decode, "IQ2_XXS matmul for a few rows: four warps a 16-column tile of an expert");
+  m.def("decode", &decode, "IQ2_XXS matmul, decode form: a row's bits do not depend on the call's other rows");
   m.def("prefill", &prefill, "IQ2_XXS matmul for many rows: 64-row tiles of one expert, x through shared memory");
 }

@@ -2,8 +2,11 @@
 
 ``iq2xxs_linear(x, w)`` and ``iq2xxs_grouped(x, w, ids)`` return ``x @ dequantize(w).T`` in bf16, accumulated in fp32
 on bf16 weights rounded as llama.cpp's dequantize_row_iq2_xxs and then bf16 give them. Up to ``DECODE_ROWS`` rows a
-call runs the decode kernel (one warp a 16-column tile; a grouped call reads each expert's rows once); more rows run
-the prefill kernel (64-row tiles of one expert, rows sorted by expert on the GPU, no host sync).
+call runs the decode kernel (16-column tiles of the call's distinct experts, each expert's weights read once); a
+row's bits there do not depend on the call's other rows or their number, so a verify window of up to 512 rows (56
+tokens of 9 experts) equals serial one-token steps bit for bit. More rows run the prefill kernel (64-row tiles of
+one expert, rows sorted by expert on the GPU, no host sync), whose sums can differ from the decode kernel's by one
+bf16 rounding.
 """
 
 from __future__ import annotations
@@ -15,7 +18,8 @@ import torch
 
 QK = 256                 # weights a block
 BLOCK_BYTES = 66         # fp16 d, then 32 uint16 qs
-DECODE_ROWS = 64         # the decode kernel's widest call: four m16 tiles
+DECODE_ROWS = 512        # calls up to this many rows run the decode kernel, bit for bit the same a row at any count
+PLAN_ROWS = 64           # a grouped decode call wider than this gets its experts from a plan kernel
 PREFILL_ROWS = 64        # rows a prefill tile
 
 # iq2xxs_grid, copied from llama.cpp ggml/src/ggml-common.h:560 (23f7aabc, 2026-10-16); entry byte j is weight j
@@ -126,7 +130,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_bolt_iq2xxs_v17", sources=[str(here / "iq2xxs.cpp"), str(here / "iq2xxs.cu")],
+    return load(name="tensorfold_bolt_iq2xxs_v18", sources=[str(here / "iq2xxs.cpp"), str(here / "iq2xxs.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -163,7 +167,7 @@ def iq2xxs_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     out = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
     tab = _tables(x.device)
     if rows <= DECODE_ROWS:
-        _ext().decode(x, w3, None, max(1, -(-rows // 16)), tab, out)
+        _ext().decode(x, w3, None, None, min(4, max(1, -(-rows // 16))), tab, out)
     else:
         _ext().prefill(x, w3, None, None, None, -(-rows // PREFILL_ROWS), tab, out)
     return out
@@ -184,7 +188,8 @@ def iq2xxs_grouped(x: torch.Tensor, w: torch.Tensor, ids: torch.Tensor) -> torch
     out = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
     tab = _tables(x.device)
     if rows <= DECODE_ROWS:
-        _ext().decode(x, w, ids, max(1, -(-rows // 16)), tab, out)
+        plan = torch.empty((2 + 2 * experts + rows,), dtype=torch.int32, device=x.device) if rows > PLAN_ROWS else None
+        _ext().decode(x, w, ids, plan, min(4, max(1, -(-rows // 16))), tab, out)
         return out
     order = torch.argsort(ids, stable=True).to(torch.int32)
     counts = torch.bincount(ids, minlength=experts)
