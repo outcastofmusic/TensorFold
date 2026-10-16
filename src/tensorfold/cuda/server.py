@@ -29,6 +29,7 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
 from tensorfold.cuda import health
 from tensorfold.cuda.chat_template import ChatTemplate
+from tensorfold.cuda.prompt_ids import PromptIds
 from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, close_call, hide_tool_calls, parse_tool_calls
 from tensorfold.cuda.turns import Turns, Yield
 from tensorfold.server.text import THINK_MARKERS, is_title_request, reasoning_count, split_thinking
@@ -392,7 +393,7 @@ class App:
                                        vision=rendered.vision, grammar=compiled, think_budget=budget,
                                        guard=self._guard(body, thinking))
             text = render(body["messages"])
-            prompt = self.tok.encode(text, add_special_tokens=False).ids
+            prompt = self._prompt_ids().encode(text)
             thinking = thinking and not answering(text)
             budget = budget if thinking else 0
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
@@ -702,6 +703,12 @@ class App:
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
                 "stats": stats, "calls_streamed": streamed}
+
+    def _prompt_ids(self) -> PromptIds:
+        """The rendered prompts' pieces kept between requests (``prompt_ids``), made on first use."""
+
+        with _MADE:
+            return self.__dict__.setdefault("prompt_ids", PromptIds(self.tok))
 
     def _turns(self) -> Turns:
         """The engine's turns (one request at a time, background ones last), made on first use."""
