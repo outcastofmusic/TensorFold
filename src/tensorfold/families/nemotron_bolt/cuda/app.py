@@ -68,7 +68,7 @@ class BoltEngine:
         if drafter and self.drafts > 0:
             from .lilicorr import Drafter
 
-            self.drafter = Drafter(drafter, self.e)
+            self.drafter = Drafter(drafter, embed=self.e.embed_rows, lm_head=self.e.head_logits)
         self.eos = tuple(c.eos)
         self.tp, self.rank = 1, 0
         from .engine import EXPERTS
@@ -110,7 +110,8 @@ class BoltEngine:
         if drafting:
             from .lilicorr import lilicorr_decode
 
-            res = lilicorr_decode(self.e, self.drafter, pending, max_tokens, sampling, stop_eos, on_tokens)
+            res = lilicorr_decode(self.e, self.drafter, pending, max_tokens, sampling, stop_eos=stop_eos,
+                                  on_tokens=on_tokens)
             stats.update(drafted=getattr(res, "drafted", 0), accepted=getattr(res, "accepted", 0))
         else:
             res = serial_decode(self.e, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,

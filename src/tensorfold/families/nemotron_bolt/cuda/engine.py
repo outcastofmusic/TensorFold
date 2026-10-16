@@ -292,6 +292,20 @@ class Engine:
         self.masked = True
 
     @property
+    def eos(self) -> tuple[int, ...]:
+        return self.c.eos
+
+    def embed_rows(self, ids: torch.Tensor) -> torch.Tensor:
+        """The target's embedding rows [n, D] bf16 for token ids [n] (a drafter shares them)."""
+
+        return self.w.embed[ids.long()]
+
+    def head_logits(self, h: torch.Tensor) -> torch.Tensor:
+        """The target's lm_head over bf16 rows [n, D] -> [n, V] bf16 (a drafter shares it)."""
+
+        return dense(h.to(torch.bfloat16).contiguous(), self.w.head, h.shape[0] > 64)
+
+    @property
     def head_width(self) -> tuple[int, int]:
         return self.c.vocab, 0
 
