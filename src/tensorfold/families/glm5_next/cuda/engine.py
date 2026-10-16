@@ -18,6 +18,7 @@ DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 whil
 EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
 GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
 MAX_ROWS = 8                          # the widest verify window (a pending token and up to 7 drafts)
+WARM_ROWS = 256                       # a background pass's chunk: a request asking for the GPU waits out one (0.7 s)
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
 # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
 DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
@@ -529,10 +530,13 @@ class GlmEngine:
         Only a regenerated or edited turn resumes from one, so it goes before another conversation's states and
         before a system block's end, which holds no user message. "Later" is in use order (the cache's, newest last):
         a turn resumed after the turn that extends it is a branch point in use, and the stale branch goes first.
+        A background pass's state counts as the turn it was kept for (``born``): it supersedes none of that turn's
+        own states, which a regenerated turn resumes from, until a later turn's do.
         """
         for i, c in enumerate(self.cache):
             n = len(c.ids)
-            if self.user_id in c.ids and any(len(d.ids) > n and d.ids[:n] == c.ids for d in self.cache[i + 1:]):
+            if self.user_id in c.ids and any((d.born if d.born >= 0 else len(d.ids)) > n and len(d.ids) > n
+                                             and d.ids[:n] == c.ids for d in self.cache[i + 1:]):
                 return c
         return None
 
@@ -656,6 +660,43 @@ class GlmEngine:
         if res.stages:
             stats["stages_ms"] = {k: round(v * 1e3, 1) for k, v in res.stages.items()}
         return stats
+
+    def warm(self, prompt: list[int], born: int, stop: Callable[[], bool], rows: int = WARM_ROWS) -> int:
+        """Prefill ``prompt`` in the background and keep its state at its end, so the next turn resumes past the
+        reply instead of prefilling it again. Returns the tokens prefilled: 0 when the state is kept already, when two
+        ranks serve (rank 1 follows requests only), or when ``stop()`` held before the last chunk, which drops the
+        pass. ``born`` is the length of the turn the state is kept for (``_superseded``)."""
+
+        from tensorfold.server.cancellation import RequestCancelled
+
+        from .decode import load_rows, prefill
+
+        if self.comm is not None or not (self.cache_entries > 0 and self.cache_bytes > 0) or not prompt:
+            return 0
+        if len(prompt) >= self.limit or any(c.ids == prompt for c in self.cache):
+            return 0
+        code = self._effective(encode_policy(self.policy))
+        _, use_mtp, use_dflash = self._drafters(code)
+        hit = self._resume(prompt, code)
+        begin = len(hit.ids) if hit is not None else 0
+        self._take_over(list(hit.ids) if hit is not None else [])
+        if hit is not None and hit.rows is not None:
+            load_rows(self.e, hit)
+            hit.rows, hit.nbytes = None, 0
+        self.live = list(hit.ids) if hit is not None else []
+
+        def keep(snap) -> None:
+            snap.born = born
+            self._remember(snap)
+
+        self.e.constraint, self.e.window = None, None
+        try:
+            prefill(self.e, prompt, None, mtp=use_mtp, drafter=self.drafter if use_dflash else None, resume=hit,
+                    keep_at=len(prompt), keep=keep, stop=stop, rows=rows)
+        except RequestCancelled:
+            return 0                                  # rows past the resume point are partial: live stays at hit
+        self.live = list(prompt)
+        return len(prompt) - begin
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
                  constraint=None) -> dict[str, Any]:

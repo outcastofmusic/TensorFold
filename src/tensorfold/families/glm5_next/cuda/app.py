@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from tensorfold.cuda import warm
 from tensorfold.cuda.server import App, PreparedRequest, RequestError
 from tensorfold.families.glm5_next.prompts import clear_thinking, thinking_off
 from tensorfold.server.errors import CONTEXT_LIMIT
+from tensorfold.server.text import is_title_request
 
 
 class ThinkingOffTemplate:
@@ -31,6 +33,10 @@ class GlmApp(App):
     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
         super().__init__(engine, model_dir, served, **kwargs)
         self.template = ThinkingOffTemplate(self.template)
+        self.warmer = None
+        if warm.enabled() and hasattr(engine, "warm") and getattr(engine, "comm", None) is None:
+            turns = self._turns()
+            self.warmer = warm.Warmer(engine.warm, lambda: turns.take(True), turns.give, turns.wanted)
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
@@ -60,4 +66,25 @@ class GlmApp(App):
         model = str(body.get("model") or "")
         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
-        return super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+        try:
+            result = super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+        finally:
+            if self.warmer is not None:
+                self.warmer.finished()
+        if self.warmer is not None and chat and result["finish"] in ("stop", "tool_calls") \
+                and body.get("priority") != "background" and not is_title_request(body["messages"], body.get("tools")):
+            self.warmer.queue(lambda: self._next_turn(body, result))
+        return result
+
+    def _next_turn(self, body: dict[str, Any], result: dict[str, Any]) -> tuple[list[int], int] | None:
+        """(the next turn's shared prompt, the length of this turn's kept state), or None when it adds nothing."""
+
+        def render(messages: list[dict[str, Any]]) -> list[int]:
+            return self._prepare({**body, "messages": messages}, True).prompt
+
+        try:
+            prompt = warm.next_turn_prefix(render, list(body["messages"]), warm.reply_message(result))
+        except RequestError:                          # the template refuses the conversation with the reply in it
+            return None
+        born = result["prompt_tokens"] - 1            # where the turn's own state was kept (``_run_once``)
+        return (prompt, born) if len(prompt) > result["prompt_tokens"] else None

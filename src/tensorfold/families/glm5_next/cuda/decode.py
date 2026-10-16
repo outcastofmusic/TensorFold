@@ -248,6 +248,7 @@ class Snapshot:
     rows: list | None = None      # the attention rows of ids, saved when another conversation took the live caches
     nbytes: int = 0
     drafter_rows: list | None = None  # a ring drafter's window rows before drafter_end, copied when taken
+    born: int = -1                # a background pass's state: the length of the turn it was kept for (-1: its own)
 
 
 def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
@@ -352,7 +353,7 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
             resume: Snapshot | None = None, keep_at: int | None = None, stops: Sequence[int] = (), keep=None,
-            stop=None) -> int:
+            stop=None, rows: int | None = None) -> int:
     """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state.
 
     ``keep`` gets the state at ``keep_at`` after the last chunk, and the state at each of ``stops`` as its chunk
@@ -360,6 +361,8 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
 
     ``stop()`` is asked before each chunk: once it holds, the prompt is abandoned with ``RequestCancelled`` and
     the caller must reset the engine before its next prompt.
+
+    ``rows`` caps a chunk below ``e.prefill_rows``: a background pass asked to stop waits out a shorter chunk.
     """
 
     if not prompt:
@@ -399,7 +402,8 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
 
             prof.active = False
             raise RequestCancelled("the client left while its prompt was filling")
-        end = min(start + e.prefill_rows, len(prompt), next((p for p in stops if p > start), len(prompt)))
+        end = min(start + min(rows or e.prefill_rows, e.prefill_rows), len(prompt),
+                  next((p for p in stops if p > start), len(prompt)))
         chunk = list(prompt[start:end])
         R = len(chunk)
         at = keep_at if keep_at is not None and start < keep_at <= end else end if end in stops else None
