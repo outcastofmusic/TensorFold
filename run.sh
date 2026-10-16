@@ -20,6 +20,7 @@
 #   QWEN_MODEL, CLEF_MODEL, GLM_MODEL   another checkpoint folder under $MODELS
 # Qwen:  CONTEXT=262144  PARALLEL=4  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)
+#        STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what the tensorfold-states volume holds
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
 set -euo pipefail
 
@@ -185,6 +186,9 @@ glm() {
     # (2026-10-15/16). Each such turn also costs the next one its reasoning again as prompt, at about 310 tok/s.
     local budget=()
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
+    # kept prompt states also go to disk, so a conversation's next turn after a swap or restart reads its state back
+    local states=()
+    [ "${STATES:-1}" = 0 ] || states=(-v tensorfold-states:/states -e TENSORFOLD_GLM_STATES=/states -e "TENSORFOLD_GLM_STATES_GIB=${STATES_GIB:-64}")
     IMAGE=$(image)
     stop_all
     [ "$(avail)" -ge 100 ] || echo "run: $(avail) GiB available; GLM needs about 100 and the server refuses to start with less" >&2
@@ -198,7 +202,7 @@ glm() {
         # TF_GLM_DENSE_PROMPT=1: prompt rows through the dense matmul, 310 -> 362 tok/s on a 20,500-token prompt
         # TF_GLM_CALIBRATE=0: no 5 s of draft timing at start; only the `auto:...` chooser reads it (TIMING=1 keeps it)
         # TF_GLM_LAZY_SPARSE=1: the 72 long-context graphs are captured at first use (0.1 s each) where start-up took 7 s
-        serve tensorfold-glm -e TF_GLM_DENSE_PROMPT=1 -e TF_GLM_CALIBRATE="${TIMING:-0}" -e TF_GLM_LAZY_SPARSE=1 -e TENSORFOLD_MEMORY_RESERVE_GIB=11 -- "$model" --tp 1 --host 127.0.0.1 --port "$PORT" --name glm-5.3-flash \
+        serve tensorfold-glm -e TF_GLM_DENSE_PROMPT=1 -e TF_GLM_CALIBRATE="${TIMING:-0}" -e TF_GLM_LAZY_SPARSE=1 -e TENSORFOLD_MEMORY_RESERVE_GIB=11 "${states[@]}" -- "$model" --tp 1 --host 127.0.0.1 --port "$PORT" --name glm-5.3-flash \
             --context "${CONTEXT:-$context}" --max-tokens "${CONTEXT:-$context}" "${drafter[@]}" "${budget[@]}" ${EXTRA:-}
         wait_ready tensorfold-glm "$PORT" && return 0
         docker logs tensorfold-glm 2>&1 | grep -q 'memory budget cannot fit' || break

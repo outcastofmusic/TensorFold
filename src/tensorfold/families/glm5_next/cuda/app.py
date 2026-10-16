@@ -35,10 +35,12 @@ class GlmApp(App):
     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
         super().__init__(engine, model_dir, served, **kwargs)
         self.template = ThinkingOffTemplate(self.template)
-        self.warmer = None
-        if warm.enabled() and hasattr(engine, "warm") and getattr(engine, "comm", None) is None:
+        self.warmer, self.warming = None, warm.enabled() and hasattr(engine, "warm")
+        keeping = getattr(engine, "disk", None) is not None          # TENSORFOLD_GLM_STATES: states also go to disk
+        if (self.warming or keeping) and getattr(engine, "comm", None) is None:
             turns = self._turns()
-            self.warmer = warm.Warmer(engine.warm, lambda: turns.take(True), turns.give, turns.wanted)
+            self.warmer = warm.Warmer(engine.warm, lambda: turns.take(True), turns.give, turns.wanted,
+                                      after=engine.persist if keeping else None)
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
@@ -75,7 +77,7 @@ class GlmApp(App):
                 self.warmer.finished()
         if self.warmer is not None and chat and result["finish"] in ("stop", "tool_calls") \
                 and body.get("priority") != "background" and not is_title_request(body["messages"], body.get("tools")):
-            self.warmer.queue(lambda: self._next_turn(body, result))
+            self.warmer.queue(lambda: self._next_turn(body, result) if self.warming else None)
         return result
 
     def _next_turn(self, body: dict[str, Any], result: dict[str, Any]) -> tuple[list[int], int] | None:

@@ -316,6 +316,93 @@ class GlmEngine:
         self.live: list[int] = []
         self.cache_entries = 0 if self.target_only else int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
         self.user_id = _token_id(self.model_dir, "<|user|>")
+        self.disk = self._disk_states(drafter)
+
+    def _disk_states(self, drafter: Path | None):
+        """``TENSORFOLD_GLM_STATES``: the folder kept states also go to (``disk``), on one rank; None without it.
+        ``TENSORFOLD_GLM_STATES_GIB`` (64) caps what it holds."""
+
+        root = os.environ.get("TENSORFOLD_GLM_STATES", "").strip()
+        if not root or self.comm is not None or self.cache_entries <= 0:
+            return None
+        import tensorfold
+
+        from .decode import _row_views
+        from .disk import DiskStates, fingerprint
+
+        def digest(paths) -> str:
+            h = hashlib.sha256()
+            for path in paths:
+                if path.is_file():
+                    h.update(path.name.encode() + path.read_bytes())
+            return h.hexdigest()
+
+        here = Path(__file__).resolve().parent
+        code = sorted([*here.glob("*.py"), *here.glob("*.cu"), *here.glob("*.cpp"), *here.glob("*.h")])
+        folders = [self.model_dir] + ([Path(drafter)] if drafter else [])
+        st = self.e.st
+        parts = {"tensorfold": tensorfold.__version__, "code": digest(code),
+                 "checkpoints": [(str(f.resolve()), digest([f / "config.json", f / "quantization_config.json"]))
+                                 for f in folders],
+                 "views": [(list(v.shape[1:]), str(v.dtype)) for v in _row_views(st, 4, 4)],
+                 "states": [list(st.rec.shape[1:]), str(st.rec.dtype), list(st.conv.shape), str(st.conv.dtype)]}
+        budget = int(float(os.environ.get("TENSORFOLD_GLM_STATES_GIB", "64")) * (1 << 30))
+        disk = DiskStates(Path(root), fingerprint(parts), budget)
+        print(f"[tensorfold] kept states on disk: {disk.dir} ({len(disk.entries)} states, up to {budget >> 30} GiB)",
+              flush=True)
+        return disk
+
+    def persist(self, stop: Callable[[], bool]) -> int:
+        """Write the kept states not on disk yet, newest first, while no request runs; the states written. A state
+        whose rows another conversation took is written from its saved rows, and one whose rows are gone is not."""
+
+        if self.disk is None:
+            return 0
+        from .decode import _row_views
+        from .disk import MIN_TOKENS
+
+        written = 0
+        for snap in reversed(list(self.cache)):
+            n, m = len(snap.ids), max(snap.mtp_len, 0)
+            if n < MIN_TOKENS or self.disk.has(snap.ids):
+                continue
+            if stop():
+                break
+
+            def views(snap=snap, n=n, m=m):
+                if snap not in self.cache:
+                    return None
+                if snap.rows is not None:
+                    return snap.rows
+                return _row_views(self.e.st, n, m) if self.live[:n] == snap.ids else None
+
+            # a flat drafter's rows are in no snapshot: such a state resumes without DFlash2 drafts (save_rows)
+            end = snap.drafter_end if snap.drafter_rows is not None else -1
+            if self.disk.write(snap.ids, views, {"rec": snap.rec, "conv": snap.conv, "pending": snap.pending},
+                               snap.drafter_rows, mtp_len=snap.mtp_len, drafter_end=end, born=snap.born, stop=stop):
+                written += 1
+        return written
+
+    def _load_disk(self, entry):
+        """Read a state from disk into the live caches and keep it; None, with the prompt prefilling instead, when a
+        piece fails its hash. Every other state's rows are saved or dropped first: the read overwrites them all."""
+
+        from .decode import Snapshot, _row_views
+        from .disk import StateError
+
+        n, m = len(entry.ids), max(entry.mtp_len, 0)
+        self._take_over([])
+        self.live = []
+        try:
+            got = self.disk.load(entry, _row_views(self.e.st, n, m), self.e.st.rec.device)
+        except StateError as exc:
+            print(f"[tensorfold] a kept state on disk did not read ({exc}); the prompt prefills", flush=True)
+            return None
+        snap = Snapshot(list(entry.ids), got["rec"], got["conv"], got.get("pending"), entry.mtp_len,
+                        entry.drafter_end, drafter_rows=got["ring"], born=entry.born)
+        self.live = list(entry.ids)
+        self._remember(snap)
+        return snap if snap in self.cache else None
 
     def _calibrate(self) -> dict:
         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""
@@ -580,10 +667,10 @@ class GlmEngine:
         return sum(snapshot_bytes(c) for c in self.cache)
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
-             code: list[int], hit, draft: bool, constraint=None) -> dict[str, Any]:
+             code: list[int], hit, draft: bool, constraint=None, disk=None) -> dict[str, Any]:
         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
         try:
-            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft)
+            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, disk)
         finally:
             self.e.constraint = self.e.window = None
 
@@ -595,7 +682,7 @@ class GlmEngine:
         return CopyIndex([*prompt, first]) if enabled() and self.e.constraint is None else None
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
-                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool) -> dict[str, Any]:
+                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool, disk=None) -> dict[str, Any]:
         from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
         from .drafter_choice import DrafterChoice, auto_decode
 
@@ -603,6 +690,10 @@ class GlmEngine:
         auto, use_mtp, use_dflash = self._drafters(code)
         drafter = self.drafter if use_dflash else None
         t0 = time.perf_counter()
+        read = self._load_disk(disk) if disk is not None else None
+        read_s = time.perf_counter() - t0
+        if disk is not None:          # the read took the live caches: a state it dropped resumes nothing any more
+            hit = read or (hit if hit is not None and hit in self.cache else None)
         # a request writes the caches from its resume point: other conversations' rows are saved first, a saved resume point's restored
         from .decode import load_rows
 
@@ -620,6 +711,8 @@ class GlmEngine:
                         stops=self._system_end(prompt, cut) if keeps else (), keep=self._remember)
         prefill_s = time.perf_counter() - t0
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
+        if read is not None:
+            stats.update(disk_tokens=len(read.ids), disk_s=round(read_s, 3))
         stopped = bool(on_tokens([first])) and self.comm is None      # rank 1 cannot hear a stop: two ranks decode on
         if max_tokens <= 1 or (stop_eos and first in self.eos) or stopped:
             return stats
@@ -713,6 +806,11 @@ class GlmEngine:
         stop_eos = bool(getattr(self.request, "stop_eos", True))
         draft = bool(draft and not self.target_only)
         hit = self._resume(list(prompt), code) if draft and self.cache_entries > 0 and self.cache_bytes > 0 else None
+        disk = None
+        if draft and self.disk is not None:
+            _, mtp, dflash = self._drafters(code)
+            disk = self.disk.find(prompt, len(hit.ids) if hit is not None else 0,
+                                  lambda e: (not dflash or e.drafter_end == len(e.ids)) and (not mtp or e.mtp_len >= 0))
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
@@ -729,7 +827,7 @@ class GlmEngine:
         self._share(list(prompt))
         if constraint is not None:                     # the request's grammar: rank 1 compiles the same
             self._share(pack(constraint))
-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint)
+        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, disk)
         stats.update(policy=spec, drafts=draft)
         from .route_log import flush as flush_routes
 

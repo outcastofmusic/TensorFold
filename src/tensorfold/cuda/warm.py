@@ -52,11 +52,14 @@ class Warmer:
     """One pending pass at a time: a newer reply's replaces it, and a request that ran since it was queued makes it
     stale. A pass is queued as ``make()``, which renders (prompt, born) on this thread, so the reply's last chunk does
     not wait on three renderings of the conversation; None skips it. ``take``/``give``/``wanted`` are the engine's
-    turns; ``run(prompt, born, stop)`` does the prefill."""
+    turns; ``run(prompt, born, stop)`` does the prefill. ``after(stop)``, when given, runs under the same turns after
+    the pass, or in its place when ``make()`` gives None: GLM writes its kept states to disk there."""
 
     def __init__(self, run: Callable[[list[int], int, Callable[[], bool]], Any], take: Callable[[], None],
-                 give: Callable[[], None], wanted: Callable[[], bool], delay: float = DELAY) -> None:
+                 give: Callable[[], None], wanted: Callable[[], bool], delay: float = DELAY,
+                 after: Callable[[Callable[[], bool]], Any] | None = None) -> None:
         self.run, self.take, self.give, self.wanted, self.delay = run, take, give, wanted, float(delay)
+        self.after = after
         self.cv = threading.Condition()
         self.served = 0                       # requests finished: a pass queued before the latest is stale
         self.pending: tuple[Callable[[], tuple[list[int], int] | None], int] | None = None
@@ -89,15 +92,17 @@ class Warmer:
                 self.pending = None
             made = make()
             time.sleep(self.delay)
-            if made is None or self._stale(served) or self.wanted():
+            if (made is None and self.after is None) or self._stale(served) or self.wanted():
                 continue
-            prompt, born = made
             self.take()
             try:
                 if self._stale(served):
                     continue
-                done = self.run(prompt, born, self.wanted)
+                done = self.run(*made, self.wanted) if made is not None else None
+                if self.after is not None and not self.wanted():
+                    self.after(self.wanted)
             finally:
                 self.give()
-            with self.cv:
-                self.passes.append(int(done or 0))
+            if made is not None:
+                with self.cv:
+                    self.passes.append(int(done or 0))
