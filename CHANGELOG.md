@@ -3,6 +3,39 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## 0.8.0 (16 Oct 2026)
+
+Measured on one DGX Spark on 16 Oct 2026.
+
+- **GLM-5.3 Flash stops decoding when a reply is cut.** Its decode loops ignored a stop, so a thinking budget's cut
+  and a client that left both decoded on to the model's own end token. A budget-cut reply that took 1,208.9 s now
+  takes 111.5 s with the same tokens, and a client that leaves frees the GPU 2 s later instead of about 13 minutes.
+  Two ranks still decode to the end, because rank 1 cannot hear the stop.
+- **GLM keeps prompt states on disk.** With `TENSORFOLD_GLM_STATES`, a folder that `run.sh` mounts as the
+  `tensorfold-states` volume (`STATES=0` turns it off), kept states of 1,024 tokens or more are written while no
+  request runs. A conversation's next turn after a swap or restart reads its state back. A turn of 11,735 tokens
+  resumed 7,445 of them from disk in 0.31 s, and its prefill took 13.9 s instead of 38.0 s, with the cold reply's
+  tokens. Every piece is checked against its SHA-256, blocks two states share are stored once, and
+  `TENSORFOLD_GLM_STATES_GIB` (64) caps the folder.
+- **GLM prefills each reply in the background for the next turn.** After a chat reply, the next turn's shared
+  prompt is prefilled once the engine has idled for 0.15 s, and a request that arrives stops the pass within a
+  256-row chunk. Over an 8-turn agent session, prefill fell from 5.51 s to 4.77 s with the same replies.
+  `TENSORFOLD_WARM_REPLIES=0` turns it off.
+- **GLM tool calls the model wrote slightly wrong are calls.** A lost `<arg_key>` is put back. A call that the end
+  token cut off before `</tool_call>` is closed when the closed call parses strictly.
+- **A later turn encodes only its new text.** On a 58,418-token Qwen3.8 Flash Next prompt, encoding fell from
+  52.8 ms to 2.5 ms, and on a 38,030-token GLM prompt from 42.2 ms to 2.5 ms.
+- **`GET /v1/models` lists each model's reasoning efforts:** `xhigh, medium, low, none` for Qwen3.8 Flash Next and
+  `max, high, low` for GLM-5.3 Flash.
+- **The think-loop detector is on.** It closes a think block that repeats itself (`TENSORFOLD_THINK_LOOP=0` turns
+  it off). On 183 saved reasoning blocks it closed the 4 true loops and nothing else.
+- `/v1/responses` accepts OpenAI's `include` values. A streamed `/v1/messages` reply on the CUDA server opens with
+  the prompt's size.
+- A bare `./run.sh` starts the swap endpoint with Qwen loaded first, and GLM serves with an 8,000-token thinking
+  budget.
+- The CPU suite passes on Linux: 4,413 passed and 0 failed, where 129 failed and 11 errored before. Tests that need
+  Apple's MLX now skip where it is not installed.
+
 ## 0.7.0 (14 Oct 2026)
 
 The fork's first release: 90 commits on upstream's frozen `python-0.6` branch.
