@@ -150,7 +150,8 @@ def require_readable(family: Family, config: dict[str, Any], backend: str) -> No
         raise ValueError(f"{family.title} on {where} does not read this checkpoint's weights "
                          f"({describe_quantization(config)}); it reads {reads}. Tested checkpoints: {tested}. "
                          f"{OWN_MODEL_HELP}")
-    if backend == "cuda" and method in ("modelopt", "compressed-tensors"):
+    if backend == "cuda" and method in ("modelopt", "compressed-tensors") and \
+            not getattr(family.package, "MODELOPT_GGML", False):     # mixed ggml blocks: the family's ``check``
         # NVFP4 / FP8 / MXFP8 weights: the config's schemes here, each linear's tensors by the loader
         from tensorfold.cuda.nvfp4 import format as nvfp4_format
 
