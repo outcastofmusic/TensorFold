@@ -1,0 +1,611 @@
+"""LiLiCorr drafts for Nemotron 3.5 Bolt: a DFlash block over target taps, a candidate lattice walked by pair scores.
+
+The draft model follows vLLM's ``qwen3_dflash.py`` / ``qwen3_dflash2.py`` / ``lilicorr.py`` and the speculator in
+``v1/worker/gpu/spec_decode/{dflash,dflash2,lilicorr}``:
+
+- Context. Each committed target position p contributes ``fc(concat of the residual stream after the tap layers)``.
+  Every draft layer projects its ``hidden_norm`` to keys and values (k_norm, RoPE at p), and drafts read them through
+  a 1024-position sliding window. The last committed row's normed context is the lattice's anchor.
+- Block. The pending token (at position ``context_end``) and N mask tokens run through 5 dense GQA layers with
+  bidirectional attention inside the block, per-head attention sinks, and a two-tap grouped dynamic convolution
+  around each attention and MLP. The mask rows' final hidden states give the target lm_head's top-8 candidates
+  at positions ``context_end + 1 .. context_end + N``.
+- Lattice. The two-layer LiLiCorr head scores anchor -> slot 0 and slot s -> slot s + 1 candidate pairs. A walk
+  then picks one candidate a slot: the argmax for greedy requests, the argmax under the target's keyed Gumbel noise
+  for sampled ones.
+
+``lilicorr_decode`` verifies the pending token and the drafts in one target window and keeps the drafts through the
+first one that differs from the target's keyed sample, so a drafted reply equals the serial reply token for token.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from tensorfold.engine.exact_sampling import Sampling, uniform_rows
+
+# FP4 (E2M1) magnitudes by code & 7; bit 3 is the sign. ModelOpt packs input 2j in byte j's low nibble.
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+NVFP4_GROUP = 16
+LATTICE_FEATURES = 5          # log p, p, log p - max, rank / (k - 1), is-top-1 (vLLM LiLiCorrHead)
+
+
+def dequantize_nvfp4(weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2: torch.Tensor | float,
+                     dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """ModelOpt NVFP4 [N, K/2] codes, [N, K/16] e4m3 scales, an fp32 tensor scale -> [N, K] dense, one rounding.
+
+    value = e2m1(code) * float(e4m3 scale) * weight_scale_2, as ModelOpt's ``NVFP4QTensor.dequantize``. The
+    family's ``quant.dequantize_nvfp4`` (the reference part) is the shared definition once it lands; this one
+    serves the drafter until then.
+    """
+
+    n, half = weight.shape
+    if weight_scale.shape != (n, 2 * half // NVFP4_GROUP):
+        raise ValueError(f"NVFP4 scales {tuple(weight_scale.shape)} do not fit codes {tuple(weight.shape)}")
+    w = weight.to(torch.int64)
+    codes = torch.stack([w & 0xF, w >> 4], dim=-1).reshape(n, 2 * half)
+    mags = torch.tensor(_E2M1, dtype=torch.float32, device=weight.device)
+    table = torch.cat([mags, -mags])
+    s2 = float(weight_scale_2.item()) if isinstance(weight_scale_2, torch.Tensor) else float(weight_scale_2)
+    scale = weight_scale.to(torch.float32).repeat_interleave(NVFP4_GROUP, dim=1) * s2
+    return (table[codes] * scale).to(dtype)
+
+
+# -- the checkpoint -------------------------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class DraftConfig:
+    """The draft checkpoint's geometry, from its config.json (``dflash_config`` holds the drafter's own keys)."""
+
+    hidden: int
+    layers: int
+    heads: int
+    kv_heads: int
+    head_dim: int
+    inter: int
+    eps: float
+    theta: float
+    vocab: int
+    mask_id: int
+    block: int                     # the trained block: the pending token and block - 1 mask tokens
+    window: int                    # sliding window: a query at q reads keys at q - window + 1 and later
+    tap_layers: tuple[int, ...]    # target layers (0-based) whose output residual stream is a tap
+    conv_taps: int
+    conv_group: int
+    sinks: bool
+    top_k: int                     # lattice candidates a slot
+    lili_hidden: int
+    lili_layers: int
+    lili_heads: int
+    lili_inter: int
+    factor_dim: int
+    vector_eps: float
+    logit_scale: float
+
+    @classmethod
+    def from_json(cls, cfg: Mapping) -> DraftConfig:
+        dc = cfg["dflash_config"]
+        if not dc.get("lilicorr_enabled", True) or dc.get("projector_type", "lilicorr") != "lilicorr":
+            raise ValueError("this draft checkpoint has no LiLiCorr head")
+        if dc.get("causal", False):
+            raise ValueError("only the bidirectional draft block is ported")
+        if int(dc.get("conv_kernel_size", 0)) != 2:
+            raise ValueError("only two-tap grouped convolutions are ported")
+        window = int(dc.get("swa_window_size") or cfg.get("sliding_window") or 0) if dc.get("use_swa", True) else 0
+        if window <= 0:
+            raise ValueError("the drafter's sliding window is missing")
+        top_k = int(dc["lilicorr_candidate_topk"])
+        if top_k <= 0 or top_k > 16 or top_k & (top_k - 1):
+            raise ValueError("LiLiCorr candidate_topk must be a power of two <= 16")
+        hidden = int(cfg["hidden_size"])
+        lili = int(dc.get("lilicorr_hidden_size") or hidden)
+        theta = cfg.get("rope_theta") or (cfg.get("rope_parameters") or {}).get("rope_theta") or 1_000_000
+        return cls(hidden=hidden, layers=int(cfg["num_hidden_layers"]), heads=int(cfg["num_attention_heads"]),
+                   kv_heads=int(cfg["num_key_value_heads"]),
+                   head_dim=int(cfg.get("head_dim") or hidden // int(cfg["num_attention_heads"])),
+                   inter=int(cfg["intermediate_size"]), eps=float(cfg["rms_norm_eps"]), theta=float(theta),
+                   vocab=int(cfg["vocab_size"]), mask_id=int(dc["mask_token_id"]),
+                   block=int(cfg.get("block_size") or dc["block_size"]), window=window,
+                   tap_layers=tuple(int(i) for i in dc["target_layer_ids"]),
+                   conv_taps=int(dc["conv_kernel_size"]), conv_group=int(dc["conv_group_size"]),
+                   sinks=bool(dc.get("attention_sink_bias", cfg.get("attention_sink_bias", False))), top_k=top_k,
+                   lili_hidden=lili, lili_layers=int(dc["lilicorr_num_layers"]),
+                   lili_heads=int(dc["lilicorr_num_heads"]),
+                   lili_inter=int(lili * float(dc["lilicorr_mlp_ratio"])),
+                   factor_dim=int(dc["lilicorr_factor_dim"]), vector_eps=float(dc["lilicorr_vector_eps"]),
+                   logit_scale=float(dc["lilicorr_logit_scale"]))
+
+
+def expected_shapes(c: DraftConfig) -> dict[str, tuple[int, ...]]:
+    """Every dense tensor the drafter reads, by checkpoint name, at its dense (dequantized) shape."""
+
+    D, hd, H, KV, G = c.hidden, c.head_dim, c.heads, c.kv_heads, c.hidden // c.conv_group
+    L, I, k = c.lili_hidden, c.lili_inter, c.top_k
+    shapes: dict[str, tuple[int, ...]] = {
+        "fc.weight": (D, D * len(c.tap_layers)), "hidden_norm.weight": (D,), "norm.weight": (D,)}
+    for i in range(c.layers):
+        p = f"layers.{i}."
+        shapes.update({
+            p + "input_layernorm.weight": (D,), p + "post_attention_layernorm.weight": (D,),
+            p + "self_attn.q_proj.weight": (H * hd, D), p + "self_attn.k_proj.weight": (KV * hd, D),
+            p + "self_attn.v_proj.weight": (KV * hd, D), p + "self_attn.o_proj.weight": (D, H * hd),
+            p + "self_attn.q_norm.weight": (hd,), p + "self_attn.k_norm.weight": (hd,),
+            p + "mlp.gate_proj.weight": (c.inter, D), p + "mlp.up_proj.weight": (c.inter, D),
+            p + "mlp.down_proj.weight": (D, c.inter)})
+        if c.sinks:
+            shapes[p + "self_attn.attention_sink_bias"] = (H,)
+        for conv in ("attention_conv", "mlp_conv"):
+            shapes[p + conv + ".base_kernel"] = (2, c.conv_taps, D)
+            shapes[p + conv + ".kernel_projection.weight"] = (2 * c.conv_taps * G, D)
+    q = "lilicorr."
+    for name, shape in {"token_proj": (L, D), "pass_hidden_proj": (L, D), "context_proj": (L, D),
+                        "feature_mlp.up_proj": (L, LATTICE_FEATURES), "feature_mlp.down_proj": (L, L),
+                        "factor_input_proj": (L, 3 * L), "out_head": (c.factor_dim, L),
+                        "in_head": (c.factor_dim, L), "anchor_out_head": (c.factor_dim, L)}.items():
+        shapes[q + name + ".weight"] = shape
+        shapes[q + name + ".bias"] = (shape[0],)
+    shapes.update({q + "feature_norm.weight": (LATTICE_FEATURES,), q + "feature_norm.bias": (LATTICE_FEATURES,),
+                   q + "slot_embedding": (1, 1, c.block - 1, 1, L), q + "rank_embedding": (1, 1, 1, k, L),
+                   q + "relative_slot_bias": (c.lili_heads, 2 * c.block - 1), q + "same_slot_bias": (c.lili_heads,),
+                   q + "output_norm.weight": (L,), q + "anchor_norm.weight": (L,)})
+    for i in range(c.lili_layers):
+        p = f"{q}layers.{i}."
+        shapes.update({p + "attn_norm.weight": (L,), p + "mlp_norm.weight": (L,),
+                       p + "attn.in_proj_weight": (3 * L, L), p + "attn.in_proj_bias": (3 * L,),
+                       p + "attn.out_proj.weight": (L, L), p + "attn.out_proj.bias": (L,),
+                       p + "mlp.up_proj.weight": (I, L), p + "mlp.up_proj.bias": (I,),
+                       p + "mlp.down_proj.weight": (L, I), p + "mlp.down_proj.bias": (L,)})
+    return shapes
+
+
+def dense_tensors(raw: Mapping[str, torch.Tensor], dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    """Checkpoint tensors -> dense ones by name: NVFP4 triples dequantized, the rest cast to ``dtype``."""
+
+    out: dict[str, torch.Tensor] = {}
+    for name, t in raw.items():
+        if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")):
+            continue
+        base = name[:-len(".weight")] if name.endswith(".weight") else None
+        if base is not None and t.dtype == torch.uint8:
+            if base + ".weight_scale" not in raw or base + ".weight_scale_2" not in raw:
+                raise ValueError(f"{name}: packed NVFP4 codes without their scales")
+            out[name] = dequantize_nvfp4(t, raw[base + ".weight_scale"], raw[base + ".weight_scale_2"], dtype)
+        else:
+            out[name] = t.to(dtype)
+    return out
+
+
+def read_checkpoint(model_dir: str | Path, device: torch.device | str,
+                    dtype: torch.dtype = torch.bfloat16) -> tuple[DraftConfig, dict[str, torch.Tensor]]:
+    """config.json and model.safetensors -> the geometry and dense tensors on ``device``, one tensor at a time."""
+
+    from contextlib import closing
+
+    from tensorfold.cuda.direct_read import SafeTensors
+
+    path = Path(model_dir)
+    cfg = DraftConfig.from_json(json.loads((path / "config.json").read_text()))
+    files = sorted(path.glob("*.safetensors"))
+    if not files:
+        raise FileNotFoundError(f"{path}: no safetensors files")
+    out: dict[str, torch.Tensor] = {}
+    with closing(SafeTensors(files)) as f:
+        names = set(f.keys())
+        for name in sorted(names):
+            if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")):
+                continue
+            group = {name: f.get(name, device)}
+            base = name[:-len(".weight")]
+            if group[name].dtype == torch.uint8:
+                for extra in (base + ".weight_scale", base + ".weight_scale_2"):
+                    if extra in names:
+                        group[extra] = f.get(extra, device)
+            out.update(dense_tensors(group, dtype))
+    return cfg, out
+
+
+# -- pieces ---------------------------------------------------------------------------------------------------------
+def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """vLLM's RMSNorm: normalize in fp32, round to the model dtype, then scale by the weight."""
+
+    xf = x.float()
+    y = (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)).to(x.dtype)
+    return y * weight
+
+
+def _conv(x: torch.Tensor, delta: torch.Tensor, base: torch.Tensor, group: int) -> torch.Tensor:
+    """DFlash2's two-tap grouped convolution over one block: row r mixes rows r and r - 1, fp32 accumulation.
+
+    x [n, D]; delta [n, taps, D / group] (one side of the kernel projection); base [taps, D].
+    """
+
+    n = x.shape[0]
+    coef = base.float()[None] + delta.float().repeat_interleave(group, dim=-1)        # [n, taps, D]
+    out = coef[:, 0] * x.float()
+    if n > 1:
+        out[1:] += coef[1:, 1] * x[:-1].float()
+    return out.to(x.dtype)
+
+
+def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Neox rotary on [..., rows, head_dim] with cos/sin [rows, head_dim / 2]."""
+
+    half = x.shape[-1] // 2
+    a, b = x[..., :half].float(), x[..., half:].float()
+    return torch.cat([a * cos - b * sin, b * cos + a * sin], dim=-1).to(x.dtype)
+
+
+@dataclass
+class Proposal:
+    """One propose(): the drafts and what produced them (kept for tests and the acceptance probe)."""
+
+    tokens: list[int]
+    candidates: torch.Tensor        # [N, top_k] int64 candidate ids
+    log_probs: torch.Tensor         # [N, top_k] fp32 candidate log-probabilities under the target lm_head
+    scores: torch.Tensor            # [N, top_k, top_k] fp32 lattice logits (row 0 repeats the anchor scores)
+
+
+class Drafter:
+    """One sequence's LiLiCorr drafter: committed context in a window-sized ring, a block pass per propose().
+
+    ``embed(ids int64 [n]) -> [n, D]`` and ``lm_head(h [n, D]) -> [n, V]`` are the target's own embedding and
+    output head (LiLiCorr shares both). ``source`` is the draft checkpoint directory, or (config, dense tensors).
+    """
+
+    def __init__(self, source: str | Path | tuple[DraftConfig, Mapping[str, torch.Tensor]], *,
+                 embed: Callable[[torch.Tensor], torch.Tensor], lm_head: Callable[[torch.Tensor], torch.Tensor],
+                 device: torch.device | str = "cuda", dtype: torch.dtype = torch.bfloat16) -> None:
+        self.dev, self.dt = torch.device(device), dtype
+        if isinstance(source, (str, Path)):
+            cfg, tensors = read_checkpoint(source, self.dev, dtype)
+        else:
+            cfg, tensors = source[0], {k: v.to(self.dev, dtype) for k, v in source[1].items()}
+        shapes = expected_shapes(cfg)
+        missing = sorted(set(shapes) - set(tensors))
+        if missing:
+            raise ValueError(f"the draft checkpoint lacks {missing[:5]}{' ...' if len(missing) > 5 else ''}")
+        for name, shape in shapes.items():
+            if tuple(tensors[name].shape) != shape:
+                raise ValueError(f"{name}: shape {tuple(tensors[name].shape)}, expected {shape}")
+        self.c, self.p = cfg, {k: tensors[k].contiguous() for k in shapes}
+        self.embed, self.lm_head = embed, lm_head
+        self.tap_layers = cfg.tap_layers
+        c = cfg
+        self.inv_freq = 1.0 / c.theta ** (torch.arange(c.head_dim // 2, device=self.dev, dtype=torch.float32)
+                                          * 2 / c.head_dim)
+        # every context row a block can read: positions context_end - window + 1 .. context_end - 1 fit in `window`
+        self.ring = c.window
+        self.kc = torch.zeros((c.layers, c.kv_heads, self.ring, c.head_dim), dtype=dtype, device=self.dev)
+        self.vc = torch.zeros_like(self.kc)
+        self.slot_pos = torch.full((self.ring,), -1, dtype=torch.int64, device=self.dev)
+        self.anchor = torch.zeros((c.hidden,), dtype=dtype, device=self.dev)
+        self.context_end = 0
+        self._lattice_bias = self._build_lattice_bias()
+        self.last: Proposal | None = None
+
+    # -- state ----------------------------------------------------------------------------------------------------
+    def reset(self) -> None:
+        self.slot_pos.fill_(-1)
+        self.anchor.zero_()
+        self.context_end = 0
+
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in (*self.p.values(), self.kc, self.vc))
+
+    def snapshot(self) -> dict:
+        """The context state (window rows, anchor, length), copied: ``restore`` resumes a kept prompt from it."""
+
+        return {"kc": self.kc.clone(), "vc": self.vc.clone(), "slot_pos": self.slot_pos.clone(),
+                "anchor": self.anchor.clone(), "context_end": self.context_end}
+
+    def restore(self, snap: dict) -> None:
+        self.kc.copy_(snap["kc"])
+        self.vc.copy_(snap["vc"])
+        self.slot_pos.copy_(snap["slot_pos"])
+        self.anchor.copy_(snap["anchor"])
+        self.context_end = int(snap["context_end"])
+
+    def _cos_sin(self, start: int, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        pos = torch.arange(start, start + n, device=self.dev, dtype=torch.float32)
+        phase = pos[:, None] * self.inv_freq[None, :]
+        return phase.cos(), phase.sin()
+
+    def _kv(self, i: int, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Layer i's keys (k_norm, RoPE) and values for rows h: [kv_heads, n, head_dim] each."""
+
+        c, p, pre = self.c, self.p, f"layers.{i}.self_attn."
+        n = h.shape[0]
+        k = F.linear(h, p[pre + "k_proj.weight"]).view(n, c.kv_heads, c.head_dim)
+        v = F.linear(h, p[pre + "v_proj.weight"]).view(n, c.kv_heads, c.head_dim)
+        k = _rope(_rms(k, p[pre + "k_norm.weight"], c.eps).transpose(0, 1), cos, sin)
+        return k, v.transpose(0, 1)
+
+    # -- the context ----------------------------------------------------------------------------------------------
+    @torch.no_grad()
+    def add_taps(self, taps: torch.Tensor) -> None:
+        """Committed rows' taps [n, len(tap_layers) * D] at positions context_end .. context_end + n - 1.
+
+        Only the window's last rows are projected: older ones are never read again.
+        """
+
+        c = self.c
+        n = int(taps.shape[0])
+        if n == 0:
+            return
+        if taps.shape[1] != c.hidden * len(c.tap_layers):
+            raise ValueError(f"taps [{n}, {taps.shape[1]}], expected {len(c.tap_layers)} rows of {c.hidden}")
+        m = min(n, self.ring)
+        start = self.context_end + n - m
+        ctx = _rms(F.linear(taps[n - m:].to(self.dev, self.dt), self.p["fc.weight"]), self.p["hidden_norm.weight"],
+                   c.eps)
+        cos, sin = self._cos_sin(start, m)
+        slots = torch.arange(start, start + m, device=self.dev) % self.ring
+        for i in range(c.layers):
+            k, v = self._kv(i, ctx, cos, sin)
+            self.kc[i].index_copy_(1, slots, k)
+            self.vc[i].index_copy_(1, slots, v)
+        self.slot_pos.index_copy_(0, slots, torch.arange(start, start + m, device=self.dev))
+        self.anchor.copy_(ctx[-1])
+        self.context_end += n
+
+    # -- the block ------------------------------------------------------------------------------------------------
+    def _attend(self, i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, s: int) -> torch.Tensor:
+        """Block queries [H, n, hd] over the window's context rows and the block (bidirectional), with sinks."""
+
+        c = self.c
+        n = q.shape[1]
+        g = c.heads // c.kv_heads
+        keys = torch.cat([self.kc[i], k], dim=1).float()                                # [KV, ring + n, hd]
+        vals = torch.cat([self.vc[i], v], dim=1).float()
+        # FlashAttention's non-causal window is symmetric, (window - 1, window - 1): |q - k| < window. The real
+        # window (1024) covers the whole block; a smaller one masks block keys too.
+        qpos = torch.arange(s, s + n, device=self.dev)
+        ok_ctx = (self.slot_pos[None, :] >= 0) & (self.slot_pos[None, :] > qpos[:, None] - c.window)
+        ok_blk = (qpos[:, None] - qpos[None, :]).abs() < c.window
+        ok = torch.cat([ok_ctx, ok_blk], dim=1)                                          # [n, ring + n]
+        scores = torch.einsum("kgnd,kld->kgnl", q.float().view(c.kv_heads, g, n, c.head_dim), keys)
+        scores = (scores * c.head_dim ** -0.5).masked_fill(~ok, float("-inf"))
+        if c.sinks:
+            sink = self.p[f"layers.{i}.self_attn.attention_sink_bias"].float().view(c.kv_heads, g, 1, 1)
+            top = torch.maximum(scores.amax(dim=-1, keepdim=True), sink)
+            e = torch.exp(scores - top)
+            probs = e / (e.sum(dim=-1, keepdim=True) + torch.exp(sink - top))
+        else:
+            probs = torch.softmax(scores, dim=-1)
+        out = torch.einsum("kgnl,kld->kgnd", probs, vals).reshape(c.heads, n, c.head_dim)
+        return out.transpose(0, 1).reshape(n, c.heads * c.head_dim).to(self.dt)
+
+    def _layer(self, i: int, x: torch.Tensor, residual: torch.Tensor | None, s: int, cos: torch.Tensor,
+               sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        c, p, pre = self.c, self.p, f"layers.{i}."
+        n = x.shape[0]
+        G = c.hidden // c.conv_group
+        residual = x if residual is None else (x.float() + residual.float()).to(self.dt)
+        h = _rms(residual, p[pre + "input_layernorm.weight"], c.eps)
+        coef = F.linear(h, p[pre + "attention_conv.kernel_projection.weight"]).view(n, 2, c.conv_taps, G)
+        base = p[pre + "attention_conv.base_kernel"]
+        h = _conv(h, coef[:, 0], base[0], c.conv_group)
+        q = F.linear(h, p[pre + "self_attn.q_proj.weight"]).view(n, c.heads, c.head_dim)
+        q = _rope(_rms(q, p[pre + "self_attn.q_norm.weight"], c.eps).transpose(0, 1), cos, sin)
+        k, v = self._kv(i, h, cos, sin)
+        h = F.linear(self._attend(i, q, k, v, s), p[pre + "self_attn.o_proj.weight"])
+        h = _conv(h, coef[:, 1], base[1], c.conv_group)
+        residual = (h.float() + residual.float()).to(self.dt)
+        h = _rms(residual, p[pre + "post_attention_layernorm.weight"], c.eps)
+        coef = F.linear(h, p[pre + "mlp_conv.kernel_projection.weight"]).view(n, 2, c.conv_taps, G)
+        base = p[pre + "mlp_conv.base_kernel"]
+        h = _conv(h, coef[:, 0], base[0], c.conv_group)
+        h = F.linear(F.silu(F.linear(h, p[pre + "mlp.gate_proj.weight"])) * F.linear(h, p[pre + "mlp.up_proj.weight"]),
+                     p[pre + "mlp.down_proj.weight"])
+        return _conv(h, coef[:, 1], base[1], c.conv_group), residual
+
+    def block_hidden(self, pending: int, depth: int) -> torch.Tensor:
+        """The final-normed hidden rows of the mask tokens [depth, D]: row j drafts position context_end + 1 + j."""
+
+        c, s = self.c, self.context_end
+        n = depth + 1
+        ids = torch.full((n,), c.mask_id, dtype=torch.int64, device=self.dev)
+        ids[0] = int(pending)
+        x = self.embed(ids).to(self.dt)
+        cos, sin = self._cos_sin(s, n)
+        residual = None
+        for i in range(c.layers):
+            x, residual = self._layer(i, x, residual, s, cos, sin)
+        return _rms((x.float() + residual.float()).to(self.dt), self.p["norm.weight"], c.eps)[1:]
+
+    # -- the lattice ----------------------------------------------------------------------------------------------
+    def _build_lattice_bias(self) -> torch.Tensor:
+        """[heads, (block - 1) * k, (block - 1) * k]: relative-slot plus same-slot bias over the flattened lattice."""
+
+        c, p = self.c, self.p
+        slots = torch.arange(c.block - 1, device=self.dev).repeat_interleave(c.top_k)
+        rel = slots[:, None] - slots[None, :]
+        bias = p["lilicorr.relative_slot_bias"][:, rel + c.block - 1]
+        same = (rel == 0).to(bias.dtype)[None] * p["lilicorr.same_slot_bias"].view(-1, 1, 1)
+        return (bias + same).contiguous()
+
+    def lattice_scores(self, cand: torch.Tensor, log_probs: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        """vLLM ``LiLiCorrHead.forward`` for one sequence: [N, k, k] fp32, row 0 the anchor's scores repeated."""
+
+        c, p, q = self.c, self.p, "lilicorr."
+        N, k = log_probs.shape
+        L = c.lili_hidden
+
+        def lin(x: torch.Tensor, name: str) -> torch.Tensor:
+            return F.linear(x, p[q + name + ".weight"], p[q + name + ".bias"])
+
+        lp = log_probs.float()
+        rank = torch.arange(k, device=self.dev, dtype=torch.float32) / float(max(k - 1, 1))
+        top1 = (torch.arange(k, device=self.dev) == 0).float()
+        feats = torch.stack([lp, lp.exp(), lp - lp.amax(dim=-1, keepdim=True), rank.expand_as(lp),
+                             top1.expand_as(lp)], dim=-1).to(self.dt)
+        feats = F.layer_norm(feats, (LATTICE_FEATURES,), p[q + "feature_norm.weight"], p[q + "feature_norm.bias"])
+        x = lin(self.embed(cand.reshape(-1)).to(self.dt), "token_proj").view(N, k, L)
+        x = x + lin(hidden.to(self.dt), "pass_hidden_proj")[:, None, :]
+        x = x + lin(F.silu(lin(feats, "feature_mlp.up_proj")), "feature_mlp.down_proj")
+        x = x + p[q + "slot_embedding"][0, 0, :N] + p[q + "rank_embedding"][0, 0]
+        x = x.reshape(1, N * k, L)
+        valid = 1.0 if self.context_end > 0 else 0.0
+        anchor = lin(self.anchor, "context_proj") * valid
+        bias = self._lattice_bias[None, :, :N * k, :N * k]
+        hh = c.lili_heads
+        for i in range(c.lili_layers):
+            pre = f"{q}layers.{i}."
+            h = _rms(x, p[pre + "attn_norm.weight"], c.eps)
+            qkv = F.linear(h, p[pre + "attn.in_proj_weight"], p[pre + "attn.in_proj_bias"])
+            qq, kk, vv = (t.view(1, N * k, hh, L // hh).transpose(1, 2) for t in qkv.chunk(3, dim=-1))
+            att = F.scaled_dot_product_attention(qq, kk, vv, attn_mask=bias)
+            x = x + F.linear(att.transpose(1, 2).reshape(1, N * k, L), p[pre + "attn.out_proj.weight"],
+                             p[pre + "attn.out_proj.bias"])
+            h = _rms(x, p[pre + "mlp_norm.weight"], c.eps)
+            x = x + F.linear(F.silu(F.linear(h, p[pre + "mlp.up_proj.weight"], p[pre + "mlp.up_proj.bias"])),
+                             p[pre + "mlp.down_proj.weight"], p[pre + "mlp.down_proj.bias"])
+        x = _rms(x, p[q + "output_norm.weight"], c.eps).view(N, k, L)
+        a = _rms(anchor, p[q + "anchor_norm.weight"], c.eps)
+        w = p[q + "factor_input_proj.weight"]
+        pre_f = (F.linear(x, w[:, :L], p[q + "factor_input_proj.bias"]) + F.linear(a, w[:, L:2 * L])
+                 + F.linear(x * a, w[:, 2 * L:]))
+        f = F.silu(pre_f)
+        out_vec = F.normalize(lin(f, "out_head"), dim=-1, eps=c.vector_eps)
+        in_vec = F.normalize(lin(f, "in_head"), dim=-1, eps=c.vector_eps)
+        a_out = F.normalize(lin(a, "anchor_out_head"), dim=-1, eps=c.vector_eps)
+        start = (a_out[None, :] * in_vec[0]).sum(dim=-1)                                   # [k]
+        pairs = torch.matmul(out_vec[:-1], in_vec[1:].transpose(-1, -2))                   # [N - 1, k, k]
+        first = start.float()[None, None, :].expand(1, k, k)
+        return c.logit_scale * torch.cat([first, pairs.float()], dim=0)
+
+    # -- drafts ---------------------------------------------------------------------------------------------------
+    @torch.no_grad()
+    def candidates(self, pending: int, depth: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The block pass: top-k candidate ids [N, k], their log-probabilities [N, k], the lattice scores."""
+
+        hidden = self.block_hidden(pending, depth)
+        logits = self.lm_head(hidden).float()
+        vals, ids = torch.topk(logits, self.c.top_k, dim=-1)
+        log_probs = vals - torch.logsumexp(logits, dim=-1, keepdim=True)
+        return ids, log_probs, self.lattice_scores(ids, log_probs, hidden)
+
+    def walk(self, cand: np.ndarray, scores: np.ndarray, sampling: Sampling | None) -> list[int]:
+        """One candidate a slot along the lattice: argmax of scores[s, previous index], under keyed noise when sampled.
+
+        The noise is the target's (seed, position, token id) draw, so a draft agrees with the target's sample as
+        often as the lattice agrees with the target's distribution. Exactness never depends on it.
+        """
+
+        N = cand.shape[0]
+        noise = None
+        if sampling is not None and sampling.temperature > 0:
+            positions = self.context_end + 1 + np.arange(N)
+            noise = -np.log(-np.log(uniform_rows(sampling.seed, positions, cand.astype(np.int64))))
+        temp = float(sampling.temperature) if noise is not None else 1.0
+        prev, out = 0, []
+        for s in range(N):
+            row = scores[s, prev].astype(np.float64)
+            pick = row / temp + noise[s] if noise is not None else row
+            prev = int(np.argmax(pick))
+            out.append(int(cand[s, prev]))
+        return out
+
+    @torch.no_grad()
+    def propose(self, pending: int, depth: int, sampling: Sampling | None) -> list[int]:
+        """Up to ``depth`` (at most block - 1) drafts for the positions after ``pending``, which sits at context_end."""
+
+        depth = min(int(depth), self.c.block - 1)
+        if depth < 1 or self.context_end == 0:
+            return []
+        ids, log_probs, scores = self.candidates(pending, depth)
+        cand, sc = ids.cpu().numpy(), scores.cpu().numpy()
+        tokens = self.walk(cand, sc, sampling)
+        self.last = Proposal(tokens, ids, log_probs, scores)
+        return tokens
+
+
+# -- verification ---------------------------------------------------------------------------------------------------
+@dataclass
+class DecodeResult:
+    tokens: list[int]
+    seconds: float
+    rounds: int
+    drafted: int = 0
+    accepted: int = 0
+    widths: list[int] = field(default_factory=list)     # rows verified a round: the pending token and its drafts
+    keeps: list[int] = field(default_factory=list)      # tokens kept a round: 1 + accepted drafts
+
+    @property
+    def tokens_per_second(self) -> float:
+        return (len(self.tokens) - 1) / self.seconds if self.seconds else 0.0
+
+    @property
+    def acceptance_length(self) -> float:
+        """Tokens a verify round yields, the README's 'acceptance length' (4.30 on SPEED-Bench at depth 7)."""
+
+        return sum(self.keeps) / len(self.keeps) if self.keeps else 0.0
+
+
+def _sample(engine, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None) -> list[int]:
+    sample = getattr(engine, "sample", None)
+    if sample is not None:
+        return list(sample(logits, positions, sampling))
+    from tensorfold.cuda.sampling import sample_rows
+
+    return sample_rows(logits, positions, sampling)
+
+
+@torch.no_grad()
+def lilicorr_decode(engine, drafter: Drafter, first: int, count: int, sampling: Sampling | None, *,
+                    stop_eos: bool = False, on_tokens: Callable[[list[int]], bool | None] | None = None,
+                    depth: int | None = None) -> DecodeResult:
+    """``count`` tokens (the first is ``first``, the prompt's sample) in verify rounds of the pending token + drafts.
+
+    A round keeps the target's keyed samples through the first draft that differs from them (or the first end token
+    under ``stop_eos``), so the reply equals serial decoding's. It commits no row past ``count`` tokens and stops
+    when ``on_tokens`` returns True. The drafter must hold the prompt's context (``context_end == engine.pos``).
+    """
+
+    if drafter.context_end != engine.pos:
+        raise ValueError(f"the drafter holds {drafter.context_end} positions, the engine {engine.pos}")
+    depth = drafter.c.block - 1 if depth is None else max(0, min(int(depth), drafter.c.block - 1))
+    eos = set(engine.eos)
+    out = [int(first)]
+    res = DecodeResult([], 0.0, 0)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    while len(out) < count and not (stop_eos and out[-1] in eos):
+        n = min(depth, count - len(out) - 1)              # the round may add 1 + n tokens
+        drafts = drafter.propose(out[-1], n, sampling) if n > 0 else []
+        logits = engine.verify([out[-1]] + drafts)
+        pos = engine.pos
+        sampled = _sample(engine, logits[:1 + len(drafts)], [pos + 1 + r for r in range(1 + len(drafts))], sampling)
+        keep = 1
+        for d, s in zip(drafts, sampled):
+            if s != d or (stop_eos and s in eos):
+                break
+            keep += 1
+        engine.commit(keep)
+        drafter.add_taps(engine.tap_rows(keep))
+        new = [int(t) for t in sampled[:keep]]
+        out.extend(new)
+        res.rounds += 1
+        res.drafted += len(drafts)
+        res.accepted += keep - 1
+        res.widths.append(1 + len(drafts))
+        res.keeps.append(keep)
+        if on_tokens is not None and on_tokens(new):
+            break
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    res.seconds = time.perf_counter() - start
+    res.tokens = out
+    return res
+
+
+__all__ = ["DecodeResult", "DraftConfig", "Drafter", "Proposal", "dense_tensors", "dequantize_nvfp4",
+           "expected_shapes", "lilicorr_decode", "read_checkpoint"]
