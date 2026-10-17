@@ -151,6 +151,36 @@ def test_a_bad_piece_reads_as_no_state_and_is_forgotten(tmp_path, capsys):
     assert d.find([*range(n), 1], 0, lambda e: True) is None
 
 
+def test_the_fingerprint_holds_the_shards_the_toolchain_and_the_shared_code(tmp_path, monkeypatch):
+    import os
+
+    import torch
+
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors.index.json").write_text('{"weight_map": {}}')
+    shard = model / "model-00001-of-00001.safetensors"
+    shard.write_bytes(b"\0" * 64)
+    monkeypatch.setenv("TENSORFOLD_QWEN_STATES", str(tmp_path / "states"))
+    key = lambda: disk.open_states(model, slot(), engine="serial", prefill_rows=256).key   # noqa: E731
+    first = key()
+    assert key() == first
+    os.utime(shard, ns=(1, 1))                                       # the same name, another shard
+    second = key()
+    (model / "model.safetensors.index.json").write_text('{"weight_map": {"x": "y"}}')
+    third = key()
+    monkeypatch.setattr(torch, "__version__", "0.0.0")
+    fourth = key()
+    assert len({first, second, third, fourth}) == 4
+    code = disk._code()
+    assert any(f.name == "scheduler.py" and f.parent.name == "cuda" for f in code)        # the shared package
+    assert any(f.name == "decode.py" and f.parent.name == "qwen4_exp" for f in code)      # the whole family
+    assert any(f.suffix == ".cu" for f in code)
+
+
 def test_a_read_fills_each_view_from_one_buffer(tmp_path, monkeypatch):
     """Every view's pieces go into one buffer and one copy, and each small tensor's likewise, bit for bit."""
 
