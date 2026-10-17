@@ -52,9 +52,37 @@ tables, whose rows a token barely reads.
 The ratio predicts the serial decode ratio before a GPU run: FP4-Local should decode at about 0.65x the EXL3 pack.
 The table also shows where a speedup can come from. Here the experts account for 0.37 GB of the 2.42 GB gap and the
 MXFP8 dense layers and bf16 head for the rest. Drafted decoding spreads the dense reads over a verify window's rows
-while the experts' reads grow with the rows' distinct picks, so measure drafted speed separately.
+while the experts' reads grow with the rows' distinct picks, so measure drafted speed separately. Served with MTP
+drafts on 17 Oct, FP4-Local decoded at 0.71 to 0.82x the EXL3 pack (67.8 against 83.0 tok/s on code, greedy), faster
+than the 0.65x the bytes predict.
 
-## 4. Prove the engine computes the model
+## 4. Size a stream, then check what the engine does with it
+
+Compute what one stream holds from `config.json`: the KV cache per token (attention layers x 2 x KV heads x head dim x
+bytes a value) and the fixed recurrent state (Mamba or DeltaNet heads x head dim x state x 4 bytes, per layer). Then
+divide the memory the weights leave by one stream at the window you want.
+
+| Per stream | Nemotron Bolt | Qwen3.8 Flash Next (int8 KV) |
+|---|---:|---:|
+| KV cache per token | 8 KiB (8 attention layers, 2 KV heads of 128, bf16) | about 18 KiB |
+| At the native 262,144 tokens | 2 GiB | about 4.5 GiB |
+| Recurrent state | about 160 MiB (40 Mamba layers, 128 x 64 x 128, fp32) | DeltaNet, of the same order |
+| Weights | 23.2 GiB | 52 to 75 GiB by checkpoint |
+
+A model whose state is this small can hold dozens of long streams. Whether it does depends on the engine, so check
+each of these before choosing what to serve:
+
+| Engine feature | Qwen Flash Next | GLM-5.3 | Bolt (17 Oct) |
+|---|---|---|---|
+| Concurrent streams | 4 (`--parallel 4`) | 1 | 1: requests queue |
+| Prompt reuse across requests | kept states at message starts, forks to spare slots | prompt end and system block end only, plus disk | none: every request prefills its whole prompt |
+| Background prefill of the next turn | yes | yes | no |
+| CUDA decode graphs | yes | yes | no |
+
+Upstream TensorFold added Nemotron prompt reuse in 1.0.5 and concurrent rounds with batched drafting in 1.0.9. Those
+are the ports that turn a small state into served capacity.
+
+## 5. Prove the engine computes the model
 
 These gates must hold before any speed number counts.
 
@@ -71,7 +99,7 @@ These gates must hold before any speed number counts.
   and 0.094 on three identical runs (findings, 15 Oct). Run any reference twice and compare before trusting a
   probability from it.
 
-## 5. Serving bugs to test for on every new model
+## 6. Serving bugs to test for on every new model
 
 Each of these shipped and was found by a client.
 
@@ -87,7 +115,7 @@ Replay real failing requests with `return_token_ids: true` to see the raw ids be
 `TENSORFOLD_REQUEST_LOG` to capture traffic for exact replays. The file is created 0600 because it holds prompts and
 tool content.
 
-## 6. Prompt reuse
+## 7. Prompt reuse
 
 Measure a multi-turn session's prefill time per turn before and after each of these.
 
@@ -99,7 +127,14 @@ Measure a multi-turn session's prefill time per turn before and after each of th
 | Branch points in the eviction rule (upstream #735) | Upstream: an agent that restarts each step from one history stops reading it again | A history resumed after a later turn extended it is freed only by LRU |
 | A kept state at the system block's end | Another conversation with the same tools resumes from it | Touch it on every use so long sessions don't age it out |
 
-## 7. Drafting
+Check where the engine keeps states before testing how it evicts them. GLM keeps a state at the prompt's end and the system
+block's end only (`engine.py`, `keep_at` and `stops`). A history that several requests share, each followed by a
+different user message, never resumes on GLM: on 17 Oct a 6,059-token history sent five times with different
+questions showed 0 cached tokens every time, with and without the branch-point rule. Qwen keeps states at message
+starts and resumes it. A served cache test must use a pattern the engine can resume (a regenerated turn, a growing
+conversation) before it can test eviction.
+
+## 8. Drafting
 
 Measure acceptance per round and tokens per second on the served path, greedy and sampled, on at least 4 seeds. A
 change that keeps the tokens can still move acceptance. The GLM splice gave 83.4 against 76.7 acceptance on one seed
@@ -108,7 +143,7 @@ and 89.5 against 89.1 on another. Check both the drafted equals serial gate and 
 A new model's drafter (MTP head, DFlash, LiLiCorr) needs its target layers' taps (Bolt's LiLiCorr reads layers 1, 18,
 35, 51, 68 and 85) and must hold the prompt's context before its first round.
 
-## 8. Working on the shared GPU
+## 9. Working on the shared GPU
 
 Production serves from this box while experiments run.
 
@@ -126,8 +161,9 @@ Production serves from this box while experiments run.
 - A killed build leaves `lock` and `.ninja_lock` in the `tensorfold-ext` volume, and the next build hangs. Remove them
   when no build runs.
 - Read `GATEWAY_API_KEY` from the environment. Never print it or write it to a file.
+- Stop a process by its PID. `pkill -f <pattern>` matched the shell that ran it and killed the command (exit 144).
 
-## 9. Measuring
+## 10. Measuring
 
 - Speed: `tools/bench_openai.py` with `--tokens 64 --reps 5 --temperatures 1.0,0`, code and chat cells, medians, both
   configs on the same image and box, alternated.
@@ -135,10 +171,22 @@ Production serves from this box while experiments run.
   is 1.7% to 7.7%, so a few points' difference needs more draws.
 - Client experiments: tag requests with `X-Gateway-Tag` and read them from `mini-llm-gateway/gateway.db` (`requests`
   table, `ts` in milliseconds).
+- Quality: TrueScore 76 scenarios x 2 and the planning measurement set (PA-M, PO-M) x 4, thinking off,
+  `reasoning_effort` xhigh in `chat_template_kwargs`, temperature 0.3, uncapped, `SPARK_BENCH_RANDOM_SEED=1` (without it
+  TensorFold's prompt-hash seed makes every repeat a copy), and `--max-tokens` equal to the context. The runner is
+  `tf-runs/truescore-queue.sh`.
+- Compare arms run in the same session, scenario by scenario, with a paired bootstrap over scenario means
+  (`tf-runs/truescore/paired.py`). Single TrueScores of one Qwen config on this box ranged from 84.7 to 93.6, mostly
+  through Calibration. On 17 Oct FP4-Local beat the EXL3 pack by +2.3 [-1.1, +6.4] on TrueScore and +1.5 [-0.4, +3.5] on
+  planning. Both intervals include zero.
+- Measure quantization loss against the full-precision model on its maker's API. Z.ai's coding endpoint serves
+  `glm-5.3-flash` with `"thinking": {"type": "disabled"}` in `SPARK_BENCH_EXTRA_BODY`. The local quantized GLM scored 93.0
+  against the API's 91.1, a paired +1.7 [-1.7, +5.3]: no loss measured. The API's speed scores (Resp, Eff) measure the
+  service and do not compare with local runs.
 - Production health: `GET :30002/health` gives `requests_running`, which is the reliable signal that a disconnect freed
   the GPU. Log lines matched the wrong request once.
 
-## 10. Upstream
+## 11. Upstream
 
 Upstream TensorFold became a Zig engine at 1.0.0 (7 Oct 2026). Read its CHANGELOG for each release and port by hand
 what fits. Ported or in progress from 1.0.9 to 1.0.12: background prefill, disk states, GLM tool-call repair, branch
