@@ -8,7 +8,7 @@ guidance for bringing up a new model; this file holds the work. Dates are 2026.
 | Task | State |
 |---|---|
 | TrueScore 76x2 and planning x4 on Qwen FP4-Local, Qwen EXL3, GLM-5.3 and Nemotron Bolt | FP4-Local 91.0 / planning 89.8, EXL3 87.8 / 89.0, GLM 93.0 / planning running, Bolt next (`tf-runs/truescore-queue.sh`, 17 Oct) |
-| Qwen disk states, and a persist endpoint `swap.py` calls before it stops a model | Background agent on `feat/qwen-disk-states`; its GPU tests run after the benchmarks |
+| Qwen disk states, and a persist endpoint `swap.py` calls before it stops a model | Built on `feat/qwen-disk-states` (`da1dc25d`, `e99b729c`): CPU suite 4,453 passed, 0 failed. GPU tests and a real-model restart check run after the benchmarks. A state takes 298.7 MB at 10k tokens and 1,030.9 MB at 50k |
 | GLM regenerate check of the branch-point rule (#735), base against ports | Chained after the benchmarks (`tf-runs/glm-regen.sh`) |
 
 ## To do
@@ -30,6 +30,8 @@ guidance for bringing up a new model; this file holds the work. Dates are 2026.
 | A budget per task shape | Choose by tools present and turn count once the budget data shows where thinking pays |
 | Empty replies | Qwen closes 4% of draws inside an open think block. A gateway retry with a fresh seed first |
 | Trial LFM2.5-24B-A2B as a resident tool-routing and sub-agent model | 24B total, 2.45B active, 13.6 GB at 4-bit or 24.8 GB FP8. Vendor-reported BFCLv4 65 and IFBench 75, no independent agentic score. First run it outside TensorFold (llama.cpp Q4_K_M or vLLM FP8) on our own tool-call suite. Upstream serves it on Metal only, so a TensorFold port means `lfm2_moe` on CUDA. License caps commercial use at under US$10M annual revenue |
+| Prune old disk-state folders | Each source change makes a new fingerprint folder of up to 64 GiB under `/states` and nothing deletes the old ones (GLM and Qwen) |
+| Persist on a swap that cuts requests off | Today it skips the persist, so those conversations' latest states are lost unless an idle write caught them. Decide: skip, or wait up to 120 s more |
 | Check local GLM's planning transcripts | Its first 31 planning scenarios averaged 53.1 against Qwen's 92 to 94 |
 
 ## Done
