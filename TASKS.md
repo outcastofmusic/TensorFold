@@ -11,6 +11,7 @@ guidance for bringing up a new model; this file holds the work. Dates are 2026.
 | GLM keeps states at message starts | Background agent, `feat/glm-message-stops` |
 | Bolt prompt reuse and adaptive draft depth | Background agent, `feat/bolt-reuse` |
 | Long-context eval set | Background agent, new files in `spark-bench-ext` (`lc_ext.py`, `run_lc.py`) |
+| d1-3B decision model as a sidecar beside Clef | Background agent, `feat/d1-sidecar`: an LFM2 (d1) family, `/v1/systemone` and `/v1/decisions`, a `d1` sidecar in `run.sh` on port 30003 |
 | Gateway empty-reply retry | Background agent, `~/workspace/gateway-empty-retry` (`feat/empty-retry`), built and tested only, not deployed |
 | TrueScore 76x2 and planning x4 on Qwen FP4-Local, Qwen EXL3, GLM-5.3 and Nemotron Bolt | FP4-Local 91.0 / planning 89.8, EXL3 87.8 / 89.0, GLM 93.0 / planning running, Bolt next (`tf-runs/truescore-queue.sh`, 17 Oct) |
 | Qwen disk states, and a persist endpoint `swap.py` calls before it stops a model | Built on `feat/qwen-disk-states` (`da1dc25d`, `e99b729c`): CPU suite 4,453 passed, 0 failed. GPU tests and a real-model restart check run after the benchmarks. A state takes 298.7 MB at 10k tokens and 1,030.9 MB at 50k |
