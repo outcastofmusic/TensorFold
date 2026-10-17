@@ -10,9 +10,9 @@ _THINK_END = "</think>"
 # (what a reply writes to open its think block, what closes it): Qwen's prompt opens the block; Gemma 4's reply does
 THINK_MARKERS = ("", _THINK_END)
 CHANNEL_MARKERS = ("<|channel>thought", "<channel|>")
-# (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block
+# (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, LFM2's Pythonic list
 _CALLS = (("<tool_call>", "</tool_call>"), ("<|tool_call>", "<tool_call|>"),
-          ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"))
+          ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"), ("<|tool_call_start|>", "<|tool_call_end|>"))
 
 
 def _partial_tag(text: str, tag: str) -> int:

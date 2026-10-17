@@ -7,6 +7,7 @@ import re
 import uuid
 from typing import Any
 
+from tensorfold.server import pythonic_calls
 from tensorfold.server.stopping import StopPolicy
 from tensorfold.server.tools import parse_glm_tool_call_block
 from tensorfold.tool_parameters import closed_json, decode_parameter, parameter_schemas
@@ -77,19 +78,27 @@ class StopStrings:
 
 
 def hide_tool_calls(text: str, *, finished: bool) -> str:
+    """The text without its tool-call blocks: Qwen's ``<tool_call>`` and LFM2's ``<|tool_call_start|>``."""
+
+    for opener, closer in ((pythonic_calls.CALL_OPEN, pythonic_calls.CALL_CLOSE), (_CALL_OPEN, _CALL_CLOSE)):
+        text = _hide(text, opener, closer, finished)
+    return text
+
+
+def _hide(text: str, opener: str, closer: str, finished: bool) -> str:
     out: list[str] = []
     pos = 0
     while True:
-        start = text.find(_CALL_OPEN, pos)
+        start = text.find(opener, pos)
         if start < 0:
             tail = text[pos:]
-            out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN))])
+            out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, opener))])
             return "".join(out)
         out.append(text[pos:start])
-        end = text.find(_CALL_CLOSE, start)
+        end = text.find(closer, start)
         if end < 0:
             return "".join(out)
-        pos = end + len(_CALL_CLOSE)
+        pos = end + len(closer)
 
 
 def _tool_name(tool: dict[str, Any]) -> str:
@@ -98,10 +107,12 @@ def _tool_name(tool: dict[str, Any]) -> str:
 
 
 def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int | None = None) -> tuple[str, list[dict[str, Any]] | None]:
-    """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..`` or JSON calls."""
+    """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..``, JSON or LFM2 calls."""
 
     if not tools:
         return text, None
+    if pythonic_calls.CALL_OPEN in text:                   # LFM2's Pythonic calls
+        return pythonic_calls.parse_tool_calls(text, tools, max_calls=max_calls)
     known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
     schemas = parameter_schemas(tools)
     calls: list[dict[str, Any]] = []
@@ -179,6 +190,8 @@ def close_call(text: str, tools: list[dict[str, Any]]) -> str:
 
     if not tools:
         return ""
+    if pythonic_calls.CALL_OPEN in text:
+        return pythonic_calls.close_call(text, tools)
     low, at, start = text.lower(), 0, None
     while (opener := low.find(_CALL_OPEN, at)) >= 0:
         closer = low.find(_CALL_CLOSE, opener + len(_CALL_OPEN))

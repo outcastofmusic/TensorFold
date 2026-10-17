@@ -11,6 +11,7 @@ All MLX families use the lane engine; CUDA families provide their own engine.
 | `glm5_next/` | GLM-5.3-Flash | MTP | Two ranks, MTP and optional DFlash2 |
 | `gemma4/` | Gemma 4 26B-A4B | Context copies | Not supported |
 | `bonsai/` | Ternary Bonsai 2 27B | DFlash2 and context copies | Not supported |
+| `lfm2_moe/` | LFM2.5-24B-A2B | Not supported | One GPU, one stream; block FP8 or bf16 |
 
 MLX load-time checks determine the usable window width and shared-forward support. Each stream has
 independent state; shared execution must reproduce its solo output. CUDA requests in the HTTP server
