@@ -56,16 +56,6 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     def raw(name: str) -> torch.Tensor:
         return rd.get(prefix + name)
 
-    def expert_scale(name: str) -> torch.Tensor:
-        """A routed expert's e4m3 block scales, decoded at load where the checkpoint stores them CSF-coded."""
-
-        if rd.has(prefix + name + ".weight_scale.nvfp4_csf_fixed"):
-            from .nvfp4 import csf_scale
-
-            stem = name + ".weight_scale.nvfp4_csf_"
-            return csf_scale(raw(stem + "fixed"), raw(stem + "exceptions"))
-        return raw(name + ".weight_scale")
-
     def table_scale(base: str, field: str) -> float:
         name = base + "ngram_embedding." + field
         if not rd.has(prefix + name):
@@ -306,7 +296,14 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
                 if any(w.dtype != torch.uint8 for w in weights):
                     raise ValueError(f"{name}.{proj}: expected packed NVFP4 experts; FP8 is read only in MTP")
                 w = torch.stack(weights)
-                s = torch.stack([expert_scale(f"{name}.experts.{i}.{proj}") for i in range(e)])
+                stem = [f"{name}.experts.{i}.{proj}.weight_scale" for i in range(e)]
+                if rd.has(prefix + stem[0] + ".nvfp4_csf_fixed"):          # CSF-coded scales, decoded here
+                    from .nvfp4 import csf_scales
+
+                    s = csf_scales(torch.stack([raw(x + ".nvfp4_csf_fixed") for x in stem]),
+                                   [raw(x + ".nvfp4_csf_exceptions") for x in stem])
+                else:
+                    s = torch.stack([raw(x) for x in stem])
                 s2 = torch.stack([raw(f"{name}.experts.{i}.{proj}.weight_scale_2") for i in range(e)])
                 return w, s, s2
 

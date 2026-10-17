@@ -4,7 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from tensorfold.families.qwen4_exp.cuda.nvfp4 import csf_scale  # noqa: E402
+from tensorfold.families.qwen4_exp.cuda.nvfp4 import csf_scales  # noqa: E402
 
 
 def encode(scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -31,30 +31,40 @@ def scales(rows: int, cols: int, seed: int) -> torch.Tensor:
     return torch.where(pick, wild, near).to(torch.uint8).view(torch.float8_e4m3fn)
 
 
+def decode(pairs):
+    return csf_scales(torch.stack([f for f, _ in pairs]), [x for _, x in pairs])
+
+
 @pytest.mark.parametrize("rows,cols", [(640, 160), (2560, 40), (16, 2)])
 def test_decode_returns_the_encoded_bytes(rows, cols):
     want = scales(rows, cols, rows + cols)
     fixed, exceptions = encode(want)
     assert fixed.shape == (rows // 16, 16 * (1 + cols // 2))
-    got = csf_scale(fixed, exceptions)
-    assert got.dtype == torch.float8_e4m3fn and got.shape == (rows, cols)
-    assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    got = decode([(fixed, exceptions)])
+    assert got.dtype == torch.float8_e4m3fn and got.shape == (1, rows, cols)
+    assert torch.equal(got[0].view(torch.uint8), want.view(torch.uint8))
 
 
-def test_no_exceptions():
-    want = torch.full((32, 8), 50, dtype=torch.uint8).view(torch.float8_e4m3fn)
-    fixed, _ = encode(want)
-    got = csf_scale(fixed, torch.zeros(0, dtype=torch.int32))
-    assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+def test_stacked_experts_keep_their_own_exceptions():
+    want = [scales(64, 20, seed) for seed in range(5)]
+    want[2] = torch.full((64, 20), 50, dtype=torch.uint8).view(torch.float8_e4m3fn)      # an expert with none
+    pairs = [encode(w) for w in want]
+    assert pairs[2][1].numel() == 0 and len({x.numel() for _, x in pairs}) > 2
+    got = decode(pairs)
+    assert got.shape == (5, 64, 20)
+    for e, w in enumerate(want):
+        assert torch.equal(got[e].view(torch.uint8), w.view(torch.uint8)), e
 
 
 def test_bad_streams_are_refused():
     fixed, exceptions = encode(scales(16, 4, 1))
     with pytest.raises(ValueError, match="uint8"):
-        csf_scale(fixed[:, :17], exceptions)
+        decode([(fixed[:, :17], exceptions)])
+    with pytest.raises(ValueError, match="exception lists"):
+        csf_scales(fixed[None], [exceptions, exceptions])
     high = fixed.clone()
     high[0, 0] = 241
     with pytest.raises(ValueError, match="0..240"):
-        csf_scale(high, exceptions)
-    with pytest.raises(ValueError, match="outside"):
-        csf_scale(fixed, torch.tensor([16 * 4], dtype=torch.int32))
+        decode([(high, exceptions)])
+    with pytest.raises(ValueError, match="inside"):
+        decode([(fixed, torch.tensor([16 * 4], dtype=torch.int32))])
