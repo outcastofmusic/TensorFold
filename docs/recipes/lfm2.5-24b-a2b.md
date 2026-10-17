@@ -45,8 +45,13 @@ The FP8 export quantizes 7,342 matrices: attention, the dense FFN and 7,296 expe
 
 ## CUDA engine
 
-One stream: requests take turns, and every request prefills its whole prompt. There are no drafts and no kept
-prompt states.
+One stream: requests take turns, and there are no drafts. A prefill keeps the conversation's state at the second
+message's start, at the last assistant turn's start and at the prompt end less one token (`tensorfold.cuda.markers`):
+the conv states (240 KiB) and the attention rows so far (20 KiB a token). A request resumes from the longest kept
+prefix of its prompt and prefills only the rest. Up to `TF_LFM2_CACHE_ENTRIES` states (default 8) are kept in at
+most `TF_LFM2_CACHE_GIB` (default 4, capped by free memory); past either cap a conversation's earlier turn goes
+first, then the oldest state. A resumed prompt starts its chunks at the kept length, so its bf16 rows can round apart
+from a fresh prefill's, within the golden bounds below. `draft: false` prefills afresh and keeps nothing.
 
 | Part | Kernel |
 | --- | --- |

@@ -156,6 +156,19 @@ def test_chunks_and_decode_steps_continue_the_prompt(weights):
     assert (steps.argmax(-1) == whole[9:].argmax(-1)).all()
 
 
+def test_a_resumed_prompt_continues_as_a_fresh_one(weights):
+    from tensorfold.families.lfm2_moe.cuda.engine import prefill
+
+    ids = torch.randint(10, 500, (300,), generator=torch.Generator().manual_seed(2)).tolist()
+    kept: dict[int, dict] = {}
+    e = _engine(weights)
+    prefill(e, ids[:200], None, keeps=[120], keep=lambda n, st: kept.setdefault(n, st))
+    a = prefill(e, ids, None, resume=kept[120])
+    resumed = e.forward([a], prompt=False)
+    b = prefill(e, ids, None)
+    assert a == b and _close(resumed, e.forward([b], prompt=False), 0.02)
+
+
 def test_keyed_sampling_repeats_a_seed_and_equals_the_host_rule(weights):
     from tensorfold.engine.exact_sampling import choose
     from tensorfold.families.lfm2_moe.cuda.engine import prefill, serial_decode
@@ -205,13 +218,18 @@ def _golden(name: str) -> dict:
     return json.loads(path.read_text())
 
 
-def _teacher_forced(e, g: dict) -> list[torch.Tensor]:
-    """The engine's logits [V] for the prompt's next token and after each of the reference's greedy tokens."""
+def _teacher_forced(e, g: dict, resume: dict | None = None) -> list[torch.Tensor]:
+    """The engine's logits [V] for the prompt's next token and after each of the reference's greedy tokens; from a
+    kept state's length when ``resume`` is given."""
 
     e.reset()
+    begin = 0
+    if resume is not None:
+        e.restore(resume)
+        begin = resume["pos"]
     e.set_sampling(None)
     ids = g["prompt_ids"]
-    for s in range(0, len(ids), e.prefill_rows):
+    for s in range(begin, len(ids), e.prefill_rows):
         logits = e.forward(ids[s:s + e.prefill_rows], prompt=True)
     rows = [logits[0]]
     for tok in g["greedy"][:-1]:
@@ -240,6 +258,42 @@ def test_logits_follow_the_fp32_reference_and_greedy_tokens_match(big, name):
     out = serial_decode(big.e, prefill(big.e, g["prompt_ids"], None), len(g["greedy"]), None, stop_eos=False).tokens
     sure = next((i for i, gap in enumerate(gaps) if gap < SURE_GAP), len(gaps))
     assert out[:sure] == g["greedy"][:sure], (out, g["greedy"], sure)
+
+
+@real
+def test_a_resumed_prompt_follows_the_reference_as_a_fresh_one(big):
+    """The long golden prompt resumed from a state kept 1,000 tokens in (inside its first chunk): teacher-forced logits
+    within the golden bounds, and within the same bounds of a fresh prefill's."""
+
+    from tensorfold.families.lfm2_moe.cuda.engine import prefill
+
+    g = _golden("long")
+    kept: dict[int, dict] = {}
+    prefill(big.e, g["prompt_ids"][:1500], None, keeps=[1000], keep=lambda n, st: kept.setdefault(n, st))
+    resumed = _teacher_forced(big.e, g, resume=kept[1000])
+    fresh = _teacher_forced(big.e, g)
+    errors = [float((row[t["ids"]] - torch.tensor(t["logits"])).abs().max()) for row, t in zip(resumed, g["step_top"])]
+    apart = [float((a[t["ids"]] - b[t["ids"]]).abs().max()) for a, b, t in zip(resumed, fresh, g["step_top"])]
+    median = sorted(errors)[len(errors) // 2]
+    print(f"resumed: top-20 logit error largest {max(errors):.3f}, median {median:.3f}; from fresh at most "
+          f"{max(apart):.3f}")
+    assert max(errors) <= GOLDEN_MAX and median <= GOLDEN_MEDIAN and max(apart) <= GOLDEN_MAX
+
+
+@real
+def test_generate_resumes_a_conversation(big):
+    """A second turn resumes from the first turn's prompt end and replies as a fresh prefill (draft: false) does."""
+
+    g = _golden("chat")
+    first = g["prompt_ids"] + g["greedy"]
+    out: list[int] = []
+    big.generate(first, 4, None, lambda new: out.extend(new) and False, stop_eos=False)
+    turn = first + out + g["prompt_ids"][-8:]
+    resumed: list[int] = []
+    fresh: list[int] = []
+    stats = big.generate(turn, 16, None, lambda new: resumed.extend(new) and False, stop_eos=False)
+    big.generate(turn, 16, None, lambda new: fresh.extend(new) and False, draft=False, stop_eos=False)
+    assert stats["cached"] == len(first) - 1 and resumed[:4] == fresh[:4]
 
 
 @real
