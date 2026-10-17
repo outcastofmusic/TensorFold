@@ -2,6 +2,10 @@ import re
 from typing import Any
 
 from tensorfold.server.errors import RequestError
+from tensorfold.server.pythonic_calls import CALL_CLOSE, CALL_OPEN
+
+# envelopes whose opener is not an XML-like ``<name:tool_call>`` tag: LFM2's Pythonic list
+_FIXED = ((CALL_OPEN, CALL_CLOSE),)
 
 
 class _ToolTextFilter:
@@ -9,14 +13,14 @@ class _ToolTextFilter:
 
     def __init__(self):
         self.pending = ""
-        self.hidden = None
+        self.hidden = None              # the closer the hidden envelope ends at
 
     def feed(self, text: str) -> str:
         self.pending += text
         out = []
         while self.pending:
             if self.hidden:
-                close = f"</{self.hidden}>"
+                close = self.hidden
                 end = self.pending.lower().find(close)
                 if end < 0:
                     self.pending = self.pending[-(len(close) - 1):]
@@ -31,6 +35,13 @@ class _ToolTextFilter:
                 break
             out.append(self.pending[:start])
             self.pending = self.pending[start:]
+            envelope = next(((o, c) for o, c in _FIXED if o.startswith(self.pending[:len(o)])), None)
+            if envelope is not None:
+                opener, closer = envelope
+                if len(self.pending) < len(opener):            # a partial opener: wait for the rest
+                    break
+                self.pending, self.hidden = self.pending[len(opener):], closer
+                continue
             end = self.pending.find(">")
             if end < 0:
                 name = self.pending[1:]
@@ -45,7 +56,7 @@ class _ToolTextFilter:
                 continue
             name = self.pending[1:end]
             if re.fullmatch(r"(?:[A-Za-z_][\w.-]*:)?tool_call", name, flags=re.I):
-                self.hidden = name.lower()
+                self.hidden = f"</{name.lower()}>"
             else:
                 out.append(self.pending[:end + 1])
             self.pending = self.pending[end + 1:]
