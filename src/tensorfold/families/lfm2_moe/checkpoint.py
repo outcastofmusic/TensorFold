@@ -22,6 +22,27 @@ def layer(i: int) -> str:
     return f"{PREFIX}layers.{i}."
 
 
+def shards(model_dir: Path) -> list[Path]:
+    """A checkpoint folder's safetensors shards: the index's, else every ``model*.safetensors``."""
+
+    index = model_dir / "model.safetensors.index.json"
+    if index.is_file():
+        return [model_dir / f for f in sorted(set(json.loads(index.read_text())["weight_map"].values()))]
+    return sorted(model_dir.glob("model*.safetensors"))
+
+
+def stored(source, prefix: str) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """A linear as ``source`` (``get`` by name, ``in``) stores it: (e4m3 bytes, block scales) for FP8, (weight,
+    None) for bf16."""
+
+    w = source.get(prefix + ".weight")
+    if w.dtype != torch.float8_e4m3fn:
+        return w, None
+    if prefix + ".weight_scale" not in source:
+        raise ValueError(f"{prefix}: an FP8 weight without its weight_scale (compressed-tensors block FP8)")
+    return w.view(torch.uint8), source.get(prefix + ".weight_scale")
+
+
 def dequantize(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """e4m3 [N, K] and its block scales [ceil(N / 128), K / 128] -> fp32 [N, K]; e4m3 x bf16 is exact in fp32."""
 
@@ -39,12 +60,7 @@ class Tensors:
     def __init__(self, model_dir: str | Path):
         from safetensors import safe_open
 
-        model_dir = Path(model_dir)
-        index = model_dir / "model.safetensors.index.json"
-        if index.is_file():
-            files = sorted({model_dir / f for f in json.loads(index.read_text())["weight_map"].values()})
-        else:
-            files = sorted(model_dir.glob("model*.safetensors"))
+        files = shards(Path(model_dir))
         if not files:
             raise ValueError(f"{model_dir} holds no safetensors shards")
         self.where: dict[str, object] = {}
@@ -62,14 +78,7 @@ class Tensors:
         return self.where[name].get_tensor(name)
 
     def stored(self, prefix: str) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """A linear as stored: (weight, block scales) for FP8, (weight, None) for bf16."""
-
-        w = self.get(prefix + ".weight")
-        if w.dtype != torch.float8_e4m3fn:
-            return w, None
-        if prefix + ".weight_scale" not in self:
-            raise ValueError(f"{prefix}: an FP8 weight without its weight_scale (compressed-tensors block FP8)")
-        return w.view(torch.uint8), self.get(prefix + ".weight_scale")
+        return stored(self, prefix)
 
     def linear(self, prefix: str) -> torch.Tensor:
         """A linear's weight [N, K] in fp32, FP8 decoded exactly."""

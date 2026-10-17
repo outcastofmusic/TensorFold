@@ -18,7 +18,7 @@ from typing import Any
 
 import torch
 
-from ..checkpoint import PREFIX, dequantize, layer
+from ..checkpoint import PREFIX, dequantize, layer, shards, stored
 from ..config import Config
 
 
@@ -128,8 +128,11 @@ class Loader:
 
         self.c = Config.read(model_dir)
         self.device = device
-        self.r = SafeTensors(_shards(model_dir))
+        self.r = SafeTensors(shards(model_dir))
         self.used: set[str] = set()
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.r
 
     def get(self, name: str) -> torch.Tensor:
         if name not in self.r:
@@ -140,12 +143,8 @@ class Loader:
     def stored(self, prefix: str) -> tuple[torch.Tensor, torch.Tensor | None]:
         """(weight, block scales as fp32) of FP8; (bf16 weight, None) of a bf16 linear."""
 
-        w = self.get(prefix + ".weight")
-        if w.dtype != torch.float8_e4m3fn:
-            return w.to(torch.bfloat16), None
-        if prefix + ".weight_scale" not in self.r:
-            raise ValueError(f"{prefix}: an FP8 weight without its weight_scale (compressed-tensors block FP8)")
-        return w.view(torch.uint8), self.get(prefix + ".weight_scale").float()
+        w, scale = stored(self, prefix)
+        return (w.to(torch.bfloat16), None) if scale is None else (w, scale.float())
 
     def linear(self, *prefixes: str) -> Linear:
         """The linears ``prefixes`` stacked by rows (one input), as one ``Linear``."""
@@ -229,15 +228,6 @@ class Loader:
 
             w.config = replace(c, layers=c.layers[:count])
         return w
-
-
-def _shards(model_dir: Path) -> list[Path]:
-    import json
-
-    index = model_dir / "model.safetensors.index.json"
-    if index.is_file():
-        return [model_dir / f for f in sorted(set(json.loads(index.read_text())["weight_map"].values()))]
-    return sorted(model_dir.glob("model*.safetensors"))
 
 
 def load(model_dir: str | Path, device: str = "cuda", *, layers: int | None = None) -> Weights:
