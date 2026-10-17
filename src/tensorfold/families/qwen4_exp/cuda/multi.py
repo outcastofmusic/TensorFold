@@ -51,6 +51,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
     spec = None                  # staircut.py's Speculation, or None (the fixed confidence cut)
     count_drafters = False       # streams count drafts by drafter
     end_anchor = False           # a finished reply's end state is kept for a next turn that sends it back
+    disk = None                  # TENSORFOLD_QWEN_STATES: kept states also on disk (disk_states.DiskStates), one GPU
 
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
@@ -230,6 +231,34 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
     def _remember(self, ids: list[int], st: State, snap: dict, tail) -> None:
         prefixes.remember(self, ids, st, snap, tail)
 
+    def _on_disk(self, s: Stream):
+        """The disk state ``s`` resumes from when it is a longer prefix of the prompt than any kept in memory."""
+
+        if self.disk is None or not s.draft or s.vision is not None:
+            return None
+        best = prefixes._best(self.kept, list(s.prompt))
+        return self.disk.find(s.prompt, len(best[0]) if best is not None else 0, lambda e: True)
+
+    def _load_disk(self, entry, st: State) -> dict | None:
+        """Read a disk state into ``st`` (a slot no kept state holds) and keep it; None when it did not read."""
+
+        from .disk import load
+
+        resume = load(self.disk, entry, st)
+        if resume is not None:
+            self._remember(list(entry.ids), st, resume["state"], resume["tail"])
+        return resume
+
+    def persist(self, stop) -> int:
+        """Write the kept states not on disk yet, newest first; the scheduler's worker calls it with no stream live, so
+        every kept state's rows are still in its slot. ``stop()`` between blocks leaves the rest for the next try."""
+
+        if self.disk is None or self.live():
+            return 0
+        from .disk import persist
+
+        return persist(self.disk, self.kept, stop)
+
     def live(self) -> int:
         return len(self.streams) + len(self.filling)
 
@@ -304,7 +333,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 s.vision = self.vision.encode(s.vision, s.prompt)
             st, resume, s.cached = self._prepare_admission(s, told)
         else:
-            st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
+            entry = self._on_disk(s)             # a longer prefix on disk than any kept here: a slot of its own
+            st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None and entry is None)
         if self.w.comm is None:
             try:
                 if not self._grow(st, len(s.prompt) + self.depth + 2,
@@ -316,6 +346,11 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 else:
                     self._remember(list(s.prompt[:s.cached]), st, resume["state"], resume["tail"])
                 raise
+            if entry is not None:
+                read = time.perf_counter()
+                resume = self._load_disk(entry, st)
+                s.cached, s.disk_tokens = (len(entry.ids),) * 2 if resume is not None else (0, 0)
+                s.disk_s = time.perf_counter() - read
         e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows)
         mtp = s.draft and self.depth > 0 and self.mbuf is not None
         try:

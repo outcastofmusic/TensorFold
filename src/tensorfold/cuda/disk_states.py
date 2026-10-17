@@ -1,12 +1,14 @@
-"""GLM's kept prompt states on disk, so a conversation's next turn after a model swap, a restart or an eviction reads
-its state back instead of prefilling the whole conversation again (``TENSORFOLD_GLM_STATES``, a folder).
+"""Kept prompt states on disk, so a conversation's next turn after a model swap, a restart or an eviction reads its
+state back instead of prefilling the whole conversation again (``TENSORFOLD_GLM_STATES``, ``TENSORFOLD_QWEN_STATES``:
+a folder each).
 
-A state is its small tensors (KDA states, conv windows, pending MTP rows, the drafter's window) and its attention
-rows: each view's first rows, along dimension 0, in blocks of ``BLOCK`` rows. Every piece is a file named by the
-SHA-256 of its bytes, so blocks two states share are stored once and every read is checked against its name. A
-state's JSON is written last, by rename, so only whole states are found. States past ``budget`` bytes go least
-recently used first, then the pieces no state names. The folder holds one subfolder per fingerprint (model,
-drafter, tensorfold source, row shapes): a state never loads into another model or build.
+A state is its small tensors (GLM: KDA states, conv windows, pending MTP rows, the drafter's window; Qwen: DeltaNet
+states, conv windows, n-gram windows, the MTP tail) and its attention rows: each view's first rows, along dimension
+0, in blocks of ``BLOCK`` rows. Every piece is a file named by the SHA-256 of its bytes, so blocks two states share
+are stored once and every read is checked against its name. A state's JSON is written last, by rename, so only whole
+states are found. States past ``budget`` bytes go least recently used first, then the pieces no state names. The
+folder holds one subfolder per fingerprint (model, drafter, tensorfold source, row shapes): a state never loads into
+another model or build.
 
 Upstream TensorFold 1.0.12 keeps conversations on disk the same way (``--learn-conversations``): a 39,228-token next
 turn on a GB10 started in 0.25 s after a restart instead of 6.2 s.
@@ -60,6 +62,34 @@ def _dtype(name: str) -> torch.dtype:
 
 def fingerprint(parts: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def digest(paths: Sequence[Path]) -> str:
+    """The SHA-256 of the files' names and bytes, in the order given (a missing file adds nothing)."""
+
+    h = hashlib.sha256()
+    for path in paths:
+        if path.is_file():
+            h.update(path.name.encode() + path.read_bytes())
+    return h.hexdigest()
+
+
+def configured(family: str) -> bool:
+    return bool(os.environ.get(f"TENSORFOLD_{family}_STATES", "").strip())
+
+
+def from_env(family: str, parts: dict[str, Any]) -> DiskStates | None:
+    """``TENSORFOLD_<family>_STATES``: the folder kept states also go to, under the fingerprint of ``parts``; None
+    without it. ``TENSORFOLD_<family>_STATES_GIB`` (64) caps what that fingerprint's folder holds."""
+
+    if not configured(family):
+        return None
+    root = os.environ[f"TENSORFOLD_{family}_STATES"].strip()
+    budget = int(float(os.environ.get(f"TENSORFOLD_{family}_STATES_GIB", "64")) * (1 << 30))
+    disk = DiskStates(Path(root), fingerprint(parts), budget)
+    print(f"[tensorfold] kept states on disk: {disk.dir} ({len(disk.entries)} states, up to {budget >> 30} GiB)",
+          flush=True)
+    return disk
 
 
 class DiskStates:

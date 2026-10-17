@@ -6,10 +6,14 @@ from __future__ import annotations
 import itertools
 import queue
 import threading
+from collections import deque
 from typing import Any, Callable
 
 from .memory_gate import NoRoom
 from .streams import Stream
+
+IDLE_DELAY = 0.15                # seconds with no stream live before the decoder's idle work (warm.DELAY)
+WAKE = object()                  # a ``Scheduler.call`` waits for the worker
 
 
 class Waiting(queue.PriorityQueue):
@@ -39,6 +43,11 @@ class Waiting(queue.PriorityQueue):
 
         super().put((2, next(self._order), None))
 
+    def wake(self) -> None:
+        """Wake an idle worker for a ``call``: after every waiting request."""
+
+        super().put((3, next(self._order), WAKE))
+
     def foreground(self) -> bool:
         """Whether a foreground request waits."""
 
@@ -47,9 +56,15 @@ class Waiting(queue.PriorityQueue):
 
 
 class Scheduler:
-    def __init__(self, decoder: Any, *, max_streams: int = 4) -> None:
+    def __init__(self, decoder: Any, *, max_streams: int = 4, idle: Callable[[Callable[[], bool]], Any] | None = None
+                 ) -> None:
         self.decoder = decoder
         self.max_streams = max_streams
+        # ``idle(stop)``: the decoder's work once no stream is live (its kept states' disk write), IDLE_DELAY after a
+        # request ends; ``stop()`` turns true when a request arrives, and the work then stops between its steps
+        self.idle = idle
+        self.owed = False                            # a request ended since ``idle`` last ran
+        self.jobs: deque = deque()                   # ``call``s waiting for the worker: (fn, box)
         self.waiting = Waiting()
         self.held: tuple | None = None               # a request waiting for memory, admitted before any other
         self.boxes: dict[int, queue.Queue] = {}
@@ -58,6 +73,17 @@ class Scheduler:
             decoder.arrived = self.waiting.foreground
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
+
+    def call(self, fn: Callable[[], Any]) -> Any:
+        """Run ``fn()`` on the worker once no stream is live and return what it returns, or raise what it raises."""
+
+        box: queue.Queue = queue.Queue()
+        self.jobs.append((fn, box))
+        self.waiting.wake()
+        kind, value = box.get()
+        if kind == "error":
+            raise value
+        return value
 
     def close(self) -> None:
         """Stop the worker once idle and let go of the decoder (its thread held it, and its weights, until now)."""
@@ -126,9 +152,12 @@ class Scheduler:
                 (stream, box), self.held = self.held, None
             else:
                 try:
-                    stream, box = self.waiting.get_nowait()
+                    item = self.waiting.get_nowait()
                 except queue.Empty:
                     break
+                if item is WAKE:                     # a call waits for no stream live: ``_next`` runs it
+                    continue
+                stream, box = item
             self.boxes[id(stream)] = box
             try:
                 self.decoder.admit(stream)
@@ -166,11 +195,39 @@ class Scheduler:
         if box is not None:
             box.put((kind, value))
 
+    def _next(self):
+        """With no stream live: the next request, or None to stop. ``call`` jobs run first, and ``idle`` runs once
+        IDLE_DELAY passes with no request after one ended."""
+
+        while True:
+            while self.jobs:
+                fn, box = self.jobs.popleft()
+                try:
+                    box.put(("done", fn()))
+                except Exception as exc:             # noqa: BLE001  (raised again on the calling thread)
+                    box.put(("error", exc))
+            try:
+                item = self.waiting.get(timeout=IDLE_DELAY if self.owed and self.idle is not None else None)
+            except queue.Empty:
+                self.owed = False
+                try:
+                    self.idle(lambda: not self.waiting.empty())
+                except RuntimeError as exc:          # a CUDA failure: the work is optional, so it stops for good
+                    self.idle = None
+                    print(f"[tensorfold] idle work off after: {type(exc).__name__}: {exc}", flush=True)
+                continue
+            if item is None:
+                while self.jobs:
+                    self.jobs.popleft()[1].put(("error", RuntimeError("the scheduler closed")))
+                return None
+            if item is not WAKE:
+                return item
+
     def _loop(self) -> None:
         while True:
             self._yield()
             idle = not self.decoder.live() and self.held is None
-            first = self.waiting.get() if idle else None                              # idle: wait for a request
+            first = self._next() if idle else None                                    # idle: wait for a request
             if idle and first is None:
                 return                                                                # close()
             done = self._admit(first)
@@ -180,5 +237,6 @@ class Scheduler:
                 for s in self.decoder.drop():
                     self._reply(s, "error", exc)
             self.decoder.finish(done)
+            self.owed = self.owed or bool(done)
             for s in done:
                 self._reply(s, *(("error", s.error) if s.error is not None else ("done", s.stats())))
