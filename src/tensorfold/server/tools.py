@@ -148,6 +148,8 @@ def _loose_tool_arguments(payload: dict[str, Any], explicit: Any) -> Any:
 _GLM_ARG_RE = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
 _GLM_NAME_RE = re.compile(r"[\w.:-]+")
 _GLM_TAG_RE = re.compile(r"</?arg_(?:key|value)>")
+_GLM_KEY_END_RE = re.compile(r"</arg_key>")
+_GLM_VALUE_AFTER_RE = re.compile(r"\s*<arg_value>")
 
 
 def repair_glm_keys(block: str) -> str:
@@ -190,11 +192,41 @@ def _parse_glm_payload(block: str, schemas: dict[str, dict[str, Any]] | None, *,
     if _GLM_NAME_RE.fullmatch(name) is None:
         return None
     rest = found + rest
-    if complete and _GLM_ARG_RE.sub("", rest).strip():
+    pairs, left = _glm_args(rest)
+    if complete and left.strip():
         return None
     schema = (schemas or {}).get(name.lower(), {})
     return name, {key.strip(): decode_parameter(value, schema.get(key.strip(), {}), python=False)
-                  for key, value in _GLM_ARG_RE.findall(rest)}
+                  for key, value in pairs}
+
+
+def _glm_args(text: str) -> tuple[list[tuple[str, str]], str]:
+    """``_GLM_ARG_RE``'s matches in ``text`` and the text outside them, in linear time (upstream #883).
+
+    A key runs to the first ``</arg_key>`` an ``<arg_value>`` follows, its value to the next ``</arg_value>``, as the
+    regex's lazy groups do. The regex retried every later ``</arg_key>`` from every ``<arg_key>``, so a call of many
+    keys without values took 6.1 s at 8,000 keys; each position here moves forward only.
+    """
+
+    ends = [m.start() for m in _GLM_KEY_END_RE.finditer(text) if _GLM_VALUE_AFTER_RE.match(text, m.end())]
+    pairs: list[tuple[str, str]] = []
+    left: list[str] = []
+    at = e = 0
+    while (start := text.find("<arg_key>", at)) >= 0:
+        key = start + len("<arg_key>")
+        while e < len(ends) and ends[e] < key:
+            e += 1
+        if e == len(ends):
+            break
+        value = _GLM_VALUE_AFTER_RE.match(text, ends[e] + len("</arg_key>")).end()
+        stop = text.find("</arg_value>", value)
+        if stop < 0:                               # no later key's value closes either
+            break
+        pairs.append((text[key:ends[e]], text[value:stop]))
+        left.append(text[at:start])
+        at = stop + len("</arg_value>")
+    left.append(text[at:])
+    return pairs, "".join(left)
 
 
 def _parse_gemma_call(block: str) -> tuple[str, dict[str, Any]] | None:
