@@ -445,7 +445,13 @@ def test_models_and_health_answer(app):
     assert [m["id"] for m in models["data"]] == ["d1-3b"]
 
 
-def test_the_server_sets_no_delay_for_decisions(app):
+def test_the_server_sets_no_delay_for_every_app(app):
+    """A reply's headers and its small body are two writes: without TCP_NODELAY a kept connection waits out the
+    client's delayed ACK (40 ms on Linux) for the body."""
+
+    from types import SimpleNamespace
+
     from tensorfold.cuda.http import make_handler
 
     assert make_handler(app).disable_nagle_algorithm is True
+    assert make_handler(SimpleNamespace()).disable_nagle_algorithm is True

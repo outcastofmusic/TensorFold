@@ -521,6 +521,9 @@ def _cuda_post(factory, app, body, path="/v1/decisions"):
         def sendall(self, data):
             self.output.extend(data)
 
+        def setsockopt(self, *args):             # the CUDA handler sets TCP_NODELAY
+            pass
+
     connection = Connection()
     factory(app)(connection, ("127.0.0.1", 0), None)
     headers, response = bytes(connection.output).split(b"\r\n\r\n", 1)
