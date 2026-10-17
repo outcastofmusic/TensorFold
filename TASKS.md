@@ -13,7 +13,6 @@ guidance for bringing up a new model; this file holds the work. Dates are 2026.
 | Long-context eval set | Background agent, new files in `spark-bench-ext` (`lc_ext.py`, `run_lc.py`) |
 | d1-3B decision model as a sidecar beside Clef | Background agent, `feat/d1-sidecar`: an LFM2 (d1) family, `/v1/systemone` and `/v1/decisions`, a `d1` sidecar in `run.sh` on port 30003 |
 | Import LFM2.5-24B-A2B (FP8) into the fork | Background agent, `feat/lfm2-moe`: an `lfm2_moe` family, Pythonic tool calls, a `lfm2-24b` swap target. Vendor-only agentic scores (BFCLv4 65), so benchmark it here before relying on it |
-| Gateway empty-reply retry | Background agent, `~/workspace/gateway-empty-retry` (`feat/empty-retry`), built and tested only, not deployed |
 | TrueScore 76x2 and planning x4 on Qwen FP4-Local, Qwen EXL3, GLM-5.3 and Nemotron Bolt | FP4-Local 91.0 / planning 89.8, EXL3 87.8 / 89.0, GLM 93.0 / planning running, Bolt next (`tf-runs/truescore-queue.sh`, 17 Oct) |
 | Qwen disk states, and a persist endpoint `swap.py` calls before it stops a model | Built on `feat/qwen-disk-states` (`da1dc25d`, `e99b729c`): CPU suite 4,453 passed, 0 failed. GPU tests and a real-model restart check run after the benchmarks. A state takes 298.7 MB at 10k tokens and 1,030.9 MB at 50k |
 | GLM regenerate check of the branch-point rule (#735), base against ports | Chained after the benchmarks (`tf-runs/glm-regen.sh`) |
@@ -22,6 +21,7 @@ guidance for bringing up a new model; this file holds the work. Dates are 2026.
 
 | Task | Notes |
 |---|---|
+| Deploy the gateway empty-reply retry | Built `2a9ea81` on `feat/empty-retry` (`~/workspace/gateway-empty-retry`), go tests pass. Deploy: merge into `~/mini-llm-gateway`, add `"reseed": {"qwen3.8-flash-next": {"retries": 1, "hold_reasoning_bytes": 4096}}` to gateway.json, Ctrl-C and `just serve` in its tmux pane. Waiting for your go |
 | Restore production Qwen | `POST :30000/swap/qwen3.8-flash-next` after the GLM regenerate check. Production has been down since 17 Oct 07:24 UTC |
 | Decide the swap set and update `swap.py` / `run.sh` | Swap between Qwen FP4-Local, Qwen EXL3, GLM-5.3 and Nemotron Bolt, from the benchmark results |
 | Nemotron 3.5 Super VL (120B-A12B) as a swap candidate | Upstream 1.0.12 serves it on one or two GB10s from NVIDIA's NVFP4. Try the upstream native binary behind `swap.py` first, then decide on a port |
