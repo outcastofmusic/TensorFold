@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -60,22 +61,38 @@ class BoltEngine:
             raise ValueError(f"Nemotron Bolt needs {need / gib:.1f} GiB on the GPU for its weights and a "
                              f"{self.max_len}-token context; {free / gib:.1f} GiB is free above the memory floor. "
                              f"Free memory or pass a smaller --context")
+        from tensorfold.cuda.markers import resume_points
+
+        from .reuse import Store
+
+        # kept prompt states get what the weights and caches leave, at most TF_BOLT_CACHE_GIB
+        budget = min(int(float(os.environ.get("TF_BOLT_CACHE_GIB", "4")) * gib), free - need)
+        self.store = Store(int(os.environ.get("TF_BOLT_CACHE_ENTRIES", "8")), budget)
+        self.marks = resume_points(self.model_dir)          # message starts a prefill keeps states at, or None
         started = time.perf_counter()
         self.w = load(self.model_dir, layers=layers)
         self.e = Engine(self.w, max_len=self.max_len, taps=taps)
         self.drafter = None
         self.drafts = int(drafts)
+        # TF_BOLT_DEPTH=fixed drafts ``drafts`` a round; otherwise a round's depth follows acceptance and measured costs
+        self.adaptive = os.environ.get("TF_BOLT_DEPTH", "auto") != "fixed"
         if drafter and self.drafts > 0:
+            from .depth import Costs
             from .lilicorr import Drafter
 
             self.drafter = Drafter(drafter, embed=self.e.embed_rows, lm_head=self.e.head_logits)
+            self.drafts = min(self.drafts, self.drafter.c.block - 1)
+            self.costs = Costs(self.drafts + 1)
         self.eos = tuple(c.eos)
         self.tp, self.rank = 1, 0
         from .engine import EXPERTS
 
-        rule = f"LiLiCorr drafts ({drafter})" if self.drafter is not None else "serial decoding (no drafter)"
+        rule = (f"LiLiCorr drafts ({drafter}), {'up to ' if self.adaptive else ''}{self.drafts} a round"
+                if self.drafter is not None else "serial decoding (no drafter)")
+        kept = (f"up to {self.store.entries} prompt states kept in {self.store.budget / gib:.1f} GiB"
+                if self.store.on else "no prompt states kept")
         print(f"[tensorfold] Nemotron Bolt on CUDA: {len(self.w.blocks)} layers, experts on the {EXPERTS}; {rule}; "
-              f"{self.max_len}-token cache; loaded in {time.perf_counter() - started:.1f}s", flush=True)
+              f"{self.max_len}-token cache; {kept}; loaded in {time.perf_counter() - started:.1f}s", flush=True)
 
     @property
     def context_window(self) -> int:
@@ -91,28 +108,46 @@ class BoltEngine:
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens: Callable[[list[int]], bool | None],
                  draft: bool = True, constraint=None, stop_eos: bool = True) -> dict[str, Any]:
-        """Prefill, then LiLiCorr rounds (``draft`` with a drafter and no grammar) or serial ones; same tokens."""
+        """Prefill, then LiLiCorr rounds (``draft`` with a drafter and no grammar) or serial ones; same tokens.
+
+        A ``draft`` request resumes from the longest kept prefix of its prompt and keeps states as its prefill passes
+        ``keep_points``; ``draft: false``, the reference, prefills afresh and keeps nothing.
+        """
 
         from .engine import prefill, serial_decode
+        from .reuse import keep_points
 
+        prompt = [int(t) for t in prompt]
         max_tokens = self._limit(prompt, max_tokens)
         drafting = bool(draft) and self.drafter is not None and constraint is None
-        if drafting:
+        reuse = bool(draft) and self.store.on
+        hit = self.store.longest(prompt, drafting) if reuse else None
+        if drafting and hit is not None:
+            self.drafter.restore(hit.drafter)
+        elif drafting:
             self.drafter.reset()
+        begin = len(hit.ids) if hit is not None else 0
+
+        def keep(n: int, state: dict) -> None:
+            self.store.add(prompt[:n], state, self.drafter.snapshot() if drafting else None)
+
         t0 = time.perf_counter()
         pending = prefill(self.e, prompt, sampling, on_taps=self.drafter.add_taps if drafting else None,
-                          constraint=constraint)
+                          constraint=constraint, resume=hit.state if hit is not None else None,
+                          keeps=keep_points(prompt, begin, self.marks) if reuse else (), keep=keep)
         prefill_s = time.perf_counter() - t0
-        stats: dict[str, Any] = {"prefill_s": round(prefill_s, 4), "cached": 0, "drafts": drafting,
-                                 "prefill_tps": round(len(prompt) / prefill_s, 2) if prefill_s else 0.0}
+        stats: dict[str, Any] = {"prefill_s": round(prefill_s, 4), "cached": begin, "drafts": drafting,
+                                 "prefill_tps": round((len(prompt) - begin) / prefill_s, 2) if prefill_s else 0.0}
         if (on_tokens is not None and on_tokens([pending])) or (stop_eos and pending in self.eos) or max_tokens <= 1:
             return stats
         if drafting:
+            from .depth import DepthPolicy
             from .lilicorr import lilicorr_decode
 
+            policy = DepthPolicy(self.drafts, self.costs) if self.adaptive else None
             res = lilicorr_decode(self.e, self.drafter, pending, max_tokens, sampling, stop_eos=stop_eos,
-                                  on_tokens=on_tokens)
-            stats.update(drafted=getattr(res, "drafted", 0), accepted=getattr(res, "accepted", 0))
+                                  on_tokens=on_tokens, depth=self.drafts, policy=policy)
+            stats.update(drafted=res.drafted, accepted=res.accepted, serial_rounds=res.widths.count(1))
         else:
             res = serial_decode(self.e, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
                                 constraint=constraint)
