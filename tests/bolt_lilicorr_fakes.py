@@ -83,8 +83,8 @@ def write_draft(path, *, seed: int = 0, **config):
 class FakeTarget:
     """A deterministic toy target: logits from the last two tokens, taps from (position, token).
 
-    It implements what ``lilicorr_decode`` reads: ``pos``, ``eos``, ``verify``, ``sample``, ``commit``,
-    ``tap_rows``, and ``embed`` / ``lm_head`` for the drafter.
+    It implements what ``lilicorr_decode`` reads: ``pos``, ``eos``, ``set_sampling``, ``verify``, ``sample``,
+    ``commit``, ``tap_rows``, and ``embed`` / ``lm_head`` for the drafter.
     """
 
     def __init__(self, prompt: Sequence[int], *, taps: int = 3, eos: tuple[int, ...] = (), seed: int = 3) -> None:
@@ -114,6 +114,9 @@ class FakeTarget:
             prev = hist[t - 1] if t > 0 else 0
             out.append(self.table[hist[t]] + self.table2[prev])
         return torch.stack(out)
+
+    def set_sampling(self, sampling: Sampling | None) -> None:
+        self.sampling = sampling
 
     def verify(self, tokens: list[int]) -> torch.Tensor:
         self.verifies += 1
@@ -183,9 +186,6 @@ class FakeEngine(FakeTarget):
     def restore(self, st: dict) -> None:
         self.reset()
         self.ids = list(st["ids"])
-
-    def set_sampling(self, sampling: Sampling | None) -> None:
-        self.sampling = sampling
 
     def prefill_chunk(self, tokens: Sequence[int], cuts: Sequence[int] = ()) -> dict[int, dict]:
         tokens = [int(t) for t in tokens]

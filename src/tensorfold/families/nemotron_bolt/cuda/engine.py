@@ -187,7 +187,6 @@ class Engine:
         for slot, layer in enumerate(self.tap_layers):
             self._tap_slots.setdefault(layer, []).append(slot)
         self._taps: list[torch.Tensor] = []
-        self.hidden = torch.zeros((0, c.hidden), dtype=torch.bfloat16, device=dev)
         self.logits = torch.zeros((max_rows, c.vocab), dtype=torch.bfloat16, device=dev)
         self.sampled = torch.zeros(max_rows, dtype=torch.int32, device=dev)
         self.p_sampled = torch.zeros(1, dtype=torch.int32, device=dev)
@@ -324,7 +323,6 @@ class Engine:
         self._staged.record()
         ids = self._inputs[4:4 + rows]
         normed = self._layers(ids, prompt=False)
-        self.hidden = normed
         self.logits[:rows].copy_(b16.matmul(normed, self.w.head))
         if self.masked:
             self.logits[:rows].add_(self.bias[:rows])
@@ -355,11 +353,6 @@ class Engine:
         if not self.tap_layers:
             raise ValueError("this engine was made without tap layers")
         return torch.cat([t[:n] for t in self._taps], dim=1)
-
-    def hidden_rows(self, n: int) -> torch.Tensor:
-        """The last window's or prompt chunk's first ``n`` final-normed hidden rows [n, D] bf16."""
-
-        return self.hidden[:n]
 
     def mask(self, constraint, window) -> None:
         """The next window's sampling masked by a reply's grammar; ``None`` lifts it."""
@@ -412,7 +405,6 @@ class Engine:
         parts = {int(c): {"ssm": torch.empty_like(self.ssm), "conv_base": self.conv_base.clone()} for c in cuts}
         ids = torch.as_tensor(list(tokens), dtype=torch.int32).to(self.device)
         normed = self._layers(ids, prompt=True, parts=parts)
-        self.hidden = normed
         self._rows = rows
         self.pos += rows
         logits = b16.matmul(normed[rows - 1:rows], self.w.head)
@@ -450,15 +442,14 @@ class DecodeResult:
 
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling, *, on_taps: Callable[[torch.Tensor], None] | None = None,
-            constraint=None, stop: Callable[[], bool] | None = None, resume: dict | None = None,
+            constraint=None, resume: dict | None = None,
             keeps: Sequence[int] = (), keep: Callable[[int, dict], None] | None = None) -> int:
     """Commit the prompt in chunks and return its first sampled token (position len(prompt)).
 
     A fresh prompt starts from a reset; ``resume`` (an ``Engine.state`` of a strict prefix) starts at its length.
     ``keep(n, state)`` gets the engine's state after each of ``keeps`` (positions past the start) once ``on_taps``
     has had the taps up to n, so a drafter's context can be kept beside it. ``on_taps`` gets the taps [R, T * D] in
-    order (a drafter's context); ``stop()`` is asked before each chunk and abandons the prompt with
-    ``RequestCancelled``.
+    order (a drafter's context).
     """
 
     prompt = [int(t) for t in prompt]
@@ -479,10 +470,6 @@ def prefill(e: Engine, prompt: Sequence[int], sampling, *, on_taps: Callable[[to
         e.mask(constraint, constraint.window([0], [-1]))
     try:
         for s in range(begin, len(prompt), e.prefill_rows):
-            if stop is not None and stop():
-                from tensorfold.server.cancellation import RequestCancelled
-
-                raise RequestCancelled("the client left while its prompt was filling")
             chunk = prompt[s:s + e.prefill_rows]
             rows = len(chunk)
             here = [p - s for p in points if s < p <= s + rows]

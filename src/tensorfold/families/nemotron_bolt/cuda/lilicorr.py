@@ -591,20 +591,12 @@ class Drafter:
 
 # -- verification ---------------------------------------------------------------------------------------------------
 def _sample(engine, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None) -> list[int]:
-    """The window's tokens from the sampler serial decoding uses: the engine's own when it has one.
-
-    An engine that samples inside ``verify`` (``tokens()``, like Nemotron-H's keyed GPU sampler) wins; then an
-    engine ``sample(logits, positions, sampling)``; then the shared CUDA rule.
-    """
+    """The window's tokens from the sampler serial decoding uses: the engine's keyed sampler inside ``verify``
+    (``tokens()``, Bolt's ``Engine``), else its ``sample(logits, positions, sampling)`` (the tests' fake targets)."""
 
     if hasattr(engine, "tokens"):
         return [int(t) for t in engine.tokens()[:len(positions)]]
-    sample = getattr(engine, "sample", None)
-    if sample is not None:
-        return list(sample(logits, positions, sampling))
-    from tensorfold.cuda.sampling import sample_rows
-
-    return sample_rows(logits, positions, sampling)
+    return list(engine.sample(logits, positions, sampling))
 
 
 OWED = 256             # committed tap rows a drafter may owe before it takes them, drafting or not
@@ -627,8 +619,7 @@ def lilicorr_decode(engine, drafter: Drafter, first: int, count: int, sampling: 
         raise ValueError(f"the drafter holds {drafter.context_end} positions, the engine {engine.pos}")
     depth = drafter.c.block - 1 if depth is None else max(0, min(int(depth), drafter.c.block - 1))
     eos = set(engine.eos)
-    if hasattr(engine, "set_sampling"):
-        engine.set_sampling(sampling)
+    engine.set_sampling(sampling)
     out = [int(first)]
     res = DecodeResult([], 0.0, 0)
     owed: list[torch.Tensor] = []
