@@ -205,4 +205,4 @@ def test_every_served_name_has_a_run_sh_target():
     spec.loader.exec_module(mod)
     dispatch = re.findall(r"^    ([a-z0-9.-]+)\)\s+ask_swap", (root / "run.sh").read_text(), re.M)
     assert set(mod.TARGET.values()) == set(dispatch)
-    assert {"qwen3.8-flash-next-fp4", "nemotron-3.5-bolt"} <= set(mod.TARGET)
+    assert {"qwen3.8-flash-next-fp4", "nemotron-3.5-bolt", "lfm2.5-24b-a2b"} <= set(mod.TARGET)
