@@ -250,6 +250,7 @@ class Snapshot:
     drafter_rows: list | None = None  # a ring drafter's window rows before drafter_end, copied when taken
     born: int = -1                # a background pass's state: the length of the turn it was kept for (-1: its own)
     branched: bool = False        # resumed again after a later turn extended it: freed only as least recently used
+    blocks: list | None = None    # its rows' full blocks on disk, once written or read back (disk_states.blocks)
 
 
 def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
@@ -301,6 +302,13 @@ def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
             ik, ig, pk = idx[-1]
             views += [ik[:m], ig[:m], pk[:m // 4 + 1]]
     return views
+
+
+def complete_rows(st, n: int, m: int) -> list[int]:
+    """The rows of each view of ``_row_views(st, n, m)`` that no later token changes: all but a pool's last, which
+    pools the tokens past the state's end as they come."""
+    pools = {pk.data_ptr() for _, _, pk in st.index or []}
+    return [v.shape[0] - (v.data_ptr() in pools) for v in _row_views(st, n, m)]
 
 
 def save_rows(e: Engine, snap: Snapshot) -> None:

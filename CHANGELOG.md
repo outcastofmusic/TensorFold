@@ -14,6 +14,11 @@ GitHub has the full notes and the measurements behind them.
   DeltaNet piece: at two such states a turn, a 30-turn conversation writes 6.9 GB less. After a restart, a
   regenerated or edited earlier turn resumes from the longest state on disk it extends and prefills the rest.
   `TENSORFOLD_QWEN_STATES_ALL=1` (`STATES_ALL=1` in `run.sh`) writes every kept state as before.
+- **A turn's disk write copies and hashes only its new rows.** Qwen and GLM copied every block of a state off the GPU
+  and hashed it before finding it on disk, so each turn hashed the whole conversation again. A state now names the
+  full 256-row blocks that an earlier state of the same rows (its slot's on Qwen, the live caches' on GLM) wrote or
+  read back. At Qwen's 18,304 bytes a token, a 30,000-token turn after a 29,000-token one copies and hashes 529 MB
+  less. The files on disk are the same bytes.
 - **Kept states on disk are pruned.** A state unused for 72 hours (`TENSORFOLD_<GLM|QWEN>_STATES_TTL_H`) is deleted, and so is
   an older build's or checkpoint's folder whose newest state is that old. `_STATES_GIB` now caps the whole folder:
   past it, older builds' folders go least recently used first, then the current build's oldest states. A folder

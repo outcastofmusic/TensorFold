@@ -351,14 +351,21 @@ class GlmEngine:
                  "states": [list(st.rec.shape[1:]), str(st.rec.dtype), list(st.conv.shape), str(st.conv.dtype)]}
         return disk_states.from_env("GLM", parts)
 
+    def _live(self, snap) -> bool:
+        """Whether ``snap``'s rows are the live caches' (``_take_over`` saves or drops a state before they change)."""
+        return snap.rows is None and self.live[:len(snap.ids)] == snap.ids
+
     def persist(self, stop: Callable[[], bool]) -> int:
         """Write the kept states not on disk yet, newest first, while no request runs; the states written. A state
-        whose rows another conversation took is written from its saved rows, and one whose rows are gone is not."""
+        whose rows another conversation took is written from its saved rows, and one whose rows are gone is not.
+
+        A state whose rows are live names the full blocks another live state wrote or read back (``Snapshot.blocks``)
+        instead of copying and hashing them again: both are the live rows, so the same bits."""
 
         if self.disk is None:
             return 0
-        from .decode import _row_views
-        from tensorfold.cuda.disk_states import MIN_TOKENS
+        from .decode import _row_views, complete_rows
+        from tensorfold.cuda.disk_states import MIN_TOKENS, blocks
 
         written = 0
         for snap in reversed(list(self.cache)):
@@ -375,19 +382,24 @@ class GlmEngine:
                     return snap.rows
                 return _row_views(self.e.st, n, m) if self.live[:n] == snap.ids else None
 
+            known = max((c.blocks for c in self.cache if c.blocks and self._live(c)), key=lambda b: sum(map(len, b)),
+                        default=[]) if self._live(snap) else []
             # a flat drafter's rows are in no snapshot: such a state resumes without DFlash2 drafts (save_rows)
             end = snap.drafter_end if snap.drafter_rows is not None else -1
             if self.disk.write(snap.ids, views, {"rec": snap.rec, "conv": snap.conv, "pending": snap.pending},
-                               snap.drafter_rows, mtp_len=snap.mtp_len, drafter_end=end, born=snap.born, stop=stop):
+                               snap.drafter_rows, mtp_len=snap.mtp_len, drafter_end=end, born=snap.born, stop=stop,
+                               known=known):
                 written += 1
+                if (got := self.disk.get(snap.ids)) is not None:      # None: the budget pruned it at once
+                    snap.blocks = blocks(got, complete_rows(self.e.st, n, m))
         return written
 
     def _load_disk(self, entry):
         """Read a state from disk into the live caches and keep it; None, with the prompt prefilling instead, when a
         piece fails its hash. Every other state's rows are saved or dropped first: the read overwrites them all."""
 
-        from .decode import Snapshot, _row_views
-        from tensorfold.cuda.disk_states import StateError
+        from .decode import Snapshot, _row_views, complete_rows
+        from tensorfold.cuda.disk_states import StateError, blocks
 
         n, m = len(entry.ids), max(entry.mtp_len, 0)
         self._take_over([])
@@ -398,7 +410,8 @@ class GlmEngine:
             print(f"[tensorfold] a kept state on disk did not read ({exc}); the prompt prefills", flush=True)
             return None
         snap = Snapshot(list(entry.ids), got["rec"], got["conv"], got.get("pending"), entry.mtp_len,
-                        entry.drafter_end, drafter_rows=got["ring"], born=entry.born)
+                        entry.drafter_end, drafter_rows=got["ring"], born=entry.born,
+                        blocks=blocks(entry, complete_rows(self.e.st, n, m)))
         self.live = list(entry.ids)
         self._remember(snap)
         return snap if snap in self.cache else None

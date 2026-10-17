@@ -285,6 +285,95 @@ def test_the_serial_engine_writes_only_its_shortest_and_longest_states(tmp_path)
     assert sorted(len(x.ids) for x in d.entries) == [1100, 2000]
 
 
+def copies(monkeypatch):
+    """Every tensor ``disk_states`` copies off its device to hash, by its rows (a block's are at most BLOCK)."""
+
+    from tensorfold.cuda import disk_states
+
+    seen, real = [], disk_states._bytes
+    monkeypatch.setattr(disk_states, "_bytes", lambda t: seen.append(t.shape[0]) or real(t))
+    return seen
+
+
+def views_of(d, ids):
+    return [s["pieces"] for s in d.get(ids).meta["views"]]
+
+
+def test_a_later_state_on_the_slot_copies_and_hashes_only_its_new_blocks(tmp_path, monkeypatch):
+    from tensorfold.cuda.disk_states import BLOCK
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    st = noise(slot(capacity=2100))
+    first, later = chain(st, 1100, 2000)
+    fresh = store(tmp_path / "fresh")                                 # the same state, every block copied
+    assert disk.persist(fresh, [chain(noise(slot(capacity=2100)), 2000)[0]], lambda: False) == 1
+    d = store(tmp_path / "d")
+    assert disk.persist(d, [first], lambda: False) == 1
+    seen = copies(monkeypatch)
+    assert disk.persist(d, [first, later], lambda: False) == 1
+    assert views_of(d, later[0]) == views_of(fresh, later[0])
+    reused = sum(len(v) for v in first[2][disk.BLOCKS])
+    assert reused == sum(v.shape[0] // BLOCK for v in disk.rows(st, 1100, 1099))
+    blocks = sum(len(v) for v in views_of(d, later[0]))
+    assert len(seen) == blocks - reused + len(disk._extras(*later[2:]))
+    dst = slot(capacity=2100)
+    got = disk.load(store(tmp_path / "d"), d.get(later[0]), dst)
+    assert same_resume(got, later[2], later[3])
+    assert all(same(a, b) for a, b in zip(disk.rows(dst, 2000, 1999), disk.rows(st, 2000, 1999)))
+
+
+def test_the_same_ids_on_another_slot_lend_no_blocks(tmp_path, monkeypatch):
+    """Equal ids are not equal rows (a decoded reply and its prefill differ): only the slot's own rows are reused."""
+
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    a, b = noise(slot(capacity=2100)), noise(slot(capacity=2100), seed=1)
+    fresh = store(tmp_path / "fresh")
+    assert disk.persist(fresh, [chain(noise(slot(capacity=2100), seed=1), 2000)[0]], lambda: False) == 1
+    d = store(tmp_path / "d")
+    first = chain(a, 1100)[0]
+    assert disk.persist(d, [first], lambda: False) == 1
+    later = chain(b, 2000)[0]                                         # extends first's ids, other bits
+    seen = copies(monkeypatch)
+    assert disk.persist(d, [first, later], lambda: False) == 1
+    assert views_of(d, later[0]) == views_of(fresh, later[0])
+    assert len(seen) == sum(len(v) for v in views_of(d, later[0])) + len(disk._extras(*later[2:]))
+
+
+def test_a_state_read_back_lends_its_blocks_to_the_next_turn(tmp_path, monkeypatch):
+    from tensorfold.cuda.disk_states import BLOCK
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    src = noise(slot(capacity=2100))
+    d = store(tmp_path / "d")
+    assert disk.persist(d, chain(src, 1100), lambda: False) == 1
+    again = store(tmp_path / "d")                                     # a restart
+    dst = noise(slot(capacity=2100), seed=5)
+    got = disk.load(again, again.get(list(range(1100))), dst)
+    later = chain(dst, 2000)[0]
+    fresh = store(tmp_path / "fresh")
+    assert disk.persist(fresh, chain(dst, 2000), lambda: False) == 1
+    seen = copies(monkeypatch)
+    assert disk.persist(again, [(list(range(1100)), dst, got["state"], got["tail"]), later], lambda: False) == 1
+    reused = sum(len(v) for v in got["state"][disk.BLOCKS])
+    assert reused == sum(v.shape[0] // BLOCK for v in disk.rows(dst, 1100, 1099))
+    assert len(seen) == sum(len(v) for v in views_of(again, later[0])) - reused + len(disk._extras(*later[2:]))
+    assert views_of(again, later[0]) == views_of(fresh, later[0])
+
+
+def test_a_pruned_block_is_written_again(tmp_path, monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    st = noise(slot(capacity=2100))
+    first, later = chain(st, 1100, 2000)
+    d = store(tmp_path)
+    assert disk.persist(d, [first], lambda: False) == 1
+    gone = first[2][disk.BLOCKS][0][0]
+    (d.pieces / gone).unlink()
+    assert disk.persist(d, [first, later], lambda: False) == 1
+    assert (d.pieces / gone).is_file() and views_of(d, later[0])[0][0] == gone
+
+
 # -- the concurrent decoder ------------------------------------------------------------------------------
 def decoder(monkeypatch, d, slots):
     """A bare ``MultiDecoder`` on host slots: admission runs as written, the prompt's first rows are recorded."""

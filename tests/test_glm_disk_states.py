@@ -151,3 +151,126 @@ def test_fingerprints_keep_models_apart(disk, tmp_path):
     assert a != b and len(a) == 16
     write(disk.DiskStates(tmp_path, a, 1 << 30), list(range(300)), rows(300))
     assert disk.DiskStates(tmp_path, b, 1 << 30).entries == []
+
+
+# -- the engine's persist: blocks already on disk are named, not copied and hashed again --------------------------
+CAP = 4096
+
+
+def live_caches(seed=0):
+    """The live caches ``decode._row_views`` reads: one latent layer with its indexer, and the MTP head's."""
+
+    import torch
+
+    g = torch.Generator().manual_seed(seed)
+    t = lambda *shape: torch.randn(*shape, generator=g).to(torch.bfloat16)    # noqa: E731
+    from types import SimpleNamespace
+
+    return SimpleNamespace(kc=[t(CAP, 8)], vc=[None], index=[(t(CAP, 4), t(CAP, 2), t(CAP // 4 + 1, 4)),
+                                                              (t(CAP, 4), t(CAP, 2), t(CAP // 4 + 1, 4))],
+                           mtp_kc=t(CAP, 8), mtp_vc=None, rec=t(2, 4, 4))
+
+
+def glm(store, st):
+    from types import SimpleNamespace
+
+    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
+
+    e = GlmEngine.__new__(GlmEngine)
+    e.disk, e.cache, e.live, e.e = store, [], [], SimpleNamespace(st=st)
+    e.cache_entries, e.cache_bytes = 8, 1 << 40
+    return e
+
+
+def snapshot(n, seed=0):
+    from tensorfold.families.glm5_next.cuda.decode import Snapshot
+
+    x = extras(seed)
+    return Snapshot(list(range(n)), x["rec"], x["conv"], None, n - 1, -1)
+
+
+def grow(st, n, seed):
+    """Tokens past n arrive: their rows, and the pools from n's partial one on."""
+
+    import torch
+
+    g = torch.Generator().manual_seed(seed)
+    for c in [st.kc[0], st.mtp_kc, *[t for ik, ig, _ in st.index for t in (ik, ig)]]:
+        c[n:] = torch.randn(c[n:].shape, generator=g).to(c.dtype)
+    for _, _, pk in st.index:
+        pk[n // 4:] = torch.randn(pk[n // 4:].shape, generator=g).to(pk.dtype)
+
+
+def pieces(store, ids):
+    return [s["pieces"] for s in store.get(ids).meta["views"]]
+
+
+def counting(monkeypatch, disk):
+    seen, real = [], disk._bytes
+    monkeypatch.setattr(disk, "_bytes", lambda t: seen.append(t.shape[0]) or real(t))
+    return seen
+
+
+def test_a_later_live_state_copies_and_hashes_only_its_new_blocks(disk, tmp_path, monkeypatch):
+    """2,047 tokens end the second pool block on a partial pool row: a later token changes it, so it is copied."""
+
+    import torch
+
+    from tensorfold.families.glm5_next.cuda.decode import _row_views
+
+    st, n, later = live_caches(), 2047, 3000
+    e = glm(disk.DiskStates(tmp_path / "d", "k", 1 << 30), st)
+    first = snapshot(n)
+    e.cache, e.live = [first], list(range(n))
+    assert e.persist(lambda: False) == 1
+    grow(st, n, seed=7)
+    second = snapshot(later, seed=1)
+    e.cache, e.live = [first, second], list(range(later))
+    fresh = glm(disk.DiskStates(tmp_path / "fresh", "k", 1 << 30), st)    # the same rows, every block copied
+    fresh.cache, fresh.live = [snapshot(later, seed=1)], list(range(later))
+    assert fresh.persist(lambda: False) == 1
+    seen = counting(monkeypatch, disk)
+    assert e.persist(lambda: False) == 1
+    assert pieces(e.disk, second.ids) == pieces(fresh.disk, second.ids)
+    reused = sum(map(len, first.blocks))
+    # 2,047 rows in 7 full blocks: the latents, index keys and gates, the MTP head's the same; each pool view's 512
+    # rows in 1, as its last row is partial
+    assert reused == 7 * 6 + 1 * 2
+    assert len(seen) == sum(map(len, pieces(e.disk, second.ids))) - reused + 2       # + rec and conv
+    dst = [torch.zeros_like(v) for v in _row_views(st, later, later - 1)]
+    e.disk.load(e.disk.get(second.ids), dst, "cpu")
+    assert all(torch.equal(a, b) for a, b in zip(dst, _row_views(st, later, later - 1)))
+
+
+def test_saved_rows_lend_no_blocks(disk, tmp_path, monkeypatch):
+    """A state whose rows another conversation took is written from its own copy: every block is hashed."""
+
+    st = live_caches()
+    e = glm(disk.DiskStates(tmp_path, "k", 1 << 30), st)
+    first = snapshot(1100)
+    e.cache, e.live = [first], list(range(1100))
+    assert e.persist(lambda: False) == 1
+    from tensorfold.families.glm5_next.cuda.decode import _row_views
+
+    second = snapshot(2000, seed=1)
+    second.rows = [v.clone() for v in _row_views(st, 2000, 1999)]
+    e.cache, e.live = [first, second], [9]                           # another conversation holds the live caches
+    seen = counting(monkeypatch, disk)
+    assert e.persist(lambda: False) == 1
+    assert len(seen) == sum(map(len, pieces(e.disk, second.ids))) + 2
+
+
+def test_a_state_read_back_lends_its_blocks(disk, tmp_path, monkeypatch):
+    st = live_caches()
+    e = glm(disk.DiskStates(tmp_path, "k", 1 << 30), st)
+    e.cache, e.live = [snapshot(1100)], list(range(1100))
+    assert e.persist(lambda: False) == 1
+    again = glm(disk.DiskStates(tmp_path, "k", 1 << 30), live_caches(seed=3))           # a restart
+    got = again._load_disk(again.disk.get(list(range(1100))))
+    assert got is not None and sum(map(len, got.blocks)) > 0
+    second = snapshot(2000, seed=1)
+    again.cache.append(second)
+    again.live = list(range(2000))
+    seen = counting(monkeypatch, disk)
+    assert again.persist(lambda: False) == 1
+    assert len(seen) == sum(map(len, pieces(again.disk, second.ids))) - sum(map(len, got.blocks)) + 2

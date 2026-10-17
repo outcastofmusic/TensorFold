@@ -5,8 +5,9 @@ a folder each).
 A state is its small tensors (GLM: KDA states, conv windows, pending MTP rows, the drafter's window; Qwen: DeltaNet
 states, conv windows, n-gram windows, the MTP tail) and its attention rows: each view's first rows, along dimension
 0, in blocks of ``BLOCK`` rows. Every piece is a file named by the SHA-256 of its bytes, so blocks two states share
-are stored once and every read is checked against its name. A state's JSON is written last, by rename, so only whole
-states are found. The folder holds one subfolder per fingerprint (model, drafter, tensorfold source, row shapes): a
+are stored once and every read is checked against its name. A later state of the same rows names the full blocks an
+earlier one wrote (``blocks``, ``write``'s ``known``) instead of copying and hashing them again. A state's JSON is
+written last, by rename, so only whole states are found. The folder holds one subfolder per fingerprint (model, drafter, tensorfold source, row shapes): a
 state never loads into another model or build.
 
 Pruning runs at start and after every write no request interrupts. A state unused for ``ttl`` seconds goes, and so
@@ -64,6 +65,16 @@ class Entry:
     drafter_end: int
     born: int
     meta: dict[str, Any] = field(repr=False)
+
+
+def blocks(entry: Entry, rows: Sequence[int] | None = None) -> list[list[str]]:
+    """Each view's full blocks' piece names, below ``rows[i]`` rows of view i (default: all of them). A later state
+    passes them to ``write`` as ``known`` while its views are these same rows, unchanged since: ``rows`` leaves out a
+    row a later token changes (a partial pool)."""
+
+    specs = entry.meta["views"]
+    rows = [s["shape"][0] for s in specs] if rows is None else rows
+    return [s["pieces"][:min(r, s["shape"][0]) // BLOCK] for s, r in zip(specs, rows)]
 
 
 def _bytes(t: torch.Tensor) -> bytes:
@@ -200,9 +211,12 @@ class DiskStates:
                 return e
         return None
 
-    def has(self, ids: Sequence[int]) -> bool:
+    def get(self, ids: Sequence[int]) -> Entry | None:
         e = self.index.get(_key(ids))
-        return e is not None and e.ids == list(map(int, ids))
+        return e if e is not None and e.ids == list(map(int, ids)) else None
+
+    def has(self, ids: Sequence[int]) -> bool:
+        return self.get(ids) is not None
 
     # -- writing ----------------------------------------------------------------------------------------------
     def _put(self, data) -> str:
@@ -214,6 +228,19 @@ class DiskStates:
             tmp.replace(path)
         self.sizes[name] = len(data)
         return name
+
+    def _known(self, names: Sequence[str], k: int, size: int) -> str | None:
+        """``names[k]``, a full block's piece ``known`` gives, while its file is on disk at ``size`` bytes."""
+
+        if k >= len(names):
+            return None
+        try:
+            if (self.pieces / names[k]).stat().st_size != size:
+                return None
+        except OSError:                                 # pruned since: the block is written again
+            return None
+        self.sizes[names[k]] = size
+        return names[k]
 
     def _tensor(self, t: torch.Tensor, stop: Callable[[], bool]) -> dict[str, Any] | None:
         """A small tensor's spec, its bytes in pieces of ``PIECE_BYTES`` with ``stop()`` checked before each (Qwen's
@@ -230,11 +257,15 @@ class DiskStates:
 
     def write(self, ids: Sequence[int], views: Callable[[], Sequence[torch.Tensor] | None],
               extras: dict[str, torch.Tensor | None], ring: Sequence[torch.Tensor] | None, *, mtp_len: int,
-              drafter_end: int, born: int, stop: Callable[[], bool]) -> bool:
+              drafter_end: int, born: int, stop: Callable[[], bool], known: Sequence[Sequence[str]] = ()) -> bool:
         """Write a state, a block of every view at a time, then its small tensors a piece at a time; ``views()``
         gives the rows where they are now, or None once they are gone. False when ``stop()`` held before a block or
         a piece, or the rows went: the pieces written stay, so the next try writes only the rest. Pruning waits
-        while ``stop()`` holds."""
+        while ``stop()`` holds.
+
+        ``known[i]`` names view i's first full blocks as an earlier state of these same rows wrote them (``blocks``):
+        such a block is neither copied nor hashed. The caller vouches that the rows are unchanged since; equal ids
+        do not do it, as a reply decoded and the same text prefilled give other bits."""
 
         self.pieces.mkdir(parents=True, exist_ok=True)       # another server may have pruned this folder
         self.states.mkdir(parents=True, exist_ok=True)
@@ -252,9 +283,12 @@ class DiskStates:
             rows = views()
             if rows is None or len(rows) != len(meta["views"]):
                 return False
-            for v, out in zip(rows, meta["views"]):
-                if start < v.shape[0]:
-                    out["pieces"].append(self._put(_bytes(v[start:start + BLOCK])))
+            for i, (v, out) in enumerate(zip(rows, meta["views"])):
+                if start >= v.shape[0]:
+                    continue
+                full = start + BLOCK <= v.shape[0]
+                name = self._known(known[i], start // BLOCK, BLOCK * v[0].nbytes) if full and i < len(known) else None
+                out["pieces"].append(name or self._put(_bytes(v[start:start + BLOCK])))
         for name, t in extras.items():
             if t is not None:
                 meta["extras"][name] = self._tensor(t, stop)
