@@ -28,6 +28,8 @@
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <mutex>
+#include <unordered_map>
 
 namespace {
 
@@ -527,10 +529,24 @@ void iq2xxs_decode_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tens
   const auto* pp = plan ? plan->data_ptr<int>() : nullptr;
   const auto* tp = reinterpret_cast<const uint32_t*>(tab.data_ptr<int>());
   auto* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  // the shared-memory opt-in and the occupancy it gives, asked of the driver once per (device, MT, smem): a call
+  // otherwise spends two driver queries before its launch
+  static std::mutex lock;
+  static std::unordered_map<uint64_t, int> blocks_per_sm;
   auto go = [&](auto kernel) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);   // static + dynamic > 48 KB
+    const uint64_t key = (uint64_t)x.get_device() << 48 | (uint64_t)mt << 40 | (uint64_t)smem;
     int per_sm = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, DWARPS * 32, smem);
+    {
+      const std::lock_guard<std::mutex> hold(lock);
+      const auto hit = blocks_per_sm.find(key);
+      if (hit != blocks_per_sm.end()) {
+        per_sm = hit->second;
+      } else {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));  // > 48 KB
+        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, DWARPS * 32, smem));
+        blocks_per_sm.emplace(key, per_sm);
+      }
+    }
     const int blocks = std::max(1, std::min(tiles, sms * std::max(per_sm, 1)));
     kernel<<<blocks, DWARPS * 32, smem, stream>>>(xp, w.data_ptr<uint8_t>(), ip, pp, R, E, N, K, tp, op);
   };
