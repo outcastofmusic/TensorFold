@@ -64,6 +64,24 @@ def test_the_resume_point_is_never_dropped_to_save_another_conversation(kept):
     assert live not in engine.cache and live.rows is None and not peaks    # no room: not saved, dropped
 
 
+def test_taking_the_caches_frees_a_superseded_turn_end_before_another_conversations_state(kept):
+    """Room for a conversation's rows goes first from its own turn end that a later turn extends, as in ``_remember``,
+    and the resume point and the state being saved are never the one freed."""
+    engine, snap, _ = kept
+    engine.user_id = 9
+    other = snap([7, 9, 8], 40)
+    other.rows, other.nbytes = object(), 40           # another conversation's state, saved earlier
+    one, two = snap([1, 9, 2], 30), snap([1, 9, 2, 9, 3], 30)    # turn two extends turn one; both rows are live
+    engine.cache, engine.live = [other, one, two], [1, 9, 2, 9, 3]
+    engine._take_over([])                             # a third conversation takes the caches
+    assert engine.cache == [other, two] and two.rows is not None and one.rows is None
+    resumed = snap([4, 9, 5], 30)
+    resumed.rows, resumed.nbytes = object(), 30
+    three = snap([4, 9, 5, 9, 6], 40)                 # extends the resume point, which is never freed
+    engine.cache, engine.live = [resumed, other, three], [4, 9, 5, 9, 6]
+    engine._take_over([4, 9, 5, 9, 7])
+    assert engine.cache == [resumed, three] and three.rows is not None
+
 def test_remember_keeps_the_newest_and_frees_what_it_drops(kept):
     engine, snap, _ = kept
     old = snap(range(10), 80)

@@ -629,8 +629,9 @@ class GlmEngine:
 
             torch.cuda.empty_cache()
 
-    def _superseded(self):
-        """The oldest kept turn end that a later kept prompt of its conversation extends, or None.
+    def _superseded(self, spare: Callable[[Any], bool] = lambda c: False):
+        """The oldest kept turn end that a later kept prompt of its conversation extends, or None; ``spare`` names
+        states it may not return.
 
         Only a regenerated or edited turn resumes from one, so it goes before another conversation's states and
         before a system block's end, which holds no user message. "Later" is in use order (the cache's, newest last).
@@ -641,7 +642,7 @@ class GlmEngine:
         own states, which a regenerated turn resumes from, until a later turn's do.
         """
         for i, c in enumerate(self.cache):
-            if not c.branched and self.user_id in c.ids and _extended(c, self.cache[i + 1:]):
+            if not spare(c) and not c.branched and self.user_id in c.ids and _extended(c, self.cache[i + 1:]):
                 return c
         return None
 
@@ -652,7 +653,8 @@ class GlmEngine:
             self.cache[:] = [c for c in self.cache if c is not hit] + [hit]
 
     def _take_over(self, keep: list[int]) -> None:
-        """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike."""
+        """Save the rows of every kept snapshot the next prefill overwrites, dropping entries past the memory budget as
+        ``_remember`` does (a superseded turn end first, then the oldest); both ranks decide alike."""
         from .decode import row_bytes, save_rows
 
         live = self.live
@@ -669,8 +671,12 @@ class GlmEngine:
                 self._drop(snap)
                 continue
             need = row_bytes(self.e, snap)
+
+            def spare(c, snap=snap) -> bool:
+                return c is snap or resumes(c)
+
             while self._held_bytes() + need > self.cache_bytes:
-                old = next((c for c in self.cache if c is not snap and not resumes(c)), None)
+                old = self._superseded(spare) or next((c for c in self.cache if not spare(c)), None)
                 if old is None:
                     break
                 self._drop(old)
