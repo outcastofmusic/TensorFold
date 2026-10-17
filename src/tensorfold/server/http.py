@@ -27,6 +27,14 @@ from tensorfold.server.request_body import read_body
 
 # TENSORFOLD_REQUEST_LOG=path appends every request body (one JSON a line), for exact replays of real traffic
 _REQUEST_LOG = os.environ.get("TENSORFOLD_REQUEST_LOG", "")
+_LOG_MODE_WARNED = False
+
+
+def _warn_log_mode() -> None:
+    global _LOG_MODE_WARNED
+    if not _LOG_MODE_WARNED:
+        _LOG_MODE_WARNED = True
+        print(f"[tensorfold] {_REQUEST_LOG} is readable by others and is not ours to chmod; set it to 0600", flush=True)
 
 
 def _memory(reset_peak: bool, *, admission: Any = None) -> dict[str, int]:
@@ -218,7 +226,11 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                     # owner-only (0600): the prompts and tool content it records are private. The mode given to open
                     # applies only when it creates the file, so a log made before this rule (0644) is tightened here
                     with os.fdopen(os.open(_REQUEST_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "a") as handle:
-                        os.fchmod(handle.fileno(), 0o600)
+                        if os.fstat(handle.fileno()).st_mode & 0o077:
+                            try:
+                                os.fchmod(handle.fileno(), 0o600)
+                            except PermissionError:      # another user's file: log the request anyway, say so once
+                                _warn_log_mode()
                         handle.write(json.dumps(redact_images(body)) + "\n")
                 raw_kw: dict[str, Any] = {}
                 if is_chat_completion:
