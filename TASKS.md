@@ -8,7 +8,7 @@ guidance for bringing up a new model; this file holds the work. Dates are 2026.
 | Task | State |
 |---|---|
 | Integration branch `feat/integration` (worktree `~/workspace/tf-int`) | Merged upstream-ports, qwen-fp4-csf, qwen-scan-marks, qwen-disk-states and bolt without conflicts; CPU suite 4,591 passed, 0 failed. GPU tests after the benchmarks, then `fork/dev` |
-| GLM keeps states at message starts | Background agent, `feat/glm-message-stops` |
+| GLM keeps states at message starts | Built on `feat/glm-message-stops` (`44781bd0`, `14200b09`) and merged into `feat/integration` (CPU 4,596 passed). Every kept point is now a cut inside its prefill pass, so keeping states adds no passes; a new stop at the last user message. GPU tests and `tools/glm_message_stops_check.py` run after the benchmarks; then update playbook section 7 |
 | Bolt prompt reuse and adaptive draft depth | Background agent, `feat/bolt-reuse` |
 | Long-context eval set | Background agent, new files in `spark-bench-ext` (`lc_ext.py`, `run_lc.py`) |
 | d1-3B decision model as a sidecar beside Clef | Background agent, `feat/d1-sidecar`: an LFM2 (d1) family, `/v1/systemone` and `/v1/decisions`, a `d1` sidecar in `run.sh` on port 30003 |
