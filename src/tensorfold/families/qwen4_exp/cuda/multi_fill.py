@@ -203,9 +203,8 @@ class PromptPasses:
             s.prefill_s += spent
             e, mtp, _, kept = self.fills[s.sid]
             self.fills[s.sid][2] = a + n
-            for state, tail in kept or ():
-                if a < state["pos"] <= a + n:
-                    self._remember(list(s.prompt[:state["pos"]]), s.st, state, tail)
+            for state, tail in kept or ():               # the piece's points (_absorb), each in (a, a + n]
+                self._remember(list(s.prompt[:state["pos"]]), s.st, state, tail)
             self.fills[s.sid][3] = None
             if a + n < len(s.prompt):
                 continue

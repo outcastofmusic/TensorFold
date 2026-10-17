@@ -406,18 +406,16 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         image_rows.attach(e.st, vision, len(prompt))
     if keep_at is not None and not start <= keep_at <= len(prompt):
         raise ValueError(f"keep_at {keep_at} is outside the prefilled range [{start}, {len(prompt)}]")
-    saved = e.kept = resume if keep_at == start else None
+    saved = resume if keep_at == start else None
     points = {p for p in stops if start < p < len(prompt)} | ({keep_at} if keep_at is not None else set())
     for start, end, here in chunk_plan(start, len(prompt), e.prefill_rows, points, marks):
         last, kept = prefill_chunk(e, prompt, start, mtp=mtp, points=here, end=end)
         for point, k in kept.items():
-            e.kept = k
             if point == keep_at:
                 saved = k
             if keep is not None:
                 keep(point, k["state"], k["tail"])
-    if keep_at is not None:
-        e.kept = saved
+    e.kept = saved
     image_rows.finish(e.st)
     if constraint is not None:                           # a reply's grammar: this rank's vocabulary columns
         last = constraint.mask(last, None, e.w.meta.get("vocab_offset", 0))

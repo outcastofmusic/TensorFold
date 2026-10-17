@@ -236,7 +236,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
 
         if self.disk is None or not s.draft or s.vision is not None:
             return None
-        best = prefixes._best(self.kept, list(s.prompt))
+        best = prefixes.longest(self.kept, list(s.prompt))
         return self.disk.find(s.prompt, len(best[0]) if best is not None else 0, lambda e: True)
 
     def _load_disk(self, entry, st: State) -> dict | None:
@@ -377,8 +377,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         s.sid, s.st = self.next_id, st
         self.next_id += 1
         s.prefill_s = time.perf_counter() - t0
-        same = resume is not None and self._keep_at(s) == begin         # the same prompt again: its own point
-        self.fills[s.sid] = [e, mtp, begin, [(resume["state"], resume["tail"])] if same else None]
+        self.fills[s.sid] = [e, mtp, begin, None]
         self.filling.append(s)
 
     def _ends(self, s: Stream) -> tuple[int, ...]:
