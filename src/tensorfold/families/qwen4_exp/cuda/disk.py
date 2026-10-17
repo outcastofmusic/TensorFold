@@ -44,27 +44,49 @@ def _extras(snap: dict, tail: torch.Tensor | None) -> dict[str, torch.Tensor | N
             "ple_history": None if history is None else torch.from_numpy(np.ascontiguousarray(history))}
 
 
+def _code() -> list[Path]:
+    """The source a state's bits depend on: this family's and the shared CUDA package's Python and kernels."""
+
+    here = Path(__file__).resolve().parent
+    return sorted(f for d in (here.parent, here.parents[2] / "cuda") for f in d.rglob("*")
+                  if f.suffix in (".py", ".cu", ".cuh", ".cpp", ".h") and f.is_file())
+
+
+def _checkpoint(folder: Path) -> list:
+    """The checkpoint's identity: its folder, the bytes of its configs and index, each shard's name, size and time."""
+
+    index = sorted(folder.glob("*.safetensors.index.json"))
+    shards = [(f.name, s.st_size, s.st_mtime_ns) for f in sorted(folder.glob("*.safetensors")) for s in [f.stat()]]
+    return [str(folder.resolve()),
+            disk_states.digest([folder / "config.json", folder / "quantization_config.json", *index]), shards]
+
+
+def _toolchain() -> dict[str, Any]:
+    """The libraries and GPU the kernels' bits come from."""
+
+    try:
+        import triton
+
+        triton_version = triton.__version__
+    except ImportError:
+        triton_version = None
+    return {"torch": torch.__version__, "cuda": torch.version.cuda, "triton": triton_version,
+            "gpu": list(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None}
+
+
 def open_states(model_dir: Path, st, *, engine: str, prefill_rows: int) -> disk_states.DiskStates | None:
     """The folder ``TENSORFOLD_QWEN_STATES`` names, under a fingerprint of everything a state's bits depend on: the
-    checkpoint, the kernels' source, the row shapes and dtypes, the engine and its prompt settings. None when unset."""
+    checkpoint and its shards, the source, torch, CUDA, Triton and the GPU, the row shapes and dtypes, the engine and
+    its prompt settings. None when unset."""
 
     if not disk_states.configured("QWEN"):
         return None
     import tensorfold
     from tensorfold.cuda import prompt_precision
 
-    here = Path(__file__).resolve().parent
-    shared = here.parents[2] / "cuda"
-    code = sorted([*here.glob("*.py"), *here.glob("*.cu"), *here.glob("*.cpp"), *here.glob("*.h"),
-                   *(f for d in ("kernels", "exl3", "nvfp4", "affine6") for f in (shared / d).rglob("*")
-                     if f.suffix in (".py", ".cu", ".cuh", ".cpp", ".h")),
-                   *(f for f in shared.glob("*") if f.suffix in (".cu", ".cuh", ".cpp", ".h")),
-                   shared / "moe.py", shared / "experts.py"])
-    folder = Path(model_dir)
     flags = {k: os.environ.get(k) for k in KERNEL_FLAGS}
-    parts = {"tensorfold": tensorfold.__version__, "code": disk_states.digest(code),
-             "checkpoint": (str(folder.resolve()),
-                            disk_states.digest([folder / "config.json", folder / "quantization_config.json"])),
+    parts = {"tensorfold": tensorfold.__version__, "code": disk_states.digest(_code()),
+             "checkpoint": _checkpoint(Path(model_dir)), "toolchain": _toolchain(),
              "views": [(list(v.shape[1:]), str(v.dtype)) for v in rows(st, 4, 4)],
              "states": [list(st.rec.shape[2:]), str(st.rec.dtype), list(st.conv.shape), str(st.conv.dtype),
                         list(st.ple_tail.shape), st.ple_history is not None],
@@ -95,7 +117,8 @@ def persist(disk: disk_states.DiskStates, kept: Sequence[tuple], stop: Callable[
 
 def load(disk: disk_states.DiskStates, entry: disk_states.Entry, st) -> dict[str, Any] | None:
     """Copy a state's rows into slot ``st`` (sized for it) and return its resume ({"state", "tail"}, as kept in
-    memory); None, with a line, when a piece fails its hash or the state is not this engine's."""
+    memory); None, with a line, when a piece fails its hash, the state is not this engine's, or the disk or the
+    GPU's memory fails the read (``disk_states.load`` raises StateError for each)."""
 
     n, m = len(entry.ids), int(entry.mtp_len)
     try:

@@ -151,6 +151,71 @@ def test_a_bad_piece_reads_as_no_state_and_is_forgotten(tmp_path, capsys):
     assert d.find([*range(n), 1], 0, lambda e: True) is None
 
 
+def test_the_fingerprint_holds_the_shards_the_toolchain_and_the_shared_code(tmp_path, monkeypatch):
+    import os
+
+    import torch
+
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors.index.json").write_text('{"weight_map": {}}')
+    shard = model / "model-00001-of-00001.safetensors"
+    shard.write_bytes(b"\0" * 64)
+    monkeypatch.setenv("TENSORFOLD_QWEN_STATES", str(tmp_path / "states"))
+    key = lambda: disk.open_states(model, slot(), engine="serial", prefill_rows=256).key   # noqa: E731
+    first = key()
+    assert key() == first
+    os.utime(shard, ns=(1, 1))                                       # the same name, another shard
+    second = key()
+    (model / "model.safetensors.index.json").write_text('{"weight_map": {"x": "y"}}')
+    third = key()
+    monkeypatch.setattr(torch, "__version__", "0.0.0")
+    fourth = key()
+    assert len({first, second, third, fourth}) == 4
+    code = disk._code()
+    assert any(f.name == "scheduler.py" and f.parent.name == "cuda" for f in code)        # the shared package
+    assert any(f.name == "decode.py" and f.parent.name == "qwen4_exp" for f in code)      # the whole family
+    assert any(f.suffix == ".cu" for f in code)
+
+
+def test_a_read_fills_each_view_from_one_buffer(tmp_path, monkeypatch):
+    """Every view's pieces go into one buffer and one copy, and each small tensor's likewise, bit for bit."""
+
+    from tensorfold.cuda import disk_states
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    monkeypatch.setattr(disk_states, "PIECE_BYTES", 500)             # rec (960 bytes) in two pieces
+    d, n, src = store(tmp_path), 1300, noise(slot())
+    snap, tail = kept(n)
+    disk.persist(d, [(list(range(n)), src, snap, tail)], lambda: False)
+    entry = d.entries[0]
+    assert len(entry.meta["extras"]["rec"]["pieces"]) == 2 and len(entry.meta["views"][0]["pieces"]) == 6
+    gathered = []
+    real = d._gather
+    monkeypatch.setattr(d, "_gather", lambda names, *a: gathered.append(len(names)) or real(names, *a))
+    dst = slot()
+    got = disk.load(d, entry, dst)
+    assert same_resume(got, snap, tail)
+    assert all(same(a, b) for a, b in zip(disk.rows(dst, n, n - 1), disk.rows(src, n, n - 1)))
+    views = disk.rows(dst, n, n - 1)
+    assert len(gathered) == len(views) + len(entry.meta["extras"])
+    assert gathered[:len(views)] == [len(s["pieces"]) for s in entry.meta["views"]]
+
+
+def test_a_piece_of_the_wrong_length_refuses_the_state(tmp_path):
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    d, n = store(tmp_path), 1100
+    disk.persist(d, [(list(range(n)), noise(slot()), *kept(n))], lambda: False)
+    entry = d.entries[0]
+    pieces = entry.meta["views"][0]["pieces"]
+    pieces[-1] = d._put((d.pieces / pieces[-1]).read_bytes() + b"\0")    # sound by its hash, a byte too long
+    assert disk.load(d, entry, slot()) is None and d.entries == []
+
+
 def test_a_full_disk_ends_the_pass_with_a_line(tmp_path, capsys, monkeypatch):
     from tensorfold.families.qwen4_exp.cuda import disk
 
@@ -237,6 +302,71 @@ def test_a_disk_state_that_fails_prefills_the_whole_prompt(tmp_path, monkeypatch
     s = stream([*range(n + 5)])
     m.admit(s)
     assert s.cached == 0 and resumed == [None] and m.kept == []
+
+
+def test_a_disk_that_cannot_record_a_use_still_resumes(tmp_path, monkeypatch, capsys):
+    """ENOSPC or EROFS on the JSON rewrite after a read: the state resumes, a line says so once, no slot leaks."""
+
+    from pathlib import Path
+
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    d, n = store(tmp_path), 1300
+    disk.persist(d, [(list(range(n)), noise(slot()), *kept(n))], lambda: False)
+    real = Path.write_text
+
+    def full(self, *args, **kw):
+        if self.parent == d.states:
+            raise OSError(28, "No space left on device")
+        return real(self, *args, **kw)
+
+    monkeypatch.setattr(Path, "write_text", full)
+    for prompt in ([*range(n), 9], [*range(n), 8]):                  # two decoders, as after two restarts
+        m, resumed = decoder(monkeypatch, d, [slot(), slot()])
+        s = stream(prompt)
+        m.admit(s)
+        assert s.cached == s.disk_tokens == n and resumed[0] is not None
+        assert len(m.free) == 1 and all(f is not s.st for f in m.free)
+    assert capsys.readouterr().out.count("last use not recorded") == 1
+    assert len(d.entries) == 1 and not list(d.states.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("error", ["os", "oom"])
+def test_a_read_the_disk_or_the_gpu_fails_prefills_and_keeps_the_state(tmp_path, monkeypatch, capsys, error):
+    import torch
+
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    d, n = store(tmp_path), 1100
+    disk.persist(d, [(list(range(n)), noise(slot()), *kept(n))], lambda: False)
+
+    def fail(name, into):
+        raise OSError(5, "Input/output error") if error == "os" else torch.cuda.OutOfMemoryError("out of memory")
+
+    monkeypatch.setattr(d, "_read", fail)
+    m, resumed = decoder(monkeypatch, d, [slot(), slot()])
+    s = stream([*range(n + 5)])
+    m.admit(s)
+    assert s.cached == 0 and resumed == [None] and m.kept == []
+    assert s in m.filling and len(m.free) == 1                       # the request holds one slot, as a prefill does
+    assert "did not read" in capsys.readouterr().out
+    assert len(d.entries) == 1                                         # the state itself is sound: it stays
+
+
+def test_a_disk_read_that_raises_returns_the_slot(tmp_path, monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    d, n = store(tmp_path), 1100
+    disk.persist(d, [(list(range(n)), noise(slot()), *kept(n))], lambda: False)
+    m, _ = decoder(monkeypatch, d, [slot(), slot()])
+
+    def broken(entry, st):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    m._load_disk = broken
+    with pytest.raises(RuntimeError, match="illegal"):
+        m.admit(stream([*range(n + 5)]))
+    assert len(m.free) == 2 and m.filling == [] and m.kept == []
 
 
 def test_the_concurrent_decoder_writes_only_with_no_stream_live(tmp_path, monkeypatch):
@@ -337,6 +467,37 @@ def test_idle_work_runs_after_a_request_and_stops_for_the_next():
         assert stopped == [True]
     finally:
         sched.close()
+
+
+def test_idle_work_that_raises_turns_off_and_the_worker_serves_on(capsys):
+    from tensorfold.cuda.scheduler import Scheduler
+
+    ran = threading.Event()
+
+    def idle(stop):
+        ran.set()
+        raise KeyError("a kept state's snapshot")
+
+    sched = Scheduler(Decoder(), max_streams=2, idle=idle)
+    try:
+        sched.submit([1, 2], 1, None, True, lambda new: False)
+        assert ran.wait(5)
+        served = threading.Thread(target=sched.submit, args=([1, 2], 1, None, True, lambda new: False), daemon=True)
+        served.start()
+        served.join(10)
+        assert not served.is_alive() and sched.thread.is_alive() and sched.idle is None
+        assert capsys.readouterr().out.count("idle work off after: KeyError") == 1
+    finally:
+        sched.close()
+
+
+def test_a_call_fails_at_once_when_the_worker_is_gone():
+    from tensorfold.cuda.scheduler import Scheduler
+
+    sched = Scheduler(Decoder(), max_streams=2)
+    sched.close()
+    with pytest.raises(RuntimeError, match="worker thread has stopped"):
+        sched.call(lambda: 1)
 
 
 def test_a_call_runs_on_the_worker_and_raises_there_errors_here():

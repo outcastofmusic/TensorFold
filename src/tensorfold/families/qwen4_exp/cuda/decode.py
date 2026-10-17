@@ -349,11 +349,18 @@ def chunk_plan(start: int, n: int, rows: int, points, marks: int = 1) -> list[tu
         raise ValueError(f"a chunk keeps 1 to {MARKS} states, not {marks}")
     points, plan = sorted(p for p in set(points) if start < p <= n), []
     while start < n:
-        here = [p for p in points if start < p <= min(start + rows, n)]
-        end = here[marks - 1] if len(here) > marks else min(start + rows, n)
-        plan.append((start, end, here[:marks]))
+        end, here = cap_points(start, min(start + rows, n), points, marks)
+        plan.append((start, end, here))
         start = end
     return plan
+
+
+def cap_points(start: int, end: int, points, marks: int) -> tuple[int, list[int]]:
+    """A chunk over rows (start, end] and the kept points inside it, ended at its ``marks``-th point when more lie
+    inside (its chain leaves up to ``marks`` states as it passes): (the chunk's end, its points)."""
+
+    here = sorted(p for p in set(points) if start < p <= end)
+    return (here[marks - 1], here[:marks]) if len(here) > marks else (end, here)
 
 
 @torch.no_grad()
@@ -406,18 +413,16 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         image_rows.attach(e.st, vision, len(prompt))
     if keep_at is not None and not start <= keep_at <= len(prompt):
         raise ValueError(f"keep_at {keep_at} is outside the prefilled range [{start}, {len(prompt)}]")
-    saved = e.kept = resume if keep_at == start else None
+    saved = resume if keep_at == start else None
     points = {p for p in stops if start < p < len(prompt)} | ({keep_at} if keep_at is not None else set())
     for start, end, here in chunk_plan(start, len(prompt), e.prefill_rows, points, marks):
         last, kept = prefill_chunk(e, prompt, start, mtp=mtp, points=here, end=end)
         for point, k in kept.items():
-            e.kept = k
             if point == keep_at:
                 saved = k
             if keep is not None:
                 keep(point, k["state"], k["tail"])
-    if keep_at is not None:
-        e.kept = saved
+    e.kept = saved
     image_rows.finish(e.st)
     if constraint is not None:                           # a reply's grammar: this rank's vocabulary columns
         last = constraint.mask(last, None, e.w.meta.get("vocab_offset", 0))

@@ -1,7 +1,9 @@
 """Select and retain prompt prefixes without consuming a longer chain when a spare slot can hold a copy."""
 
 
-def _best(kept, prompt, busy=()):
+def longest(kept, prompt, busy=()):
+    """The kept entry of the longest strict prefix of ``prompt`` whose slot is not ``busy``, or None."""
+
     return max((k for k in kept if id(k[1]) not in busy and len(k[0]) < len(prompt)
                 and prompt[:len(k[0])] == k[0]), key=lambda k: len(k[0]), default=None)
 
@@ -14,7 +16,7 @@ def slot_for(owner, prompt: list[int], reuse: bool):
     """Copy a fork into spare capacity; otherwise retain the released idle-slot and memory-pressure behavior."""
 
     busy = owner._busy()
-    best = _best(owner.kept, prompt) if reuse else None
+    best = longest(owner.kept, prompt) if reuse else None
     fork = best is not None and (id(best[1]) in busy or _longer(owner.kept, best))
     if fork:
         if owner.free:
@@ -28,7 +30,7 @@ def slot_for(owner, prompt: list[int], reuse: bool):
                 owner._shrink(spare, force=True)
                 raise
             owner.free.append(spare)
-        best = _best(owner.kept, prompt, busy) if reuse else None
+        best = longest(owner.kept, prompt, busy) if reuse else None
         if best is not None and owner.free and _longer(owner.kept, best):
             best = None
     if best is not None:

@@ -12,7 +12,8 @@ from tensorfold.cuda.streams import Stream
 
 from . import image_rows
 from .copy_drafts import CopyIndex
-from .decode import _gathered_fits, absorb, choose_gathered, entry_end, draft, draft_cut, tp_sample_rows
+from .decode import (_gathered_fits, absorb, cap_points, choose_gathered, entry_end, draft, draft_cut,
+                     tp_sample_rows)
 from .forward import Cut, commit, compute, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
 from .state import CAND, ENDS
@@ -86,11 +87,11 @@ class PromptPasses:
         for s in self._order():
             e, mtp, start, _ = self.fills[s.sid]
             n = min(len(s.prompt) - start, room)
-            # _points without the slot, so a plan's shadow slots cut the same pieces: stops mean a drafting text prompt
-            points = sorted({p for p in [*e.stops, entry_end(s.prompt)] if start < p <= start + n}) if e.stops else []
             marks = max(1, min(MARKS, 1 + spare))
-            if len(points) > marks:
-                n, points = points[marks - 1] - start, points[:marks]
+            # _points without the slot, so a plan's shadow slots cut the same pieces: stops mean a drafting text prompt
+            end, points = (cap_points(start, start + n, [*e.stops, entry_end(s.prompt)], marks) if e.stops
+                           else (start + n, []))
+            n = end - start
             ends = sum(1 for x, a, k in pieces if a + k == len(x.prompt))
             if n == 0 or (start + n == len(s.prompt) and ends == ENDS):
                 break
@@ -203,9 +204,8 @@ class PromptPasses:
             s.prefill_s += spent
             e, mtp, _, kept = self.fills[s.sid]
             self.fills[s.sid][2] = a + n
-            for state, tail in kept or ():
-                if a < state["pos"] <= a + n:
-                    self._remember(list(s.prompt[:state["pos"]]), s.st, state, tail)
+            for state, tail in kept or ():               # the piece's points (_absorb), each in (a, a + n]
+                self._remember(list(s.prompt[:state["pos"]]), s.st, state, tail)
             self.fills[s.sid][3] = None
             if a + n < len(s.prompt):
                 continue

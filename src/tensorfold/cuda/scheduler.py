@@ -77,13 +77,23 @@ class Scheduler:
     def call(self, fn: Callable[[], Any]) -> Any:
         """Run ``fn()`` on the worker once no stream is live and return what it returns, or raise what it raises."""
 
+        self._alive()
         box: queue.Queue = queue.Queue()
         self.jobs.append((fn, box))
         self.waiting.wake()
-        kind, value = box.get()
+        while True:
+            try:
+                kind, value = box.get(timeout=1.0)
+                break
+            except queue.Empty:
+                self._alive()
         if kind == "error":
             raise value
         return value
+
+    def _alive(self) -> None:
+        if not self.thread.is_alive():
+            raise RuntimeError("the scheduler's worker thread has stopped; restart the server")
 
     def close(self) -> None:
         """Stop the worker once idle and let go of the decoder (its thread held it, and its weights, until now)."""
@@ -212,7 +222,7 @@ class Scheduler:
                 self.owed = False
                 try:
                     self.idle(lambda: not self.waiting.empty())
-                except RuntimeError as exc:          # a CUDA failure: the work is optional, so it stops for good
+                except Exception as exc:             # noqa: BLE001  (optional work: it stops for good, the worker lives)
                     self.idle = None
                     print(f"[tensorfold] idle work off after: {type(exc).__name__}: {exc}", flush=True)
                 continue

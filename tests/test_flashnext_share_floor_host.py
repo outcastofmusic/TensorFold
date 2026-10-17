@@ -14,6 +14,8 @@ def _decoder():
     methods = {"_pass_rows", "_pieces", "_timed", "_pass"}
     nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     nodes.extend(node for node in plan.body if isinstance(node, ast.FunctionDef) and node.name == "pass_limit")
+    decode = ast.parse((root / "decode.py").read_text())
+    nodes.extend(node for node in decode.body if isinstance(node, ast.FunctionDef) and node.name == "cap_points")
     nodes.extend(node for node in source.body if isinstance(node, ast.Assign) and any(
         isinstance(target, ast.Name) and target.id == "PASS_MIN" for target in node.targets))
     owner = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "PromptPasses")
