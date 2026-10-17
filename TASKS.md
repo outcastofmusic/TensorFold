@@ -30,7 +30,6 @@ guidance for bringing up a new model; this file holds the work. Dates are 2026.
 | A budget per task shape | Choose by tools present and turn count once the budget data shows where thinking pays |
 | Empty replies | Qwen closes 4% of draws inside an open think block. A gateway retry with a fresh seed first |
 | Trial LFM2.5-24B-A2B as a resident tool-routing and sub-agent model | 24B total, 2.45B active, 13.6 GB at 4-bit or 24.8 GB FP8. Vendor-reported BFCLv4 65 and IFBench 75, no independent agentic score. First run it outside TensorFold (llama.cpp Q4_K_M or vLLM FP8) on our own tool-call suite. Upstream serves it on Metal only, so a TensorFold port means `lfm2_moe` on CUDA. License caps commercial use at under US$10M annual revenue |
-| Prune old disk-state folders | Each source change makes a new fingerprint folder of up to 64 GiB under `/states` and nothing deletes the old ones (GLM and Qwen) |
 | Persist on a swap that cuts requests off | Today it skips the persist, so those conversations' latest states are lost unless an idle write caught them. Decide: skip, or wait up to 120 s more |
 | Check local GLM's planning transcripts | Its first 31 planning scenarios averaged 53.1 against Qwen's 92 to 94 |
 
@@ -46,6 +45,7 @@ guidance for bringing up a new model; this file holds the work. Dates are 2026.
 | Upstream ports | Owner-only request log, linear-time GLM call parse (#883), branch points (#735), DeltaNet scan marks (#851) |
 | `playbook.md` | Guidance for bringing up a new model |
 | Z.ai GLM-5.3-Flash reference runs | TrueScore 91.1, planning 72.5. Its thinking-off switch did not hold (reasoning in 56/152 and 159/160 replies) |
+| Prune kept states on disk | 72 h TTL on unused states and old builds' folders, one budget over every build's folder, oldest first (`feat/qwen-disk-states`). CPU suite 4,459 passed |
 | LFM2.5 research | Only the 24B-A2B suits agentic work. 1.2B-Instruct and 350M skip thinking, for titles and guards. LFM2.5 cannot draft for our models (different vocabularies) |
 | Muse Spark Open research | 822B-A44B, smallest checkpoint 175.6 GB: does not fit one Spark. AA index 39 against Qwen 40 and GLM 42 |
 
