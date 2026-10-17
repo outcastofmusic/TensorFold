@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from ..quant import IQ2XXS_BYTES, Q8_0_BLOCK, Q8_0_BYTES, dequantize_q8_0
+from ..quant import IQ2XXS_BYTES, Q8_0_BLOCK, Q8_0_BYTES, dequantize_nvfp4, dequantize_q8_0
 
 KINDS = {"mamba": "M", "attention": "*", "moe": "E"}
 
@@ -169,12 +169,7 @@ class Fp4:
         if self.raw is None:
             raise ValueError("this projection did not keep its stored tensors (load with raw=True)")
         codes, scales, scale2 = self.raw
-        table = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-                             device=codes.device)
-        lo, hi = table[(codes & 15).long()], table[(codes >> 4).long()]
-        values = torch.stack([lo, hi], dim=-1).reshape(self.n, self.k)        # the low nibble is the even input
-        s = scales.float().repeat_interleave(16, dim=1) * scale2
-        return (values * s).to(torch.bfloat16)
+        return dequantize_nvfp4(codes, scales, scale2)
 
     def nbytes(self) -> int:
         if self.lin is not None:

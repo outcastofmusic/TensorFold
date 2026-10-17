@@ -162,7 +162,7 @@ def dequantize_iq2xxs(packed: torch.Tensor, dtype: torch.dtype = torch.bfloat16)
     return y.reshape(*packed.shape[:-1], -1).to(dtype)
 
 
-def dequantize_nvfp4(weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2: torch.Tensor,
+def dequantize_nvfp4(weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2: torch.Tensor | float,
                      dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
     """ModelOpt W4A16 NVFP4: uint8 [N, K // 2] codes (low nibble the even input), e4m3 [N, K // 16] scales and the
     fp32 tensor scale -> [N, K] = e2m1 * (fp32(scale) * weight_scale_2), as vLLM's emulation decodes it

@@ -34,34 +34,22 @@ import torch.nn.functional as F
 
 from tensorfold.engine.exact_sampling import Sampling, uniform_rows
 
-# FP4 (E2M1) magnitudes by code & 7; bit 3 is the sign. ModelOpt packs input 2j in byte j's low nibble.
-_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-NVFP4_GROUP = 16
+NVFP4_GROUP = 16              # inputs an e4m3 scale covers
 LATTICE_FEATURES = 5          # log p, p, log p - max, rank / (k - 1), is-top-1 (vLLM LiLiCorrHead)
 
 
-def dequantize_nvfp4(weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2: torch.Tensor | float,
-                     dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    """ModelOpt NVFP4 [N, K/2] codes, [N, K/16] e4m3 scales, an fp32 tensor scale -> [N, K] dense, one rounding.
+def _nvfp4_rows(weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2, dtype: torch.dtype) -> torch.Tensor:
+    """``quant.dequantize_nvfp4`` a slice of rows at a time, so its int64 gather indices stay near 128 MiB."""
 
-    value = e2m1(code) * float(e4m3 scale) * weight_scale_2, as ModelOpt's ``NVFP4QTensor.dequantize``. The
-    family's ``quant.dequantize_nvfp4`` (the reference part) is the shared definition once it lands; this one
-    serves the drafter until then.
-    """
+    from .. import quant
 
     n, half = weight.shape
     if weight_scale.shape != (n, 2 * half // NVFP4_GROUP):
         raise ValueError(f"NVFP4 scales {tuple(weight_scale.shape)} do not fit codes {tuple(weight.shape)}")
-    mags = torch.tensor(_E2M1, dtype=torch.float32, device=weight.device)
-    table = torch.cat([mags, -mags])
-    s2 = float(weight_scale_2.item()) if isinstance(weight_scale_2, torch.Tensor) else float(weight_scale_2)
     out = torch.empty((n, 2 * half), dtype=dtype, device=weight.device)
-    step = max(1, (1 << 24) // (2 * half))         # rows a pass: its int64 codes stay near 128 MiB
+    step = max(1, (1 << 24) // (2 * half))
     for r in range(0, n, step):
-        w = weight[r:r + step].to(torch.int64)
-        codes = torch.stack([w & 0xF, w >> 4], dim=-1).reshape(w.shape[0], 2 * half)
-        scale = weight_scale[r:r + step].to(torch.float32).repeat_interleave(NVFP4_GROUP, dim=1) * s2
-        out[r:r + step] = (table[codes] * scale).to(dtype)
+        out[r:r + step] = quant.dequantize_nvfp4(weight[r:r + step], weight_scale[r:r + step], weight_scale_2, dtype)
     return out
 
 
@@ -182,7 +170,7 @@ def dense_tensors(raw: Mapping[str, torch.Tensor], dtype: torch.dtype) -> dict[s
         if base is not None and t.dtype == torch.uint8:
             if base + ".weight_scale" not in raw or base + ".weight_scale_2" not in raw:
                 raise ValueError(f"{name}: packed NVFP4 codes without their scales")
-            out[name] = dequantize_nvfp4(t, raw[base + ".weight_scale"], raw[base + ".weight_scale_2"], dtype)
+            out[name] = _nvfp4_rows(t, raw[base + ".weight_scale"], raw[base + ".weight_scale_2"], dtype)
         else:
             out[name] = t.to(dtype)
     return out
@@ -702,5 +690,5 @@ def lilicorr_decode(engine, drafter: Drafter, first: int, count: int, sampling: 
     return res
 
 
-__all__ = ["DecodeResult", "DraftConfig", "Drafter", "Proposal", "dense_tensors", "dequantize_nvfp4",
+__all__ = ["DecodeResult", "DraftConfig", "Drafter", "Proposal", "dense_tensors", "device_bytes",
            "expected_shapes", "fp4_kept", "lilicorr_decode", "read_checkpoint"]

@@ -90,7 +90,7 @@ def test_packed_matches_dequantized(drafter):
     projection amplified by random activations, so the check sits at the projection.
     """
 
-    from tensorfold.families.nemotron_bolt.cuda.lilicorr import dequantize_nvfp4
+    from tensorfold.families.nemotron_bolt.quant import dequantize_nvfp4
 
     with closing(SafeTensors([DRAFT / "model.safetensors"])) as f:
         for name in ("fc", "layers.0.mlp.gate_proj", "layers.4.mlp.down_proj"):
@@ -102,3 +102,33 @@ def test_packed_matches_dequantized(drafter):
                 got = drafter._lin(x, name + ".weight").float()
                 rel = float((got - ref).norm() / ref.norm())
                 assert rel < 4e-3, (name, rows, rel)            # bf16 F.linear sits at 1.7e-3
+
+
+def _former_nvfp4(weight: torch.Tensor, weight_scale: torch.Tensor, s2: float, dtype: torch.dtype) -> torch.Tensor:
+    """The drafter's NVFP4 decoder before 2026-10-17 (lilicorr.dequantize_nvfp4), 2,048 rows at a time."""
+
+    mags = torch.tensor((0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0), dtype=torch.float32, device=weight.device)
+    table = torch.cat([mags, -mags])
+    out = torch.empty((weight.shape[0], 2 * weight.shape[1]), dtype=dtype, device=weight.device)
+    for r in range(0, weight.shape[0], 2048):
+        w = weight[r:r + 2048].to(torch.int64)
+        codes = torch.stack([w & 0xF, w >> 4], dim=-1).reshape(w.shape[0], -1)
+        scale = weight_scale[r:r + 2048].to(torch.float32).repeat_interleave(16, dim=1) * s2
+        out[r:r + 2048] = (table[codes] * scale).to(dtype)
+    return out
+
+
+def test_every_nvfp4_tensor_decodes_as_before():
+    """quant.dequantize_nvfp4, which the drafter now loads with, gives the former decoder's bits on the checkpoint."""
+
+    from tensorfold.families.nemotron_bolt.cuda.lilicorr import dense_tensors
+
+    with closing(SafeTensors([DRAFT / "model.safetensors"])) as f:
+        keys = set(f.keys())                                     # noqa: SIM118  (no __iter__)
+        names = [n for n in keys if n.endswith(".weight") and n + "_scale" in keys]
+        assert len(names) >= 16
+        for name in names:
+            w, s, s2 = (f.get(name + x, "cuda") for x in ("", "_scale", "_scale_2"))
+            got = dense_tensors({name: w, name + "_scale": s, name + "_scale_2": s2}, torch.bfloat16)[name]
+            want = _former_nvfp4(w, s, float(s2.item()), torch.bfloat16)
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16)), name
