@@ -195,22 +195,3 @@ what fits. Ported or in progress from 1.0.9 to 1.0.12: background prefill, disk 
 points (#735), the owner-only request log, the linear-time GLM key parse (#883) and DeltaNet scan marks (#851). Left
 out: `--precision checkpoint` (NVFP4 activations), which prefilled 1.81x faster upstream at a mean KL of 0.0077 nats a
 token and so changes replies.
-
-## 12. Open improvements (17 Oct 2026)
-
-Ordered by what they buy a box that swaps between four models.
-
-| Item | Evidence | Plan |
-|---|---|---|
-| Qwen writes kept states to disk | Only GLM has `disk.py`, so every swap away from Qwen drops its conversations' states | Port GLM's content-addressed disk states to `qwen4_exp`. GLM's resumed 11,735-token turn prefilled in 13.9 s against 38.0 s |
-| A swap saves states before it stops a model | `swap.py` drains requests for up to 600 s, then stops the container. GLM writes only while idle | The swap asks the model to persist and waits for it |
-| GLM keeps states at message starts | A shared 6,059-token history resumed 0 of 5 times | Add message-start stops to GLM's prefill, as Qwen has |
-| Bolt reuses prompts and runs concurrent streams | One sequence, every request prefills in full | Port upstream Nemotron's prompt reuse (1.0.5), concurrent rounds and batched drafting (1.0.9) |
-| Nemotron 3.5 Super VL (120B-A12B) as a fifth swap model | Upstream TensorFold 1.0.12 serves it on CUDA from NVIDIA's NVFP4 checkpoint on one or two GB10s, with MTP drafts and RADIO images | Size it (sections 1 to 4), then port the family or run the upstream native binary behind `swap.py`, and benchmark it with the other four |
-| A long-context eval | TrueScore has 1 LC and 1 LCH scenario | Recall with distractors and multi-step questions at 16k, 64k and 128k, paired across models |
-| GLM's window | It runs at 98,304 tokens of a native 1,048,576 because its start-up estimate fills 101.1 of 105.4 GiB, and it has no int8 KV | Measure KV bytes per token, then try int8 KV with a quality check |
-| Behaviour past the window | Untested per engine and through the gateway | Test refusal, truncation and client compaction |
-| Thinking budget | Only `canon-budget/2048-s1` ran (51 requests) | Run 4,096 and 8,000, then pick from the gateway data |
-| Thinking on | Every 17 Oct arm ran thinking off. Earlier Qwen thinking-on runs scored 88.2 to 88.9 with Eff 32 to 36 | A thinking-on arm of TrueScore and planning per model |
-| A budget per task shape | One fixed 8,000 for every request | Choose by tools present and turn count once the budget data shows where thinking pays |
-| Empty replies | Qwen closes 4% of draws inside an open think block (8 of 200 on int8 and bf16) | A gateway retry with a fresh seed first. Masking the end token until `</think>` changes the distribution and needs measuring |
