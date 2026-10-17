@@ -1,6 +1,6 @@
 # d1-3B decision sidecar
 
-`run.sh` starts Liquid AI's d1-3B on `127.0.0.1:30003` beside every model target, once the model answers. d1-3B reads
+With `D1=1`, `run.sh` starts Liquid AI's d1-3B on `127.0.0.1:30003` beside every model target except GLM, once the model answers. d1-3B reads
 a state (text, JSON, pictures) and answers typed questions about it with probabilities in one forward pass, with zero
 output tokens. Nothing calls it yet: the gateway and the model servers are unchanged, and the three uses below are
 requests a later change could send. `D1=1` turns the sidecar on (off by default until its GPU parity and latency are measured), and `./prepare.sh d1` downloads the checkpoint.
@@ -80,10 +80,12 @@ over the same state.
 ## Memory beside the big models
 
 d1 starts after the model answers, so a model's startup admission never counts it. It admits itself against what the
-model left, with a 2 GiB reserve (`TENSORFOLD_MEMORY_RESERVE_GIB=2`). The default reserve of 12.2 GiB would refuse it
-beside GLM. A loaded GLM leaves 14 to 16 GiB available (`run.sh`, 2026-10-13), so d1 leaves 6 to 9 GiB. Qwen's four
-streams grow their KV caches against the memory available at the time, so d1's 7.3 GiB comes out of that room. A
-missing checkpoint or a failed d1 load prints a warning and leaves the model serving.
+model left, with a 2 GiB reserve (`TENSORFOLD_MEMORY_RESERVE_GIB=2`). Measured on 2026-10-17: GLM leaves 17 GiB, and
+d1's load took available memory under 8 GiB, so `run.sh` does not start d1 beside GLM. Beside Qwen FP4-Local, d1
+loaded with 30 GiB left. Qwen's four streams grow their KV caches against the memory available at the time, so d1's
+7.3 GiB comes out of that room. On the GB10, one question took 25.9 ms and three 31.6 ms (medians), and
+`/v1/systemone` over one kept connection 26.9 ms. A missing checkpoint or a failed d1 load prints a warning and leaves
+the model serving.
 
 ## Three uses on this box
 

@@ -199,13 +199,21 @@ qwen() {
     fi
     # kept prompt states also go to disk, so a conversation's next turn after a swap or restart reads its state back;
     # Qwen's folder sits beside GLM's checkpoint folders, each holding a subfolder per checkpoint and build
+    # FP4-Local's weights leave Clef no room behind Qwen's reserve ("cannot fit requested context 16384"), so Clef starts
+    # first there and Qwen's admission sizes its caches around it: 10.1 GiB for caches, 21 GiB left (2026-10-17)
+    if [ "${GUARD:-1}" != 0 ] && [ "${CLEF_FIRST:-0}" = 1 ]; then
+        serve clef-serve -- "$clef" --host 127.0.0.1 --port "$CLEF_PORT" --name clef --context 16384
+        wait_ready clef-serve "$CLEF_PORT" || failed clef-serve
+    fi
     [ "${STATES:-1}" = 0 ] || flags+=(-v tensorfold-states:/states -e TENSORFOLD_QWEN_STATES=/states/qwen -e "TENSORFOLD_QWEN_STATES_GIB=${STATES_GIB:-64}" -e "TENSORFOLD_QWEN_STATES_TTL_H=${STATES_TTL_H:-72}")
     serve tensorfold-serve "${flags[@]}" -- "$model" --host 127.0.0.1 --port "$PORT" --name "$name" \
         --context "${CONTEXT:-262144}" --max-tokens "${CONTEXT:-262144}" --parallel "${PARALLEL:-4}" --kv-dtype "${KV:-int8}" \
         "${vision[@]}" "${guard[@]}" "${budget[@]}" ${EXTRA:-}
     # Clef starts second: it is ready 17 s before Qwen either way, and Qwen's start is the one a switch waits for
-    [ "${GUARD:-1}" = 0 ] || serve clef-serve -- "$clef" --host 127.0.0.1 --port "$CLEF_PORT" --name clef --context 16384
-    [ "${GUARD:-1}" = 0 ] || wait_ready clef-serve "$CLEF_PORT" || failed clef-serve
+    if [ "${GUARD:-1}" != 0 ] && [ "${CLEF_FIRST:-0}" != 1 ]; then
+        serve clef-serve -- "$clef" --host 127.0.0.1 --port "$CLEF_PORT" --name clef --context 16384
+        wait_ready clef-serve "$CLEF_PORT" || failed clef-serve
+    fi
     wait_ready tensorfold-serve "$PORT" || failed tensorfold-serve
     d1
 }
@@ -213,7 +221,7 @@ qwen() {
 # NVIDIA's QAD FP4-Local checkpoint through the same path: decode 0.71-0.82x the EXL3 pack's, TrueScore 91.0 against
 # 87.8 (paired +2.3 [-1.1, +6.4]) and planning +1.5 [-0.4, +3.5], 2026-10-17
 qwen_fp4() {
-    QWEN_MODEL="${QWEN_FP4_MODEL:-$MODELS/Qwen3.8-Flash-Next-FP4-Local}" QWEN_NAME=qwen3.8-flash-next-fp4 \
+    QWEN_MODEL="${QWEN_FP4_MODEL:-$MODELS/Qwen3.8-Flash-Next-FP4-Local}" QWEN_NAME=qwen3.8-flash-next-fp4 CLEF_FIRST=1 \
         VISION="${VISION:-0}" qwen
 }
 
@@ -280,7 +288,8 @@ glm() {
         # TF_GLM_LAZY_SPARSE=1: the 72 long-context graphs are captured at first use (0.1 s each) where start-up took 7 s
         serve tensorfold-glm -e TF_GLM_DENSE_PROMPT=1 -e TF_GLM_CALIBRATE="${TIMING:-0}" -e TF_GLM_LAZY_SPARSE=1 -e TENSORFOLD_MEMORY_RESERVE_GIB=11 "${states[@]}" -- "$model" --tp 1 --host 127.0.0.1 --port "$PORT" --name glm-5.3-flash \
             --context "${CONTEXT:-$context}" --max-tokens "${CONTEXT:-$context}" "${drafter[@]}" "${budget[@]}" ${EXTRA:-}
-        wait_ready tensorfold-glm "$PORT" && { d1; return 0; }
+        # no d1 beside GLM: GLM leaves 17 GiB, and d1's load took it under 8 GiB (2026-10-17)
+        wait_ready tensorfold-glm "$PORT" && return 0
         docker logs tensorfold-glm 2>&1 | grep -q 'memory budget cannot fit' || break
         echo "run: refused for lack of memory ($(avail) GiB available), trying again in 2 s" >&2
         sleep 2
