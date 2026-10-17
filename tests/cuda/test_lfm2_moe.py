@@ -169,6 +169,24 @@ def test_a_resumed_prompt_continues_as_a_fresh_one(weights):
     assert a == b and _close(resumed, e.forward([b], prompt=False), 0.02)
 
 
+def test_graph_replay_gives_the_eager_step_s_bits(weights):
+    """Teacher-forced decode steps at moving positions, eager and replayed, and a sampled reply both ways."""
+
+    from tensorfold.families.lfm2_moe.cuda.engine import prefill, serial_decode
+
+    rows, replies = {}, {}
+    s = Sampling(5, temperature=50.0, top_k=50, top_p=1.0)
+    for graphs in (False, True):
+        e = _engine(weights)
+        e.graphs = graphs
+        e.forward(IDS[:5], prompt=True)
+        rows[graphs] = [e.forward([t], prompt=False) for t in IDS[5:]]
+        replies[graphs] = serial_decode(e, prefill(e, IDS, s), 24, s, stop_eos=False).tokens
+        assert (e.graph is not None) == graphs
+    assert all(torch.equal(a, b) for a, b in zip(rows[False], rows[True]))
+    assert replies[False] == replies[True]
+
+
 def test_keyed_sampling_repeats_a_seed_and_equals_the_host_rule(weights):
     from tensorfold.engine.exact_sampling import choose
     from tensorfold.families.lfm2_moe.cuda.engine import prefill, serial_decode
@@ -354,8 +372,22 @@ def test_the_real_tensor_core_kernel_equals_the_grouped_path(big):
 
 
 @real
+def test_real_graph_replay_gives_the_eager_step_s_bits(big):
+    """The chat golden teacher-forced, eager and replayed: every step's logits equal bit for bit."""
+
+    g = _golden("chat")
+    rows = {}
+    for graphs in (False, True):
+        big.e.graphs = graphs
+        rows[graphs] = _teacher_forced(big.e, g)
+    big.e.graphs = True
+    assert all(torch.equal(a, b) for a, b in zip(rows[False], rows[True]))
+
+
+@real
 def test_decode_speed(big):
-    """A 256-token greedy reply to the chat prompt; prints tok/s next to the 85 tok/s bytes bound."""
+    """A 256-token greedy reply to the chat prompt, eager and on the decode graph; prints tok/s next to the 85 tok/s
+    bytes bound."""
 
     from tokenizers import Tokenizer
 
@@ -365,10 +397,13 @@ def test_decode_speed(big):
     text = ChatTemplate(REAL).render([{"role": "user", "content": "Write a short story about a lighthouse."}],
                                      tools=None, enable_thinking=True)
     prompt = tok.encode(text, add_special_tokens=False).ids
-    big.generate(prompt, 16, None, None, stop_eos=False)                     # warm the kernels
-    torch.cuda.synchronize()
-    started = time.perf_counter()
-    stats = big.generate(prompt, 256, None, None, stop_eos=False)
-    wall = time.perf_counter() - started
-    print(f"decode {stats['decode_tps']} tok/s, prefill {stats['prefill_tps']} tok/s, {wall:.1f} s for 256 tokens")
-    assert stats["decode_tps"] >= DECODE_FLOOR
+    for graphs in (False, True):
+        big.e.graphs = graphs
+        big.generate(prompt, 16, None, None, stop_eos=False, draft=False)            # warm the kernels
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        stats = big.generate(prompt, 256, None, None, stop_eos=False, draft=False)
+        wall = time.perf_counter() - started
+        print(f"{'graph' if graphs else 'eager'}: decode {stats['decode_tps']} tok/s, prefill {stats['prefill_tps']} "
+              f"tok/s ({len(prompt)} tokens), {wall:.1f} s for 256 tokens")
+        assert stats["decode_tps"] >= DECODE_FLOOR

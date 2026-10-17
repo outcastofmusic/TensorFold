@@ -65,6 +65,10 @@ from a fresh prefill's, within the golden bounds below. `draft: false` prefills 
 
 Activations round as transformers' bf16 forward does. The conv's state is the last two products B * x, bf16.
 
+A one-row decode step replays a CUDA graph captured on the first step. The step reads its position (RoPE, the KV row
+it writes, attention's length) from a device tensor and its token from a static buffer, so one graph serves every
+position, and a replay gives the eager step's bits. `TF_LFM2_GRAPHS=0` runs every step eagerly.
+
 ## Memory and speed
 
 | Per stream | |

@@ -6,6 +6,10 @@ the fork's lane matmul (``Fp8BlockLinear``), bf16 ones on ``b16``, the norms on 
 prompt attention on ``prefill_attention`` and decode attention on Nemotron-H's chunked kernel. A token samples with the
 CUDA families' keyed rule (seed, position, logits), so a seed gives the same reply here as on the others' engines.
 
+A one-row decode step replays a CUDA graph (``TF_LFM2_GRAPHS=0`` runs it eagerly): it reads its position from the
+device ``meta`` (RoPE, the KV row it writes, attention's length) and its token from a static buffer, so one capture
+serves every position and the replay launches the eager step's kernels with its shapes, giving its bits.
+
 Every tensor operation here also runs on the CPU, with fp32 matmuls and attention in place of the kernels, so the
 tests drive this same code against the fp32 reference.
 """
@@ -77,8 +81,13 @@ class Engine:
         self.decoded = torch.empty(max((b.moe.experts.w13[0].numel() for b in w.blocks if b.moe is not None),
                                        default=0), dtype=torch.float32, device=dev)
         self.inv_freq = (1.0 / (c.theta ** (torch.arange(0, c.head_dim, 2, dtype=torch.float32) / c.head_dim))).to(dev)
-        self.meta = torch.zeros(4, dtype=torch.int32, device=dev)
+        self.meta = torch.zeros(4, dtype=torch.int32, device=dev)       # meta[0]: the call's first position
         self.sampled = torch.zeros(1, dtype=torch.int32, device=dev)
+        self.offsets = torch.arange(max(prefill_rows, DECODE_ROWS), dtype=torch.int32, device=dev)
+        self.tok = torch.zeros(1, dtype=torch.int32, device=dev)       # a graphed step's input token
+        self.graphs = self.cuda and os.environ.get("TF_LFM2_GRAPHS", "1").strip() != "0"
+        self.graph = None
+        self.graph_out: torch.Tensor | None = None
         self.sampling = None
         self.params = None
         if self.cuda:
@@ -128,7 +137,8 @@ class Engine:
 
     # -- layers --------------------------------------------------------------------------------------------------
     def _rope(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
-        positions = torch.arange(self.pos, self.pos + rows, device=self.device, dtype=torch.float32)
+        # from the device meta, so a captured step serves every position; whole numbers below 2^24 add exactly
+        positions = (self.meta[:1] + self.offsets[:rows]).float()
         freqs = positions[:, None] * self.inv_freq[None, :]
         angles = torch.cat([freqs, freqs], -1)
         return angles.cos(), angles.sin()
@@ -155,8 +165,9 @@ class Engine:
         q = head_norm_rope(qkv[:, :qd].view(rows, c.heads, c.head_dim), a.q_norm, cos, sin, c.eps)
         k = head_norm_rope(qkv[:, qd:qd + kd].view(rows, c.kv_heads, c.head_dim), a.k_norm, cos, sin, c.eps)
         kc, vc = self.k_cache[j], self.v_cache[j]
-        kc[self.pos:self.pos + rows] = k
-        vc[self.pos:self.pos + rows] = qkv[:, qd + kd:].view(rows, c.kv_heads, c.head_dim)
+        at = (self.meta[:1] + self.offsets[:rows]).long()
+        kc.index_copy_(0, at, k)
+        vc.index_copy_(0, at, qkv[:, qd + kd:].view(rows, c.kv_heads, c.head_dim))
         scale = c.head_dim ** -0.5
         if not self.cuda:
             out = _attend(q, kc[:self.pos + rows], vc[:self.pos + rows], self.pos, scale)
@@ -167,7 +178,6 @@ class Engine:
         else:
             from tensorfold.families.nemotron_h.cuda import attention as A
 
-            self.meta[0] = self.pos
             # the kernel reads each row's q from its first heads * head_dim columns, rows its width apart
             out, _ = A.attention(q.view(rows, qd), kc, vc, self.meta, rows, heads=c.heads, kv_heads=c.kv_heads,
                                  head_dim=c.head_dim, max_chunks=self.max_len // CHUNK)
@@ -221,13 +231,38 @@ class Engine:
         if any(not 0 < int(q) < rows for q in cuts):
             raise ValueError("a cut lies inside the call")
         self.parts = {int(q): torch.empty_like(self.conv_state) for q in cuts}
-        ids = torch.as_tensor(list(tokens), dtype=torch.int32).to(self.device)
-        normed = self._layers(ids, prompt)
+        self.meta[0] = self.pos
+        if self.graphs and not prompt and rows == 1:
+            self.tok[0] = int(tokens[0])
+            logits = self._graphed()
+        else:
+            ids = torch.as_tensor(list(tokens), dtype=torch.int32).to(self.device)
+            normed = self._layers(ids, prompt)
+            logits = self.head(normed if every else normed[rows - 1:rows])
         self.pos += rows
-        logits = self.head(normed if every else normed[rows - 1:rows])
         if self.masked:
             logits = logits + self.bias[:1]
         return logits
+
+    def _step(self) -> torch.Tensor:
+        """One decode row: the token in ``tok`` at position meta[0] -> its logits [1, V]."""
+
+        return self.head(self._layers(self.tok, False))
+
+    def _graphed(self) -> torch.Tensor:
+        """``_step`` by graph replay. The first call runs the step eagerly (it compiles the kernels and commits its
+        row), then captures it; capturing launches nothing, so the state moves once."""
+
+        if self.graph is None:
+            out = self._step()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, capture_error_mode="thread_local"):   # the server's threads keep running
+                self.graph_out = self._step()
+            self.graph = g
+            return out
+        self.graph.replay()
+        return self.graph_out.clone()               # the next replay rewrites graph_out
 
     def sample(self, logits: torch.Tensor) -> int:
         """The token after position pos - 1 from its logits [1, V], by the request's keyed rule (greedy at T = 0)."""
