@@ -732,6 +732,62 @@ def test_prompt_cuts_keep_fresh_states_at_every_point(engine_f, monkeypatch):
     _forget(engine_f)
 
 
+def test_a_cut_far_before_its_chunks_end_keeps_its_dflash2_window(engine_f):
+    """In a 2,048-row chunk, cuts 1,700 and 300 rows before its end (the ring's slack is 129 rows) keep the DFlash2
+    window a fresh prefill of their prefix leaves, so a DFlash2 request resumes them (44781bd0 kept drafter_end -1)."""
+    from tensorfold.families.glm5_next.cuda import decode
+
+    _forget(engine_f)
+    e, drafter = engine_f.e, engine_f.drafter
+    assert e.prefill_rows == 2048 and drafter.ring - drafter.window == 129
+    prompt = [int(t) for t in np.random.default_rng(41).integers(10, 1000, size=2000)]
+    kept = []
+    decode.prefill(e, prompt, None, drafter=drafter, keep_at=1999, stops=[300, 1700], keep=kept.append)
+    assert [len(s.ids) for s in kept] == [300, 1700, 1999]
+    for snap in kept:
+        n = len(snap.ids)
+        assert snap.drafter_end == n and snap.drafter_rows is not None, n
+        decode.prefill(e, prompt[:n], None, drafter=drafter)
+        fresh = decode.take_snapshot(e, prompt[:n], e.last_hidden, mtp=True, drafter=drafter)
+        for name in ("rec", "conv", "pending"):
+            assert torch.equal(getattr(snap, name), getattr(fresh, name)), (n, name)
+        assert all(torch.equal(a, b) for a, b in zip(snap.drafter_rows, fresh.drafter_rows)), n
+    _forget(engine_f)
+
+
+@pytest.fixture(scope="module")
+def engine_long_f(tmp_path_factory):
+    """The model with the DFlash2 drafter and a 2,600-token context: prompts span two 2,048-row chunks."""
+
+    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
+
+    path = tmp_path_factory.mktemp("glm_long_f")
+    _checkpoint(path / "model")
+    _drafter(path / "dflash2")
+    return GlmEngine(path / "model", rank=0, master="", port=0, drafter=path / "dflash2", comm=_TwoCopies(),
+                     context=2600)
+
+
+@pytest.mark.parametrize("sampling", [None, Sampling(37, 1.0, 20, 0.95)], ids=["greedy", "sampled"])
+def test_a_long_history_resumes_under_dflash2(engine_long_f, sampling, monkeypatch):
+    """A 2,221-token history and a 200-token question: the state where the question starts lies 201 rows before its
+    chunk's end, and the next question resumes it under DFlash2 with the serial reply of a fresh prefill."""
+    engine = engine_long_f
+    _forget(engine)
+    monkeypatch.setattr(engine, "user_id", 9)
+    rng = np.random.default_rng(43)
+    history = list(range(11, 31)) + [9] + [int(t) for t in rng.integers(10, 1000, size=2200)]
+    first, second = (history + [9] + [int(t) for t in rng.integers(10, 1000, size=200)] for _ in range(2))
+    _, stats = _generate(engine, first, sampling, policy="fc5:0.3", tokens=12)
+    assert stats["cached"] == 0
+    drafted, stats = _generate(engine, second, sampling, policy="fc5:0.3", tokens=12)
+    assert stats["cached"] == len(history)
+    _forget(engine)
+    serial, stats = _generate(engine, second, sampling, draft=False, tokens=12)
+    assert stats["cached"] == 0 and serial == drafted
+    _forget(engine)
+
+
 @pytest.mark.parametrize("sampling", [None, Sampling(29, 1.0, 20, 0.95)], ids=["greedy", "sampled"])
 def test_questions_after_one_history_resume_where_the_last_question_starts(engine, sampling, monkeypatch):
     """Five different last questions after one history (2026-10-17: 0 of 6,059 tokens cached each time): the first

@@ -25,3 +25,22 @@ def test_request_log_is_created_owner_only(tmp_path, monkeypatch):
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
     rows = [json.loads(line) for line in log.read_text().splitlines()]
     assert [r["messages"][0]["content"] for r in rows] == ["first", "second"]     # appended, one request a line
+
+
+def test_an_existing_world_readable_log_is_tightened(tmp_path, monkeypatch):
+    """A log written before the rule (0644) becomes 0600 at the next request, its earlier lines kept."""
+    log = tmp_path / "requests.jsonl"
+    log.write_text(json.dumps({"messages": [{"role": "user", "content": "earlier"}]}) + "\n")
+    log.chmod(0o644)
+    monkeypatch.setattr(server_http, "_REQUEST_LOG", str(log))
+    server = serve_fake(FakeApp())
+    try:
+        status, _ = post_json(server, "/v1/chat/completions",
+                              {"model": "fake-model", "messages": [{"role": "user", "content": "later"}]})
+        assert status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [r["messages"][0]["content"] for r in rows] == ["earlier", "later"]

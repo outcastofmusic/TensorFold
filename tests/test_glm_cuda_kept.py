@@ -64,6 +64,24 @@ def test_the_resume_point_is_never_dropped_to_save_another_conversation(kept):
     assert live not in engine.cache and live.rows is None and not peaks    # no room: not saved, dropped
 
 
+def test_taking_the_caches_frees_a_superseded_turn_end_before_another_conversations_state(kept):
+    """Room for a conversation's rows goes first from its own turn end that a later turn extends, as in ``_remember``,
+    and the resume point and the state being saved are never the one freed."""
+    engine, snap, _ = kept
+    engine.user_id = 9
+    other = snap([7, 9, 8], 40)
+    other.rows, other.nbytes = object(), 40           # another conversation's state, saved earlier
+    one, two = snap([1, 9, 2], 30), snap([1, 9, 2, 9, 3], 30)    # turn two extends turn one; both rows are live
+    engine.cache, engine.live = [other, one, two], [1, 9, 2, 9, 3]
+    engine._take_over([])                             # a third conversation takes the caches
+    assert engine.cache == [other, two] and two.rows is not None and one.rows is None
+    resumed = snap([4, 9, 5], 30)
+    resumed.rows, resumed.nbytes = object(), 30
+    three = snap([4, 9, 5, 9, 6], 40)                 # extends the resume point, which is never freed
+    engine.cache, engine.live = [resumed, other, three], [4, 9, 5, 9, 6]
+    engine._take_over([4, 9, 5, 9, 7])
+    assert engine.cache == [resumed, three] and three.rows is not None
+
 def test_remember_keeps_the_newest_and_frees_what_it_drops(kept):
     engine, snap, _ = kept
     old = snap(range(10), 80)
@@ -76,6 +94,31 @@ def test_remember_keeps_the_newest_and_frees_what_it_drops(kept):
     engine._remember(again)                           # the same prompt again replaces its entry
     assert engine.cache == [again] and new.rows is None
 
+
+
+def test_a_branch_point_kept_again_stays_a_branch_point(kept):
+    engine, snap, _ = kept
+    engine.user_id = 7
+    one, two = snap([1, 7, 2], 10), snap([1, 7, 2, 7, 3], 10)
+    engine.cache = [one, two]
+    engine._use(one)
+    assert one.branched
+    again = snap([1, 7, 2], 10)                       # the same prompt's state, kept by a later prefill
+    engine._remember(again)
+    assert engine.cache == [two, again] and again.branched and engine._superseded() is None
+
+
+def test_kept_states_compare_by_identity():
+    """The cache's ``in`` and ``remove`` mean one state: equal ids with tensors used to raise on the comparison."""
+    import torch
+
+    from tensorfold.families.glm5_next.cuda.decode import Snapshot
+
+    a, b = (Snapshot([1, 2, 3], torch.zeros(4), torch.zeros(2), None, -1, -1) for _ in range(2))
+    cache = [b]
+    assert a not in cache and b in cache
+    cache.remove(b)
+    assert cache == []
 
 def test_a_prompt_keeps_a_state_where_its_system_block_ends(kept):
     engine, _, _ = kept
@@ -249,3 +292,62 @@ def test_prefill_keeps_every_point_as_a_cut_without_splitting_a_chunk(monkeypatc
     kept.clear()
     decode.prefill(e, prompt, None, keep_at=40, keep=kept.append, rows=8)   # a background pass's state at the end
     assert passes == [(p, 8, []) for p in range(0, 40, 8)] and [len(s.ids) for s in kept] == [40]
+
+
+class RingDrafter:
+    """The context side of a ring ``dflash2.Drafter``: each tap row (its position) lands at position % ring."""
+
+    window, ring = 48, 128                       # a slack of 79 rows past a kept point's window
+
+    def __init__(self, torch) -> None:
+        self.kc = [torch.full((1, self.ring, 1), -1.0)]
+        self.vc = [torch.full((1, self.ring, 1), -1.0)]
+        self.context_end = 0
+        self.pos_dev = torch.zeros((1,), dtype=torch.int64)
+
+    def reset(self) -> None:
+        self.context_end = 0
+        self.pos_dev.zero_()
+
+    def add_taps(self, taps) -> None:
+        for p in taps[:, 0].tolist():
+            assert p == self.context_end, "taps arrive in position order"
+            for c in self.kc + self.vc:
+                c[:, int(p) % self.ring] = p
+            self.context_end += 1
+        self.pos_dev.fill_(self.context_end)
+
+
+def test_a_cut_far_before_its_chunks_end_keeps_its_ring_window(monkeypatch):
+    """A cut more than the ring's slack before its chunk's end keeps the DFlash2 window a fresh prefill of its prefix
+    leaves (before the fix: ``drafter_end`` -1, so no DFlash2 request resumed it)."""
+    import torch
+
+    from tensorfold.families.glm5_next.cuda import decode
+
+    st = SimpleNamespace(rec=torch.zeros(2, 3), conv=torch.zeros(3), cur=[0], pos=0, mtp_len=0, mtp_drafted=0)
+
+    def commit(w, st, b, R, keep):
+        st.pos += R
+
+    monkeypatch.setattr(decode, "stage", lambda w, st, b, chunk: len(chunk))
+    monkeypatch.setattr(decode, "compute", lambda w, st, b, R, *, nch, host_pos, cuts: torch.zeros(1))
+    monkeypatch.setattr(decode, "commit", commit)
+    monkeypatch.setattr(decode, "chunks_for", lambda st, R: 1)
+    e = SimpleNamespace(w=SimpleNamespace(mtp=None, cfg=SimpleNamespace(mtp_layers=0)), st=st,
+                        pbuf=SimpleNamespace(fnormed=torch.zeros(256, 1)), prefill_rows=256, constraint=None,
+                        reset=lambda: setattr(st, "pos", 0), sample=lambda last, at, s: [5], follow=lambda t: None,
+                        tap_rows=lambda n, b: torch.arange(st.pos, st.pos + n, dtype=torch.float32)[:, None])
+    drafter = RingDrafter(torch)
+    prompt = list(range(400))
+    kept = []
+    decode.prefill(e, prompt, None, drafter=drafter, keep_at=399, stops=[20, 100, 300], keep=kept.append)
+    assert [len(s.ids) for s in kept] == [20, 100, 300, 399]
+    assert drafter.context_end == 400                       # every tap went in once, in order
+    for snap in kept:                                       # 236, 156, 100 and 1 rows before their chunks' ends
+        n = len(snap.ids)
+        assert snap.drafter_end == n and snap.drafter_rows is not None, n
+        decode.prefill(e, prompt[:n], None, drafter=drafter)
+        fresh = decode.take_snapshot(e, prompt[:n], None, mtp=False, drafter=drafter)
+        assert all(torch.equal(a, b) for a, b in zip(snap.drafter_rows, fresh.drafter_rows)), n
+        assert snap.drafter_rows[0][0, :, 0].tolist() == list(range(max(0, n - drafter.window - 1), n))

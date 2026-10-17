@@ -145,7 +145,6 @@ def _loose_tool_arguments(payload: dict[str, Any], explicit: Any) -> Any:
 
 
 # GLM-4.5 and later (GLM-5.3-Flash): <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>
-_GLM_ARG_RE = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
 _GLM_NAME_RE = re.compile(r"[\w.:-]+")
 _GLM_TAG_RE = re.compile(r"</?arg_(?:key|value)>")
 _GLM_KEY_END_RE = re.compile(r"</arg_key>")
@@ -201,11 +200,13 @@ def _parse_glm_payload(block: str, schemas: dict[str, dict[str, Any]] | None, *,
 
 
 def _glm_args(text: str) -> tuple[list[tuple[str, str]], str]:
-    """``_GLM_ARG_RE``'s matches in ``text`` and the text outside them, in linear time (upstream #883).
+    """Each ``<arg_key>K</arg_key><arg_value>V</arg_value>`` pair in ``text`` (whitespace allowed between the two tags)
+    and the text outside the pairs, in linear time (upstream #883).
 
     A key runs to the first ``</arg_key>`` an ``<arg_value>`` follows, its value to the next ``</arg_value>``, as the
-    regex's lazy groups do. The regex retried every later ``</arg_key>`` from every ``<arg_key>``, so a call of many
-    keys without values took 6.1 s at 8,000 keys; each position here moves forward only.
+    lazy groups of the regex it replaced did (kept in its test). That regex retried every later ``</arg_key>`` from
+    every ``<arg_key>``, so a call of many keys without values took 6.1 s at 8,000 keys; each position here moves
+    forward only.
     """
 
     ends = [m.start() for m in _GLM_KEY_END_RE.finditer(text) if _GLM_VALUE_AFTER_RE.match(text, m.end())]

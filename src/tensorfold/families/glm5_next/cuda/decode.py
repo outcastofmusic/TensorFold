@@ -235,7 +235,7 @@ def draft(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int], position:
 
 
 # -- prefix snapshots ---------------------------------------------------------------------------------------------
-@dataclass
+@dataclass(eq=False)          # the cache's lookups and removals mean this one state: identity
 class Snapshot:
     """Copy committed KDA state and retain attention caches whose valid prefixes survive resume; pending MTP rows await next tokens from the new prompt."""
 
@@ -418,13 +418,14 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
                                   b.fnormed[point - 1:point].clone() if use_mtp else None,
                                   at - 1 if use_mtp else -1, at if drafter is not None else -1))
         if drafter is not None:
-            drafter.add_taps(e.tap_rows(R, b))
+            taps, done = e.tap_rows(R, b), 0
+            # a ring's rows past a kept point overwrite its window once they pass the ring's slack (129 rows for
+            # GLM-5.3-Flash-DFlash2), so the taps go in up to each point and its window is copied there
             for snap in snaps if getattr(drafter, "ring", 0) else ():
-                # a ring keeps the kept point's window unless this chunk wrote past it by more than the ring's slack
-                if end - len(snap.ids) < drafter.ring - drafter.window:
-                    snap.drafter_rows = _ring_window(drafter, len(snap.ids))
-                else:
-                    snap.drafter_end = -1
+                point = len(snap.ids) - start
+                drafter.add_taps(taps[done:point])
+                snap.drafter_rows, done = _ring_window(drafter, len(snap.ids)), point
+            drafter.add_taps(taps[done:])
         if use_mtp:
             nxt = list(prompt[start + 1:start + R + 1])
             if nxt:

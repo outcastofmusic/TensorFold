@@ -215,8 +215,10 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                 probability_options(body)
                 named = reply_model(app, body)          # the id the request asked for, as vLLM names it
                 if _REQUEST_LOG and body.get("priority") != "background":   # batch jobs are not client traffic
-                    # owner-only (0600) when created: the prompts and tool content it records are private
+                    # owner-only (0600): the prompts and tool content it records are private. The mode given to open
+                    # applies only when it creates the file, so a log made before this rule (0644) is tightened here
                     with os.fdopen(os.open(_REQUEST_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "a") as handle:
+                        os.fchmod(handle.fileno(), 0o600)
                         handle.write(json.dumps(redact_images(body)) + "\n")
                 raw_kw: dict[str, Any] = {}
                 if is_chat_completion:
