@@ -7,6 +7,8 @@
 #                                 and its draft model (2.3 GB)
 #   ./prepare.sh qwen-flash-next-fp4   NVIDIA's Qwen3.8 Flash Next FP4-Local (96 GB) and Clef-Flash
 #   ./prepare.sh nemotron-bolt    Nemotron 3.5 Bolt 74B-A9B 24 GB (23 GB) and its LiLiCorr draft model (0.9 GB)
+#   ./prepare.sh d1               d1-3B, Liquid AI's decision model (6.3 GB), the sidecar run.sh starts beside each model;
+#                                 LFM Open License v1.0: commercial use only below US$10M annual revenue
 #
 # Needs Docker with the NVIDIA runtime. Downloads run inside the serving image, so the host needs no Python packages.
 # A gated or rate-limited download reads HF_TOKEN from the environment. Reruns resume and skip what is complete.
@@ -38,6 +40,7 @@ HYBRID=glm53-flash-sushi-experts-mosaic-dense
 QWEN_FP4=(nvidia/Qwen3.8-Flash-Next-FP4-Local b9ce18a6887e18c089fdea8509a33e63429a3300 Qwen3.8-Flash-Next-FP4-Local)
 BOLT=(nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB c6cc2e8ffa353403213d6b9b18aaf8eb684d705a Nemotron-3.5-Bolt-74B-A9B-24GB)
 BOLT_DRAFT=(nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr abd478065678ee83a93821c4b3f512da24e4cecb Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr)
+D1=(LiquidAI/d1-3B 051bcc464b01b9f92942b364d9586b0ef5912432 d1-3B)
 
 die() { echo "prepare: $*" >&2; exit 1; }
 
@@ -111,8 +114,9 @@ case "$what" in
     glm-5.3-flash)   need=$glm_need ;;
     qwen-flash-next-fp4) need=115 ;;
     nemotron-bolt)   need=25 ;;
+    d1)              need=7 ;;
     all)             need=$((100 + glm_need)) ;;
-    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, nemotron-bolt, or nothing for the first two)" ;;
+    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, nemotron-bolt, d1, or nothing for the first two)" ;;
 esac
 free=$(df -BG --output=avail "$MODELS" | tail -1 | tr -dc 0-9)
 [ "$free" -ge "$need" ] || echo "prepare: $MODELS has $free GB free and a first download needs $need GB" >&2
@@ -122,6 +126,7 @@ case "$what" in
     glm-5.3-flash)   glm ;;
     qwen-flash-next-fp4) qwen_fp4 ;;
     nemotron-bolt)   bolt ;;
+    d1)              fetch "${D1[@]}" ;;
     all)             qwen; glm ;;
 esac
 echo "prepare: done. Start a model with ./run.sh qwen-flash-next or ./run.sh glm-5.3-flash"
