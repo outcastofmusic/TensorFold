@@ -96,7 +96,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             live() if live is not None else 1 << 62, reserve=max(2 * GIB, workspace_bytes), live=live)
         self.streams: dict[int, Stream] = {}
         self.filling: list[Stream] = []                  # admitted, prompts still prefilling (oldest first)
-        self.fills: dict[int, list] = {}                 # stream id -> [its engine, drafts?, next row, kept state]
+        self.fills: dict[int, list] = {}                 # stream id -> [its engine, drafts?, next row, kept states]
         self.passed = {}
         self.arrived = lambda: False
         self.fill_yield = False
@@ -334,7 +334,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         self.next_id += 1
         s.prefill_s = time.perf_counter() - t0
         same = resume is not None and self._keep_at(s) == begin         # the same prompt again: its own point
-        self.fills[s.sid] = [e, mtp, begin, (resume["state"], resume["tail"]) if same else None]
+        self.fills[s.sid] = [e, mtp, begin, [(resume["state"], resume["tail"])] if same else None]
         self.filling.append(s)
 
     def _ends(self, s: Stream) -> tuple[int, ...]:

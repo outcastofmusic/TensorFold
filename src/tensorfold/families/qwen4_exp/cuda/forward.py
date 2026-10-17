@@ -13,6 +13,7 @@ import triton.language as tl
 
 from tensorfold.cuda import moe as moe_mod
 from tensorfold.cuda.kernels import gdn as shared_gdn
+from tensorfold.cuda.kernels.gdn import MARKS
 
 from . import attention as attn_mod
 from . import gdn as gdn_mod
@@ -152,9 +153,11 @@ def gdn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int
     li = segs[0][0].lin_index[layer.index]
     if b.prefill:
         _mm(b.mixed[:R], g.proj, b.xs_mixed[:R], b.proj[0, :R], b)
-        at = {cut.at: cut for cut in cuts}
+        at: dict[int, list[Cut]] = {}
+        for cut in sorted(cuts, key=lambda cut: cut.row):
+            at.setdefault(cut.at, []).append(cut)
         for st, a0, a1 in segs:
-            _prefill_chain(g, st, li, b, a0, a1, c, at.get(a0))
+            _prefill_chain(g, st, li, b, a0, a1, c, at.get(a0, ()))
         return _out_proj(w, b, b.gout[:R], g.out, b.gxs[:R], R)
     _mm(b.mixed[:R], g.proj, b.xs_mixed[:R], b.proj[li, :R], b)
     tables = getattr(b, "gdn_tables", None)           # a concurrent round: every stream in one launch a step
@@ -168,27 +171,21 @@ def gdn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int
     return _out_proj(w, b, b.gout[:R], g.out, b.gxs[:R], R)
 
 
-def _prefill_chain(g, st: State, li: int, b: Buffers, a0: int, a1: int, c, cut: Cut | None = None) -> None:
-    """A prompt chunk's DeltaNet; the layer commits at once (a chunk keeps every row)."""
+def _prefill_chain(g, st: State, li: int, b: Buffers, a0: int, a1: int, c, cuts: Sequence[Cut] = ()) -> None:
+    """A prompt chunk's DeltaNet; the layer commits at once (a chunk keeps every row). One chain also leaves each of
+    ``cuts`` (rising rows) the state and conv window a chunk ending at its row would."""
 
     n, p, cur = a1 - a0, b.proj[0, a0:a1], st.cur[li]
     b.conv_ptr.fill_(st.conv[li].data_ptr())
     q, k, v, gt, beta = gdn_io.front(p, b.conv_ptr, b.sid[:n], b.windows[:n], g.conv, g.a_log, g.dt_bias, c.nk)
-    if cut is None:
-        y = shared_gdn.chain(q, k, v, gt, beta, st.rec[cur, li], st.rec[1 - cur, li])
-        gdn_io.back(y, p, g.norm, c.eps, b.gout[a0:a1], b.gxs[a0:a1])
-    else:                                        # the rows before the kept point, its state, then the rest from it
-        m, mid = cut.row, st.rec[1 - cur, li]
-        y = shared_gdn.chain(q[:m], k[:m], v[:m], gt[:m], beta[:m], st.rec[cur, li], mid)
-        gdn_io.back(y, p[:m], g.norm, c.eps, b.gout[a0:a0 + m], b.gxs[a0:a0 + m])
+    for cut in cuts:
         if cut.rec is None:
             cut.rec, cut.conv = torch.empty_like(st.rec[0]), torch.empty_like(st.conv)
-        cut.rec[li].copy_(mid)
         cut.conv[li].copy_(st.conv[li])
-        shift_windows(cut.conv[li:li + 1], b.proj[0:1, a0:a0 + m], m, c.conv_dim)
-        y = shared_gdn.chain(q[m:], k[m:], v[m:], gt[m:], beta[m:], mid, st.rec[cur, li])
-        gdn_io.back(y, p[m:], g.norm, c.eps, b.gout[a0 + m:a1], b.gxs[a0 + m:a1])
-        cur = 1 - cur                            # the second launch wrote the state back where the first read it
+        shift_windows(cut.conv[li:li + 1], b.proj[0:1, a0:a0 + cut.row], cut.row, c.conv_dim)
+    y = shared_gdn.chain(q, k, v, gt, beta, st.rec[cur, li], st.rec[1 - cur, li], [cut.rec[li] for cut in cuts],
+                         [cut.row for cut in cuts])
+    gdn_io.back(y, p, g.norm, c.eps, b.gout[a0:a1], b.gxs[a0:a1])
     st.cur[li] = 1 - cur
     shift_windows(st.conv[li:li + 1], b.proj[0:1, a0:a1], n, c.conv_dim)
 
@@ -535,13 +532,14 @@ def compute_mixed(w: Weights, dsegs: Sequence[Seg], db: Buffers, psegs: Sequence
 
 @torch.no_grad()
 def forward(w: Weights, st: State, b: Buffers, tokens: Sequence[int], *, logits: bool = True,
-            cut: Cut | None = None, features=None):
-    """Rows for ``tokens`` at positions st.pos .. st.pos + R - 1: logits [R, V] bf16 (a view of b.logits) and the residual streams b.streams[:R]. The committed state is unchanged until ``commit``; ``cut`` (a prompt chunk): keeps each DeltaNet layer's state at its row."""
+            cuts: Sequence[Cut] = (), features=None):
+    """Rows for ``tokens`` at positions st.pos .. st.pos + R - 1: logits [R, V] bf16 (a view of b.logits) and the residual streams b.streams[:R]. The committed state is unchanged until ``commit``; ``cuts`` (a prompt chunk, up to MARKS): keep each DeltaNet layer's state at their rows."""
 
-    if cut is not None and not (b.prefill and cut.at == 0 and 0 < cut.row < len(tokens)):
-        raise ValueError(f"a prompt chunk of {len(tokens)} rows has no kept point at row {cut.row}")
-    return compute(w, stage(w, b, [(st, tokens)]), b, logits=logits,
-                   cuts=() if cut is None else (cut,), features=features)
+    rows = [cut.row for cut in cuts]
+    if cuts and not (b.prefill and len(cuts) <= MARKS and all(cut.at == 0 for cut in cuts)
+                     and len(set(rows)) == len(rows) and all(0 < r < len(tokens) for r in rows)):
+        raise ValueError(f"a prompt chunk of {len(tokens)} rows has no kept points at rows {rows}")
+    return compute(w, stage(w, b, [(st, tokens)]), b, logits=logits, cuts=cuts, features=features)
 
 
 @triton.jit

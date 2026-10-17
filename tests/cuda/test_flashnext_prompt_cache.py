@@ -63,14 +63,17 @@ def _engine(w, sampling) -> tuple[Engine, list[dict]]:
     return e, []
 
 
-def _run(e: Engine, prompt, sampling, *, stops=(), keep=None, resume=None):
-    return prefill(e, prompt, sampling, stops=stops, keep=keep, resume=resume)
+def _run(e: Engine, prompt, sampling, *, stops=(), keep=None, resume=None, marks=1):
+    return prefill(e, prompt, sampling, stops=stops, keep=keep, resume=resume, marks=marks)
 
 
+@pytest.mark.parametrize("marks", [1, 2, 4])
 @pytest.mark.parametrize("n", [8, 17, 33, 64, 130])
-@pytest.mark.parametrize("cuts", [[], [7], [3, 9], [CHUNK - 1, CHUNK, CHUNK + 1], [1], [64]])
-def test_stops_leave_the_prefill_and_the_kept_states_fresh(w, n, cuts):
-    """Arbitrary stop points preserve the final state and each saved prefix bit for bit."""
+@pytest.mark.parametrize("cuts", [[], [7], [3, 9], [CHUNK - 1, CHUNK, CHUNK + 1], [1], [64],
+                                  [2, 4, 6, 8, 10, 12], [1, 2, 3, 4, 5, 15, 16, 17, 31]])
+def test_stops_leave_the_prefill_and_the_kept_states_fresh(w, n, cuts, marks):
+    """Arbitrary stop points, up to ``marks`` kept inside one chunk's chain, preserve the final state and each saved
+    prefix bit for bit."""
 
     sampling = Sampling(seed=31, top_k=20, top_p=0.95)
     prompt = _prompt(n, seed=n)
@@ -84,7 +87,7 @@ def test_stops_leave_the_prefill_and_the_kept_states_fresh(w, n, cuts):
         keeps[p] = (snap, tail)
 
     mine = Engine(w, capacity=1024, max_rows=8, prefill_rows=CHUNK)
-    first = _run(mine, prompt, sampling, stops=stops, keep=keep)
+    first = _run(mine, prompt, sampling, stops=stops, keep=keep, marks=marks)
     assert first == first_ref
     _assert_same_state(mine.st, ref)
     assert set(keeps) == set(stops)
@@ -294,3 +297,35 @@ def test_filling_requests_do_not_retain_evicted_snapshot_references(w):
     while dec.live():
         dec.finish(dec.round())
     assert len(dec.kept) == 1
+
+
+@pytest.mark.parametrize("prefill_rows", [300, 1024])
+@pytest.mark.parametrize("beside", [False, True])
+def test_marked_states_inside_a_pass_are_fresh_prefills(w, prefill_rows, beside):
+    """Message points inside the concurrent decoder's prompt passes (marks within the spare slots, the next point
+    ends a piece) keep the state a fresh prefill up to each point leaves; replies are serial decoding's."""
+
+    sampling = Sampling(seed=19, top_k=20, top_p=0.95)
+    prompt = _prompt(1200, seed=21)
+    marks = [300, 340, 341, 600, 700, 900, 1000]
+    others = [_prompt(400, seed=22)] if beside else []
+
+    def fresh(p):
+        e = Engine(w, capacity=2048, max_rows=8, prefill_rows=CHUNK)
+        first = prefill(e, p, sampling)
+        return serial_decode(e, first, 10, sampling, stop_eos=False).tokens
+
+    dec = MultiDecoder(w, slots=4, capacity=2048, depth=3, confidence=0.3, prefill_rows=prefill_rows,
+                       points=lambda ids: marks if len(ids) == len(prompt) else [], keep=16)
+    streams = [Stream(list(p), 10, sampling, stop_eos=False) for p in [prompt, *others]]
+    for s in streams:
+        dec.admit(s)
+    while dec.live():
+        dec.finish(dec.round())
+    assert [s.out for s in streams] == [fresh(p) for p in [prompt, *others]]
+    for p in marks + [entry_end(prompt)]:
+        _, _, snap, tail = next(k for k in dec.kept if k[0] == prompt[:p])
+        e = Engine(w, capacity=2048, max_rows=8, prefill_rows=CHUNK)
+        prefill(e, prompt[:p], None)
+        assert _same_snap(snap, e.st.snapshot()), p
+        assert _same_bits(tail, e.last_streams), p
