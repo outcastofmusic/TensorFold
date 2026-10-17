@@ -469,6 +469,37 @@ def test_idle_work_runs_after_a_request_and_stops_for_the_next():
         sched.close()
 
 
+def test_idle_work_that_raises_turns_off_and_the_worker_serves_on(capsys):
+    from tensorfold.cuda.scheduler import Scheduler
+
+    ran = threading.Event()
+
+    def idle(stop):
+        ran.set()
+        raise KeyError("a kept state's snapshot")
+
+    sched = Scheduler(Decoder(), max_streams=2, idle=idle)
+    try:
+        sched.submit([1, 2], 1, None, True, lambda new: False)
+        assert ran.wait(5)
+        served = threading.Thread(target=sched.submit, args=([1, 2], 1, None, True, lambda new: False), daemon=True)
+        served.start()
+        served.join(10)
+        assert not served.is_alive() and sched.thread.is_alive() and sched.idle is None
+        assert capsys.readouterr().out.count("idle work off after: KeyError") == 1
+    finally:
+        sched.close()
+
+
+def test_a_call_fails_at_once_when_the_worker_is_gone():
+    from tensorfold.cuda.scheduler import Scheduler
+
+    sched = Scheduler(Decoder(), max_streams=2)
+    sched.close()
+    with pytest.raises(RuntimeError, match="worker thread has stopped"):
+        sched.call(lambda: 1)
+
+
 def test_a_call_runs_on_the_worker_and_raises_there_errors_here():
     from tensorfold.cuda.scheduler import Scheduler
 
