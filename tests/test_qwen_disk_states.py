@@ -151,6 +151,41 @@ def test_a_bad_piece_reads_as_no_state_and_is_forgotten(tmp_path, capsys):
     assert d.find([*range(n), 1], 0, lambda e: True) is None
 
 
+def test_a_read_fills_each_view_from_one_buffer(tmp_path, monkeypatch):
+    """Every view's pieces go into one buffer and one copy, and each small tensor's likewise, bit for bit."""
+
+    from tensorfold.cuda import disk_states
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    monkeypatch.setattr(disk_states, "PIECE_BYTES", 500)             # rec (960 bytes) in two pieces
+    d, n, src = store(tmp_path), 1300, noise(slot())
+    snap, tail = kept(n)
+    disk.persist(d, [(list(range(n)), src, snap, tail)], lambda: False)
+    entry = d.entries[0]
+    assert len(entry.meta["extras"]["rec"]["pieces"]) == 2 and len(entry.meta["views"][0]["pieces"]) == 6
+    gathered = []
+    real = d._gather
+    monkeypatch.setattr(d, "_gather", lambda names, *a: gathered.append(len(names)) or real(names, *a))
+    dst = slot()
+    got = disk.load(d, entry, dst)
+    assert same_resume(got, snap, tail)
+    assert all(same(a, b) for a, b in zip(disk.rows(dst, n, n - 1), disk.rows(src, n, n - 1)))
+    views = disk.rows(dst, n, n - 1)
+    assert len(gathered) == len(views) + len(entry.meta["extras"])
+    assert gathered[:len(views)] == [len(s["pieces"]) for s in entry.meta["views"]]
+
+
+def test_a_piece_of_the_wrong_length_refuses_the_state(tmp_path):
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    d, n = store(tmp_path), 1100
+    disk.persist(d, [(list(range(n)), noise(slot()), *kept(n))], lambda: False)
+    entry = d.entries[0]
+    pieces = entry.meta["views"][0]["pieces"]
+    pieces[-1] = d._put((d.pieces / pieces[-1]).read_bytes() + b"\0")    # sound by its hash, a byte too long
+    assert disk.load(d, entry, slot()) is None and d.entries == []
+
+
 def test_a_full_disk_ends_the_pass_with_a_line(tmp_path, capsys, monkeypatch):
     from tensorfold.families.qwen4_exp.cuda import disk
 
@@ -275,7 +310,7 @@ def test_a_read_the_disk_or_the_gpu_fails_prefills_and_keeps_the_state(tmp_path,
     d, n = store(tmp_path), 1100
     disk.persist(d, [(list(range(n)), noise(slot()), *kept(n))], lambda: False)
 
-    def fail(name):
+    def fail(name, into):
         raise OSError(5, "Input/output error") if error == "os" else torch.cuda.OutOfMemoryError("out of memory")
 
     monkeypatch.setattr(d, "_read", fail)

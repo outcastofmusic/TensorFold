@@ -23,13 +23,16 @@ turn on a GB10 started in 0.25 s after a restart instead of 6.2 s.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import time
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,6 +45,7 @@ KEEP_UNNAMED_S = 3600            # how long a piece no whole state names stays, 
 TTL_H = 72                       # hours a state stays unused before it goes (TENSORFOLD_<family>_STATES_TTL_H)
 PIECE_BYTES = 16 << 20           # a small tensor's piece: a request waits for at most one to hash and write
 SCAN_S = 600                     # seconds between scans of the other fingerprints' folders
+READERS = 8                      # threads a read's pieces are read and hashed on
 _KEY = re.compile(r"[0-9a-f]{16}")  # a fingerprint folder's name: nothing else under the root is pruned
 VERSION = 1
 
@@ -71,6 +75,11 @@ def _dtype(name: str) -> torch.dtype:
     if not isinstance(dtype, torch.dtype):
         raise StateError(f"a state names dtype {name}")
     return dtype
+
+
+@functools.cache
+def _readers() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(READERS, thread_name_prefix="tensorfold-states")
 
 
 def _key(ids: Sequence[int]) -> str:
@@ -340,38 +349,68 @@ class DiskStates:
                 pass
 
     # -- reading ----------------------------------------------------------------------------------------------
-    def _read(self, name: str) -> bytes:
+    def _read(self, name: str, into: memoryview) -> None:
+        """Read piece ``name`` into ``into``, which its size must fill exactly, and check it against its hash."""
+
         try:
-            data = (self.pieces / name).read_bytes()
+            with open(self.pieces / name, "rb", buffering=0) as f:
+                got = 0
+                while got < len(into) and (n := f.readinto(into[got:])):
+                    got += n
+                longer = bool(f.read(1))
         except OSError as exc:
             raise StateError(f"piece {name[:12]} is missing") from exc
-        if hashlib.sha256(data).hexdigest() != name:
+        if got != len(into) or longer or hashlib.sha256(into).hexdigest() != name:
             raise StateError(f"piece {name[:12]} does not match its hash")
-        return data
 
-    def _load(self, spec: dict[str, Any], device) -> torch.Tensor:
-        data = b"".join(self._read(name) for name in spec["pieces"])
-        t = torch.frombuffer(bytearray(data), dtype=torch.uint8).view(_dtype(spec["dtype"])).reshape(spec["shape"])
-        return t.to(device)
+    def _piece_bytes(self, name: str) -> int:
+        if name not in self.sizes:                      # another server's piece, written since this one started
+            try:
+                self.sizes[name] = (self.pieces / name).stat().st_size
+            except OSError as exc:
+                raise StateError(f"piece {name[:12]} is missing") from exc
+        return self.sizes[name]
+
+    def _gather(self, names: Sequence[str], sizes: Sequence[int], total: int, pin: bool) -> torch.Tensor:
+        """The pieces end to end in one buffer (uint8, pinned for a copy to the GPU), read and checked on the reader
+        threads (file reads and hashlib let go of the GIL)."""
+
+        if sum(sizes) != total:
+            raise StateError(f"the pieces hold {sum(sizes)} bytes where the state names {total}")
+        out = torch.empty(total, dtype=torch.uint8, pin_memory=pin)
+        mem, at = memoryview(out.numpy()), [0]
+        for size in sizes:
+            at.append(at[-1] + size)
+        list(_readers().map(lambda k: self._read(names[k], mem[at[k]:at[k + 1]]), range(len(names))))
+        return out
+
+    def _small(self, spec: dict[str, Any], device: torch.device) -> torch.Tensor:
+        dtype, shape = _dtype(spec["dtype"]), spec["shape"]
+        total = math.prod(shape) * dtype.itemsize
+        buf = self._gather(spec["pieces"], [self._piece_bytes(n) for n in spec["pieces"]], total,
+                           device.type == "cuda")
+        return buf.view(dtype).reshape(shape).to(device, non_blocking=True)
 
     def load(self, entry: Entry, views: Sequence[torch.Tensor], device) -> dict[str, Any]:
-        """Copy the state's rows into ``views`` (the live caches, sized for it) block by block, and return its small
-        tensors on ``device``; StateError, with the entry forgotten, when a piece fails or the shapes differ, and
-        with the entry kept when the disk or the GPU's memory fails the read."""
+        """Copy the state's rows into ``views`` (the live caches, sized for it), one copy a view from a buffer its
+        pieces are read into, and return its small tensors on ``device``; StateError, with the entry forgotten, when
+        a piece fails or the shapes differ, and with the entry kept when the disk or the GPU's memory fails the
+        read."""
 
-        meta = entry.meta
+        meta, device = entry.meta, torch.device(device)
         try:
             if len(views) != len(meta["views"]) or any(list(v.shape) != s["shape"] or str(v.dtype) != s["dtype"]
                                                        for v, s in zip(views, meta["views"])):
                 raise StateError("the state's views have other shapes than this engine's")
             for v, spec in zip(views, meta["views"]):
-                for k, name in enumerate(spec["pieces"]):
-                    part = v[k * BLOCK:(k + 1) * BLOCK]
-                    data = self._read(name)
-                    src = torch.frombuffer(bytearray(data), dtype=torch.uint8).view(v.dtype).reshape(part.shape)
-                    part.copy_(src)
-            out = {k: self._load(s, device) for k, s in meta["extras"].items()}
-            out["ring"] = [self._load(s, device) for s in meta["ring"]] or None
+                row = math.prod(v.shape[1:]) * v.element_size()
+                sizes = [min(BLOCK, v.shape[0] - k * BLOCK) * row for k in range(len(spec["pieces"]))]
+                buf = self._gather(spec["pieces"], sizes, v.numel() * v.element_size(), v.is_cuda)
+                v.copy_(buf.view(v.dtype).view(v.shape), non_blocking=True)
+            out = {k: self._small(s, device) for k, s in meta["extras"].items()}
+            out["ring"] = [self._small(s, device) for s in meta["ring"]] or None
+            if device.type == "cuda" or any(v.is_cuda for v in views):
+                torch.cuda.current_stream(device if device.type == "cuda" else views[0].device).synchronize()
         except StateError:
             self.forget(entry)
             raise
