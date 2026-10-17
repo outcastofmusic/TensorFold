@@ -16,6 +16,7 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 
 | Task | Notes |
 |---|---|
+| Follow-ups 1-4: approved 17 Oct | Each starts when its area's review fix is merged into `feat/integration` and branches from it (Bolt after `fix/review-bolt`, LFM2.5 and d1 after `fix/review-lfm2`, Qwen and GLM disk after `fix/review-qwen`), so no two agents edit the same files. Order: 1, 2, 3, 4 |
 | Follow-up 1: Bolt decode CUDA graphs | Deferred from the 17 Oct review. Bolt is launch-bound (~2,300 launches a window). Accept: graph replay bit-equal to eager on golden and drafted == serial, speed from `test_bolt_depth.py` |
 | Follow-up 2: LFM2.5 prompt reuse and fast short prefill | Short chunks on the FP8 decode kernel or a tensor-core grouped kernel (~1.5 s to <0.3 s), kept conv/KV states, decode CUDA graphs (53 toward 85 tok/s). bf16 rounding moves: accept within the golden bounds, resumed within tolerance of fresh, then a paired TrueScore |
 | Follow-up 3: Bolt drafter-only Q8_0 head | Changes drafts and acceptance only (verify keeps the bf16 head). Accept: drafted == serial, acceptance and tok/s before/after |
