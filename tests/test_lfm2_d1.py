@@ -203,6 +203,23 @@ def test_engine_answers_three_questions_in_one_forward(engine):
     assert out["usage"] == {"input_tokens": read, "output_tokens": 0}
 
 
+def test_a_request_s_questions_read_the_head_once(engine, monkeypatch):
+    """Every question's options from one head matmul over the union of their tokens."""
+
+    calls: list[tuple[int, int]] = []
+    own = engine.model.logits
+
+    def counted(hidden, ids=None):
+        calls.append((hidden.shape[0], len(ids) if ids is not None else -1))
+        return own(hidden, ids)
+
+    monkeypatch.setattr(engine.model, "logits", counted)
+    engine.decide(STATE, {"refund": NOUL, "team": TEAM, "urgency": URGENCY})
+    f = engine.fmt
+    union = {t for q in (NOUL, TEAM, URGENCY) for forms in f.readout(question(q)) for t in forms}
+    assert calls == [(3, len(union))]
+
+
 def test_a_question_reads_the_same_alone_and_beside_others(engine, tiny):
     together = engine.decide(STATE, {"refund": NOUL, "team": TEAM, "urgency": URGENCY})["answers"]
     alone = engine.decide(STATE, {"team": TEAM})["answers"]["team"]

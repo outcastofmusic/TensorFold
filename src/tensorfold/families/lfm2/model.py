@@ -235,7 +235,7 @@ class Model:
 
     def logits(self, hidden: Tensor, ids: list[int] | None = None) -> Tensor:
         """fp32 logits at each row of ``hidden``: the tied head in the model's dtype (as transformers' lm_head), over
-        ``ids`` alone when given, so a question reads only its own options' rows of the head."""
+        ``ids`` alone when given, so a request reads only its questions' option rows of the head."""
 
         head = self.embed if ids is None else self.embed[torch.tensor(ids, device=hidden.device)]
         return F.linear(hidden, head).float()
