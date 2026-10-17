@@ -122,6 +122,29 @@ def test_tree_tables():
                                   [True, True, True, False, True, True, True]]
 
 
+@pytest.mark.parametrize("change,eps,thetas", [
+    ({}, 1e-5, (1e6, 1e4)),
+    ({"norm_eps": None, "block_norm_eps": 1e-6}, 1e-6, (1e6, 1e4)),
+    ({"norm_eps": None}, 1e-5, (1e6, 1e4)),
+    ({"rope_parameters": None, "rope_theta": 5e5}, 1e-5, (5e5, 5e5)),
+    ({"rope_parameters": None}, 1e-5, (1e6, 1e6)),
+    ({"rope_parameters": {"rope_type": "default", "rope_theta": 1e7}}, 1e-5, (1e7, 1e7)),
+])
+def test_both_families_read_the_core_text_fields_alike(change, eps, thetas):
+    """d1's Config and LFM2-MoE's read hidden size, heads, layers, taps, norm epsilon and RoPE theta from one parser,
+    in one order: norm_eps, else block_norm_eps, else 1e-5; rope_parameters' theta, else
+    rope_theta, else 1e6."""
+
+    from tensorfold.families.lfm2_moe.config import Config as MoeConfig
+    from tests import lfm2_moe_tiny
+
+    text = {**lfm2_tiny.text_config(300), **change}
+    d1 = Config.of(text)
+    assert (d1.eps, d1.theta, d1.taps, d1.head_dim, d1.layers) == (eps, thetas[0], 3, 16, lfm2_tiny.LAYERS)
+    moe = MoeConfig.parse({**lfm2_moe_tiny.config(), **change})
+    assert (moe.eps, moe.theta, moe.conv_taps, moe.head_dim) == (eps, thetas[1], 3, 64)
+
+
 def _reference(tiny):
     """transformers' Lfm2ForCausalLM in float32 with the tiny checkpoint's language weights."""
 

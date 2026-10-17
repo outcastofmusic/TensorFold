@@ -18,6 +18,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from .layout import ATTENTION_OUT, CONV, CONV_TAPS, HEAD_NORMS, MLP, NORMS, QKV, core
+
 Tensor = torch.Tensor
 ROWS = 512           # branch query rows a masked attention call takes
 
@@ -39,7 +41,7 @@ class Config:
     def of(cls, text: dict) -> Config:
         """From a checkpoint's text config (transformers' Lfm2Config fields)."""
 
-        hidden, heads = int(text["hidden_size"]), int(text["num_attention_heads"])
+        c = core(text)
         ffn = int(text["intermediate_size"])
         if text.get("block_auto_adjust_ff_dim"):          # transformers' sizing rule, kept exactly
             ffn = int(2 * ffn / 3)
@@ -47,10 +49,7 @@ class Config:
                 ffn = int(text["block_ffn_dim_multiplier"] * ffn)
                 m = int(text["block_multiple_of"])
                 ffn = m * ((ffn + m - 1) // m)
-        rope = text.get("rope_parameters") or {"rope_theta": text.get("rope_theta", 1e6)}
-        return cls(hidden, heads, int(text["num_key_value_heads"]), int(text.get("head_dim") or hidden // heads), ffn,
-                   tuple(text["layer_types"]), float(text.get("norm_eps") or text.get("block_norm_eps")),
-                   float(rope["rope_theta"]), int(text["conv_L_cache"]), int(text["vocab_size"]))
+        return cls(c.hidden, c.heads, c.kv_heads, c.head_dim, ffn, c.layers, c.eps, c.theta, c.taps, c.vocab)
 
     def token_bytes(self) -> int:
         """Bytes one packed token's forward holds at once (bf16): the residual stream and its normed copy, the conv's
@@ -139,19 +138,17 @@ class Model:
         model = cls(cfg, take("embed_tokens.weight"), take("embedding_norm.weight"))
         for i, kind in enumerate(cfg.layers):
             p = f"layers.{i}."
-            op_norm, ffn_norm = take(p + "operator_norm.weight"), take(p + "ffn_norm.weight")
-            up = torch.cat((take(p + "feed_forward.w1.weight"), take(p + "feed_forward.w3.weight")))
-            down = take(p + "feed_forward.w2.weight")
+            op_norm, ffn_norm = (take(f"{p}{name}.weight") for name in NORMS)
+            gate, up, down = (take(f"{p}{name}.weight") for name in MLP)
             if kind == "conv":
-                conv = take(p + "conv.conv.weight")       # (C, 1, taps)
-                model.layers.append(Layer(kind, op_norm, ffn_norm, up, down, take(p + "conv.in_proj.weight"),
-                                          take(p + "conv.out_proj.weight"), conv=conv[:, 0].t().contiguous()))
+                in_proj, out_proj, taps = (take(f"{p}{name}.weight") for name in (*CONV, CONV_TAPS))
+                model.layers.append(Layer(kind, op_norm, ffn_norm, torch.cat((gate, up)), down, in_proj, out_proj,
+                                          conv=taps[:, 0].t().contiguous()))       # taps (C, 1, taps) as [taps, C]
             else:
-                qkv = torch.cat((take(p + "self_attn.q_proj.weight"), take(p + "self_attn.k_proj.weight"),
-                                 take(p + "self_attn.v_proj.weight")))
-                model.layers.append(Layer(kind, op_norm, ffn_norm, up, down, qkv, take(p + "self_attn.out_proj.weight"),
-                                          q_norm=take(p + "self_attn.q_layernorm.weight"),
-                                          k_norm=take(p + "self_attn.k_layernorm.weight")))
+                names = (*QKV, ATTENTION_OUT, *HEAD_NORMS)
+                q, k, v, out, q_norm, k_norm = (take(f"{p}{name}.weight") for name in names)
+                model.layers.append(Layer(kind, op_norm, ffn_norm, torch.cat((gate, up)), down, torch.cat((q, k, v)),
+                                          out, q_norm=q_norm, k_norm=k_norm))
         tensors.pop("lm_head.weight", None)              # tied: the head is the embedding
         if tensors:
             raise ValueError(f"{len(tensors)} language tensor(s) the LFM2 forward does not read: "

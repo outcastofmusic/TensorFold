@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tensorfold.families.lfm2.layout import core
+
 BLOCK = (128, 128)          # compressed-tensors' FP8 weight blocks (rows, inputs)
 KINDS = ("conv", "full_attention")
 # compressed-tensors' ``ignore`` patterns of the 24B-A2B FP8 export: what it keeps in bf16
@@ -57,16 +59,12 @@ class Config:
 
     @classmethod
     def parse(cls, raw: dict[str, Any], eos: tuple[int, ...] = (124900,)) -> Config:
-        heads = int(raw["num_attention_heads"])
-        rope = raw.get("rope_parameters") or {}
-        return cls(hidden=int(raw["hidden_size"]), vocab=int(raw["vocab_size"]), layers=tuple(raw["layer_types"]),
-                   heads=heads, kv_heads=int(raw["num_key_value_heads"]),
-                   head_dim=int(raw.get("head_dim") or raw["hidden_size"] // heads),
-                   conv_taps=int(raw["conv_L_cache"]), dense_layers=int(raw["num_dense_layers"]),
+        c = core(raw)
+        return cls(hidden=c.hidden, vocab=c.vocab, layers=c.layers, heads=c.heads, kv_heads=c.kv_heads,
+                   head_dim=c.head_dim, conv_taps=c.taps, dense_layers=int(raw["num_dense_layers"]),
                    intermediate=int(raw["intermediate_size"]), experts=int(raw["num_experts"]),
                    top_k=int(raw["num_experts_per_tok"]), moe_width=int(raw["moe_intermediate_size"]),
-                   scaling=float(raw.get("routed_scaling_factor") or 1.0), eps=float(raw.get("norm_eps") or 1e-5),
-                   theta=float(rope.get("rope_theta") or raw.get("rope_theta") or 1e6),
+                   scaling=float(raw.get("routed_scaling_factor") or 1.0), eps=c.eps, theta=c.theta,
                    context=int(raw.get("max_position_embeddings") or 0),
                    fp8=bool(raw.get("quantization_config")), eos=eos, bos=int(raw.get("bos_token_id") or 1))
 

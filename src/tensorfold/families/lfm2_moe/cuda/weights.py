@@ -18,6 +18,8 @@ from typing import Any
 
 import torch
 
+from tensorfold.families.lfm2.layout import ATTENTION_OUT, CONV, CONV_TAPS, HEAD_NORMS, MLP, NORMS, QKV
+
 from ..checkpoint import PREFIX, dequantize, layer, shards, stored
 from ..config import Config
 
@@ -190,18 +192,17 @@ class Loader:
 
     def block(self, i: int) -> Block:
         c, p = self.c, layer(i)
-        b = Block(c.layers[i], self.vector(p + "operator_norm.weight"), self.vector(p + "ffn_norm.weight"))
+        b = Block(c.layers[i], *(self.vector(f"{p}{name}.weight") for name in NORMS))
         if b.kind == "conv":
-            taps = self.get(p + "conv.conv.weight")
-            b.conv = Conv(self.linear(p + "conv.in_proj"), self.linear(p + "conv.out_proj"),
+            taps = self.get(f"{p}{CONV_TAPS}.weight")
+            b.conv = Conv(*(self.linear(p + name) for name in CONV),
                           taps.reshape(taps.shape[0], -1).float().contiguous())
         else:
-            a = p + "self_attn."
-            b.attn = Attention(self.linear(a + "q_proj", a + "k_proj", a + "v_proj"), self.linear(a + "out_proj"),
-                               self.vector(a + "q_layernorm.weight"), self.vector(a + "k_layernorm.weight"))
+            b.attn = Attention(self.linear(*(p + name for name in QKV)), self.linear(p + ATTENTION_OUT),
+                               *(self.vector(f"{p}{name}.weight") for name in HEAD_NORMS))
         f = p + "feed_forward."
         if not c.moe(i):
-            b.w13, b.w2 = self.linear(f + "w1", f + "w3"), self.linear(f + "w2")
+            b.w13, b.w2 = self.linear(p + MLP[0], p + MLP[1]), self.linear(p + MLP[2])
         else:
             b.moe = Moe(self.vector(f + "gate.weight", torch.float32), self.vector(f + "expert_bias", torch.float32),
                         self.experts(f))

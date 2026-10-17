@@ -19,6 +19,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from tensorfold.families.lfm2.layout import ATTENTION_OUT, CONV, CONV_TAPS, HEAD_NORMS, MLP, NORMS, QKV
+
 from .checkpoint import PREFIX, Tensors, layer
 from .config import Config
 
@@ -98,26 +100,25 @@ class Reference:
         return self.w(PREFIX + "embed_tokens")
 
     def conv(self, i: int, x: torch.Tensor, state: State) -> torch.Tensor:
-        c, p = self.c, layer(i) + "conv."
-        b, gate, v = (x @ self.w(p + "in_proj").t()).chunk(3, dim=-1)
+        c, p = self.c, layer(i)
+        b, gate, v = (x @ self.w(p + CONV[0]).t()).chunk(3, dim=-1)
         bx = b * v
-        taps = self.w(p + "conv")[:, 0, :]                                     # [D, taps], oldest input first
+        taps = self.w(p + CONV_TAPS)[:, 0, :]                                  # [D, taps], oldest input first
         before = state.conv.get(i, torch.zeros(c.conv_taps - 1, c.hidden))
         seq = torch.cat([before, bx])
         rows = x.shape[0]
         out = sum(seq[j:j + rows] * taps[:, j] for j in range(c.conv_taps))
         state.conv[i] = seq[-(c.conv_taps - 1):].clone()
-        return (gate * out) @ self.w(p + "out_proj").t()
+        return (gate * out) @ self.w(p + CONV[1]).t()
 
     def attention(self, i: int, x: torch.Tensor, state: State) -> torch.Tensor:
-        c, p = self.c, layer(i) + "self_attn."
+        c, p = self.c, layer(i)
         rows = x.shape[0]
-        q = (x @ self.w(p + "q_proj").t()).view(rows, c.heads, c.head_dim)
-        k = (x @ self.w(p + "k_proj").t()).view(rows, c.kv_heads, c.head_dim)
-        v = (x @ self.w(p + "v_proj").t()).view(rows, c.kv_heads, c.head_dim)
+        q, k, v = ((x @ self.w(p + name).t()).view(rows, -1, c.head_dim) for name in QKV)
         positions = torch.arange(state.pos, state.pos + rows)
-        q = rotate(rmsnorm(q, self.w(p + "q_layernorm"), c.eps), positions, c.theta)
-        k = rotate(rmsnorm(k, self.w(p + "k_layernorm"), c.eps), positions, c.theta)
+        q_norm, k_norm = (self.w(p + name) for name in HEAD_NORMS)
+        q = rotate(rmsnorm(q, q_norm, c.eps), positions, c.theta)
+        k = rotate(rmsnorm(k, k_norm, c.eps), positions, c.theta)
         keys = torch.cat([state.keys[i], k]) if i in state.keys else k
         values = torch.cat([state.values[i], v]) if i in state.values else v
         state.keys[i], state.values[i] = keys, values
@@ -127,7 +128,7 @@ class Reference:
         seen = torch.arange(keys.shape[0])[None, :] <= positions[:, None]       # [R, T]
         scores = scores.masked_fill(~seen[None], float("-inf"))
         out = torch.einsum("hrt,thd->rhd", scores.softmax(-1), vv).reshape(rows, c.heads * c.head_dim)
-        return out @ self.w(p + "out_proj").t()
+        return out @ self.w(p + ATTENTION_OUT).t()
 
     def moe(self, i: int, x: torch.Tensor) -> torch.Tensor:
         c, p = self.c, layer(i) + "feed_forward."
@@ -141,8 +142,7 @@ class Reference:
     def ffn(self, i: int, x: torch.Tensor) -> torch.Tensor:
         if self.c.moe(i):
             return self.moe(i, x)
-        p = layer(i) + "feed_forward."
-        return swiglu(x, self.w(p + "w1"), self.w(p + "w3"), self.w(p + "w2"))
+        return swiglu(x, *(self.w(layer(i) + name) for name in MLP))
 
     @torch.no_grad()
     def hidden(self, ids: list[int] | torch.Tensor, state: State, *, upto: int | None = None) -> torch.Tensor:
@@ -153,10 +153,10 @@ class Reference:
         h = self.embed(ids)
         count = len(c.layers) if upto is None else upto
         for i in range(count):
-            p = layer(i)
-            x = rmsnorm(h, self.w(p + "operator_norm"), c.eps)
+            operator_norm, ffn_norm = (self.w(layer(i) + name) for name in NORMS)
+            x = rmsnorm(h, operator_norm, c.eps)
             h = h + (self.attention(i, x, state) if c.layers[i] == "full_attention" else self.conv(i, x, state))
-            h = h + self.ffn(i, rmsnorm(h, self.w(p + "ffn_norm"), c.eps))
+            h = h + self.ffn(i, rmsnorm(h, ffn_norm, c.eps))
         state.pos += len(ids)
         return h if upto is not None else rmsnorm(h, self.w(PREFIX + "embedding_norm"), c.eps)
 
