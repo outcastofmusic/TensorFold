@@ -20,6 +20,7 @@ turn on a GB10 started in 0.25 s after a restart instead of 6.2 s.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -110,6 +111,7 @@ class DiskStates:
         self.pieces.mkdir(parents=True, exist_ok=True)
         self.states.mkdir(parents=True, exist_ok=True)
         self.budget = int(budget)
+        self.untouched = False           # a state's use could not be recorded (said once)
         self.entries: list[Entry] = []
         for path in sorted(self.states.glob("*.json")):
             try:
@@ -267,7 +269,8 @@ class DiskStates:
 
     def load(self, entry: Entry, views: Sequence[torch.Tensor], device) -> dict[str, Any]:
         """Copy the state's rows into ``views`` (the live caches, sized for it) block by block, and return its small
-        tensors on ``device``; StateError, with the entry forgotten, when a piece fails or the shapes differ."""
+        tensors on ``device``; StateError, with the entry forgotten, when a piece fails or the shapes differ, and
+        with the entry kept when the disk or the GPU's memory fails the read."""
 
         meta = entry.meta
         try:
@@ -285,9 +288,26 @@ class DiskStates:
         except StateError:
             self.forget(entry)
             raise
-        meta["used"] = time.time()
-        entry.path.write_text(json.dumps(meta))
+        except (OSError, torch.cuda.OutOfMemoryError) as exc:    # the disk or the GPU failed, not the state: it stays
+            raise StateError(f"{type(exc).__name__}: {exc}") from exc
+        self._touch(entry)
         return out
+
+    def _touch(self, entry: Entry) -> None:
+        """Record the state's use for pruning, best effort: on a full or read-only disk it keeps its old time."""
+
+        entry.meta["used"] = time.time()
+        tmp = entry.path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(entry.meta))
+            tmp.replace(entry.path)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            if not self.untouched:
+                print(f"[tensorfold] kept states on disk: a state's last use not recorded ({exc}); reads go on",
+                      flush=True)
+            self.untouched = True
 
     def forget(self, entry: Entry) -> None:
         if entry in self.entries:

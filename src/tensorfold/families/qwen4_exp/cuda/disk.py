@@ -95,7 +95,8 @@ def persist(disk: disk_states.DiskStates, kept: Sequence[tuple], stop: Callable[
 
 def load(disk: disk_states.DiskStates, entry: disk_states.Entry, st) -> dict[str, Any] | None:
     """Copy a state's rows into slot ``st`` (sized for it) and return its resume ({"state", "tail"}, as kept in
-    memory); None, with a line, when a piece fails its hash or the state is not this engine's."""
+    memory); None, with a line, when a piece fails its hash, the state is not this engine's, or the disk or the
+    GPU's memory fails the read (``disk_states.load`` raises StateError for each)."""
 
     n, m = len(entry.ids), int(entry.mtp_len)
     try:

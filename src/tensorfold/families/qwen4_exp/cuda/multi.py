@@ -346,9 +346,18 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 else:
                     self._remember(list(s.prompt[:s.cached]), st, resume["state"], resume["tail"])
                 raise
+            except Exception:                    # the request fails; its slot goes back, as below
+                self._drop_kept(st)
+                self.free.append(st)
+                raise
             if entry is not None:
                 read = time.perf_counter()
-                resume = self._load_disk(entry, st)
+                try:
+                    resume = self._load_disk(entry, st)
+                except Exception:
+                    self._drop_kept(st)
+                    self.free.append(st)
+                    raise
                 s.cached, s.disk_tokens = (len(entry.ids),) * 2 if resume is not None else (0, 0)
                 s.disk_s = time.perf_counter() - read
         e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows)

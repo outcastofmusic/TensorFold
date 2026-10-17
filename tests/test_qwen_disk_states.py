@@ -239,6 +239,71 @@ def test_a_disk_state_that_fails_prefills_the_whole_prompt(tmp_path, monkeypatch
     assert s.cached == 0 and resumed == [None] and m.kept == []
 
 
+def test_a_disk_that_cannot_record_a_use_still_resumes(tmp_path, monkeypatch, capsys):
+    """ENOSPC or EROFS on the JSON rewrite after a read: the state resumes, a line says so once, no slot leaks."""
+
+    from pathlib import Path
+
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    d, n = store(tmp_path), 1300
+    disk.persist(d, [(list(range(n)), noise(slot()), *kept(n))], lambda: False)
+    real = Path.write_text
+
+    def full(self, *args, **kw):
+        if self.parent == d.states:
+            raise OSError(28, "No space left on device")
+        return real(self, *args, **kw)
+
+    monkeypatch.setattr(Path, "write_text", full)
+    for prompt in ([*range(n), 9], [*range(n), 8]):                  # two decoders, as after two restarts
+        m, resumed = decoder(monkeypatch, d, [slot(), slot()])
+        s = stream(prompt)
+        m.admit(s)
+        assert s.cached == s.disk_tokens == n and resumed[0] is not None
+        assert len(m.free) == 1 and all(f is not s.st for f in m.free)
+    assert capsys.readouterr().out.count("last use not recorded") == 1
+    assert len(d.entries) == 1 and not list(d.states.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("error", ["os", "oom"])
+def test_a_read_the_disk_or_the_gpu_fails_prefills_and_keeps_the_state(tmp_path, monkeypatch, capsys, error):
+    import torch
+
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    d, n = store(tmp_path), 1100
+    disk.persist(d, [(list(range(n)), noise(slot()), *kept(n))], lambda: False)
+
+    def fail(name):
+        raise OSError(5, "Input/output error") if error == "os" else torch.cuda.OutOfMemoryError("out of memory")
+
+    monkeypatch.setattr(d, "_read", fail)
+    m, resumed = decoder(monkeypatch, d, [slot(), slot()])
+    s = stream([*range(n + 5)])
+    m.admit(s)
+    assert s.cached == 0 and resumed == [None] and m.kept == []
+    assert s in m.filling and len(m.free) == 1                       # the request holds one slot, as a prefill does
+    assert "did not read" in capsys.readouterr().out
+    assert len(d.entries) == 1                                         # the state itself is sound: it stays
+
+
+def test_a_disk_read_that_raises_returns_the_slot(tmp_path, monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    d, n = store(tmp_path), 1100
+    disk.persist(d, [(list(range(n)), noise(slot()), *kept(n))], lambda: False)
+    m, _ = decoder(monkeypatch, d, [slot(), slot()])
+
+    def broken(entry, st):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    m._load_disk = broken
+    with pytest.raises(RuntimeError, match="illegal"):
+        m.admit(stream([*range(n + 5)]))
+    assert len(m.free) == 2 and m.filling == [] and m.kept == []
+
+
 def test_the_concurrent_decoder_writes_only_with_no_stream_live(tmp_path, monkeypatch):
     d = store(tmp_path)
     m, _ = decoder(monkeypatch, d, [])
