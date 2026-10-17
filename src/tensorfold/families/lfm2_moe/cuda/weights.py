@@ -12,7 +12,7 @@ On the CPU (``device="cpu"``, the tests' engine) every linear is its exact fp32 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -40,9 +40,6 @@ class Linear:
 
         return b16.prompt(x, self.w) if prompt else b16.matmul(x, self.w)
 
-    def nbytes(self) -> int:
-        return int(self.fp8.nbytes()) if self.fp8 is not None else self.w.numel() * self.w.element_size()
-
 
 @dataclass
 class Experts:
@@ -64,9 +61,6 @@ class Experts:
     @property
     def fp8(self) -> bool:
         return self.s13 is not None
-
-    def nbytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in (self.w13, self.w2, self.s13, self.s2) if t is not None)
 
 
 @dataclass
@@ -109,7 +103,6 @@ class Weights:
     embed: torch.Tensor              # [V, D] bf16, the head too (tied)
     norm: torch.Tensor               # [D] bf16, embedding_norm (the final norm)
     blocks: list[Block]
-    extra: dict = field(default_factory=dict)
 
     @property
     def device(self) -> torch.device:
@@ -137,7 +130,6 @@ class Loader:
         self.device = device
         self.r = SafeTensors(_shards(model_dir))
         self.used: set[str] = set()
-        self.staging = None
 
     def get(self, name: str) -> torch.Tensor:
         if name not in self.r:

@@ -132,7 +132,7 @@ def dequantized_copy(src: Path, dst: Path) -> Path:
     dst.mkdir(parents=True, exist_ok=True)
     t = Tensors(src)
     out = {}
-    for name in t.names():
+    for name in sorted(t.where):
         if name.endswith(".weight_scale"):
             continue
         w = t.get(name)

@@ -258,12 +258,8 @@ def _sync(e: Engine) -> None:
 
 
 @torch.no_grad()
-def prefill(e: Engine, prompt: Sequence[int], sampling, *, constraint=None,
-            stop: Callable[[], bool] | None = None) -> int:
-    """Reset, commit the prompt in chunks and return its first sampled token (position len(prompt)).
-
-    ``stop()`` is asked before each chunk and abandons the prompt with ``RequestCancelled``.
-    """
+def prefill(e: Engine, prompt: Sequence[int], sampling, *, constraint=None) -> int:
+    """Reset, commit the prompt in chunks and return its first sampled token (position len(prompt))."""
 
     prompt = [int(t) for t in prompt]
     if not prompt:
@@ -272,10 +268,6 @@ def prefill(e: Engine, prompt: Sequence[int], sampling, *, constraint=None,
     e.set_sampling(sampling)
     try:
         for s in range(0, len(prompt), e.prefill_rows):
-            if stop is not None and stop():
-                from tensorfold.server.cancellation import RequestCancelled
-
-                raise RequestCancelled("the client left while its prompt was filling")
             last = s + e.prefill_rows >= len(prompt)
             if last and constraint is not None:        # a reply's grammar masks the first token's row
                 e.mask(constraint, constraint.window([0], [-1]))

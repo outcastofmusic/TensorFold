@@ -56,9 +56,6 @@ class Tensors:
     def __contains__(self, name: str) -> bool:
         return name in self.where
 
-    def names(self) -> list[str]:
-        return sorted(self.where)
-
     def get(self, name: str) -> torch.Tensor:
         if name not in self.where:
             raise KeyError(f"the checkpoint has no tensor {name}")
