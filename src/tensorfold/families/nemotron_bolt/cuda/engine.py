@@ -168,7 +168,11 @@ class Engine:
         self.max_len, self.max_rows, self.max_chunks = max_len, max_rows, max_len // A.CHUNK
         self.prefill_rows = prefill_rows
         nm = c.pattern.count("M")
-        self.meta = torch.zeros(4, dtype=torch.int32, device=dev)
+        # a window's meta (pos, parity, prev_keep, 0) and token ids reach the GPU in one copy from pinned memory
+        self._host = torch.zeros(4 + max_rows, dtype=torch.int32, pin_memory=True)
+        self._inputs = torch.zeros(4 + max_rows, dtype=torch.int32, device=dev)
+        self._staged = torch.cuda.Event()                 # that copy has read the pinned buffer
+        self.meta = self._inputs[:4]
         self.p_meta = torch.zeros(4, dtype=torch.int32, device=dev)
         self.k_cache = [torch.zeros((max_len, kv, c.head_dim), dtype=torch.bfloat16, device=dev) for kv in c.kv_heads]
         self.v_cache = [torch.zeros_like(k) for k in self.k_cache]
@@ -314,8 +318,11 @@ class Engine:
             raise ValueError(f"a window holds 1..{self.max_rows} rows")
         if self.pos + rows > self.max_len:
             raise ValueError("the KV cache is full")
-        self.meta.copy_(torch.tensor([self.pos, self.parity, self.prev_keep, 0], dtype=torch.int32))
-        ids = torch.as_tensor(list(tokens), dtype=torch.int32).to(self.device)
+        self._staged.synchronize()                        # the last window's copy is done with the buffer
+        self._host[:4 + rows] = torch.tensor([self.pos, self.parity, self.prev_keep, 0, *tokens], dtype=torch.int32)
+        self._inputs[:4 + rows].copy_(self._host[:4 + rows], non_blocking=True)
+        self._staged.record()
+        ids = self._inputs[4:4 + rows]
         normed = self._layers(ids, prompt=False)
         self.hidden = normed
         self.logits[:rows].copy_(b16.matmul(normed, self.w.head))

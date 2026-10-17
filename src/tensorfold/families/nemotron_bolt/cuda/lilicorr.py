@@ -406,20 +406,27 @@ class Drafter:
         self.context_end += n
 
     # -- the block ------------------------------------------------------------------------------------------------
-    def _attend(self, i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, s: int) -> torch.Tensor:
-        """Block queries [H, n, hd] over the window's context rows and the block (bidirectional), with sinks."""
+    def _mask(self, s: int, n: int) -> torch.Tensor:
+        """[n, ring + n]: which context rows and block rows the block's queries at s .. s + n - 1 read.
+
+        FlashAttention's non-causal window is symmetric, (window - 1, window - 1): |q - k| < window. The real window
+        (1024) covers the whole block; a smaller one masks block keys too.
+        """
+
+        w = self.c.window
+        qpos = torch.arange(s, s + n, device=self.dev)
+        ok_ctx = (self.slot_pos[None, :] >= 0) & (self.slot_pos[None, :] > qpos[:, None] - w)
+        ok_blk = (qpos[:, None] - qpos[None, :]).abs() < w
+        return torch.cat([ok_ctx, ok_blk], dim=1)
+
+    def _attend(self, i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, ok: torch.Tensor) -> torch.Tensor:
+        """Block queries [H, n, hd] over the window's context rows and the block (bidirectional, ``ok``), with sinks."""
 
         c = self.c
         n = q.shape[1]
         g = c.heads // c.kv_heads
         keys = torch.cat([self.kc[i], k], dim=1).float()                                # [KV, ring + n, hd]
         vals = torch.cat([self.vc[i], v], dim=1).float()
-        # FlashAttention's non-causal window is symmetric, (window - 1, window - 1): |q - k| < window. The real
-        # window (1024) covers the whole block; a smaller one masks block keys too.
-        qpos = torch.arange(s, s + n, device=self.dev)
-        ok_ctx = (self.slot_pos[None, :] >= 0) & (self.slot_pos[None, :] > qpos[:, None] - c.window)
-        ok_blk = (qpos[:, None] - qpos[None, :]).abs() < c.window
-        ok = torch.cat([ok_ctx, ok_blk], dim=1)                                          # [n, ring + n]
         scores = torch.einsum("kgnd,kld->kgnl", q.float().view(c.kv_heads, g, n, c.head_dim), keys)
         scores = (scores * c.head_dim ** -0.5).masked_fill(~ok, float("-inf"))
         if c.sinks:
@@ -432,7 +439,7 @@ class Drafter:
         out = torch.einsum("kgnl,kld->kgnd", probs, vals).reshape(c.heads, n, c.head_dim)
         return out.transpose(0, 1).reshape(n, c.heads * c.head_dim).to(self.dt)
 
-    def _layer(self, i: int, x: torch.Tensor, residual: torch.Tensor | None, s: int, cos: torch.Tensor,
+    def _layer(self, i: int, x: torch.Tensor, residual: torch.Tensor | None, ok: torch.Tensor, cos: torch.Tensor,
                sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         c, p, pre = self.c, self.p, f"layers.{i}."
         n = x.shape[0]
@@ -445,7 +452,7 @@ class Drafter:
         q = F.linear(h, p[pre + "self_attn.q_proj.weight"]).view(n, c.heads, c.head_dim)
         q = _rope(_rms(q, p[pre + "self_attn.q_norm.weight"], c.eps).transpose(0, 1), cos, sin)
         k, v = self._kv(i, h, cos, sin)
-        h = F.linear(self._attend(i, q, k, v, s), p[pre + "self_attn.o_proj.weight"])
+        h = F.linear(self._attend(i, q, k, v, ok), p[pre + "self_attn.o_proj.weight"])
         h = _conv(h, coef[:, 1], base[1], c.conv_group)
         residual = (h.float() + residual.float()).to(self.dt)
         h = _rms(residual, p[pre + "post_attention_layernorm.weight"], c.eps)
@@ -465,9 +472,10 @@ class Drafter:
         ids[0] = int(pending)
         x = self.embed(ids).to(self.dt)
         cos, sin = self._cos_sin(s, n)
+        ok = self._mask(s, n)                                     # the same for every layer
         residual = None
         for i in range(c.layers):
-            x, residual = self._layer(i, x, residual, s, cos, sin)
+            x, residual = self._layer(i, x, residual, ok, cos, sin)
         return _rms((x.float() + residual.float()).to(self.dt), self.p["norm.weight"], c.eps)[1:]
 
     # -- the lattice ----------------------------------------------------------------------------------------------
@@ -571,7 +579,11 @@ class Drafter:
         if depth < 1 or self.context_end == 0:
             return []
         ids, log_probs, scores = self.candidates(pending, depth)
-        cand, sc = ids.cpu().numpy(), scores.cpu().numpy()
+        # one transfer for both: the candidate ids and the scores' fp32 bits, as int32
+        both = torch.cat([ids.to(torch.int32).reshape(-1), scores.contiguous().view(torch.int32).reshape(-1)])
+        both = both.cpu().numpy()
+        cand = both[:ids.numel()].reshape(tuple(ids.shape))
+        sc = both[ids.numel():].view(np.float32).reshape(tuple(scores.shape))
         tokens = self.walk(cand, sc, sampling)
         self.last = Proposal(tokens, ids, log_probs, scores)
         return tokens
