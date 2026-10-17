@@ -174,7 +174,7 @@ def bolt(*, keep: bool = True):
     b.e = FakeEngine(prefill_rows=64)
     b.drafter = drafter(b.e)
     b.store = Store(8, 1 << 30 if keep else 0)
-    b.marks, b.eos, b.max_len, b.drafts = marks, (), 8192, 7
+    b.marks, b.eos, b.max_len, b.drafts, b.adaptive = marks, (), 8192, 7, False
     return b
 
 

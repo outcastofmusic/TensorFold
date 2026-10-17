@@ -74,15 +74,21 @@ class BoltEngine:
         self.e = Engine(self.w, max_len=self.max_len, taps=taps)
         self.drafter = None
         self.drafts = int(drafts)
+        # TF_BOLT_DEPTH=fixed drafts ``drafts`` a round; otherwise a round's depth follows acceptance and measured costs
+        self.adaptive = os.environ.get("TF_BOLT_DEPTH", "auto") != "fixed"
         if drafter and self.drafts > 0:
+            from .depth import Costs
             from .lilicorr import Drafter
 
             self.drafter = Drafter(drafter, embed=self.e.embed_rows, lm_head=self.e.head_logits)
+            self.drafts = min(self.drafts, self.drafter.c.block - 1)
+            self.costs = Costs(self.drafts + 1)
         self.eos = tuple(c.eos)
         self.tp, self.rank = 1, 0
         from .engine import EXPERTS
 
-        rule = f"LiLiCorr drafts ({drafter})" if self.drafter is not None else "serial decoding (no drafter)"
+        rule = (f"LiLiCorr drafts ({drafter}), {'up to ' if self.adaptive else ''}{self.drafts} a round"
+                if self.drafter is not None else "serial decoding (no drafter)")
         kept = (f"up to {self.store.entries} prompt states kept in {self.store.budget / gib:.1f} GiB"
                 if self.store.on else "no prompt states kept")
         print(f"[tensorfold] Nemotron Bolt on CUDA: {len(self.w.blocks)} layers, experts on the {EXPERTS}; {rule}; "
@@ -135,11 +141,13 @@ class BoltEngine:
         if (on_tokens is not None and on_tokens([pending])) or (stop_eos and pending in self.eos) or max_tokens <= 1:
             return stats
         if drafting:
+            from .depth import DepthPolicy
             from .lilicorr import lilicorr_decode
 
+            policy = DepthPolicy(self.drafts, self.costs) if self.adaptive else None
             res = lilicorr_decode(self.e, self.drafter, pending, max_tokens, sampling, stop_eos=stop_eos,
-                                  on_tokens=on_tokens)
-            stats.update(drafted=getattr(res, "drafted", 0), accepted=getattr(res, "accepted", 0))
+                                  on_tokens=on_tokens, depth=self.drafts, policy=policy)
+            stats.update(drafted=res.drafted, accepted=res.accepted, serial_rounds=res.widths.count(1))
         else:
             res = serial_decode(self.e, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
                                 constraint=constraint)

@@ -16,6 +16,7 @@ The draft model follows vLLM's ``qwen3_dflash.py`` / ``qwen3_dflash2.py`` / ``li
 
 ``lilicorr_decode`` verifies the pending token and the drafts in one target window and keeps the drafts through the
 first one that differs from the target's keyed sample, so a drafted reply equals the serial reply token for token.
+A ``depth.DepthPolicy`` picks the drafts a round from measured costs and running acceptance, serial rounds included.
 """
 
 from __future__ import annotations
@@ -605,15 +606,20 @@ def _sample(engine, logits: torch.Tensor, positions: Sequence[int], sampling: Sa
     return sample_rows(logits, positions, sampling)
 
 
+OWED = 256             # committed tap rows a drafter may owe before it takes them, drafting or not
+
+
 @torch.no_grad()
 def lilicorr_decode(engine, drafter: Drafter, first: int, count: int, sampling: Sampling | None, *,
                     stop_eos: bool = False, on_tokens: Callable[[list[int]], bool | None] | None = None,
-                    depth: int | None = None) -> DecodeResult:
+                    depth: int | None = None, policy=None) -> DecodeResult:
     """``count`` tokens (the first is ``first``, the prompt's sample) in verify rounds of the pending token + drafts.
 
     A round keeps the target's keyed samples through the first draft that differs from them (or the first end token
     under ``stop_eos``), so the reply equals serial decoding's. It commits no row past ``count`` tokens and stops
-    when ``on_tokens`` returns True. The drafter must hold the prompt's context (``context_end == engine.pos``).
+    when ``on_tokens`` returns True. The drafter must hold the prompt's context (``context_end == engine.pos``), and
+    holds the reply's by the end. ``policy`` (a ``depth.DepthPolicy``) picks each round's drafts in place of the
+    fixed ``depth``; a round of none runs no drafter, and the drafter takes the rows it owes before it next drafts.
     """
 
     if drafter.context_end != engine.pos:
@@ -624,22 +630,38 @@ def lilicorr_decode(engine, drafter: Drafter, first: int, count: int, sampling: 
         engine.set_sampling(sampling)
     out = [int(first)]
     res = DecodeResult([], 0.0, 0)
+    owed: list[torch.Tensor] = []
+
+    def pay() -> None:
+        if owed:
+            drafter.add_taps(owed[0] if len(owed) == 1 else torch.cat(owed))
+            owed.clear()
+
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in eos):
-        n = min(depth, count - len(out) - 1)              # the round may add 1 + n tokens
-        drafts = drafter.propose(out[-1], n, sampling) if n > 0 else []
+        t0 = time.perf_counter()
+        room = count - len(out) - 1                       # the round may add 1 + n tokens
+        n = min(policy.next(room) if policy is not None else depth, room, drafter.c.block - 1)
+        drafts = []
+        if n > 0:
+            pay()
+            drafts = drafter.propose(out[-1], n, sampling)
+        t1 = time.perf_counter()
         logits = engine.verify([out[-1]] + drafts)
         pos = engine.pos
         sampled = _sample(engine, logits[:1 + len(drafts)], [pos + 1 + r for r in range(1 + len(drafts))], sampling)
+        t2 = time.perf_counter()
         keep = 1
         for d, s in zip(drafts, sampled):
             if s != d or (stop_eos and s in eos):
                 break
             keep += 1
         engine.commit(keep)
-        drafter.add_taps(engine.tap_rows(keep))
+        owed.append(engine.tap_rows(keep))
+        if sum(t.shape[0] for t in owed) >= OWED:
+            pay()
         new = [int(t) for t in sampled[:keep]]
         out.extend(new)
         res.rounds += 1
@@ -647,8 +669,12 @@ def lilicorr_decode(engine, drafter: Drafter, first: int, count: int, sampling: 
         res.accepted += keep - 1
         res.widths.append(1 + len(drafts))
         res.keeps.append(keep)
-        if on_tokens is not None and on_tokens(new):
+        stop = on_tokens is not None and on_tokens(new)
+        if policy is not None:
+            policy.done(len(drafts), keep - 1, 1e3 * (t2 - t1), 1e3 * (t1 - t0), 1e3 * (time.perf_counter() - t2))
+        if stop:
             break
+    pay()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     res.seconds = time.perf_counter() - start
