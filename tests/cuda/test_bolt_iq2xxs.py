@@ -37,14 +37,11 @@ def dequant(packed: np.ndarray) -> np.ndarray:
 
 
 def random_packed(shape: tuple, k: int, seed: int) -> np.ndarray:
-    """Random qs bytes; d a finite fp16 of either sign, 1e-3 .. 2e-2 like real experts'."""
+    """Random qs bytes, flat [*shape, K / 256 * 66]; d a finite fp16 of either sign, 1e-2 .. 2e-2."""
 
-    rng = np.random.default_rng(seed)
-    nb = k // 256
-    raw = rng.integers(0, 256, size=(*shape, nb, quant.IQ2XXS_BYTES), dtype=np.uint8)
-    d = (rng.uniform(1e-3, 2e-2, size=(*shape, nb)) * rng.choice([-1, 1], size=(*shape, nb))).astype("<f2")
-    raw[..., :2] = d[..., None].view(np.uint8)
-    return raw.reshape(*shape, nb * quant.IQ2XXS_BYTES)
+    from tests.bolt_tiny import iq2xxs as packed
+
+    return packed(shape, k, torch.Generator().manual_seed(seed), scale=2.0, signed=True).flatten(-2).numpy()
 
 
 def bf16(a: np.ndarray) -> torch.Tensor:

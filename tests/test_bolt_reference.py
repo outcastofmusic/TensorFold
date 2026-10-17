@@ -1,4 +1,5 @@
-"""Bolt's reference forward on a tiny checkpoint in the 24GB layout: a prompt fed whole or a token at a time agrees."""
+"""Bolt's reference forward on the tiny checkpoint in the 24GB layout (tests/bolt_tiny.py): a prompt fed whole or a
+token at a time agrees."""
 
 import json
 
@@ -6,104 +7,9 @@ import pytest
 
 pytestmark = pytest.mark.torch
 
-HIDDEN, VOCAB, LATENT, WIDTH, SHARED = 256, 96, 256, 256, 256
-HEADS, KV, HD = 4, 2, 16
-MH, MP, MG, MS, CONV = 8, 8, 2, 16, 4
-EXPERTS, TOP_K = 4, 2
-KINDS = ("mamba", "moe", "attention", "moe", "mamba")
+from tests.bolt_tiny import PATTERN, write
 
-
-def _q8_0(n: int, k: int, gen):
-    import torch
-
-    q = torch.randint(-127, 128, (n, k // 32, 32), dtype=torch.int8, generator=gen).view(torch.uint8)
-    d = torch.full((n, k // 32, 1), 0.002, dtype=torch.float16).view(torch.uint8).reshape(n, k // 32, 2)
-    return torch.cat([d, q], -1)                                          # [n, k/32, 34] as the checkpoint stores it
-
-
-def _iq2xxs(n: int, k: int, gen):
-    import torch
-
-    qs = torch.randint(0, 256, (n, k // 256, 64), dtype=torch.uint8, generator=gen)
-    d = torch.full((n, k // 256, 1), 0.002, dtype=torch.float16).view(torch.uint8).reshape(n, k // 256, 2)
-    return torch.cat([d, qs], -1)
-
-
-def _nvfp4(n: int, k: int, gen):
-    import torch
-
-    w = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, generator=gen)
-    s = torch.full((n, k // 16), 0.02, dtype=torch.float32).to(torch.float8_e4m3fn)
-    return w, s, torch.tensor(0.5, dtype=torch.float32)
-
-
-def _checkpoint(root):
-    import torch
-    from safetensors.torch import save_file
-
-    gen = torch.Generator().manual_seed(7)
-    rnd = lambda *shape, s=0.05: (torch.randn(shape, generator=gen) * s).bfloat16()
-    t, recipes = {}, {}
-    q8 = {"quant_algo": "Q8_0", "group_size": 32, "block_payload_bytes": 34, "packing": "ggml"}
-    iq2 = {"quant_algo": "IQ2_XXS", "group_size": 256, "block_payload_bytes": 66, "packing": "ggml"}
-    p = "language_model."
-    t[p + "backbone.embeddings.weight"] = rnd(VOCAB, HIDDEN, s=1.0)
-    t[p + "backbone.norm_f.weight"] = (1 + rnd(HIDDEN, s=0.1).float()).bfloat16()
-    t[p + "lm_head.weight"] = _q8_0(VOCAB, HIDDEN, gen)
-    recipes[p + "lm_head"] = q8
-    xd, conv_dim = MH * MP, MH * MP + 2 * MG * MS
-    blocks = []
-    for i, kind in enumerate(KINDS):
-        b = f"{p}backbone.layers.{i}."
-        t[b + "norm.weight"] = (1 + rnd(HIDDEN, s=0.1).float()).bfloat16()
-        if kind == "mamba":
-            blocks.append({"block_type": "mamba"})
-            for name, n, k in (("in_proj", xd + conv_dim + MH, HIDDEN), ("out_proj", HIDDEN, xd)):
-                w, s, s2 = _nvfp4(n, k, gen)
-                t[b + f"mixer.{name}.weight"], t[b + f"mixer.{name}.weight_scale"] = w, s
-                t[b + f"mixer.{name}.weight_scale_2"] = s2
-                recipes[b + f"mixer.{name}"] = {"quant_algo": "W4A16_NVFP4", "group_size": 16}
-            t[b + "mixer.conv1d.weight"] = rnd(conv_dim, 1, CONV, s=0.3)
-            t[b + "mixer.conv1d.bias"] = rnd(conv_dim, s=0.1)
-            t[b + "mixer.A_log"] = rnd(MH, s=1.0)
-            t[b + "mixer.D"] = rnd(MH, s=1.0)
-            t[b + "mixer.dt_bias"] = rnd(MH, s=1.0)
-            t[b + "mixer.norm.weight"] = (1 + rnd(xd, s=0.1).float()).bfloat16()
-        elif kind == "attention":
-            blocks.append({"block_type": "attention"})
-            for name, n, k in (("q_proj", HEADS * HD, HIDDEN), ("k_proj", KV * HD, HIDDEN), ("v_proj", KV * HD, HIDDEN),
-                               ("o_proj", HIDDEN, HEADS * HD)):
-                t[b + f"mixer.{name}.weight"] = _q8_0(n, k, gen)
-                recipes[b + f"mixer.{name}"] = q8
-        else:
-            blocks.append({"block_type": "moe", "moe_intermediate_size": WIDTH, "n_routed_experts": EXPERTS,
-                           "num_experts_per_tok": TOP_K})
-            t[b + "mixer.gate.weight"] = rnd(EXPERTS, HIDDEN, s=0.2)
-            t[b + "mixer.gate.e_score_correction_bias"] = torch.randn(EXPERTS, generator=gen) * 0.1
-            for name, n, k in (("fc1_latent_proj", LATENT, HIDDEN), ("fc2_latent_proj", HIDDEN, LATENT)):
-                t[b + f"mixer.{name}.weight"] = _q8_0(n, k, gen)
-                recipes[b + f"mixer.{name}"] = q8
-            for name, n, k in [(f"experts.{e}.up_proj", WIDTH, LATENT) for e in range(EXPERTS)] + \
-                    [(f"experts.{e}.down_proj", LATENT, WIDTH) for e in range(EXPERTS)] + \
-                    [("shared_experts.up_proj", SHARED, HIDDEN), ("shared_experts.down_proj", HIDDEN, SHARED)]:
-                t[b + f"mixer.{name}.weight"] = _iq2xxs(n, k, gen)
-                recipes[b + f"mixer.{name}"] = iq2
-    names = sorted(t)
-    half = len(names) // 2
-    files = {"model-00001-of-00002.safetensors": names[:half], "model-00002-of-00002.safetensors": names[half:]}
-    for f, keys in files.items():
-        save_file({k: t[k].contiguous() for k in keys}, str(root / f))
-    (root / "model.safetensors.index.json").write_text(json.dumps(
-        {"weight_map": {k: f for f, keys in files.items() for k in keys}}))
-    (root / "hf_quant_config.json").write_text(json.dumps(
-        {"quantization": {"quant_algo": "MIXED_PRECISION", "quantized_layers": recipes}}))
-    (root / "config.json").write_text(json.dumps({"llm_config": {
-        "hidden_size": HIDDEN, "vocab_size": VOCAB, "block_configs": blocks, "num_attention_heads": HEADS,
-        "num_key_value_heads": KV, "head_dim": HD, "mamba_num_heads": MH, "mamba_head_dim": MP, "n_groups": MG,
-        "ssm_state_size": MS, "conv_kernel": CONV, "moe_latent_size": LATENT,
-        "moe_shared_expert_intermediate_size": SHARED, "n_shared_experts": 1, "routed_scaling_factor": 5.0,
-        "norm_topk_prob": True, "layer_norm_epsilon": 1e-5, "eos_token_id": 2}}))
-    return root
+VOCAB = 1024
 
 
 def test_whole_prompt_equals_token_by_token(tmp_path):
@@ -111,14 +17,14 @@ def test_whole_prompt_equals_token_by_token(tmp_path):
 
     from tensorfold.families.nemotron_bolt import reference as ref
 
-    ck = ref.Checkpoint(_checkpoint(tmp_path))
-    assert [b.kind for b in ck.config.blocks] == list(KINDS)
+    ck = ref.Checkpoint(write(tmp_path))
+    assert [b.kind for b in ck.config.blocks] == list(PATTERN)
     tokens = torch.tensor([5, 17, 3, 88, 41, 41, 9, 60])
     whole = ref.forward(ck, tokens)
     st = ref.State()
     steps = torch.cat([ref.forward(ck, tokens[i:i + 1], st) for i in range(len(tokens))])
     assert whole.shape == (8, VOCAB) and torch.isfinite(whole).all()
-    assert st.length == 8 and st.keys[2].shape == (8, KV, HD)
+    assert st.length == 8 and st.keys[2].shape == (8, 2, 64)
     assert (whole - steps).abs().max().item() < 1e-4 * whole.abs().max().item()
     # a split prompt resumes from the state as well: 5 rows, then 3
     st = ref.State()
@@ -134,7 +40,7 @@ def test_greedy_returns_the_rows_each_token_came_from(tmp_path):
 
     from tensorfold.families.nemotron_bolt import reference as ref
 
-    ck = ref.Checkpoint(_checkpoint(tmp_path))
+    ck = ref.Checkpoint(write(tmp_path))
     prompt = torch.tensor([5, 17, 3])
     tokens, prompt_rows, rows = ref.greedy(ck, prompt, 4, last=2)
     assert tokens.shape == (4,) and prompt_rows.shape == (2, VOCAB) and rows.shape == (4, VOCAB)
