@@ -13,7 +13,8 @@ import torch
 
 from tensorfold.cuda.direct_read import SafeTensors
 from tensorfold.engine.exact_sampling import Sampling
-from tensorfold.families.nemotron_bolt.cuda.lilicorr import DraftConfig, Drafter, expected_shapes
+from tensorfold.families.nemotron_bolt.cuda.lilicorr import DraftConfig, Drafter, device_bytes, expected_shapes
+from tensorfold.families.nemotron_bolt.cuda.weights import dequantize_q8_0_rows
 
 DRAFT = Path(os.environ.get("TF_BOLT_DRAFT", "/home/agis/models/Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr"))
 TARGET = Path(os.environ.get("TF_BOLT_TARGET", "/home/agis/models/Nemotron-3.5-Bolt-74B-A9B-24GB"))
@@ -21,18 +22,6 @@ TARGET = Path(os.environ.get("TF_BOLT_TARGET", "/home/agis/models/Nemotron-3.5-B
 pytestmark = pytest.mark.skipif(not (DRAFT / "model.safetensors").exists() or
                                 not (TARGET / "model.safetensors.index.json").exists(),
                                 reason="needs the Bolt target and LiLiCorr draft checkpoints")
-
-
-def _q8_0(packed: torch.Tensor) -> torch.Tensor:
-    """ggml block_q8_0 (ggml-common.h: an fp16 d, then 32 int8 qs) [N, K/32, 34] -> bf16 [N, K] = d * qs."""
-
-    out = torch.empty((packed.shape[0], packed.shape[1] * 32), dtype=torch.bfloat16, device=packed.device)
-    for r in range(0, packed.shape[0], 8192):
-        part = packed[r:r + 8192]
-        d = part[..., :2].contiguous().view(torch.float16).float()
-        qs = part[..., 2:].contiguous().view(torch.int8).float()
-        out[r:r + 8192] = (qs * d).reshape(part.shape[0], -1).to(torch.bfloat16)
-    return out
 
 
 @pytest.fixture(scope="module")
@@ -43,7 +32,7 @@ def shared():
     names = ("language_model.backbone.embeddings.weight", "language_model.lm_head.weight")
     with closing(SafeTensors(sorted({TARGET / index[n] for n in names}))) as f:
         embedding = f.get(names[0], "cuda")
-        head = _q8_0(f.get(names[1], "cuda"))
+        head = dequantize_q8_0_rows(f.get(names[1], "cuda").flatten(-2))
     return {"embed": lambda ids: embedding[ids], "lm_head": lambda h: h @ head.T}
 
 
@@ -67,6 +56,7 @@ def test_loads_and_drafts_on_the_gpu(drafter):
     assert len(d.q) == 1 + 3 * 5                             # fc and every MLP projection stay NVFP4
     assert all(t.dtype == torch.bfloat16 and t.is_cuda for t in d.p.values())
     assert all(torch.isfinite(t).all() for t in d.p.values())
+    assert d.nbytes() == device_bytes(DRAFT)                  # what admission charges for the drafter
     g = torch.Generator(device="cuda").manual_seed(0)
     taps = torch.randn((1500, 6 * 4096), generator=g, device="cuda", dtype=torch.bfloat16)
     d.reset()

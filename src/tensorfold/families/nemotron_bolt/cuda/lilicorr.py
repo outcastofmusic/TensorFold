@@ -22,6 +22,7 @@ A ``depth.DepthPolicy`` picks the drafts a round from measured costs and running
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -191,6 +192,25 @@ def fp4_kept(name: str) -> bool:
     """The backbone's NVFP4 projections (fc and the MLPs, 0.86B of the 1.11B weights) that stay packed on CUDA."""
 
     return name == "fc.weight" or (name.startswith("layers.") and ".mlp." in name)
+
+
+def device_bytes(model_dir: str | Path, *, fp4: bool = True) -> int:
+    """The bytes a bf16 ``Drafter`` of ``model_dir`` holds (its ``nbytes()``): dense weights, the NVFP4 ones it keeps
+    packed with ``fp4`` (CUDA: ``Fp4Linear`` pads rows to 128) and its window's keys and values."""
+
+    from tensorfold.cuda.capacity import headers
+
+    path = Path(model_dir)
+    c = DraftConfig.from_json(json.loads((path / "config.json").read_text()))
+    stored = headers(path)
+    total = 2 * c.layers * c.kv_heads * c.window * c.head_dim * 2
+    for name, shape in expected_shapes(c).items():
+        if fp4 and fp4_kept(name) and stored.get(name, {}).get("dtype") == "U8":
+            n, k = shape
+            total += -(-n // 128) * 128 * (k // 2 + k // NVFP4_GROUP)
+        else:
+            total += math.prod(shape) * 2
+    return total
 
 
 Packed = tuple[torch.Tensor, torch.Tensor, torch.Tensor]       # NVFP4 codes, e4m3 scales, the fp32 tensor scale

@@ -45,6 +45,41 @@ def test_a_per_block_kv_head_count_overrides_the_global_one():
     assert Config.parse(t).kv_heads == (4,)
 
 
+def test_q8_0_slices_equal_the_whole_decode():
+    import torch
+
+    from tensorfold.families.nemotron_bolt import quant
+    from tensorfold.families.nemotron_bolt.cuda.weights import dequantize_q8_0_rows
+    from tests.bolt_tiny import q8_0
+
+    gen = torch.Generator().manual_seed(4)
+    packed = q8_0(torch.randn((301, 128), generator=gen), gen).flatten(-2)
+    whole = quant.dequantize_q8_0(packed)
+    for rows in (1, 7, 300, 301, 4096):
+        assert torch.equal(dequantize_q8_0_rows(packed, rows), whole), rows
+
+
+def test_admission_counts_the_drafter_and_the_widest_activation(tiny, tmp_path):
+    import torch
+
+    from tensorfold.families.nemotron_bolt.cuda.app import cache_bytes, chunk_bytes, need_bytes
+    from tensorfold.families.nemotron_bolt.cuda.lilicorr import Drafter, device_bytes
+    from tensorfold.families.nemotron_bolt.cuda.weights import Config
+    from tests.bolt_lilicorr_fakes import write_draft
+
+    c = Config.read(tiny)
+    # the tiny model's widest prompt activation is a routed MoE's 3 x 512, wider than the shared expert's 512; no
+    # tensor is top_k x Mamba's in_proj wide
+    assert chunk_bytes(c, 64) == 64 * (3 * 512 * 2 * 2 + c.proj_dim * 2 + 8 * c.hidden * 2)
+    assert cache_bytes(c, 1024, 16, 64) - chunk_bytes(c, 64) == cache_bytes(c, 1024, 16, 0)
+    draft = write_draft(tmp_path / "draft")
+    loaded = Drafter(draft, embed=lambda ids: torch.zeros((ids.shape[0], 64)), lm_head=lambda h: h, device="cpu")
+    assert device_bytes(draft, fp4=False) == loaded.nbytes()                  # what a CPU load holds, all dense
+    packed = device_bytes(draft)                                              # CUDA: fc and the MLPs stay NVFP4
+    assert 0 < packed < loaded.nbytes()
+    assert need_bytes(tiny, c, 1024, drafter=draft) - need_bytes(tiny, c, 1024) == packed
+
+
 def _f16(b: bytes) -> float:
     return struct.unpack("<e", b)[0]
 
@@ -52,7 +87,7 @@ def _f16(b: bytes) -> float:
 def test_q8_0_is_code_times_scale():
     import torch
 
-    from tensorfold.families.nemotron_bolt.cuda.weights import dequantize_q8_0
+    from tensorfold.families.nemotron_bolt.quant import dequantize_q8_0
 
     gen = torch.Generator().manual_seed(1)
     packed = torch.randint(0, 256, (3, 2 * 34), generator=gen, dtype=torch.int32).to(torch.uint8)
@@ -134,7 +169,8 @@ def test_loader_maps_the_checkpoint(tiny):
 
     from tensorfold.cuda.nvfp4 import format as nvfp4_format
     from tensorfold.families.nemotron_bolt.cuda.fallback import dequantize_iq2xxs
-    from tensorfold.families.nemotron_bolt.cuda.weights import dequantize_q8_0, load
+    from tensorfold.families.nemotron_bolt.cuda.weights import load
+    from tensorfold.families.nemotron_bolt.quant import dequantize_q8_0
     from tests.bolt_tiny import EXPERTS
 
     w = load(tiny, "cpu")

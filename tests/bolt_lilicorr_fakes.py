@@ -55,6 +55,31 @@ def nvfp4_pack(n: int, k: int, g: torch.Generator) -> tuple[torch.Tensor, torch.
     return codes, scale, torch.tensor(0.01, dtype=torch.float32)
 
 
+def write_draft(path, *, seed: int = 0, **config):
+    """A tiny draft checkpoint folder: config.json, and model.safetensors with fc and the MLPs packed as NVFP4."""
+
+    import json
+
+    from safetensors.torch import save_file
+
+    from tensorfold.families.nemotron_bolt.cuda.lilicorr import DraftConfig, expected_shapes, fp4_kept
+
+    path.mkdir(parents=True, exist_ok=True)
+    raw = tiny_config(**config)
+    (path / "config.json").write_text(json.dumps(raw))
+    g = torch.Generator().manual_seed(seed + 1)
+    tensors = {}
+    for name, t in random_tensors(expected_shapes(DraftConfig.from_json(raw)), seed).items():
+        if not fp4_kept(name):
+            tensors[name] = t.to(torch.bfloat16)
+            continue
+        codes, scale, scale2 = nvfp4_pack(t.shape[0], t.shape[1], g)
+        base = name.removesuffix(".weight")
+        tensors.update({name: codes, base + ".weight_scale": scale, base + ".weight_scale_2": scale2})
+    save_file(tensors, str(path / "model.safetensors"))
+    return path
+
+
 class FakeTarget:
     """A deterministic toy target: logits from the last two tokens, taps from (position, token).
 

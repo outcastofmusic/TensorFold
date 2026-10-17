@@ -123,16 +123,21 @@ def _eos(model_dir: Path, raw: dict) -> tuple[int, ...]:
 
 # -- formats ------------------------------------------------------------------------------------------------------
 
-def dequantize_q8_0(packed: torch.Tensor) -> torch.Tensor:
-    """uint8 [..., K // 32 * 34] -> bf16 [..., K]: q * d in fp32, rounded once."""
+def dequantize_q8_0_rows(packed: torch.Tensor, rows: int = 8192) -> torch.Tensor:
+    """uint8 [N, K // 32 * 34] -> bf16 [N, K], ``quant.dequantize_q8_0`` a slice of ``rows`` at a time: the same
+    values, with fp32 temporaries of 0.27 GiB instead of the 4 GiB the whole lm_head (131072 x 4096) takes."""
 
-    if packed.dtype != torch.uint8 or packed.shape[-1] % Q8_BYTES:
-        raise ValueError(f"Q8_0 rows are uint8 in blocks of {Q8_BYTES} bytes, not {packed.dtype} {tuple(packed.shape)}")
-    nb = packed.shape[-1] // Q8_BYTES
-    b = packed.reshape(-1, nb, Q8_BYTES)
-    d = b[..., :2].contiguous().view(torch.float16).float()
-    q = b[..., 2:].contiguous().view(torch.int8).float()
-    return (q * d).reshape(*packed.shape[:-1], nb * Q8_BLOCK).to(torch.bfloat16)
+    from .. import quant
+
+    if packed.dtype != torch.uint8 or packed.dim() != 2 or packed.shape[-1] % quant.Q8_0_BYTES:
+        raise ValueError(f"Q8_0 rows are uint8 in blocks of {quant.Q8_0_BYTES} bytes, not {packed.dtype} "
+                         f"{tuple(packed.shape)}")
+    n = packed.shape[0]
+    out = torch.empty((n, packed.shape[1] // quant.Q8_0_BYTES * quant.Q8_0_BLOCK), dtype=torch.bfloat16,
+                      device=packed.device)
+    for r in range(0, n, rows):
+        out[r:r + rows] = quant.dequantize_q8_0(packed[r:r + rows])
+    return out
 
 
 def flat(packed: torch.Tensor, block_bytes: int) -> torch.Tensor:
@@ -302,7 +307,7 @@ class Loader:
         kind = self.format(short)
         w = self.tensor(short + ".weight")
         if kind == "Q8_0":
-            return dequantize_q8_0(flat(w, Q8_BYTES)).contiguous()
+            return dequantize_q8_0_rows(flat(w, Q8_BYTES))
         if kind in ("BF16", "") and w.dtype in (torch.bfloat16, torch.float16, torch.float32):
             return w.to(torch.bfloat16).contiguous()
         raise ValueError(f"{self.name(short)}: Bolt reads this projection as Q8_0 or bf16, not {kind}")
