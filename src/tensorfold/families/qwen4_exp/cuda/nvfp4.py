@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -188,6 +189,36 @@ def _fp8_bytes(weight_scale: torch.Tensor) -> torch.Tensor:
     """The stored scale bytes as uint8 (a safetensors fp8e4m3 tensor arrives as fp8; the kernel reads bytes)."""
 
     return weight_scale.contiguous().view(torch.uint8)
+
+
+def csf_scales(fixed: torch.Tensor, exceptions: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Stacked CSF-coded e4m3 scales (``weight_scale_encoding: csf``) -> the [E, N, K/16] bytes they encode, exactly.
+
+    ``fixed`` uint8 [E, N/16, 16 * (1 + K/32)] holds per 16-row slab one base byte a row, then a nibble a scale
+    (low first): byte = base + nibble. ``exceptions[e]`` holds expert e's uint32 words (int32 as read) for the bytes
+    no nibble reaches: position (row-major) in bits 0..23, the byte in bits 24..31. vLLM's
+    ``decode_nvfp4_csf_scale`` (csf_scales.py) defines the format. One call decodes a layer's projection: a call a
+    matrix spent 4.4 ms in launches and host syncs, 5 minutes over Flash Next's 73,728 expert matrices.
+    """
+
+    if fixed.dtype != torch.uint8 or fixed.dim() != 3 or fixed.shape[2] % 16 or len(exceptions) != fixed.shape[0]:
+        raise ValueError(f"CSF fixed streams are uint8 [E, N/16, 16 * (1 + K/32)] with E exception lists, not "
+                         f"{fixed.dtype} {list(fixed.shape)} and {len(exceptions)}")
+    e, rows, cols = fixed.shape[0], fixed.shape[1] * 16, (fixed.shape[2] // 16 - 1) * 2
+    bases = fixed[:, :, :16].reshape(e, rows, 1)
+    packed = fixed[:, :, 16:].reshape(e, rows, cols // 2)
+    out = (torch.stack((packed & 0xF, packed >> 4), dim=-1).reshape(e, rows, cols) + bases).reshape(-1)  # <= 255
+    words = torch.cat([x.reshape(-1).view(torch.int32) for x in exceptions]).to(torch.int64) & 0xFFFFFFFF
+    owner = torch.repeat_interleave(torch.arange(e, device=fixed.device),
+                                    torch.tensor([x.numel() for x in exceptions], device=fixed.device))
+    local = words & 0xFFFFFF
+    bad = (bases > 240).any()
+    if words.numel():
+        bad |= (local >= rows * cols).any()
+    if bool(bad):                                     # the one host sync
+        raise ValueError("CSF row bases must be in 0..240 and exception positions inside their scale matrix")
+    out[owner * (rows * cols) + local] = (words >> 24).to(torch.uint8)
+    return out.view(torch.float8_e4m3fn).reshape(e, rows, cols)
 
 
 def make_fp4(words: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2) -> FP4:
