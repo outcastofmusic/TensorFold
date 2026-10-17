@@ -69,6 +69,9 @@ class Engine:
                         for _ in range(na)]
         self.v_cache = [torch.zeros_like(k) for k in self.k_cache]
         self.conv_state = torch.zeros((nc, c.conv_taps - 1, c.hidden), dtype=torch.bfloat16, device=dev)
+        # one fp32 buffer a prompt chunk's experts decode into in turn: w13 [2I, D] is the wider of an expert's two
+        self.decoded = torch.empty(max((b.moe.experts.w13[0].numel() for b in w.blocks if b.moe is not None),
+                                       default=0), dtype=torch.float32, device=dev)
         self.inv_freq = (1.0 / (c.theta ** (torch.arange(0, c.head_dim, 2, dtype=torch.float32) / c.head_dim))).to(dev)
         self.meta = torch.zeros(4, dtype=torch.int32, device=dev)
         self.sampled = torch.zeros(1, dtype=torch.int32, device=dev)
@@ -139,14 +142,14 @@ class Engine:
             from tensorfold.families.nemotron_h.cuda import attention as A
 
             self.meta[0] = self.pos
-            packed = torch.cat([q.view(rows, qd), qkv[:, qd:]], dim=-1)  # the kernel reads q from its first columns
-            out, _ = A.attention(packed, kc, vc, self.meta, rows, heads=c.heads, kv_heads=c.kv_heads,
+            # the kernel reads each row's q from its first heads * head_dim columns, rows its width apart
+            out, _ = A.attention(q.view(rows, qd), kc, vc, self.meta, rows, heads=c.heads, kv_heads=c.kv_heads,
                                  head_dim=c.head_dim, max_chunks=self.max_len // CHUNK)
         return a.out(out, prompt)
 
     def _ffn(self, b: Block, x: torch.Tensor, prompt: bool) -> torch.Tensor:
         if b.moe is not None:
-            return X.moe(x, b.moe, self.c.top_k, self.c.scaling, few=DECODE_ROWS)
+            return X.moe(x, b.moe, self.c.top_k, self.c.scaling, few=DECODE_ROWS, work=self.decoded)
         g, u = b.w13(x, prompt).chunk(2, dim=-1)
         act = (torch.nn.functional.silu(g.float()).to(torch.bfloat16).float() * u.float()).to(torch.bfloat16)
         return b.w2(act, prompt)
@@ -255,12 +258,8 @@ def _sync(e: Engine) -> None:
 
 
 @torch.no_grad()
-def prefill(e: Engine, prompt: Sequence[int], sampling, *, constraint=None,
-            stop: Callable[[], bool] | None = None) -> int:
-    """Reset, commit the prompt in chunks and return its first sampled token (position len(prompt)).
-
-    ``stop()`` is asked before each chunk and abandons the prompt with ``RequestCancelled``.
-    """
+def prefill(e: Engine, prompt: Sequence[int], sampling, *, constraint=None) -> int:
+    """Reset, commit the prompt in chunks and return its first sampled token (position len(prompt))."""
 
     prompt = [int(t) for t in prompt]
     if not prompt:
@@ -269,10 +268,6 @@ def prefill(e: Engine, prompt: Sequence[int], sampling, *, constraint=None,
     e.set_sampling(sampling)
     try:
         for s in range(0, len(prompt), e.prefill_rows):
-            if stop is not None and stop():
-                from tensorfold.server.cancellation import RequestCancelled
-
-                raise RequestCancelled("the client left while its prompt was filling")
             last = s + e.prefill_rows >= len(prompt)
             if last and constraint is not None:        # a reply's grammar masks the first token's row
                 e.mask(constraint, constraint.window([0], [-1]))

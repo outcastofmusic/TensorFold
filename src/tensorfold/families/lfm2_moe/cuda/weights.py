@@ -12,13 +12,15 @@ On the CPU (``device="cpu"``, the tests' engine) every linear is its exact fp32 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from ..checkpoint import PREFIX, dequantize, layer
+from tensorfold.families.lfm2.layout import ATTENTION_OUT, CONV, CONV_TAPS, HEAD_NORMS, MLP, NORMS, QKV
+
+from ..checkpoint import PREFIX, dequantize, layer, shards, stored
 from ..config import Config
 
 
@@ -39,9 +41,6 @@ class Linear:
         from tensorfold.families.qwen3_5.cuda import b16
 
         return b16.prompt(x, self.w) if prompt else b16.matmul(x, self.w)
-
-    def nbytes(self) -> int:
-        return int(self.fp8.nbytes()) if self.fp8 is not None else self.w.numel() * self.w.element_size()
 
 
 @dataclass
@@ -64,16 +63,6 @@ class Experts:
     @property
     def fp8(self) -> bool:
         return self.s13 is not None
-
-    def dense(self, e: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Expert ``e``'s (w13, w2) in fp32: e4m3 x scale, exact."""
-
-        if not self.fp8:
-            return self.w13[e].float(), self.w2[e].float()
-        return dequantize(self.w13[e], self.s13[e]), dequantize(self.w2[e], self.s2[e])
-
-    def nbytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in (self.w13, self.w2, self.s13, self.s2) if t is not None)
 
 
 @dataclass
@@ -116,7 +105,6 @@ class Weights:
     embed: torch.Tensor              # [V, D] bf16, the head too (tied)
     norm: torch.Tensor               # [D] bf16, embedding_norm (the final norm)
     blocks: list[Block]
-    extra: dict = field(default_factory=dict)
 
     @property
     def device(self) -> torch.device:
@@ -142,9 +130,11 @@ class Loader:
 
         self.c = Config.read(model_dir)
         self.device = device
-        self.r = SafeTensors(_shards(model_dir))
+        self.r = SafeTensors(shards(model_dir))
         self.used: set[str] = set()
-        self.staging = None
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.r
 
     def get(self, name: str) -> torch.Tensor:
         if name not in self.r:
@@ -155,12 +145,8 @@ class Loader:
     def stored(self, prefix: str) -> tuple[torch.Tensor, torch.Tensor | None]:
         """(weight, block scales as fp32) of FP8; (bf16 weight, None) of a bf16 linear."""
 
-        w = self.get(prefix + ".weight")
-        if w.dtype != torch.float8_e4m3fn:
-            return w.to(torch.bfloat16), None
-        if prefix + ".weight_scale" not in self.r:
-            raise ValueError(f"{prefix}: an FP8 weight without its weight_scale (compressed-tensors block FP8)")
-        return w.view(torch.uint8), self.get(prefix + ".weight_scale").float()
+        w, scale = stored(self, prefix)
+        return (w.to(torch.bfloat16), None) if scale is None else (w, scale.float())
 
     def linear(self, *prefixes: str) -> Linear:
         """The linears ``prefixes`` stacked by rows (one input), as one ``Linear``."""
@@ -206,18 +192,17 @@ class Loader:
 
     def block(self, i: int) -> Block:
         c, p = self.c, layer(i)
-        b = Block(c.layers[i], self.vector(p + "operator_norm.weight"), self.vector(p + "ffn_norm.weight"))
+        b = Block(c.layers[i], *(self.vector(f"{p}{name}.weight") for name in NORMS))
         if b.kind == "conv":
-            taps = self.get(p + "conv.conv.weight")
-            b.conv = Conv(self.linear(p + "conv.in_proj"), self.linear(p + "conv.out_proj"),
+            taps = self.get(f"{p}{CONV_TAPS}.weight")
+            b.conv = Conv(*(self.linear(p + name) for name in CONV),
                           taps.reshape(taps.shape[0], -1).float().contiguous())
         else:
-            a = p + "self_attn."
-            b.attn = Attention(self.linear(a + "q_proj", a + "k_proj", a + "v_proj"), self.linear(a + "out_proj"),
-                               self.vector(a + "q_layernorm.weight"), self.vector(a + "k_layernorm.weight"))
+            b.attn = Attention(self.linear(*(p + name for name in QKV)), self.linear(p + ATTENTION_OUT),
+                               *(self.vector(f"{p}{name}.weight") for name in HEAD_NORMS))
         f = p + "feed_forward."
         if not c.moe(i):
-            b.w13, b.w2 = self.linear(f + "w1", f + "w3"), self.linear(f + "w2")
+            b.w13, b.w2 = self.linear(p + MLP[0], p + MLP[1]), self.linear(p + MLP[2])
         else:
             b.moe = Moe(self.vector(f + "gate.weight", torch.float32), self.vector(f + "expert_bias", torch.float32),
                         self.experts(f))
@@ -244,15 +229,6 @@ class Loader:
 
             w.config = replace(c, layers=c.layers[:count])
         return w
-
-
-def _shards(model_dir: Path) -> list[Path]:
-    import json
-
-    index = model_dir / "model.safetensors.index.json"
-    if index.is_file():
-        return [model_dir / f for f in sorted(set(json.loads(index.read_text())["weight_map"].values()))]
-    return sorted(model_dir.glob("model*.safetensors"))
 
 
 def load(model_dir: str | Path, device: str = "cuda", *, layers: int | None = None) -> Weights:

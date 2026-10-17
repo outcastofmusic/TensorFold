@@ -84,6 +84,19 @@ def test_the_family_claims_the_checkpoint_and_reads_it_on_cuda(tiny):
         family.package.check(tiny.parent / "bad")
 
 
+@pytest.mark.parametrize("options,message", [
+    ({"tp": 2}, "one GPU"), ({"master": "10.0.0.2"}, "one GPU"), ({"drafter": "/models/x"}, "--drafter"),
+    ({"vision": True}, "text model"), ({"parallel": 4}, "--parallel"), ({"kv_dtype": "int8"}, "kv_dtype"),
+    ({"mtp_drafts": 2}, "mtp_drafts"), ({"decode_share": 0.5}, "decode_share"),
+])
+def test_serve_options_without_a_meaning_are_refused(tiny, options, message):
+    from tensorfold.families import lfm2_moe
+
+    with pytest.raises(ValueError, match=message):
+        lfm2_moe.cuda_engine(tiny, master_port=29551, no_drafts=False, context=None, context_explicit=False,
+                             **options)
+
+
 def test_block_fp8_decodes_to_e4m3_times_its_block_scale():
     import torch
 

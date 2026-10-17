@@ -16,8 +16,6 @@ REFUSAL = "d1 is a decision model and writes no text: use POST /v1/systemone or 
 
 
 class DecisionApp(App):
-    no_delay = True          # a decision's reply follows its headers within milliseconds (cuda.http)
-
     def _pictures(self, body: dict[str, Any]) -> tuple[Any, list]:
         """The state with its pictures taken out (as llama-server reads a System One state), and the pictures.
 

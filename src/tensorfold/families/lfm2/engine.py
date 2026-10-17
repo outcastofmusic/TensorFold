@@ -76,7 +76,6 @@ class Engine:
             self.pictures = Vision.load(self.model_dir, device, processor=processor)
         self.fmt = Format(Tokenizer.from_file(str(self.model_dir / "tokenizer.json")))
         self.load_s = time.perf_counter() - started
-        self.served = 0
         self._lock = threading.Lock()
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -93,7 +92,6 @@ class Engine:
             raise DecisionError("this checkpoint has no vision tower, so it reads no pictures")
         with self._lock:
             answers, read = self._answer(state, named, list(images or []))
-            self.served += 1
         return {"answers": answers, "usage": {"input_tokens": read, "output_tokens": 0}}
 
     def generate(self, *_, **__):
@@ -119,7 +117,6 @@ class Engine:
             for row, (_, labels) in zip(hidden, items):
                 logits = self.model.logits(row[None])[0]
                 out.append(([float(logits[int(t)]) for t in labels], float(logits.logsumexp(0))))
-            self.served += 1
         return out
 
     # ---------------------------------------------------------------- forwards

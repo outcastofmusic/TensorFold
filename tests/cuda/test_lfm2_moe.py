@@ -83,6 +83,30 @@ def test_the_expert_kernels_equal_the_grouped_path(weights):
     assert _close(X.pairs(x, ids, ex), X.grouped(x, ids, ex), 0.01)
 
 
+def test_the_block_decode_kernel_gives_dequantize_s_bits():
+    from tensorfold.families.lfm2_moe.checkpoint import dequantize
+    from tensorfold.families.lfm2_moe.cuda import experts as X
+    from tests.lfm2_moe_tiny import e4m3_codes
+
+    w = e4m3_codes(3072, 2048, 1)
+    s = torch.rand(24, 16, generator=torch.Generator().manual_seed(2)) * 1e-2
+    want = dequantize(w, s)
+    work = torch.full((w.numel(),), float("nan"), device="cuda")
+    got = X.dense(w.cuda(), s.cuda(), work)
+    assert got.data_ptr() == work.data_ptr() and torch.equal(got.cpu(), want)
+
+
+def test_the_grouped_path_keeps_its_bits(weights):
+    from tensorfold.families.lfm2_moe.cuda import experts as X
+    from tests.lfm2_moe_tiny import grouped_by_dequantize
+
+    ex = weights.blocks[2].moe.experts
+    g = torch.Generator().manual_seed(3)
+    x = torch.randn(300, weights.config.hidden, generator=g).to(torch.bfloat16).cuda()
+    ids = torch.randint(0, ex.count, (300, 2), generator=g).cuda()
+    assert torch.equal(X.grouped(x, ids, ex), grouped_by_dequantize(x, ids, ex))
+
+
 def test_the_engine_computes_the_reference_on_its_own_picks(tiny, weights, monkeypatch):
     from tests.lfm2_moe_tiny import Picks, reference_logits
 
@@ -223,6 +247,18 @@ def test_the_real_experts_kernels_equal_the_grouped_path(big):
     x = torch.randn(3, big.w.config.hidden, device="cuda").to(torch.bfloat16)
     ids = torch.tensor([[0, 17, 33, 63], [5, 6, 7, 8], [63, 0, 1, 2]], device="cuda")
     assert _close(X.pairs(x, ids, ex), X.grouped(x, ids, ex), 0.01)
+
+
+@real
+def test_the_real_grouped_path_keeps_its_bits(big):
+    from tensorfold.families.lfm2_moe.cuda import experts as X
+    from tests.lfm2_moe_tiny import grouped_by_dequantize
+
+    ex = big.w.blocks[2].moe.experts
+    g = torch.Generator().manual_seed(4)
+    x = torch.randn(512, big.w.config.hidden, generator=g).to(torch.bfloat16).cuda()
+    ids = torch.randint(0, ex.count, (512, 4), generator=g).cuda()
+    assert torch.equal(X.grouped(x, ids, ex, big.e.decoded), grouped_by_dequantize(x, ids, ex))
 
 
 @real

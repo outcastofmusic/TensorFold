@@ -9,7 +9,8 @@ from typing import Any
 
 from tensorfold.server import pythonic_calls
 from tensorfold.server.stopping import StopPolicy
-from tensorfold.server.tools import parse_glm_tool_call_block
+from tensorfold.server.text import hide_tool_calls  # noqa: F401  (the CUDA server's, with the Mac's four formats)
+from tensorfold.server.tools import parse_glm_tool_call_block, tool_spec_name
 from tensorfold.tool_parameters import closed_json, decode_parameter, parameter_schemas
 
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
@@ -17,13 +18,6 @@ _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNOR
 _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
 _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
 
-
-
-def _partial_tag(text: str, tag: str) -> int:
-    for k in range(min(len(tag) - 1, len(text)), 0, -1):
-        if text.endswith(tag[:k]):
-            return k
-    return 0
 
 
 class StreamDecoder:
@@ -77,43 +71,28 @@ class StopStrings:
         return StopPolicy.visible(self, text, partial=partial)
 
 
-def hide_tool_calls(text: str, *, finished: bool) -> str:
-    """The text without its tool-call blocks: Qwen's ``<tool_call>`` and LFM2's ``<|tool_call_start|>``."""
-
-    for opener, closer in ((pythonic_calls.CALL_OPEN, pythonic_calls.CALL_CLOSE), (_CALL_OPEN, _CALL_CLOSE)):
-        text = _hide(text, opener, closer, finished)
-    return text
-
-
-def _hide(text: str, opener: str, closer: str, finished: bool) -> str:
-    out: list[str] = []
-    pos = 0
-    while True:
-        start = text.find(opener, pos)
-        if start < 0:
-            tail = text[pos:]
-            out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, opener))])
-            return "".join(out)
-        out.append(text[pos:start])
-        end = text.find(closer, start)
-        if end < 0:
-            return "".join(out)
-        pos = end + len(closer)
-
-
-def _tool_name(tool: dict[str, Any]) -> str:
-    fn = tool.get("function") if isinstance(tool, dict) else None
-    return str((fn or tool).get("name") or "").strip() if isinstance(tool, dict) else ""
-
-
 def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int | None = None) -> tuple[str, list[dict[str, Any]] | None]:
-    """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..``, JSON or LFM2 calls."""
+    """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..``, JSON or LFM2 calls.
+
+    A reply may name the other format's opener in its prose: LFM2's Pythonic list is read when the reply holds its
+    opener, unless a ``<tool_call>`` block in it parses to calls."""
 
     if not tools:
         return text, None
-    if pythonic_calls.CALL_OPEN in text:                   # LFM2's Pythonic calls
-        return pythonic_calls.parse_tool_calls(text, tools, max_calls=max_calls)
-    known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
+    if pythonic_calls.CALL_OPEN not in text:
+        return _parse_tagged(text, tools, max_calls)
+    if _CALL_OPEN in text.lower():
+        content, calls = _parse_tagged(text, tools, max_calls)
+        if calls:
+            return content, calls
+    return pythonic_calls.parse_tool_calls(text, tools, max_calls=max_calls)
+
+
+def _parse_tagged(text: str, tools: list[dict[str, Any]],
+                  max_calls: int | None) -> tuple[str, list[dict[str, Any]] | None]:
+    """The ``<tool_call>`` blocks' calls (Qwen, GLM or JSON inside)."""
+
+    known = {tool_spec_name(t).lower(): tool_spec_name(t) for t in tools}
     schemas = parameter_schemas(tools)
     calls: list[dict[str, Any]] = []
     residue: list[str] = []
@@ -190,9 +169,9 @@ def close_call(text: str, tools: list[dict[str, Any]]) -> str:
 
     if not tools:
         return ""
-    if pythonic_calls.CALL_OPEN in text:
-        return pythonic_calls.close_call(text, tools)
     low, at, start = text.lower(), 0, None
+    if text.rfind(pythonic_calls.CALL_OPEN) > low.rfind(_CALL_OPEN):     # the reply ends in LFM2's list
+        return pythonic_calls.close_call(text, tools)
     while (opener := low.find(_CALL_OPEN, at)) >= 0:
         closer = low.find(_CALL_CLOSE, opener + len(_CALL_OPEN))
         if closer < 0:

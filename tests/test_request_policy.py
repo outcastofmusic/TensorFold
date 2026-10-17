@@ -223,3 +223,19 @@ def test_single_call_hides_incomplete_namespaced_envelopes(stream, content, visi
         assert not message.get("tool_calls")
         content = message["content"]
     assert content == visible
+
+
+LFM2_CALL = "<|tool_call_start|>[get_weather(city='a')]<|tool_call_end|>"
+
+
+def test_single_call_hides_lfm2_s_pythonic_envelope():
+    from tensorfold.server.tool_policy import ToolCallPolicy
+
+    policy = ToolCallPolicy({"parallel_tool_calls": False})
+    assert policy.content(f"Sure. {LFM2_CALL}", finished=False) == "Sure. "
+    assert policy.content(f"Sure. {LFM2_CALL} Done.") == "Sure.  Done."
+    assert policy.content("Sure. <|tool_ca", finished=False) == "Sure. "
+    assert policy.content("a <|im_end|> b <|x") == "a <|im_end|> b <|x"
+    streamed = ToolCallPolicy({"parallel_tool_calls": False})
+    shown = "".join(streamed.delta(ch) for ch in f"Sure. {LFM2_CALL} Done.") + streamed.flush()
+    assert shown == "Sure.  Done."
