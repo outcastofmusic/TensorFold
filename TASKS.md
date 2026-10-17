@@ -9,7 +9,7 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 
 | Task | State |
 |---|---|
-| Follow-up 2 and d1 part of 4: LFM2.5 fast short prefill, prompt reuse, decode graphs; d1 one head matmul | Agent on `perf/lfm2-prompts` |
+| Follow-up 2 and d1 part of 4: LFM2.5 fast short prefill, prompt reuse, decode graphs; d1 one head matmul | Built on `perf/lfm2-prompts` (`d6319a1e`, `e8c805e2`, `a0b41220`, `b585b8fb`), CPU 4,803 passed. Not merged until `tf-runs/gpu-lfm2/run.sh` passes after bench2, then `PAIRS_ROWS` from its timing tool and a paired TrueScore |
 | Follow-up 4: Qwen persists only the longest state per chain; GLM and Qwen reuse already-written blocks; scheduler `submit` liveness | Agent on `perf/disk-states` |
 | Follow-ups 1 and 3: Bolt decode CUDA graphs and a drafter-only Q8_0 head | Built on `perf/bolt-graphs` (`20201633`, `1b52dad4`), CPU 4,745 passed; expected serial 40-60 tok/s against 29. Not merged until its GPU run passes: `tf-runs/gpu-graphs/run.sh` after bench2 |
 | Code review since 0.8.0 (`8c405e56..7891345f`) | All fixes merged into `feat/integration` (`1bd20c09`): ops, GLM, Bolt, LFM2, Qwen and disk states; CPU 4,794 passed. Gateway branches fixed separately. Waiting for the GPU tests after bench2, then `fork/dev` and "Last reviewed" |
@@ -56,6 +56,7 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 | Four-model TrueScore and planning (thinking off, 17 Oct) | TrueScore: GLM 93.0, Bolt 92.0, FP4-Local 91.0, EXL3 87.8; no pair significant. Planning: FP4-Local 89.8 (Q94), EXL3 89.0 (Q92), GLM 60.5 (Q58), Bolt 38.3 (Q27). GLM and Bolt trail Qwen by 35+ points on planning with thinking off. Results in `tf-runs/truescore`, paired script `paired.py` |
 | GLM regenerate check (#735) | Three served attempts never hit the eviction window; replies identical across arms each time. The CPU tests cover the eviction choice |
 | Faster LFM2.5 prompts | Prefill 747-756 tok/s from 4k tokens, but a fixed ~1.5 s a prompt (42 tok/s at 64 tokens) because each chunk decodes its used experts to fp32. Decode experts to bf16 once a chunk, or run short chunks on the grouped FP8 kernel; it hurts the short tool-routing turns this model is for |
+| Next review: shared prompt-state store | LFM2.5's reuse imports Bolt's `Store`/`keep_points` from `nemotron_bolt/cuda/reuse.py`; move them to a shared module (e.g. `tensorfold/cuda/kept_states.py`) once both branches are merged |
 | Tool-call markup with parallel_tool_calls false | Gemma 4's `<|tool_call>` and DeepSeek-V4's DSML envelopes still stream as content; `server/tool_policy.py`'s `_FIXED` table can take them |
 | Restore production Qwen | Back on 17 Oct 20:21 from `fork/dev` (`8c405e56`, image `tensorfold-run:590ffa112f24`), down from 07:24 UTC |
 | Merge into `fork/dev` | `5d90dc01` pushed 17 Oct: upstream ports, FP4-Local CSF, scan marks, Qwen disk states with pruning and swap persist, GLM message stops, Bolt with reuse and adaptive depth, d1 (opt-in), LFM2.5-24B, swap targets for all. GPU tests 559/560 then all pass; served checks pass (Qwen disk resume 12,071 tokens in 1.6 s, same reply as cold; GLM message stops; LFM2.5 and Super VL smoke). Clef now starts before FP4-Local, and d1 stays off beside GLM |
