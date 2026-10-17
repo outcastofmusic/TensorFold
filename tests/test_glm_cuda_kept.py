@@ -249,3 +249,62 @@ def test_prefill_keeps_every_point_as_a_cut_without_splitting_a_chunk(monkeypatc
     kept.clear()
     decode.prefill(e, prompt, None, keep_at=40, keep=kept.append, rows=8)   # a background pass's state at the end
     assert passes == [(p, 8, []) for p in range(0, 40, 8)] and [len(s.ids) for s in kept] == [40]
+
+
+class RingDrafter:
+    """The context side of a ring ``dflash2.Drafter``: each tap row (its position) lands at position % ring."""
+
+    window, ring = 48, 128                       # a slack of 79 rows past a kept point's window
+
+    def __init__(self, torch) -> None:
+        self.kc = [torch.full((1, self.ring, 1), -1.0)]
+        self.vc = [torch.full((1, self.ring, 1), -1.0)]
+        self.context_end = 0
+        self.pos_dev = torch.zeros((1,), dtype=torch.int64)
+
+    def reset(self) -> None:
+        self.context_end = 0
+        self.pos_dev.zero_()
+
+    def add_taps(self, taps) -> None:
+        for p in taps[:, 0].tolist():
+            assert p == self.context_end, "taps arrive in position order"
+            for c in self.kc + self.vc:
+                c[:, int(p) % self.ring] = p
+            self.context_end += 1
+        self.pos_dev.fill_(self.context_end)
+
+
+def test_a_cut_far_before_its_chunks_end_keeps_its_ring_window(monkeypatch):
+    """A cut more than the ring's slack before its chunk's end keeps the DFlash2 window a fresh prefill of its prefix
+    leaves (before the fix: ``drafter_end`` -1, so no DFlash2 request resumed it)."""
+    import torch
+
+    from tensorfold.families.glm5_next.cuda import decode
+
+    st = SimpleNamespace(rec=torch.zeros(2, 3), conv=torch.zeros(3), cur=[0], pos=0, mtp_len=0, mtp_drafted=0)
+
+    def commit(w, st, b, R, keep):
+        st.pos += R
+
+    monkeypatch.setattr(decode, "stage", lambda w, st, b, chunk: len(chunk))
+    monkeypatch.setattr(decode, "compute", lambda w, st, b, R, *, nch, host_pos, cuts: torch.zeros(1))
+    monkeypatch.setattr(decode, "commit", commit)
+    monkeypatch.setattr(decode, "chunks_for", lambda st, R: 1)
+    e = SimpleNamespace(w=SimpleNamespace(mtp=None, cfg=SimpleNamespace(mtp_layers=0)), st=st,
+                        pbuf=SimpleNamespace(fnormed=torch.zeros(256, 1)), prefill_rows=256, constraint=None,
+                        reset=lambda: setattr(st, "pos", 0), sample=lambda last, at, s: [5], follow=lambda t: None,
+                        tap_rows=lambda n, b: torch.arange(st.pos, st.pos + n, dtype=torch.float32)[:, None])
+    drafter = RingDrafter(torch)
+    prompt = list(range(400))
+    kept = []
+    decode.prefill(e, prompt, None, drafter=drafter, keep_at=399, stops=[20, 100, 300], keep=kept.append)
+    assert [len(s.ids) for s in kept] == [20, 100, 300, 399]
+    assert drafter.context_end == 400                       # every tap went in once, in order
+    for snap in kept:                                       # 236, 156, 100 and 1 rows before their chunks' ends
+        n = len(snap.ids)
+        assert snap.drafter_end == n and snap.drafter_rows is not None, n
+        decode.prefill(e, prompt[:n], None, drafter=drafter)
+        fresh = decode.take_snapshot(e, prompt[:n], None, mtp=False, drafter=drafter)
+        assert all(torch.equal(a, b) for a, b in zip(snap.drafter_rows, fresh.drafter_rows)), n
+        assert snap.drafter_rows[0][0, :, 0].tolist() == list(range(max(0, n - drafter.window - 1), n))
