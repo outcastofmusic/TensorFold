@@ -209,8 +209,10 @@ def csf_scales(fixed: torch.Tensor, exceptions: Sequence[torch.Tensor]) -> torch
     packed = fixed[:, :, 16:].reshape(e, rows, cols // 2)
     out = (torch.stack((packed & 0xF, packed >> 4), dim=-1).reshape(e, rows, cols) + bases).reshape(-1)  # <= 255
     words = torch.cat([x.reshape(-1).view(torch.int32) for x in exceptions]).to(torch.int64) & 0xFFFFFFFF
+    # output_size: the count is known here, so repeat_interleave does not read it back from the device
     owner = torch.repeat_interleave(torch.arange(e, device=fixed.device),
-                                    torch.tensor([x.numel() for x in exceptions], device=fixed.device))
+                                    torch.tensor([x.numel() for x in exceptions], device=fixed.device),
+                                    output_size=words.numel())
     local = words & 0xFFFFFF
     bad = (bases > 240).any()
     if words.numel():
