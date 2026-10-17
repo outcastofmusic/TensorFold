@@ -13,7 +13,7 @@ from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 from . import glue, prof, qmm
-from .forward import Buffers, State, chunks_for, commit, compute, stage
+from .forward import Buffers, Cut, State, chunks_for, commit, compute, stage
 from .mtp import mtp_compute, mtp_forward, mtp_stage
 from .sparse import pool_bucket
 from .weights import Weights
@@ -358,7 +358,8 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
     """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state.
 
     ``keep`` gets the state at ``keep_at`` after the last chunk, and the state at each of ``stops`` as its chunk
-    ends there.
+    ends. A kept point splits no chunk: one inside a chunk is a cut (``forward.Cut``), which runs the KDA chain in
+    pieces within the same pass, so a prompt costs its passes however many states it keeps.
 
     ``stop()`` is asked before each chunk: once it holds, the prompt is abandoned with ``RequestCancelled`` and
     the caller must reset the engine before its next prompt.
@@ -385,14 +386,12 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         if use_mtp:
             k = resume.pending.shape[0]
             _absorb_rows(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
-    if keep_at is not None:                              # only a kept prefix cuts a chunk at an interior row
-        from .forward import Cut
-
-        if keep is None or not max(1, begin) <= keep_at <= len(prompt):
-            raise ValueError("a kept prefix needs a callback and a point in the prompt's prefill")
+    if keep_at is not None and (keep is None or not max(1, begin) <= keep_at <= len(prompt)):
+        raise ValueError("a kept prefix needs a callback and a point in the prompt's prefill")
     stops = sorted({p for p in stops if begin < p < len(prompt) and p != keep_at})
     if stops and keep is None:
         raise ValueError("kept prefixes need a callback")
+    points = sorted(stops + ([keep_at] if keep_at is not None and keep_at > begin else []))
     kept = resume if keep_at == begin else None
     last = None
     prof.active = True
@@ -403,28 +402,27 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
 
             prof.active = False
             raise RequestCancelled("the client left while its prompt was filling")
-        end = min(start + min(rows or e.prefill_rows, e.prefill_rows), len(prompt),
-                  next((p for p in stops if p > start), len(prompt)))
+        end = min(start + min(rows or e.prefill_rows, e.prefill_rows), len(prompt))
         chunk = list(prompt[start:end])
         R = len(chunk)
-        at = keep_at if keep_at is not None and start < keep_at <= end else end if end in stops else None
-        point = at - start if at is not None else 0
-        cut = Cut(point, torch.empty_like(st.rec[0]), st.conv.clone()) if 0 < point < R else None
-        last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cut=cut).clone()
+        here = [p - start for p in points if start < p <= end]
+        cuts = [Cut(point, torch.empty_like(st.rec[0]), st.conv.clone()) for point in here if point < R]
+        last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cuts=cuts).clone()
         e.last_hidden = b.fnormed[R - 1:R].clone()
-        snap = None
-        if 0 < point <= R:
+        snaps = []
+        for point, cut in zip(here, cuts + [None]):       # the cuts in order, then a point at the chunk's end
             rec = cut.rec if cut is not None else st.rec[st.cur[0] if st.cur else 0].clone()
             conv = cut.conv if cut is not None else st.conv.clone()
-            snap = Snapshot(list(prompt[:at]), rec, conv,
-                            b.fnormed[point - 1:point].clone() if use_mtp else None,
-                            at - 1 if use_mtp else -1, at if drafter is not None else -1)
+            at = start + point
+            snaps.append(Snapshot(list(prompt[:at]), rec, conv,
+                                  b.fnormed[point - 1:point].clone() if use_mtp else None,
+                                  at - 1 if use_mtp else -1, at if drafter is not None else -1))
         if drafter is not None:
             drafter.add_taps(e.tap_rows(R, b))
-            if snap is not None and getattr(drafter, "ring", 0):
+            for snap in snaps if getattr(drafter, "ring", 0) else ():
                 # a ring keeps the kept point's window unless this chunk wrote past it by more than the ring's slack
-                if R - point < drafter.ring - drafter.window:
-                    snap.drafter_rows = _ring_window(drafter, at)
+                if end - len(snap.ids) < drafter.ring - drafter.window:
+                    snap.drafter_rows = _ring_window(drafter, len(snap.ids))
                 else:
                     snap.drafter_end = -1
         if use_mtp:
@@ -434,10 +432,11 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
                     _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
         with prof.timed("commit"):
             commit(w, st, b, R, R)
-        if snap is not None and at == keep_at:
-            kept = snap
-        elif snap is not None:
-            keep(snap)
+        for snap in snaps:
+            if len(snap.ids) == keep_at:
+                kept = snap
+            else:
+                keep(snap)
         start = end
     if kept is not None:
         keep(kept)
