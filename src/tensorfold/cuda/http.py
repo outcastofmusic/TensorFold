@@ -111,6 +111,8 @@ def make_handler(app: App):
                 return self._post_decisions()
             if path.endswith("/systemone"):
                 return self._post_decisions("systemone")
+            if path == "/internal/persist":
+                return self._post_persist()
             if anthropic.route(self.path):
                 return anthropic.post(self, app)
             if responses.route(self.path) == "":         # a Response: this handler's chat completion, translated
@@ -279,6 +281,20 @@ def make_handler(app: App):
                            "usage": usage, "tensorfold": result["stats"]}
             if result.get("stop_sequence") is not None:
                 payload["stop_sequence"] = result["stop_sequence"]
+            self._json(200, payload)
+
+        def _post_persist(self) -> None:
+            """Write the kept prompt states to disk and answer once they are there (swap.py, before a swap)."""
+
+            self._discard_body()
+            try:
+                payload = app.persist()
+            except Exception as exc:        # a failed write is the server's, and the swap goes on without it
+                _log_error(exc)
+                try:
+                    return self._json(500, {"error": {"message": _error_message(exc)}})
+                except OSError:
+                    return
             self._json(200, payload)
 
         def _post_decisions(self, name: str = "decisions") -> None:

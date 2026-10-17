@@ -21,6 +21,9 @@ def swap(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "loaded", lambda: None)
+    with socket.socket() as free:                        # no backend: a swap's persist must not reach a real server
+        free.bind(("127.0.0.1", 0))
+        module.BACKEND = free.getsockname()[1]
     return module
 
 
@@ -139,3 +142,54 @@ def test_a_body_without_a_usable_length_is_refused(swap, headers, status):
         assert status in client.recv(200).split(b"\r\n")[0] + b" "
     finally:
         front.shutdown()
+
+
+class _Persist(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    log: Path
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        with open(_Persist.log, "a") as f:
+            f.write(f"{self.path}\n")
+        body = json.dumps({"disk": True, "written": 2, "states": 5}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_a_swap_has_the_outgoing_model_write_its_states_before_run_sh_stops_it(swap, tmp_path, capsys):
+    log = tmp_path / "order"
+    _Persist.log = log
+    backend = _serve(_Persist)
+    swap.BACKEND = backend.server_address[1]
+    run = tmp_path / "run.sh"
+    run.write_text(f"#!/bin/sh\necho run $1 >> {log}\n")
+    run.chmod(0o755)
+    swap.RUN = str(run)
+    try:
+        swapper = swap.Swapper()
+        swapper.current = "qwen3.8-flash-next"
+        assert swapper.enter("glm-5.3-flash") == "glm-5.3-flash"
+        swapper.leave()
+    finally:
+        backend.shutdown()
+    assert log.read_text().splitlines() == ["/internal/persist", "run glm-5.3-flash"]
+    assert "qwen3.8-flash-next wrote 2 kept states to disk" in capsys.readouterr().out
+
+
+def test_a_swap_goes_on_when_the_outgoing_model_cannot_write(swap, tmp_path, capsys):
+    log = tmp_path / "order"
+    run = tmp_path / "run.sh"
+    run.write_text(f"#!/bin/sh\necho run $1 >> {log}\n")
+    run.chmod(0o755)
+    swap.RUN = str(run)
+    swapper = swap.Swapper()
+    swapper.current = "qwen3.8-flash-next"
+    assert swapper.enter("glm-5.3-flash") == "glm-5.3-flash"     # nothing listens on the backend port
+    assert log.read_text().split() == ["run", "glm-5.3-flash"]
+    assert "did not write its kept states" in capsys.readouterr().out

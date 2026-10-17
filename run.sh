@@ -14,7 +14,7 @@
 # Settings (environment):
 #   MODELS=~/models            where prepare.sh put the checkpoints
 #   PORT=30000                 the model's port;  CLEF_PORT=30001 the guard's;  BACKEND_PORT=30002 the model's under swap
-#   SWAP_DRAIN=600  SWAP_HOLD=0  SWAP_TIMEOUT=3600   swap.py's waits, in seconds (its header says what each does)
+#   SWAP_DRAIN=600  SWAP_HOLD=0  SWAP_TIMEOUT=3600  SWAP_PERSIST=120   swap.py's waits, in seconds (its header says what each does)
 #   TF_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 #   EXTRA="..."                more `tensorfold serve` flags
 #   QWEN_MODEL, CLEF_MODEL, GLM_MODEL   another checkpoint folder under $MODELS

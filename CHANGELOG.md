@@ -16,6 +16,9 @@ GitHub has the full notes and the measurements behind them.
   bytes a token: 298.7 MB at 10,000 tokens and 1,030.9 MB at 50,000. GLM's store now serves both models
   (`tensorfold.cuda.disk_states`), and `TENSORFOLD_QWEN_STATES_GIB` (64) caps Qwen's folder. Two ranks refuse to
   start with it set. Not yet measured on the GPU.
+- **A swap writes the outgoing model's kept states to disk first.** `POST /internal/persist` writes every kept state
+  not on disk yet and answers once they are there, at once when states stay in memory. `swap.py` sends it after the
+  running requests finish and before `run.sh` stops the model, and waits up to `SWAP_PERSIST` seconds (120).
 
 ## 0.8.0 (16 Oct 2026)
 
