@@ -3,6 +3,8 @@
 The running list of TensorFold work on this box: what is done, in progress, to do or cancelled. `playbook.md` holds the
 guidance for bringing up a new model; this file holds the work. Dates are 2026.
 
+Standing rule: after every few merges into `fork/dev`, review what landed since the last review (bugs, poor engineering, over-complicated, dead or duplicated code, optimizations) without changing replies or speed, and record the reviewed range here. Last reviewed: 0.8.0 (`8c405e56`).
+
 ## In progress
 
 | Task | State |
