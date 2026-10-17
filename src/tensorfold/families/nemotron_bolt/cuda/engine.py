@@ -427,11 +427,18 @@ class DecodeResult:
     rounds: int
     drafted: int = 0
     accepted: int = 0
-    widths: list[int] = field(default_factory=list)
+    widths: list[int] = field(default_factory=list)     # rows verified a round: the pending token and its drafts
+    keeps: list[int] = field(default_factory=list)      # tokens kept a round: 1 + accepted drafts
 
     @property
     def tokens_per_second(self) -> float:
         return (len(self.tokens) - 1) / self.seconds if self.seconds else 0.0
+
+    @property
+    def acceptance_length(self) -> float:
+        """Tokens a verify round yields, the README's 'acceptance length' (4.30 on SPEED-Bench at depth 7)."""
+
+        return sum(self.keeps) / len(self.keeps) if self.keeps else 0.0
 
 
 @torch.no_grad()
@@ -516,4 +523,5 @@ def serial_decode(e: Engine, pending: int, count: int, sampling, *, stop_eos: bo
     finally:
         e.mask(None, None)
     torch.cuda.synchronize()
-    return DecodeResult(out, time.perf_counter() - start, len(out) - 1, widths=[1] * (len(out) - 1))
+    steps = len(out) - 1
+    return DecodeResult(out, time.perf_counter() - start, steps, widths=[1] * steps, keeps=[1] * steps)

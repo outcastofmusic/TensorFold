@@ -1,7 +1,9 @@
 """fp32 PyTorch forward of Bolt from the loaded weights (any device), the yardstick for the engine's bf16 kernels.
 
 It follows modeling_nemotron_h.py of the checkpoint (NemotronHBlock, NemotronHMoE, NemotronHMamba2Mixer's torch path)
-with every activation in fp32; NVFP4 projections need ``load(..., raw=True)``.
+with every activation in fp32; NVFP4 projections need ``load(..., raw=True)``. The routing, relu2 and RMSNorm are
+``reference.py``'s; this module keeps its own layers because it reads the engine's loaded ``Weights`` (bf16 Q8_0
+decodes, stacked IQ2_XXS tables, fused qkv) where ``reference.py`` reads the checkpoint, a layer at a time.
 """
 
 from __future__ import annotations
@@ -9,27 +11,8 @@ from __future__ import annotations
 import torch
 
 from ..quant import dequantize_iq2xxs
+from ..reference import relu2, rms, route
 from .weights import Attention, Mamba, MoE, Weights
-
-
-def _rms(x: torch.Tensor, w: torch.Tensor | None, eps: float) -> torch.Tensor:
-    y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    return y * w.float() if w is not None else y
-
-
-def route(logits: torch.Tensor, bias: torch.Tensor, top_k: int, scaling: float, norm: bool):
-    """Top-k by sigmoid score + bias (ties to the lower expert id); weights from the plain scores, scaled."""
-
-    score = torch.sigmoid(logits)
-    order = torch.sort(score + bias, dim=-1, descending=True, stable=True).indices[:, :top_k]
-    w = torch.gather(score, 1, order)
-    if norm:
-        w = w / (w.sum(-1, keepdim=True) + 1e-20)
-    return order, w * scaling
-
-
-def _relu2(x: torch.Tensor) -> torch.Tensor:
-    return torch.relu(x).pow(2)
 
 
 def moe(m: MoE, x: torch.Tensor, scaling: float, norm: bool) -> torch.Tensor:
@@ -39,8 +22,8 @@ def moe(m: MoE, x: torch.Tensor, scaling: float, norm: bool) -> torch.Tensor:
     for e in torch.unique(idx).tolist():
         rows, slot = (idx == e).nonzero(as_tuple=True)
         up = latent[rows] @ dequantize_iq2xxs(m.up[e]).float().T
-        routed.index_add_(0, rows, wts[rows, slot][:, None] * (_relu2(up) @ dequantize_iq2xxs(m.down[e]).float().T))
-    shared = _relu2(x @ dequantize_iq2xxs(m.shared_up).float().T) @ dequantize_iq2xxs(m.shared_down).float().T
+        routed.index_add_(0, rows, wts[rows, slot][:, None] * (relu2(up) @ dequantize_iq2xxs(m.down[e]).float().T))
+    shared = relu2(x @ dequantize_iq2xxs(m.shared_up).float().T) @ dequantize_iq2xxs(m.shared_down).float().T
     return routed @ m.fc2.float().T + shared
 
 
@@ -64,7 +47,7 @@ def mamba(m: Mamba, x: torch.Tensor, c) -> torch.Tensor:
         state = state * torch.exp(m.a * dt[t])[:, None, None] + (xs[t] * dt[t][:, None])[:, :, None] * Bt[:, None, :]
         ys.append((state * Ct[:, None, :]).sum(-1) + m.d[:, None] * xs[t])
     y = torch.stack(ys).reshape(T, c.xd) * torch.nn.functional.silu(z)
-    y = _rms(y.reshape(T, c.m_groups, -1), None, c.eps).reshape(T, c.xd) * m.gnorm.float()
+    y = rms(y.reshape(T, c.m_groups, -1), None, c.eps).reshape(T, c.xd) * m.gnorm.float()
     return y @ m.out_proj.dequantized().float().T
 
 
@@ -91,7 +74,7 @@ def forward(w: Weights, tokens: torch.Tensor, taps: tuple[int, ...] = ()) -> tup
     x = w.embed[tokens.long()].float()
     streams = []
     for blk in w.blocks:
-        h = _rms(x, blk.norm, c.eps)
+        h = rms(x, blk.norm, c.eps)
         if blk.kind == "M":
             x = x + mamba(blk.mamba, h, c)
         elif blk.kind == "*":
@@ -99,4 +82,4 @@ def forward(w: Weights, tokens: torch.Tensor, taps: tuple[int, ...] = ()) -> tup
         else:
             x = x + moe(blk.moe, h, c.scaling, c.norm_topk)
         streams.append(x)
-    return _rms(x, w.norm_f, c.eps) @ w.head.float().T, [streams[t] for t in taps]
+    return rms(x, w.norm_f, c.eps) @ w.head.float().T, [streams[t] for t in taps]

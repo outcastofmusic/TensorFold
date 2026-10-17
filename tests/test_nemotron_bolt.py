@@ -175,7 +175,7 @@ def test_reference_is_causal_and_taps_the_stream(tiny):
     assert full.shape == (8, 1024) and torch.isfinite(full).all()
     assert torch.allclose(full[:5], head, rtol=1e-4, atol=1e-4)
     assert [t.shape for t in taps] == [(8, 512), (8, 512)]
-    final = reference._rms(taps[1], w.norm_f, w.config.eps) @ w.head.float().T
+    final = reference.rms(taps[1], w.norm_f.float(), w.config.eps) @ w.head.float().T
     assert torch.allclose(final, full, rtol=1e-5, atol=1e-5)      # the last layer's stream is the head's input
 
 

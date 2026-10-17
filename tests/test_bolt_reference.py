@@ -159,6 +159,17 @@ def test_route_ranks_by_biased_score_and_weights_by_plain_score():
         assert wt == pytest.approx(want[e].item(), rel=1e-6)
 
 
+def test_route_breaks_ties_toward_the_lower_expert():
+    import torch
+
+    from tensorfold.families.nemotron_bolt.cuda import reference as cuda_reference
+    from tensorfold.families.nemotron_bolt.reference import route
+
+    idx, _ = route(torch.zeros((1, 64)), torch.zeros(64), 9, 1.0, True)
+    assert idx[0].tolist() == list(range(9))                     # as the engine's router kernel picks
+    assert cuda_reference.route is route
+
+
 def test_config_reads_the_bolt_layout(tmp_path):
     from tensorfold.families.nemotron_bolt.reference import Config
 
@@ -178,3 +189,8 @@ def test_config_reads_the_bolt_layout(tmp_path):
     assert c.conv_dim == 128 * 64 + 2 * 8 * 128 == 10240
     assert c.xd + c.conv_dim + c.m_heads == 18560                          # in_proj's rows in the checkpoint
     assert c.blocks[1].experts == 240 and c.blocks[1].top_k == 9 and c.eos == (2, 11)
+    assert (c.dt_floor, c.dt_ceil) == (0.0, float("inf"))                 # no time_step_limit: unclamped
+    raw["llm_config"]["time_step_limit"] = [0.001, {"__float__": "Infinity"}]
+    (root / "config.json").write_text(json.dumps(raw))
+    c = Config.from_dir(root)
+    assert (c.dt_floor, c.dt_ceil) == (0.001, float("inf"))

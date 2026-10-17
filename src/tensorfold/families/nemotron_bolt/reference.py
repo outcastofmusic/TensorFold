@@ -5,8 +5,8 @@ than one layer: the routed experts alone would be about 132 GB in bf16. Every de
 matmul runs in fp32, so the reference's gap to a bf16 engine is the engine's own rounding.
 
 The math follows the checkpoint's modeling_nemotron_h.py: a block is ``x + mixer(rmsnorm(x))``; Mamba-2 runs as a
-plain sequential scan with no clamp on dt (the checkpoint's CUDA path and vLLM pass dt_limit = (0, inf); its torch
-fallback clamps dt at time_step_min = 1e-3, see ``Config.dt_floor``); attention is GQA without positional encoding;
+plain sequential scan with dt clamped to the config's time_step_limit, as the checkpoint's CUDA path and vLLM clamp it
+((0, inf) on Bolt; its torch fallback clamps dt at time_step_min = 1e-3, see ``Config.dt_floor``); attention is GQA without positional encoding;
 MoE routes on sigmoid scores plus the correction bias, weights the top 9 by their plain scores normalized and times
 routed_scaling_factor, runs relu2 experts inside the 1024-wide latent (fc1_latent_proj in, fc2_latent_proj out) and
 adds the shared relu2 expert on the block's input.
@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from . import quant
+from .cuda.weights import config_float
 
 PREFIX = "language_model."
 LAYERS = PREFIX + "backbone.layers."
@@ -57,7 +58,8 @@ class Config:
     norm_topk: bool
     eps: float
     eos: tuple[int, ...]
-    dt_floor: float = 0.0         # 1e-3 reproduces the HF torch fallback's clamp; 0 is what the CUDA path runs
+    dt_floor: float = 0.0         # time_step_limit[0]; 1e-3 reproduces the HF torch fallback's clamp
+    dt_ceil: float = float("inf")  # time_step_limit[1]
 
     @property
     def xd(self) -> int:
@@ -78,7 +80,8 @@ class Config:
         gen = model_dir / "generation_config.json"
         if gen.is_file():
             eos = json.loads(gen.read_text()).get("eos_token_id", eos)
-        return cls(hidden=c["hidden_size"], vocab=c["vocab_size"], blocks=blocks, heads=c["num_attention_heads"],
+        limit = c.get("time_step_limit") or (0.0, float("inf"))     # the checkpoint's CUDA path and vLLM clamp here
+        return cls(dt_floor=config_float(limit[0]), dt_ceil=config_float(limit[1]),hidden=c["hidden_size"], vocab=c["vocab_size"], blocks=blocks, heads=c["num_attention_heads"],
                    kv_heads=c["num_key_value_heads"], head_dim=c["head_dim"], m_heads=c["mamba_num_heads"],
                    m_head_dim=c["mamba_head_dim"], m_groups=c["n_groups"], m_state=c["ssm_state_size"],
                    conv_kernel=c["conv_kernel"], latent=c["moe_latent_size"],
@@ -171,7 +174,7 @@ def mamba(ck: Checkpoint, i: int, x: torch.Tensor, st: State) -> torch.Tensor:
     xs = conv[:, :c.xd].reshape(T, c.m_heads, c.m_head_dim)
     B = conv[:, c.xd:c.xd + gs].reshape(T, c.m_groups, c.m_state).repeat_interleave(c.m_heads // c.m_groups, 1)
     C = conv[:, c.xd + gs:].reshape(T, c.m_groups, c.m_state).repeat_interleave(c.m_heads // c.m_groups, 1)
-    dt = F.softplus(dt + ck.vector(p + "dt_bias")).clamp_min(c.dt_floor)  # [T, H]
+    dt = F.softplus(dt + ck.vector(p + "dt_bias")).clamp(c.dt_floor, c.dt_ceil)  # [T, H]
     A = -torch.exp(ck.vector(p + "A_log"))
     D = ck.vector(p + "D")
     h = st.ssm.get(i, torch.zeros((c.m_heads, c.m_head_dim, c.m_state), device=x.device))
@@ -204,10 +207,11 @@ def attention(ck: Checkpoint, i: int, x: torch.Tensor, st: State) -> torch.Tenso
 
 
 def route(logits: torch.Tensor, bias: torch.Tensor, top_k: int, scaling: float, norm: bool):
-    """Top-k experts by sigmoid score + bias; weights are the chosen plain scores, normalized, times ``scaling``."""
+    """Top-k experts by sigmoid score + bias (ties to the lower expert id, as the engine's router picks); weights are
+    the chosen plain scores, normalized, times ``scaling``."""
 
     score = torch.sigmoid(logits)
-    idx = torch.topk(score + bias, top_k, dim=-1).indices
+    idx = torch.sort(score + bias, dim=-1, descending=True, stable=True).indices[:, :top_k]
     w = torch.gather(score, 1, idx)
     if norm:
         w = w / (w.sum(-1, keepdim=True) + 1e-20)

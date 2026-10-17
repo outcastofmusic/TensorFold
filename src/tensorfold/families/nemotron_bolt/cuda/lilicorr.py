@@ -25,7 +25,7 @@ import json
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +33,8 @@ import torch
 import torch.nn.functional as F
 
 from tensorfold.engine.exact_sampling import Sampling, uniform_rows
+
+from .engine import DecodeResult
 
 NVFP4_GROUP = 16              # inputs an e4m3 scale covers
 LATTICE_FEATURES = 5          # log p, p, log p - max, rank / (k - 1), is-top-1 (vLLM LiLiCorrHead)
@@ -576,27 +578,6 @@ class Drafter:
 
 
 # -- verification ---------------------------------------------------------------------------------------------------
-@dataclass
-class DecodeResult:
-    tokens: list[int]
-    seconds: float
-    rounds: int
-    drafted: int = 0
-    accepted: int = 0
-    widths: list[int] = field(default_factory=list)     # rows verified a round: the pending token and its drafts
-    keeps: list[int] = field(default_factory=list)      # tokens kept a round: 1 + accepted drafts
-
-    @property
-    def tokens_per_second(self) -> float:
-        return (len(self.tokens) - 1) / self.seconds if self.seconds else 0.0
-
-    @property
-    def acceptance_length(self) -> float:
-        """Tokens a verify round yields, the README's 'acceptance length' (4.30 on SPEED-Bench at depth 7)."""
-
-        return sum(self.keeps) / len(self.keeps) if self.keeps else 0.0
-
-
 def _sample(engine, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None) -> list[int]:
     """The window's tokens from the sampler serial decoding uses: the engine's own when it has one.
 

@@ -22,7 +22,7 @@ from ..quant import IQ2XXS_BYTES, Q8_0_BLOCK, Q8_0_BYTES, dequantize_nvfp4, dequ
 KINDS = {"mamba": "M", "attention": "*", "moe": "E"}
 
 
-def _number(value: Any) -> float:
+def config_float(value: Any) -> float:
     """A config float; ``{"__float__": "Infinity"}`` is how the checkpoint writes inf."""
 
     if isinstance(value, dict) and "__float__" in value:
@@ -103,7 +103,7 @@ class Config:
             latent=int(t.get("moe_latent_size") or t["hidden_size"]),
             scaling=float(t.get("routed_scaling_factor") or 1.0), norm_topk=bool(t.get("norm_topk_prob", True)),
             eps=float(t.get("layer_norm_epsilon") or t.get("norm_eps") or 1e-5),
-            dt_min=_number(limit[0]), dt_max=_number(limit[1]), eos=eos)
+            dt_min=config_float(limit[0]), dt_max=config_float(limit[1]), eos=eos)
 
 
 def _eos(model_dir: Path, raw: dict) -> tuple[int, ...]:
