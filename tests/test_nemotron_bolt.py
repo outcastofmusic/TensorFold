@@ -154,6 +154,22 @@ def test_loader_names_a_tensor_it_did_not_read(tmp_path):
         load(path, "cpu")
 
 
+def test_a_failed_load_closes_its_files(tmp_path, monkeypatch):
+    from tensorfold.families.nemotron_bolt.cuda import weights
+    from tests.bolt_tiny import write
+
+    path = write(tmp_path / "odd")
+    quant = json.loads((path / "hf_quant_config.json").read_text())
+    quant["quantization"]["quantized_layers"]["language_model.backbone.layers.4.mixer.in_proj"]["quant_algo"] = "Q8_0"
+    (path / "hf_quant_config.json").write_text(json.dumps(quant))
+    closed = []
+    close = weights._Reader.close
+    monkeypatch.setattr(weights._Reader, "close", lambda self: closed.append(1) or close(self))
+    with pytest.raises(ValueError, match="W4A16_NVFP4, not Q8_0"):
+        weights.load(path, "cpu")
+    assert closed == [1]
+
+
 def test_a_truncated_load_reads_only_its_layers(tiny):
     from tensorfold.families.nemotron_bolt.cuda.weights import load, weight_bytes
 

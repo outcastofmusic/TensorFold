@@ -280,9 +280,9 @@ class Loader:
     def __init__(self, model_dir: Path, device: str, raw: bool):
         self.dir, self.device, self.raw = model_dir, device, raw
         self.c = Config.read(model_dir)
-        self.r = _Reader(sorted(model_dir.glob("model*.safetensors")), device)
-        self.root = "language_model." if "language_model.lm_head.weight" in self.r else ""
         self.formats = quant_layers(model_dir)
+        self.r = _Reader(sorted(model_dir.glob("model*.safetensors")), device)     # ``load`` closes it
+        self.root = "language_model." if "language_model.lm_head.weight" in self.r else ""
         self.staging = None
 
     def name(self, short: str) -> str:
@@ -390,7 +390,6 @@ class Loader:
                     norm_f=self.tensor("backbone.norm_f.weight").to(torch.bfloat16), head=self.bf16("lm_head"))
         # the omni checkpoint's vision, audio and projector tensors sit outside the language model's root
         left = [n for n in self.r.unused() if n.startswith(self.root) and not n.startswith(TEXT_ONLY_SKIPS)]
-        self.r.close()
         if left:
             raise ValueError(f"unused checkpoint tensors: {left[:5]}")
         return w
@@ -411,7 +410,11 @@ def load(model_dir: str | Path, device: str = "cuda", *, raw: bool = False, laye
     ``raw`` keeps the NVFP4 projections' stored tensors beside their kernels' layout, for references and tests.
     """
 
-    return Loader(Path(model_dir), device, raw).load(layers)
+    loader = Loader(Path(model_dir), device, raw)
+    try:
+        return loader.load(layers)
+    finally:
+        loader.r.close()
 
 
 def weight_bytes(model_dir: str | Path, layers: int | None = None) -> int:
