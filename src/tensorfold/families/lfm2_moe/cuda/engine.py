@@ -142,8 +142,8 @@ class Engine:
             from tensorfold.families.nemotron_h.cuda import attention as A
 
             self.meta[0] = self.pos
-            packed = torch.cat([q.view(rows, qd), qkv[:, qd:]], dim=-1)  # the kernel reads q from its first columns
-            out, _ = A.attention(packed, kc, vc, self.meta, rows, heads=c.heads, kv_heads=c.kv_heads,
+            # the kernel reads each row's q from its first heads * head_dim columns, rows its width apart
+            out, _ = A.attention(q.view(rows, qd), kc, vc, self.meta, rows, heads=c.heads, kv_heads=c.kv_heads,
                                  head_dim=c.head_dim, max_chunks=self.max_len // CHUNK)
         return a.out(out, prompt)
 
