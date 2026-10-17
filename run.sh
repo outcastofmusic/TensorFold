@@ -18,7 +18,7 @@
 #   TF_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 #   EXTRA="..."                more `tensorfold serve` flags
 #   QWEN_MODEL, CLEF_MODEL, GLM_MODEL   another checkpoint folder under $MODELS
-# Both:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds
+# Both:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused
 # Qwen:  CONTEXT=262144  PARALLEL=4  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
@@ -163,7 +163,7 @@ qwen() {
     fi
     # kept prompt states also go to disk, so a conversation's next turn after a swap or restart reads its state back;
     # Qwen's folder sits beside GLM's checkpoint folders, each holding a subfolder per checkpoint and build
-    [ "${STATES:-1}" = 0 ] || flags+=(-v tensorfold-states:/states -e TENSORFOLD_QWEN_STATES=/states/qwen -e "TENSORFOLD_QWEN_STATES_GIB=${STATES_GIB:-64}")
+    [ "${STATES:-1}" = 0 ] || flags+=(-v tensorfold-states:/states -e TENSORFOLD_QWEN_STATES=/states/qwen -e "TENSORFOLD_QWEN_STATES_GIB=${STATES_GIB:-64}" -e "TENSORFOLD_QWEN_STATES_TTL_H=${STATES_TTL_H:-72}")
     serve tensorfold-serve "${flags[@]}" -- "$model" --host 127.0.0.1 --port "$PORT" --name qwen3.8-flash-next \
         --context "${CONTEXT:-262144}" --max-tokens "${CONTEXT:-262144}" --parallel "${PARALLEL:-4}" --kv-dtype "${KV:-int8}" \
         "${vision[@]}" "${guard[@]}" "${budget[@]}" ${EXTRA:-}
@@ -191,7 +191,7 @@ glm() {
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
     # kept prompt states also go to disk, so a conversation's next turn after a swap or restart reads its state back
     local states=()
-    [ "${STATES:-1}" = 0 ] || states=(-v tensorfold-states:/states -e TENSORFOLD_GLM_STATES=/states -e "TENSORFOLD_GLM_STATES_GIB=${STATES_GIB:-64}")
+    [ "${STATES:-1}" = 0 ] || states=(-v tensorfold-states:/states -e TENSORFOLD_GLM_STATES=/states -e "TENSORFOLD_GLM_STATES_GIB=${STATES_GIB:-64}" -e "TENSORFOLD_GLM_STATES_TTL_H=${STATES_TTL_H:-72}")
     IMAGE=$(image)
     stop_all
     [ "$(avail)" -ge 100 ] || echo "run: $(avail) GiB available; GLM needs about 100 and the server refuses to start with less" >&2

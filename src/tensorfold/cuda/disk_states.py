@@ -6,9 +6,13 @@ A state is its small tensors (GLM: KDA states, conv windows, pending MTP rows, t
 states, conv windows, n-gram windows, the MTP tail) and its attention rows: each view's first rows, along dimension
 0, in blocks of ``BLOCK`` rows. Every piece is a file named by the SHA-256 of its bytes, so blocks two states share
 are stored once and every read is checked against its name. A state's JSON is written last, by rename, so only whole
-states are found. States past ``budget`` bytes go least recently used first, then the pieces no state names. The
-folder holds one subfolder per fingerprint (model, drafter, tensorfold source, row shapes): a state never loads into
-another model or build.
+states are found. The folder holds one subfolder per fingerprint (model, drafter, tensorfold source, row shapes): a
+state never loads into another model or build.
+
+Pruning runs at start and after every write. A state unused for ``ttl`` seconds goes, and so does every other
+fingerprint's folder (an older build or checkpoint) whose newest state is that old. ``budget`` caps the whole folder:
+past it, other fingerprints' folders go least recently used first, then this one's states, then the pieces no state
+names. A folder used within ``KEEP_UNNAMED_S`` stays whatever its size, as another server may still be using it.
 
 Upstream TensorFold 1.0.12 keeps conversations on disk the same way (``--learn-conversations``): a 39,228-token next
 turn on a GB10 started in 0.25 s after a restart instead of 6.2 s.
@@ -19,6 +23,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -30,6 +36,8 @@ import torch
 BLOCK = 256                      # rows of a view a piece holds
 MIN_TOKENS = 1024                # a shorter state prefills faster than its files are found and read
 KEEP_UNNAMED_S = 3600            # how long a piece no whole state names stays, for the next try of its write
+TTL_H = 72                       # hours a state stays unused before it goes (TENSORFOLD_<family>_STATES_TTL_H)
+_KEY = re.compile(r"[0-9a-f]{16}")  # a fingerprint folder's name: nothing else under the root is pruned
 VERSION = 1
 
 
@@ -80,20 +88,23 @@ def configured(family: str) -> bool:
 
 def from_env(family: str, parts: dict[str, Any]) -> DiskStates | None:
     """``TENSORFOLD_<family>_STATES``: the folder kept states also go to, under the fingerprint of ``parts``; None
-    without it. ``TENSORFOLD_<family>_STATES_GIB`` (64) caps what that fingerprint's folder holds."""
+    without it. ``TENSORFOLD_<family>_STATES_GIB`` (64) caps the whole folder, every fingerprint's states together,
+    and ``TENSORFOLD_<family>_STATES_TTL_H`` (72) is how long a state stays unused."""
 
     if not configured(family):
         return None
     root = os.environ[f"TENSORFOLD_{family}_STATES"].strip()
     budget = int(float(os.environ.get(f"TENSORFOLD_{family}_STATES_GIB", "64")) * (1 << 30))
-    disk = DiskStates(Path(root), fingerprint(parts), budget)
-    print(f"[tensorfold] kept states on disk: {disk.dir} ({len(disk.entries)} states, up to {budget >> 30} GiB)",
-          flush=True)
+    ttl = float(os.environ.get(f"TENSORFOLD_{family}_STATES_TTL_H", str(TTL_H))) * 3600
+    disk = DiskStates(Path(root), fingerprint(parts), budget, ttl)
+    print(f"[tensorfold] kept states on disk: {disk.dir} ({len(disk.entries)} states, up to {budget >> 30} GiB, "
+          f"{ttl / 3600:g} h unused)", flush=True)
     return disk
 
 
 class DiskStates:
-    def __init__(self, root: Path, key: str, budget: int) -> None:
+    def __init__(self, root: Path, key: str, budget: int, ttl: float = TTL_H * 3600) -> None:
+        self.root, self.key, self.ttl = Path(root), key, float(ttl)
         self.dir = Path(root) / key
         self.pieces, self.states = self.dir / "pieces", self.dir / "states"
         self.pieces.mkdir(parents=True, exist_ok=True)
@@ -105,6 +116,7 @@ class DiskStates:
                 self.entries.append(self._entry(path, json.loads(path.read_text())))
             except (ValueError, KeyError, OSError):      # half a file from a kill mid-rename never gets here; this does
                 path.unlink(missing_ok=True)
+        self._trim()
 
     @staticmethod
     def _entry(path: Path, meta: dict[str, Any]) -> Entry:
@@ -188,11 +200,38 @@ class DiskStates:
         names += [p for t in meta["extras"].values() for p in t["pieces"]]
         return names + [p for t in meta["ring"] for p in t["pieces"]]
 
-    def _trim(self) -> None:
-        """States past the budget go least recently used first, then every piece no state names."""
+    def _others(self) -> list[tuple[float, int, Path]]:
+        """Every other fingerprint's folder under the root: (last use, bytes, path), least recently used first."""
 
+        out = []
+        for path in self.root.iterdir() if self.root.is_dir() else ():
+            if path.name == self.key or not _KEY.fullmatch(path.name) or not path.is_dir():
+                continue
+            files = [f for f in path.rglob("*") if f.is_file()]
+            used = max((f.stat().st_mtime for f in files if f.suffix == ".json"), default=path.stat().st_mtime)
+            out.append((used, sum(f.stat().st_size for f in files), path))
+        return sorted(out)
+
+    def _trim(self) -> None:
+        """Unused states past the TTL go, and other fingerprints' folders past it. Over the budget, other folders go
+        least recently used first, then this folder's states; then every piece no state names."""
+
+        now = time.time()
+        others = []
+        for used, size, path in self._others():
+            if used < now - self.ttl:
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                others.append((used, size, path))
+        for e in [e for e in self.entries if e.meta.get("used", 0) < now - self.ttl]:
+            self.forget(e)
         held = {name for e in self.entries for name in self._names(e.meta)}
-        total = sum(self._size(name) for name in held)
+        total = sum(self._size(name) for name in held) + sum(size for _, size, _ in others)
+        for used, size, path in others:
+            if total <= self.budget or used > now - KEEP_UNNAMED_S:
+                break
+            shutil.rmtree(path, ignore_errors=True)
+            total -= size
         for e in sorted(self.entries, key=lambda e: e.meta.get("used", 0)):
             if total <= self.budget or len(self.entries) <= 1:
                 break

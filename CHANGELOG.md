@@ -5,6 +5,10 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **Kept states on disk are pruned.** A state unused for 72 hours (`TENSORFOLD_<GLM|QWEN>_STATES_TTL_H`) is deleted, and so is
+  an older build's or checkpoint's folder whose newest state is that old. `_STATES_GIB` now caps the whole folder:
+  past it, older builds' folders go least recently used first, then the current build's oldest states. A folder
+  used within the last hour is never deleted for size.
 - **GLM-5.3 Flash writes a gate's cut into its live stream.** When a thinking budget or a loop gate cuts a reply,
   the cut's tokens join the running decode as forced drafts, so the reply is not prefilled again. Each cut's prefill
   fell from 6.5 to 6.9 s to 0.18 to 0.47 s on one DGX Spark on 17 Oct 2026. Replies with no cut keep their tokens.
