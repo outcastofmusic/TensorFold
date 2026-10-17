@@ -215,7 +215,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                 probability_options(body)
                 named = reply_model(app, body)          # the id the request asked for, as vLLM names it
                 if _REQUEST_LOG and body.get("priority") != "background":   # batch jobs are not client traffic
-                    with open(_REQUEST_LOG, "a") as handle:
+                    # owner-only (0600) when created: the prompts and tool content it records are private
+                    with os.fdopen(os.open(_REQUEST_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "a") as handle:
                         handle.write(json.dumps(redact_images(body)) + "\n")
                 raw_kw: dict[str, Any] = {}
                 if is_chat_completion:
