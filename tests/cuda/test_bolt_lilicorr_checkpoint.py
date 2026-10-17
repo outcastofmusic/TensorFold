@@ -124,7 +124,7 @@ def test_every_nvfp4_tensor_decodes_as_before():
     from tensorfold.families.nemotron_bolt.cuda.lilicorr import dense_tensors
 
     with closing(SafeTensors([DRAFT / "model.safetensors"])) as f:
-        keys = set(f.keys())                                     # noqa: SIM118  (no __iter__)
+        keys = set(f.keys())
         names = [n for n in keys if n.endswith(".weight") and n + "_scale" in keys]
         assert len(names) >= 16
         for name in names:
