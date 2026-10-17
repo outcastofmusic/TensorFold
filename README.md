@@ -35,6 +35,11 @@ fetched them: `qwen3.8-flash-next-fp4` (NVIDIA's QAD FP4-Local checkpoint, Clef-
 Measured on 17 Oct 2026 against the EXL3 pack on one Spark, FP4-Local decoded at 0.71 to 0.82x its speed and scored
 TrueScore 91.0 against 87.8, a paired +2.3 [-1.1, +6.4] over 76 scenarios.
 
+Once `./prepare.sh d1` has fetched it (6.3 GB), every model target also starts Liquid AI's d1-3B decision model on
+`127.0.0.1:30003` after the model answers. It answers yes/no, choice and score questions about a state with
+probabilities (`POST /v1/systemone`, `/v1/decisions`) and writes no text. `D1=0` leaves it off. Nothing calls it yet:
+[docs/d1-sidecar.md](docs/d1-sidecar.md) gives its API, memory and three candidate uses.
+
 `prepare.sh` downloads the checkpoints into `~/models` (set `MODELS` for another place) at the revisions the numbers
 below were measured on, and converts Qwen's image tower once. Downloads run inside the serving image
 (`nvcr.io/nvidia/pytorch:26.07-py3`), so the host needs no Python packages.
