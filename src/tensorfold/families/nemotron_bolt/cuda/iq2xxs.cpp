@@ -1,0 +1,84 @@
+#include <torch/extension.h>
+
+void iq2xxs_decode_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor* ids, at::Tensor* plan, int64_t n,
+                        int64_t mt, const at::Tensor& tab, at::Tensor& out);
+void iq2xxs_prefill_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor* order,
+                         const at::Tensor* tile_end, const at::Tensor* starts, int64_t experts, int64_t tiles,
+                         int64_t n, const at::Tensor& tab, at::Tensor& out);
+
+static void check(const at::Tensor& t, const char* name, at::ScalarType dtype) {
+  TORCH_CHECK(t.is_cuda() && t.scalar_type() == dtype && t.is_contiguous(), name,
+              ": expected a contiguous CUDA tensor of the right dtype");
+}
+
+// x [R, K] bf16, w [E, N, K / 256 * 66] uint8 (E = 1 for a linear call), out [R, N] bf16, all on x's GPU
+static void check_call(const at::Tensor& x, const at::Tensor& w, int64_t n, const at::Tensor& tab,
+                       const at::Tensor& out) {
+  check(x, "x", at::kBFloat16);
+  check(w, "w", at::kByte);
+  check(out, "out", at::kBFloat16);
+  check(tab, "tab", at::kInt);
+  TORCH_CHECK(x.dim() == 2 && x.size(1) % 256 == 0, "x: rows of K inputs, K a multiple of 256");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
+              "x and w must be 16-byte aligned");
+  TORCH_CHECK(w.dim() == 3 && w.size(1) == n && w.size(2) == x.size(1) / 256 * 66,
+              "w: [E, N, K / 256 * 66] bytes of IQ2_XXS blocks");
+  TORCH_CHECK(n % 8 == 0, "N must be a multiple of 8");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == x.size(0) && out.size(1) == n, "out: [R, N]");
+  TORCH_CHECK(tab.numel() == 1024, "tab: two variants of selectors [256, 2]");
+  for (const auto* t : {&w, &out, &tab}) TORCH_CHECK(t->device() == x.device(), "all tensors on x's GPU");
+}
+
+// plan: int32 [2 + 2 E + R] scratch for a grouped call of more than 64 rows (the kernel finds a smaller call's experts
+// itself); any number of rows per expert
+void decode(const at::Tensor& x, const at::Tensor& w, const c10::optional<at::Tensor>& ids,
+            c10::optional<at::Tensor> plan, int64_t mt, const at::Tensor& tab, at::Tensor out) {
+  const int64_t n = w.size(1), e = w.size(0);
+  check_call(x, w, n, tab, out);
+  TORCH_CHECK(mt >= 1 && mt <= 4, "decode: mt 1 .. 4");
+  if (ids) {
+    check(*ids, "ids", at::kInt);
+    TORCH_CHECK(ids->numel() == x.size(0) && ids->device() == x.device(), "ids: one expert a row");
+    TORCH_CHECK(plan.has_value() == (x.size(0) > 64), "decode: a plan exactly when a grouped call has over 64 rows");
+    if (plan) {
+      check(*plan, "plan", at::kInt);
+      TORCH_CHECK(plan->numel() == 2 + 2 * e + x.size(0) && plan->device() == x.device(), "plan: [2 + 2 E + R]");
+      TORCH_CHECK(e <= 1024 && x.size(0) < (1 << 20), "plan: at most 1024 experts and 2^20 rows");
+    } else {
+      TORCH_CHECK(x.size(0) <= 16 * mt, "decode: at most 16 * mt rows without a plan");
+    }
+  } else {
+    TORCH_CHECK(e == 1 && !plan, "a linear call has one weight matrix and no plan");
+  }
+  if (x.size(0) == 0) return;
+  iq2xxs_decode_cuda(x, w, ids ? &*ids : nullptr, plan ? &*plan : nullptr, n, mt, tab, out);
+}
+
+void prefill(const at::Tensor& x, const at::Tensor& w, const c10::optional<at::Tensor>& order,
+             const c10::optional<at::Tensor>& tile_end, const c10::optional<at::Tensor>& starts, int64_t tiles,
+             const at::Tensor& tab, at::Tensor out) {
+  const int64_t n = w.size(1), e = w.size(0);
+  check_call(x, w, n, tab, out);
+  TORCH_CHECK(order.has_value() == tile_end.has_value() && order.has_value() == starts.has_value(),
+              "prefill: order, tile_end and starts come together");
+  if (order) {
+    for (const auto* t : {&*order, &*tile_end, &*starts}) {
+      check(*t, "plan", at::kInt);
+      TORCH_CHECK(t->device() == x.device(), "plan on x's GPU");
+    }
+    TORCH_CHECK(order->numel() == x.size(0) && tile_end->numel() == e && starts->numel() == e + 1,
+                "plan: order [R], tile_end [E], starts [E + 1]");
+  } else {
+    TORCH_CHECK(e == 1, "a linear call has one weight matrix");
+  }
+  if (x.size(0) == 0 || tiles == 0) return;
+  TORCH_CHECK(tiles <= 65535, "prefill: at most 65535 row tiles a call");
+  iq2xxs_prefill_cuda(x, w, order ? &*order : nullptr, tile_end ? &*tile_end : nullptr, starts ? &*starts : nullptr,
+                      e, tiles, n, tab, out);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("decode", &decode, "IQ2_XXS matmul, decode form: a row's bits do not depend on the call's other rows");
+  m.def("prefill", &prefill, "IQ2_XXS matmul for many rows: 64-row tiles of one expert, x through shared memory");
+}
