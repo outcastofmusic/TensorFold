@@ -9,7 +9,8 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 
 | Task | State |
 |---|---|
-| Code review since 0.8.0 (`8c405e56..7891345f`) | Six reviews done, triage in `docs/reviews/2026-10-17.md`. Ops fixes committed (`7891345f`). Five fix agents running: `fix/review-glm`, `fix/review-qwen`, `fix/review-bolt`, `fix/review-lfm2`, and the gateway branches. Then the CPU suite, GPU tests after bench2, merge, and "Last reviewed" moves to the merge |
+| Follow-ups 1 and 3: Bolt decode CUDA graphs and a drafter-only Q8_0 head | Agent on `perf/bolt-graphs` from `feat/integration` 8d7db0d3 |
+| Code review since 0.8.0 (`8c405e56..7891345f`) | Triage in `docs/reviews/2026-10-17.md`. Merged into `feat/integration`: ops (`7891345f`), GLM (`fix/review-glm` + `98b0e6fd`), Bolt (`fix/review-bolt`, CPU 4,733 passed). Gateway branches fixed (`19d4145`, `e1e1f8d`). Still running: `fix/review-qwen`, `fix/review-lfm2`. GPU tests after bench2, then `fork/dev` and "Last reviewed" |
 | Benchmark round 2 (`tf-runs/bench2.sh`) | LFM2.5-24B and Super VL TrueScore + planning; GLM and Bolt planning with thinking on; long-context pilot on FP4-Local. Then production restarts on the new `fork/dev` |
 
 ## To do
