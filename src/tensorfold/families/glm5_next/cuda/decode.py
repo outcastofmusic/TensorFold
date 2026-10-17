@@ -235,7 +235,7 @@ def draft(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int], position:
 
 
 # -- prefix snapshots ---------------------------------------------------------------------------------------------
-@dataclass
+@dataclass(eq=False)          # the cache's lookups and removals mean this one state: identity
 class Snapshot:
     """Copy committed KDA state and retain attention caches whose valid prefixes survive resume; pending MTP rows await next tokens from the new prompt."""
 

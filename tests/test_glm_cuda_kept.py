@@ -95,6 +95,31 @@ def test_remember_keeps_the_newest_and_frees_what_it_drops(kept):
     assert engine.cache == [again] and new.rows is None
 
 
+
+def test_a_branch_point_kept_again_stays_a_branch_point(kept):
+    engine, snap, _ = kept
+    engine.user_id = 7
+    one, two = snap([1, 7, 2], 10), snap([1, 7, 2, 7, 3], 10)
+    engine.cache = [one, two]
+    engine._use(one)
+    assert one.branched
+    again = snap([1, 7, 2], 10)                       # the same prompt's state, kept by a later prefill
+    engine._remember(again)
+    assert engine.cache == [two, again] and again.branched and engine._superseded() is None
+
+
+def test_kept_states_compare_by_identity():
+    """The cache's ``in`` and ``remove`` mean one state: equal ids with tensors used to raise on the comparison."""
+    import torch
+
+    from tensorfold.families.glm5_next.cuda.decode import Snapshot
+
+    a, b = (Snapshot([1, 2, 3], torch.zeros(4), torch.zeros(2), None, -1, -1) for _ in range(2))
+    cache = [b]
+    assert a not in cache and b in cache
+    cache.remove(b)
+    assert cache == []
+
 def test_a_prompt_keeps_a_state_where_its_system_block_ends(kept):
     engine, _, _ = kept
     engine.user_id = 9

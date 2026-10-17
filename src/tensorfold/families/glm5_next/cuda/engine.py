@@ -618,6 +618,7 @@ class GlmEngine:
         if self.cache_entries <= 0 or self.cache_bytes <= 0:
             return
         for c in [c for c in self.cache if c.ids == snap.ids and c is not snap]:
+            snap.branched |= c.branched                # a branch point kept again stays one
             self._drop(c)
         self.cache[:] = [c for c in self.cache if c is not snap] + [snap]   # a resumed prompt kept again moves last
         dropped = False
