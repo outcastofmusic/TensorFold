@@ -45,6 +45,9 @@ POLLED = ("/metrics", "/v1/metrics", "/health", "/v1/health")
 def make_handler(app: App):
     class Handler(Rearming):              # USR1's stack dump armed again after each request
         protocol_version = "HTTP/1.1"
+        # headers and a small body are two writes: an app whose replies take milliseconds (d1) sets TCP_NODELAY, so
+        # a reused connection does not wait out the client's delayed ACK (40 ms on Linux) for the body
+        disable_nagle_algorithm = bool(getattr(app, "no_delay", False))
 
         def log_message(self, fmt, *args):    # one line a request, as the Mac server prints
             print(f"[tensorfold] {self.address_string()} {fmt % args}", flush=True)
