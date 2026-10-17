@@ -110,6 +110,25 @@ def test_one_call_when_parallel_calls_are_off():
     assert [json.loads(c["function"]["arguments"]) for c in calls] == [{"city": "a"}]
 
 
+QWEN_CALL = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+
+
+def test_a_reply_that_names_the_other_format_s_opener_keeps_its_own_calls():
+    mention = f"See {P.CALL_OPEN} in LFM docs. "
+    content, calls = reply_text.parse_tool_calls(mention + QWEN_CALL, TOOLS)
+    assert content == mention.strip() and json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
+    content, calls = reply_text.parse_tool_calls(mention + QWEN_CALL, TOOLS, max_calls=1)
+    assert len(calls) == 1
+    cut = mention + QWEN_CALL.removesuffix("</function>\n</tool_call>")
+    assert reply_text.close_call(cut, TOOLS) == "</function></tool_call>"
+    lfm = f"Qwen writes <tool_call> blocks. {P.CALL_OPEN}[get_weather(city='a')]{P.CALL_CLOSE}"
+    content, calls = reply_text.parse_tool_calls(lfm, TOOLS)
+    assert content == "Qwen writes <tool_call> blocks."
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "a"}
+    assert reply_text.close_call(f"Qwen writes <tool_call> blocks. {P.CALL_OPEN}[get_weather(city='a')", TOOLS) == \
+        "]" + P.CALL_CLOSE
+
+
 def test_a_call_cut_by_the_end_token_is_closed_when_it_parses():
     assert reply_text.close_call(f"x {P.CALL_OPEN}[get_weather(city='a')]", TOOLS) == P.CALL_CLOSE
     assert reply_text.close_call(f"x {P.CALL_OPEN}[get_weather(city='a')", TOOLS) == "]" + P.CALL_CLOSE

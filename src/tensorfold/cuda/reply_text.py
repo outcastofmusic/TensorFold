@@ -107,12 +107,26 @@ def _tool_name(tool: dict[str, Any]) -> str:
 
 
 def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int | None = None) -> tuple[str, list[dict[str, Any]] | None]:
-    """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..``, JSON or LFM2 calls."""
+    """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..``, JSON or LFM2 calls.
+
+    A reply may name the other format's opener in its prose: LFM2's Pythonic list is read when the reply holds its
+    opener, unless a ``<tool_call>`` block in it parses to calls."""
 
     if not tools:
         return text, None
-    if pythonic_calls.CALL_OPEN in text:                   # LFM2's Pythonic calls
-        return pythonic_calls.parse_tool_calls(text, tools, max_calls=max_calls)
+    if pythonic_calls.CALL_OPEN not in text:
+        return _parse_tagged(text, tools, max_calls)
+    if _CALL_OPEN in text.lower():
+        content, calls = _parse_tagged(text, tools, max_calls)
+        if calls:
+            return content, calls
+    return pythonic_calls.parse_tool_calls(text, tools, max_calls=max_calls)
+
+
+def _parse_tagged(text: str, tools: list[dict[str, Any]],
+                  max_calls: int | None) -> tuple[str, list[dict[str, Any]] | None]:
+    """The ``<tool_call>`` blocks' calls (Qwen, GLM or JSON inside)."""
+
     known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
     schemas = parameter_schemas(tools)
     calls: list[dict[str, Any]] = []
@@ -190,9 +204,9 @@ def close_call(text: str, tools: list[dict[str, Any]]) -> str:
 
     if not tools:
         return ""
-    if pythonic_calls.CALL_OPEN in text:
-        return pythonic_calls.close_call(text, tools)
     low, at, start = text.lower(), 0, None
+    if text.rfind(pythonic_calls.CALL_OPEN) > low.rfind(_CALL_OPEN):     # the reply ends in LFM2's list
+        return pythonic_calls.close_call(text, tools)
     while (opener := low.find(_CALL_OPEN, at)) >= 0:
         closer = low.find(_CALL_CLOSE, opener + len(_CALL_OPEN))
         if closer < 0:
