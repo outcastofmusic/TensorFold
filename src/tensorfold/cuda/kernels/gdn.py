@@ -9,6 +9,8 @@ from typing import Sequence
 
 import torch
 
+MARKS = 4                # states a prefill chain also leaves inside itself (gdn_prefill.cu's Marks)
+
 
 @lru_cache(maxsize=1)
 def _ext():
@@ -160,7 +162,8 @@ def replay(table: torch.Tensor, layers: int, streams: int, rows: torch.Tensor, c
 
 
 def chain(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, state: torch.Tensor,
-          final: torch.Tensor) -> torch.Tensor:
-    """Prefill chain from ``state`` (read only) to ``final``: chunk-invariant bits, not the verify kernel's."""
+          final: torch.Tensor, marks: Sequence[torch.Tensor] = (), rows: Sequence[int] = ()) -> torch.Tensor:
+    """Prefill chain from ``state`` (read only) to ``final``: chunk-invariant bits, not the verify kernel's.
+    ``marks[i]`` gets the state a chain over the first ``rows[i]`` rows leaves (up to MARKS rows, rising, inside)."""
 
-    return _ext().prefill(q, k, v, g, beta, state, final)
+    return _ext().prefill(q, k, v, g, beta, state, final, list(marks), [int(r) for r in rows])
