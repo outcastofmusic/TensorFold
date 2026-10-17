@@ -206,3 +206,37 @@ def test_every_served_name_has_a_run_sh_target():
     dispatch = re.findall(r"^    ([a-z0-9.-]+)\)\s+ask_swap", (root / "run.sh").read_text(), re.M)
     assert set(mod.TARGET.values()) == set(dispatch)
     assert {"qwen3.8-flash-next-fp4", "nemotron-3.5-bolt", "lfm2.5-24b-a2b"} <= set(mod.TARGET)
+
+
+def _run_logger(swap, tmp_path):
+    log = tmp_path / "order"
+    run = tmp_path / "run.sh"
+    run.write_text(f"#!/bin/sh\necho run $1 >> {log}\n")
+    run.chmod(0o755)
+    swap.RUN = str(run)
+    _Persist.log = log
+    backend = _serve(_Persist)
+    swap.BACKEND = backend.server_address[1]
+    return log, backend
+
+
+def test_a_swap_that_cuts_requests_off_skips_the_persist(swap, tmp_path, monkeypatch):
+    """Requests still running hold the engine, so a persist would wait for them: the swap goes straight to run.sh."""
+    log, backend = _run_logger(swap, tmp_path)
+    monkeypatch.setattr(swap, "DRAIN", 0)
+    try:
+        swapper = swap.Swapper()
+        swapper.current, swapper.running = "qwen3.8-flash-next", 1
+        assert swapper.enter("glm-5.3-flash") == "glm-5.3-flash"
+    finally:
+        backend.shutdown()
+    assert log.read_text().splitlines() == ["run glm-5.3-flash"]
+
+
+def test_a_first_load_has_nothing_to_persist(swap, tmp_path):
+    log, backend = _run_logger(swap, tmp_path)
+    try:
+        assert swap.Swapper().enter("glm-5.3-flash") == "glm-5.3-flash"
+    finally:
+        backend.shutdown()
+    assert log.read_text().splitlines() == ["run glm-5.3-flash"]

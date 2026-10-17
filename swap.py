@@ -204,6 +204,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400 if length < 0 else 413,
                               {"error": {"message": f"Content-Length must be 0 to {MAX_BODY} bytes"}})
         body = self.rfile.read(length)
+        if self.path.startswith("/internal/"):          # the model's own routes (persist): this endpoint calls them itself
+            return self.reply(404, {"error": {"message": f"unknown path {self.path}"}})
         if self.path.startswith("/swap/"):
             name = self.path[len("/swap/"):].strip("/")
             name = ALIAS.get(name, name)

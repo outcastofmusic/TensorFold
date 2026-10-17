@@ -29,15 +29,17 @@ thinking guard, and `glm-5.3-flash` gets GLM-5.3 Flash alone. Qwen loads first, 
 it in. `./run.sh qwen-flash-next` or `./run.sh glm-5.3-flash` serves one model with
 no swap endpoint. On this branch the think-loop detector is on (`TENSORFOLD_THINK_LOOP`, [TANDEM-EVAL.md](TANDEM-EVAL.md)).
 
-Two more models swap in the same way once `./prepare.sh qwen-flash-next-fp4` or `./prepare.sh nemotron-bolt` has
-fetched them: `qwen3.8-flash-next-fp4` (NVIDIA's QAD FP4-Local checkpoint, Clef-Flash beside it, text only) and
-`nemotron-3.5-bolt` (Nemotron 3.5 Bolt 74B-A9B with its LiLiCorr draft model, one stream, no kept states yet).
+Three more models swap in the same way once `./prepare.sh qwen-flash-next-fp4`, `./prepare.sh nemotron-bolt` or
+`./prepare.sh lfm2-24b` has fetched them: `qwen3.8-flash-next-fp4` (NVIDIA's QAD FP4-Local checkpoint, Clef-Flash
+started before it, text only), `nemotron-3.5-bolt` (Nemotron 3.5 Bolt 74B-A9B with its LiLiCorr draft model, one
+stream, prompt reuse in memory) and `lfm2.5-24b-a2b` (Liquid's LFM2.5-24B-A2B in block FP8, one stream; LFM Open
+License v1.0, commercial use only below US$10M annual revenue).
 Measured on 17 Oct 2026 against the EXL3 pack on one Spark, FP4-Local decoded at 0.71 to 0.82x its speed and scored
 TrueScore 91.0 against 87.8, a paired +2.3 [-1.1, +6.4] over 76 scenarios.
 
-Once `./prepare.sh d1` has fetched it (6.3 GB), every model target also starts Liquid AI's d1-3B decision model on
-`127.0.0.1:30003` after the model answers. It answers yes/no, choice and score questions about a state with
-probabilities (`POST /v1/systemone`, `/v1/decisions`) and writes no text. It starts only with `D1=1` until its GPU parity and latency are measured. Nothing calls it yet:
+Once `./prepare.sh d1` has fetched it (6.3 GB), `D1=1` makes every model target but GLM also start Liquid AI's
+d1-3B decision model on `127.0.0.1:30003` after the model answers. It answers yes/no, choice and score questions about a state with
+probabilities (`POST /v1/systemone`, `/v1/decisions`) and writes no text. It answered one question in 25.9 ms on the GB10 (2026-10-17). Nothing calls it yet:
 [docs/d1-sidecar.md](docs/d1-sidecar.md) gives its API, memory and three candidate uses.
 
 `prepare.sh` downloads the checkpoints into `~/models` (set `MODELS` for another place) at the revisions the numbers
@@ -70,7 +72,7 @@ streamed request receives an SSE comment every 5 s while it waits, which keeps c
 `SWAP_HOLD=120` keeps each model loaded for at least that many seconds: with two clients on two models, each request
 otherwise pays a swap.
 
-Both models write their kept prompt states to the `tensorfold-states` Docker volume while no request runs. A
+Qwen (both checkpoints) and GLM write their kept prompt states to the `tensorfold-states` Docker volume while no request runs. A
 conversation's next turn after a swap or a restart reads its state back instead of prefilling the whole conversation.
 On GLM, an 11,735-token turn resumed 7,445 tokens from disk in 0.31 s and prefilled in 13.9 s instead of 38.0 s, with
 the cold reply's tokens (2026-10-16). A Qwen state at `--kv-dtype int8` takes 115.7 MB plus 18,304 bytes a token,

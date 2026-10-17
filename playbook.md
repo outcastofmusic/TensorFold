@@ -127,11 +127,11 @@ Measure a multi-turn session's prefill time per turn before and after each of th
 | Branch points in the eviction rule (upstream #735) | Upstream: an agent that restarts each step from one history stops reading it again | A history resumed after a later turn extended it is freed only by LRU |
 | A kept state at the system block's end | Another conversation with the same tools resumes from it | Touch it on every use so long sessions don't age it out |
 
-Check where the engine keeps states before testing how it evicts them. GLM keeps a state at the prompt's end and the system
-block's end only (`engine.py`, `keep_at` and `stops`). A history that several requests share, each followed by a
-different user message, never resumes on GLM: on 17 Oct a 6,059-token history sent five times with different
-questions showed 0 cached tokens every time, with and without the branch-point rule. Qwen keeps states at message
-starts and resumes it. A served cache test must use a pattern the engine can resume (a regenerated turn, a growing
+Check where the engine keeps states before testing how it evicts them. GLM used to keep a state at the prompt's end and
+the system block's end only, so a history that several requests share, each followed by a different user message,
+never resumed: on 17 Oct a 6,059-token history sent five times with different questions showed 0 cached tokens every
+time. GLM now also keeps the last user message's start, inside the prefill pass at no extra pass, and the same test
+resumes 6,073 tokens on every question after the first (served check, 17 Oct). A served cache test must use a pattern the engine can resume (a regenerated turn, a growing
 conversation) before it can test eviction.
 
 ## 8. Drafting

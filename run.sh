@@ -7,7 +7,7 @@
 #   ./run.sh qwen-flash-next-fp4   Qwen3.8 Flash Next from NVIDIA's FP4-Local checkpoint (QAD NVFP4), Clef-Flash beside it
 #   ./run.sh nemotron-bolt     Nemotron 3.5 Bolt 74B-A9B (24 GB) with its LiLiCorr draft model
 #   ./run.sh lfm2-24b          Liquid's LFM2.5-24B-A2B (block FP8, 24.75 GB): tool routing and sub-agents
-#                              With D1=1 each model target also starts d1-3B, Liquid AI's decision model, on :30003 once
+#                              With D1=1 each model target but GLM also starts d1-3B, Liquid AI's decision model, on :30003 once
 #                              the model answers (POST /v1/systemone and /v1/decisions; docs/d1-sidecar.md)
 #   ./run.sh swap              one endpoint on 127.0.0.1:30000 that loads whichever model a request names (swap.py)
 #   ./run.sh stop              stop whatever this script started
@@ -24,7 +24,7 @@
 #   TF_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 #   EXTRA="..."                more `tensorfold serve` flags
 #   QWEN_MODEL, QWEN_FP4_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL, D1_MODEL   another checkpoint folder under $MODELS
-# Both:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused
+# Qwen, Qwen FP4, GLM:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused
 # Qwen:  CONTEXT=262144  PARALLEL=4  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
@@ -33,6 +33,7 @@
 # LFM2:  CONTEXT=131072 (KV 20 KiB a token)  THINK_BUDGET=8000 (0: none); one stream, no drafts, no disk states.
 #        LFM Open License v1.0: commercial use is licensed only under US$10M annual revenue
 set -euo pipefail
+shopt -s inherit_errexit            # a failure inside $(image) stops the caller too
 
 MODELS="${MODELS:-$HOME/models}"
 BASE="${TF_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
@@ -40,7 +41,7 @@ PORT="${PORT:-30000}"
 CLEF_PORT="${CLEF_PORT:-30001}"
 D1_PORT="${D1_PORT:-30003}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
-NAMES="tensorfold-serve clef-serve tensorfold-glm tensorfold-bolt tensorfold-lfm2 d1-serve"
+NAMES="tensorfold-serve clef-serve tensorfold-glm tensorfold-bolt tensorfold-lfm2 d1-serve tensorfold-build"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/tensorfold-run"
 
 die() { echo "run: $*" >&2; exit 1; }
@@ -50,8 +51,10 @@ avail_mib() { awk '/MemAvailable/{printf "%d", $2 / 1024}' /proc/meminfo; }
 
 uncache() {  # drop the served checkpoints' files from the page cache (they stay on disk)
     local f
-    for f in "$MODELS"/{Qwen3.8-Flash-Next-exl3-3.05bpw,clef-flash,glm53-flash-mosaic-12l,glm53-flash-sushi-experts-mosaic-dense,GLM-5.3-Flash-DFlash*,d1-3B}/*.safetensors \
-             "${QWEN_MODEL:-}"/*.safetensors "${CLEF_MODEL:-}"/*.safetensors "${GLM_MODEL:-}"/*.safetensors \
+    for f in "$MODELS"/{Qwen3.8-Flash-Next-exl3-3.05bpw,Qwen3.8-Flash-Next-FP4-Local,clef-flash,glm53-flash-mosaic-12l,glm53-flash-sushi-experts-mosaic-dense,GLM-5.3-Flash-DFlash*,Nemotron-3.5-Bolt-74B-A9B-24GB*,LFM2.5-24B-A2B-FP8,d1-3B}/*.safetensors \
+             "$MODELS"/Qwen3.8-Flash-Next-FP4-Local/tensors/*.safetensors \
+             "${QWEN_MODEL:-}"/*.safetensors "${QWEN_FP4_MODEL:-}"/*.safetensors "${CLEF_MODEL:-}"/*.safetensors \
+             "${GLM_MODEL:-}"/*.safetensors "${BOLT_MODEL:-}"/*.safetensors "${LFM2_MODEL:-}"/*.safetensors \
              "${D1_MODEL:-}"/*.safetensors; do
         [ -f "$f" ] && dd if="$f" iflag=nocache count=0 status=none 2>/dev/null
     done
@@ -81,11 +84,15 @@ image() {
     if ! docker image inspect "$tag" >/dev/null 2>&1; then
         echo "run: installing this checkout into the image $tag (once per source change)" >&2
         docker rm -f tensorfold-build >/dev/null 2>&1 || true
+        # a failed install must not be committed under the source's hash, nor prune the images that still work
         docker run --name tensorfold-build -v "$SRC:/tf:ro" "$BASE" \
-            bash -c "cp -r /tf /tmp/tf && pip install -q -c /tmp/tf/run-constraints.txt '/tmp/tf[vision]' && rm -rf /tmp/tf" >/dev/null
-        docker commit tensorfold-build "$tag" >/dev/null
+            bash -c "cp -r /tf /tmp/tf && pip install -q -c /tmp/tf/run-constraints.txt '/tmp/tf[vision]' && rm -rf /tmp/tf" >/dev/null \
+            || { docker rm -f tensorfold-build >/dev/null 2>&1; die "installing the checkout into $tag failed"; }
+        docker commit --change "LABEL tensorfold.src=$SRC" tensorfold-build "$tag" >/dev/null || die "committing $tag failed"
         docker rm tensorfold-build >/dev/null
-        for old in $(docker images --format '{{.Repository}}:{{.Tag}}' tensorfold-run); do
+        docker image inspect "$tag" >/dev/null 2>&1 || die "$tag is missing after its build"
+        # only this checkout's older images: another worktree's (or an unlabelled one a test names) stays
+        for old in $(docker images --filter "label=tensorfold.src=$SRC" --format '{{.Repository}}:{{.Tag}}' tensorfold-run); do
             [ "$old" = "$tag" ] || docker rmi "$old" >/dev/null 2>&1 || true
         done
     fi
@@ -125,8 +132,11 @@ swapping() {  # the swap endpoint's process is alive
 ask_swap() {
     [ -z "${TF_SWAP_CHILD:-}" ] && swapping || return 1
     echo "run: asking the swap endpoint on 127.0.0.1:$PORT for $1"
-    # a swap first waits up to SWAP_DRAIN for running requests, then loads (15 minutes at most, with an image build)
-    curl -sf -m $(( ${SWAP_DRAIN:-600} + 900 )) -X POST "http://127.0.0.1:$PORT/swap/$1" || die "the swap endpoint could not load $1; see $STATE/swap.log"
+    # a swap may hold the loaded model (SWAP_HOLD), drain (SWAP_DRAIN), persist (SWAP_PERSIST), then load: an image build
+    # and up to four GLM tries of 15 minutes each
+    local wait
+    wait=$(awk -v h="${SWAP_HOLD:-0}" -v d="${SWAP_DRAIN:-600}" -v p="${SWAP_PERSIST:-120}" 'BEGIN { printf "%d", h + d + p + 3900 }')
+    curl -sf -m "$wait" -X POST "http://127.0.0.1:$PORT/swap/$1" || die "the swap endpoint could not load $1; see $STATE/swap.log"
     echo
 }
 
@@ -154,16 +164,15 @@ swap() {
     done
     swapping && curl -sf -m 1 "http://127.0.0.1:$PORT/swap" >/dev/null 2>&1 ||
         { tail -3 "$STATE/swap.log" >&2; die "the swap endpoint did not start"; }
-    echo "run: swap endpoint on http://127.0.0.1:$PORT/v1 (log: $STATE/swap.log). A request's \"model\" picks qwen3.8-flash-next or glm-5.3-flash."
+    echo "run: swap endpoint on http://127.0.0.1:$PORT/v1 (log: $STATE/swap.log). A request's \"model\" picks one of: $(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swap; print(", ".join(swap.TARGET))' "$SRC" 2>/dev/null || echo "the names in swap.py")."
     [ -z "${1:-}" ] || ask_swap "$1"
 }
 
-# d1-3B beside whichever model is loaded: it starts once that model answers, so the model's startup admission never
-# counts it, and it admits itself against what the model left (GLM leaves 14 to 16 GiB). Its startup estimate at
-# D1_CONTEXT=4096 is 7.3 GiB (5.8 GiB of bf16 weights with the vision tower, 1.5 GiB of loading buffers), plus its
-# CUDA context.
-# TENSORFOLD_MEMORY_RESERVE_GIB=2: the default reserve (a tenth of the Spark's memory, 12.2 GiB) would refuse it beside
-# GLM. A missing checkpoint or a failed load leaves the model serving without it.
+# d1-3B beside the loaded model (not GLM): it starts once that model answers, so the model's startup admission never
+# counts it, and it admits itself against what the model left. Its startup estimate at D1_CONTEXT=4096 is 7.3 GiB
+# (5.8 GiB of bf16 weights with the vision tower, 1.5 GiB of loading buffers), plus its CUDA context. With the default
+# reserve (a tenth of the Spark's memory, 12.2 GiB) it would refuse to start beside most models, hence
+# TENSORFOLD_MEMORY_RESERVE_GIB=2. A missing checkpoint or a failed load leaves the model serving without it.
 d1() {
     [ "${D1:-0}" != 0 ] || return 0                    # opt-in until its GPU parity and latency are measured
     local model="${D1_MODEL:-$MODELS/d1-3B}"
@@ -181,18 +190,18 @@ d1() {
     echo "run: d1-serve exited while loading; the model serves without it" >&2
 }
 
-qwen() {
+qwen() {  # [served name] [clef_first: 1 starts Clef before Qwen]
     local model="${QWEN_MODEL:-$MODELS/Qwen3.8-Flash-Next-exl3-3.05bpw}" clef="${CLEF_MODEL:-$MODELS/clef-flash}"
-    local name="${QWEN_NAME:-qwen3.8-flash-next}"
+    local name="${1:-qwen3.8-flash-next}" clef_first="${2:-0}"
     local tower="$MODELS/Qwen3.8-Flash-Next-exl3-3.05bpw-vision/vision-f16-v3.safetensors"
     [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh qwen-flash-next)"
+    # checked before anything stops: a missing guard must leave the running model loaded
+    [ "${GUARD:-1}" = 0 ] || [ -e "$clef/joint_head.safetensors" ] \
+        || die "no Clef-Flash at $clef (run ./prepare.sh qwen-flash-next, or GUARD=0)"
     IMAGE=$(image)
     stop_all
     local guard=() budget=() vision=() flags=()
-    if [ "${GUARD:-1}" != 0 ]; then
-        [ -e "$clef/joint_head.safetensors" ] || die "no Clef-Flash at $clef (run ./prepare.sh qwen-flash-next, or GUARD=0)"
-        guard=(--thinking-guard "http://127.0.0.1:$CLEF_PORT/v1")
-    fi
+    [ "${GUARD:-1}" = 0 ] || guard=(--thinking-guard "http://127.0.0.1:$CLEF_PORT/v1")
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
     if [ "${VISION:-1}" != 0 ] && [ -e "$tower" ]; then
         vision=(--vision); flags=(-e "TENSORFOLD_VISION_WEIGHTS=$tower")
@@ -201,7 +210,7 @@ qwen() {
     # Qwen's folder sits beside GLM's checkpoint folders, each holding a subfolder per checkpoint and build
     # FP4-Local's weights leave Clef no room behind Qwen's reserve ("cannot fit requested context 16384"), so Clef starts
     # first there and Qwen's admission sizes its caches around it: 10.1 GiB for caches, 21 GiB left (2026-10-17)
-    if [ "${GUARD:-1}" != 0 ] && [ "${CLEF_FIRST:-0}" = 1 ]; then
+    if [ "${GUARD:-1}" != 0 ] && [ "$clef_first" = 1 ]; then
         serve clef-serve -- "$clef" --host 127.0.0.1 --port "$CLEF_PORT" --name clef --context 16384
         wait_ready clef-serve "$CLEF_PORT" || failed clef-serve
     fi
@@ -210,7 +219,7 @@ qwen() {
         --context "${CONTEXT:-262144}" --max-tokens "${CONTEXT:-262144}" --parallel "${PARALLEL:-4}" --kv-dtype "${KV:-int8}" \
         "${vision[@]}" "${guard[@]}" "${budget[@]}" ${EXTRA:-}
     # Clef starts second: it is ready 17 s before Qwen either way, and Qwen's start is the one a switch waits for
-    if [ "${GUARD:-1}" != 0 ] && [ "${CLEF_FIRST:-0}" != 1 ]; then
+    if [ "${GUARD:-1}" != 0 ] && [ "$clef_first" != 1 ]; then
         serve clef-serve -- "$clef" --host 127.0.0.1 --port "$CLEF_PORT" --name clef --context 16384
         wait_ready clef-serve "$CLEF_PORT" || failed clef-serve
     fi
@@ -221,8 +230,7 @@ qwen() {
 # NVIDIA's QAD FP4-Local checkpoint through the same path: decode 0.71-0.82x the EXL3 pack's, TrueScore 91.0 against
 # 87.8 (paired +2.3 [-1.1, +6.4]) and planning +1.5 [-0.4, +3.5], 2026-10-17
 qwen_fp4() {
-    QWEN_MODEL="${QWEN_FP4_MODEL:-$MODELS/Qwen3.8-Flash-Next-FP4-Local}" QWEN_NAME=qwen3.8-flash-next-fp4 CLEF_FIRST=1 \
-        VISION="${VISION:-0}" qwen
+    QWEN_MODEL="${QWEN_FP4_MODEL:-$MODELS/Qwen3.8-Flash-Next-FP4-Local}" VISION="${VISION:-0}" qwen qwen3.8-flash-next-fp4 1
 }
 
 bolt() {
@@ -290,7 +298,7 @@ glm() {
             --context "${CONTEXT:-$context}" --max-tokens "${CONTEXT:-$context}" "${drafter[@]}" "${budget[@]}" ${EXTRA:-}
         # no d1 beside GLM: GLM leaves 17 GiB, and d1's load took it under 8 GiB (2026-10-17)
         wait_ready tensorfold-glm "$PORT" && return 0
-        docker logs tensorfold-glm 2>&1 | grep -q 'memory budget cannot fit' || break
+        [[ $(docker logs tensorfold-glm 2>&1) == *'memory budget cannot fit'* ]] || break
         echo "run: refused for lack of memory ($(avail) GiB available), trying again in 2 s" >&2
         sleep 2
     done
@@ -303,6 +311,7 @@ status() {
     for n in $NAMES; do
         up "$n" || continue
         any=1
+        [ "$n" = tensorfold-build ] && { echo "tensorfold-build: installing this checkout into an image"; continue; }
         local port=$PORT; [ "$n" = clef-serve ] && port=$CLEF_PORT; [ "$n" = d1-serve ] && port=$D1_PORT
         curl -sf -m 3 "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1 && echo "$n: ready on 127.0.0.1:$port" || echo "$n: loading"
     done
@@ -310,6 +319,11 @@ status() {
 }
 
 command -v docker >/dev/null || die "docker is not installed"
+# one start at a time: two direct runs would both stop_all, then load two models side by side
+case "${1:-}" in
+    qwen-flash-next|glm-5.3-flash|qwen-flash-next-fp4|nemotron-bolt|lfm2-24b)
+        mkdir -p "$STATE"; exec 9>"$STATE/run.lock"; flock 9 ;;
+esac
 case "${1:-}" in
     "")              swap qwen-flash-next ;;
     qwen-flash-next) ask_swap "$1" || qwen ;;

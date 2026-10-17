@@ -103,10 +103,10 @@ levels, and the budget stays a cap.
    "criteria": ["none", "a few hundred tokens", "a few thousand tokens", "as much as allowed"]}}}
 ```
 
-**Routing a request to one of the four models.** One `choice` over the served names, each described by what it is
+**Routing a request to one of the swap models.** One `choice` over the served names, each described by what it is
 good at. On the CPU check, "What is the capital of France?" went to `nemotron-bolt` at 0.86 and the Lean proof to
 `glm-5.3-flash` at 0.48 against `qwen-flash-next` at 0.42. A router should act on a pick only above a confidence it
-has measured, and swaps cost 21 to 24 s, so it should also weigh the model already loaded.
+has measured, and a swap costs a model load (25 s to 4 minutes) plus up to SWAP_PERSIST (120 s) of state writing, so it should also weigh the model already loaded.
 
 ```json
 {"state": {"request": "<the user's last message>", "tools": ["bash", "edit"], "loaded": "qwen3.8-flash-next"},
@@ -155,7 +155,7 @@ docker run --rm --gpus all --ipc=host -v "$PWD":/tf:ro -v ~/models/d1-3B:/home/a
 The served sidecar, beside any model target:
 
 ```bash
-./run.sh nemotron-bolt && ./run.sh status        # d1-serve: ready on 127.0.0.1:30003
+D1=1 ./run.sh nemotron-bolt && ./run.sh status   # d1-serve: ready on 127.0.0.1:30003
 curl -s http://127.0.0.1:30003/v1/systemone -d '{"state": "The app crashes when I open settings.",
   "questions": {"team": {"type": "choice", "instructions": "Which team should handle this?",
   "criteria": {"billing": "Charges", "technical": "App faults"}}}}'

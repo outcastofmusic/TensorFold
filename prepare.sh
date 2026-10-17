@@ -138,4 +138,4 @@ case "$what" in
     lfm2-24b)        lfm2 ;;
     all)             qwen; glm ;;
 esac
-echo "prepare: done. Start a model with ./run.sh qwen-flash-next or ./run.sh glm-5.3-flash"
+echo "prepare: done. Start a model with ./run.sh <target> (./run.sh help lists them), or ./run.sh for the swap endpoint"
