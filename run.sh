@@ -18,7 +18,7 @@
 # Settings (environment):
 #   MODELS=~/models            where prepare.sh put the checkpoints
 #   PORT=30000                 the model's port;  CLEF_PORT=30001 the guard's;  BACKEND_PORT=30002 the model's under swap
-#   D1=1 (0: no d1 sidecar)  D1_PORT=30003  D1_CONTEXT=4096: the most tokens one decision reads (state and question)
+#   D1=0 (1: start the d1 decision sidecar)  D1_PORT=30003  D1_CONTEXT=4096: the most tokens one decision reads (state and question)
 #   SWAP_DRAIN=600  SWAP_HOLD=0  SWAP_TIMEOUT=3600  SWAP_PERSIST=120   swap.py's waits, in seconds (its header says what each does)
 #   TF_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 #   EXTRA="..."                more `tensorfold serve` flags
@@ -162,10 +162,10 @@ swap() {
 # TENSORFOLD_MEMORY_RESERVE_GIB=2: the default reserve (a tenth of the Spark's memory, 12.2 GiB) would refuse it beside
 # GLM. A missing checkpoint or a failed load leaves the model serving without it.
 d1() {
-    [ "${D1:-1}" != 0 ] || return 0
+    [ "${D1:-0}" != 0 ] || return 0                    # opt-in until its GPU parity and latency are measured
     local model="${D1_MODEL:-$MODELS/d1-3B}"
     if [ ! -e "$model/config.json" ]; then
-        echo "run: no d1-3B at $model, so no decision sidecar (./prepare.sh d1, or D1=0)" >&2
+        echo "run: no d1-3B at $model, so no decision sidecar (./prepare.sh d1, or leave D1 unset)" >&2
         return 0
     fi
     serve d1-serve -e TENSORFOLD_MEMORY_RESERVE_GIB=2 -- "$model" --host 127.0.0.1 --port "$D1_PORT" --name d1-3b \

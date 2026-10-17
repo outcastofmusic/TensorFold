@@ -37,7 +37,7 @@ TrueScore 91.0 against 87.8, a paired +2.3 [-1.1, +6.4] over 76 scenarios.
 
 Once `./prepare.sh d1` has fetched it (6.3 GB), every model target also starts Liquid AI's d1-3B decision model on
 `127.0.0.1:30003` after the model answers. It answers yes/no, choice and score questions about a state with
-probabilities (`POST /v1/systemone`, `/v1/decisions`) and writes no text. `D1=0` leaves it off. Nothing calls it yet:
+probabilities (`POST /v1/systemone`, `/v1/decisions`) and writes no text. It starts only with `D1=1` until its GPU parity and latency are measured. Nothing calls it yet:
 [docs/d1-sidecar.md](docs/d1-sidecar.md) gives its API, memory and three candidate uses.
 
 `prepare.sh` downloads the checkpoints into `~/models` (set `MODELS` for another place) at the revisions the numbers

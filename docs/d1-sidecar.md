@@ -3,7 +3,7 @@
 `run.sh` starts Liquid AI's d1-3B on `127.0.0.1:30003` beside every model target, once the model answers. d1-3B reads
 a state (text, JSON, pictures) and answers typed questions about it with probabilities in one forward pass, with zero
 output tokens. Nothing calls it yet: the gateway and the model servers are unchanged, and the three uses below are
-requests a later change could send. `D1=0` turns the sidecar off, and `./prepare.sh d1` downloads the checkpoint.
+requests a later change could send. `D1=1` turns the sidecar on (off by default until its GPU parity and latency are measured), and `./prepare.sh d1` downloads the checkpoint.
 
 ## The model
 
