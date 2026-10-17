@@ -30,22 +30,26 @@ def check(model_dir: str | Path) -> None:
         raise ValueError(f"{TITLE} cannot run this checkpoint: {why}. Use {MODELS[0]}")
 
 
-def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, no_drafts: bool = False,
-                mtp_drafts: int | None = None, context: int | None = None, **options: Any):
-    """One GPU, one stream, no drafts."""
+def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
+                master_port: int = 29551, no_drafts: bool = False, context: int | None = None,
+                context_explicit: bool = False, **options: Any):
+    """One GPU, one stream, no drafts; a serve option it has no use for is refused."""
 
-    if tp != 1 or rank != 0:
-        raise ValueError(f"{TITLE} runs on one GPU on CUDA")
-    if options.get("vision"):
+    if int(tp) != 1 or int(rank) != 0 or master:
+        raise ValueError(f"{TITLE} runs on one GPU on CUDA: serve with --tp 1")
+    if options.pop("vision", False):
         raise ValueError(f"{TITLE} is a text model")
     if drafter:
         raise ValueError(f"{TITLE} has no draft model on CUDA: drop --drafter")
-    if int(options.get("parallel") or 1) > 1:
+    if int(options.pop("parallel", None) or 1) > 1:
         raise ValueError(f"{TITLE} serves one stream on CUDA: requests take turns (drop --parallel)")
+    if options:
+        raise ValueError(f"{TITLE} takes no {', '.join(sorted(options))} on CUDA: one stream, no drafts, a bf16 KV "
+                         "cache")
     check(model_dir)
     from .cuda.app import Lfm2MoeEngine
 
-    return Lfm2MoeEngine(Path(model_dir), context=context, context_explicit=bool(options.get("context_explicit")))
+    return Lfm2MoeEngine(Path(model_dir), context=context, context_explicit=bool(context_explicit))
 
 
 def __getattr__(name: str) -> Any:
