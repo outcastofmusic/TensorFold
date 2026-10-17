@@ -142,6 +142,56 @@ def test_nvfp4_hand_built_matrix_equals_the_scalar_definition():
     assert torch.equal(got, torch.tensor(want, dtype=torch.float32).reshape(n, k))
 
 
+def _drafter_nvfp4(weight, weight_scale, s2: float, dtype):
+    """The drafter's former NVFP4 decoder (lilicorr.dequantize_nvfp4 before 2026-10-17): a table gather."""
+
+    import torch
+
+    mags = torch.tensor(_E2M1, dtype=torch.float32)
+    table = torch.cat([mags, -mags])
+    w = weight.to(torch.int64)
+    codes = torch.stack([w & 0xF, w >> 4], dim=-1).reshape(w.shape[0], -1)
+    return (table[codes] * (weight_scale.to(torch.float32).repeat_interleave(16, dim=1) * s2)).to(dtype)
+
+
+def _mamba_nvfp4(codes, scales, s2: float):
+    """The Mamba loader's former Fp4.dequantized: e2m1 codes times fp32(e4m3) * scale_2, bf16."""
+
+    import torch
+
+    table = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+    lo, hi = table[(codes & 15).long()], table[(codes >> 4).long()]
+    values = torch.stack([lo, hi], dim=-1).reshape(codes.shape[0], -1)
+    return (values * (scales.float().repeat_interleave(16, dim=1) * s2)).to(torch.bfloat16)
+
+
+def test_nvfp4_equals_the_drafters_and_the_loaders_former_decoders():
+    """Every code (8 is -0) under every finite e4m3 scale, subnormals and -0 included: the same bits."""
+
+    import torch
+
+    from tensorfold.families.nemotron_bolt.cuda.lilicorr import dense_tensors
+    from tensorfold.families.nemotron_bolt.cuda.weights import Fp4
+
+    q = _quant()
+    finite = torch.tensor([b for b in range(256) if b & 0x7F != 0x7F], dtype=torch.uint8)      # 254 scales
+    n, k = len(finite), 256
+    codes = torch.arange(n * k // 2, dtype=torch.int64).remainder(256).to(torch.uint8).reshape(n, k // 2)
+    scales = finite[:, None].expand(n, k // 16).contiguous().view(torch.float8_e4m3fn)
+    s2 = torch.tensor(0.0123, dtype=torch.float32)
+    for dtype in (torch.bfloat16, torch.float32):
+        got = q.dequantize_nvfp4(codes, scales, s2, dtype=dtype)
+        want = _drafter_nvfp4(codes, scales, float(s2), dtype)
+        assert torch.equal(got.view(torch.int16 if dtype == torch.bfloat16 else torch.int32),
+                           want.view(torch.int16 if dtype == torch.bfloat16 else torch.int32)), dtype
+    raw = {"a.weight": codes, "a.weight_scale": scales, "a.weight_scale_2": s2}
+    dense = dense_tensors(raw, torch.bfloat16)["a.weight"]
+    assert torch.equal(dense.view(torch.int16), _drafter_nvfp4(codes, scales, float(s2), torch.bfloat16).view(torch.int16))
+    loaded = Fp4(n, k, raw=(codes, scales, float(s2))).dequantized()
+    assert torch.equal(loaded.view(torch.int16), _mamba_nvfp4(codes, scales, float(s2)).view(torch.int16))
+    assert (loaded.view(torch.int16) == -0x8000).any()                    # code 8 decodes to -0 and stays -0
+
+
 def test_bf16_output_is_the_fp32_value_rounded_once():
     import torch
 

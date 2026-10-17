@@ -17,12 +17,12 @@ from typing import Any
 
 import torch
 
-Q8_BLOCK, Q8_BYTES = 32, 34
-IQ2_BLOCK, IQ2_BYTES = 256, 66
+from ..quant import IQ2XXS_BYTES, Q8_0_BLOCK, Q8_0_BYTES, dequantize_nvfp4, dequantize_q8_0
+
 KINDS = {"mamba": "M", "attention": "*", "moe": "E"}
 
 
-def _number(value: Any) -> float:
+def config_float(value: Any) -> float:
     """A config float; ``{"__float__": "Infinity"}`` is how the checkpoint writes inf."""
 
     if isinstance(value, dict) and "__float__" in value:
@@ -103,7 +103,7 @@ class Config:
             latent=int(t.get("moe_latent_size") or t["hidden_size"]),
             scaling=float(t.get("routed_scaling_factor") or 1.0), norm_topk=bool(t.get("norm_topk_prob", True)),
             eps=float(t.get("layer_norm_epsilon") or t.get("norm_eps") or 1e-5),
-            dt_min=_number(limit[0]), dt_max=_number(limit[1]), eos=eos)
+            dt_min=config_float(limit[0]), dt_max=config_float(limit[1]), eos=eos)
 
 
 def _eos(model_dir: Path, raw: dict) -> tuple[int, ...]:
@@ -123,16 +123,19 @@ def _eos(model_dir: Path, raw: dict) -> tuple[int, ...]:
 
 # -- formats ------------------------------------------------------------------------------------------------------
 
-def dequantize_q8_0(packed: torch.Tensor) -> torch.Tensor:
-    """uint8 [..., K // 32 * 34] -> bf16 [..., K]: q * d in fp32, rounded once."""
+def dequantize_q8_0_rows(packed: torch.Tensor, rows: int = 8192) -> torch.Tensor:
+    """uint8 [N, K // 32 * 34] -> bf16 [N, K], ``quant.dequantize_q8_0`` a slice of ``rows`` at a time: the same
+    values, with fp32 temporaries of 0.27 GiB instead of the 4 GiB the whole lm_head (131072 x 4096) takes."""
 
-    if packed.dtype != torch.uint8 or packed.shape[-1] % Q8_BYTES:
-        raise ValueError(f"Q8_0 rows are uint8 in blocks of {Q8_BYTES} bytes, not {packed.dtype} {tuple(packed.shape)}")
-    nb = packed.shape[-1] // Q8_BYTES
-    b = packed.reshape(-1, nb, Q8_BYTES)
-    d = b[..., :2].contiguous().view(torch.float16).float()
-    q = b[..., 2:].contiguous().view(torch.int8).float()
-    return (q * d).reshape(*packed.shape[:-1], nb * Q8_BLOCK).to(torch.bfloat16)
+    if packed.dtype != torch.uint8 or packed.dim() != 2 or packed.shape[-1] % Q8_0_BYTES:
+        raise ValueError(f"Q8_0 rows are uint8 in blocks of {Q8_0_BYTES} bytes, not {packed.dtype} "
+                         f"{tuple(packed.shape)}")
+    n = packed.shape[0]
+    out = torch.empty((n, packed.shape[1] // Q8_0_BYTES * Q8_0_BLOCK), dtype=torch.bfloat16,
+                      device=packed.device)
+    for r in range(0, n, rows):
+        out[r:r + rows] = dequantize_q8_0(packed[r:r + rows])
+    return out
 
 
 def flat(packed: torch.Tensor, block_bytes: int) -> torch.Tensor:
@@ -166,12 +169,7 @@ class Fp4:
         if self.raw is None:
             raise ValueError("this projection did not keep its stored tensors (load with raw=True)")
         codes, scales, scale2 = self.raw
-        table = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-                             device=codes.device)
-        lo, hi = table[(codes & 15).long()], table[(codes >> 4).long()]
-        values = torch.stack([lo, hi], dim=-1).reshape(self.n, self.k)        # the low nibble is the even input
-        s = scales.float().repeat_interleave(16, dim=1) * scale2
-        return (values * s).to(torch.bfloat16)
+        return dequantize_nvfp4(codes, scales, scale2)
 
     def nbytes(self) -> int:
         if self.lin is not None:
@@ -282,9 +280,9 @@ class Loader:
     def __init__(self, model_dir: Path, device: str, raw: bool):
         self.dir, self.device, self.raw = model_dir, device, raw
         self.c = Config.read(model_dir)
-        self.r = _Reader(sorted(model_dir.glob("model*.safetensors")), device)
-        self.root = "language_model." if "language_model.lm_head.weight" in self.r else ""
         self.formats = quant_layers(model_dir)
+        self.r = _Reader(sorted(model_dir.glob("model*.safetensors")), device)     # ``load`` closes it
+        self.root = "language_model." if "language_model.lm_head.weight" in self.r else ""
         self.staging = None
 
     def name(self, short: str) -> str:
@@ -302,7 +300,7 @@ class Loader:
         kind = self.format(short)
         w = self.tensor(short + ".weight")
         if kind == "Q8_0":
-            return dequantize_q8_0(flat(w, Q8_BYTES)).contiguous()
+            return dequantize_q8_0_rows(flat(w, Q8_0_BYTES))
         if kind in ("BF16", "") and w.dtype in (torch.bfloat16, torch.float16, torch.float32):
             return w.to(torch.bfloat16).contiguous()
         raise ValueError(f"{self.name(short)}: Bolt reads this projection as Q8_0 or bf16, not {kind}")
@@ -311,7 +309,7 @@ class Loader:
         kind = self.format(short)
         if kind != "IQ2_XXS":
             raise ValueError(f"{self.name(short)}: Bolt's experts are IQ2_XXS, not {kind}")
-        return flat(self.tensor(short + ".weight"), IQ2_BYTES)
+        return flat(self.tensor(short + ".weight"), IQ2XXS_BYTES)
 
     def fp4(self, short: str) -> Fp4:
         kind = self.format(short)
@@ -392,7 +390,6 @@ class Loader:
                     norm_f=self.tensor("backbone.norm_f.weight").to(torch.bfloat16), head=self.bf16("lm_head"))
         # the omni checkpoint's vision, audio and projector tensors sit outside the language model's root
         left = [n for n in self.r.unused() if n.startswith(self.root) and not n.startswith(TEXT_ONLY_SKIPS)]
-        self.r.close()
         if left:
             raise ValueError(f"unused checkpoint tensors: {left[:5]}")
         return w
@@ -413,7 +410,11 @@ def load(model_dir: str | Path, device: str = "cuda", *, raw: bool = False, laye
     ``raw`` keeps the NVFP4 projections' stored tensors beside their kernels' layout, for references and tests.
     """
 
-    return Loader(Path(model_dir), device, raw).load(layers)
+    loader = Loader(Path(model_dir), device, raw)
+    try:
+        return loader.load(layers)
+    finally:
+        loader.r.close()
 
 
 def weight_bytes(model_dir: str | Path, layers: int | None = None) -> int:
@@ -432,7 +433,7 @@ def weight_bytes(model_dir: str | Path, layers: int | None = None) -> int:
         shape, dtype = info["shape"], info["dtype"]
         n = math.prod(shape)
         if formats.get(name.removesuffix(".weight")) == "Q8_0":
-            total += n // Q8_BYTES * Q8_BLOCK * 2
+            total += n // Q8_0_BYTES * Q8_0_BLOCK * 2
         else:
             total += n * (2 if dtype in ("BF16", "F16") else 4 if dtype == "F32" else 1)
     return total

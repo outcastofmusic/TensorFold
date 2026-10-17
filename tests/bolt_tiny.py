@@ -1,6 +1,7 @@
 """A tiny Nemotron 3.5 Bolt checkpoint in the real layout: omni config with llm_config.block_configs, ModelOpt's
 hf_quant_config.json, Q8_0 / IQ2_XXS ggml blocks stored [N, K // block, bytes], NVFP4 Mamba projections, per-expert
-tensors, and vision / projector tensors the text engine skips. Shapes are the smallest the CUDA kernels take."""
+tensors, and vision / projector tensors the text engine skips, with the index the fp32 reference reads. Shapes are the
+smallest the CUDA kernels take."""
 
 from __future__ import annotations
 
@@ -43,13 +44,18 @@ def q8_0(w: torch.Tensor, rng: torch.Generator) -> torch.Tensor:
     return torch.cat([d.view(torch.uint8).reshape(n, k // 32, 2), q.view(torch.uint8)], dim=-1).contiguous()
 
 
-def iq2xxs(n: int, k: int, rng: torch.Generator, scale: float = 0.02) -> torch.Tensor:
-    """Random ggml IQ2_XXS blocks uint8 [N, K // 256, 66]: fp16 scales near ``scale`` / 100, random words."""
+def iq2xxs(n: int | tuple[int, ...], k: int, rng: torch.Generator, scale: float = 0.02, *,
+           signed: bool = False) -> torch.Tensor:
+    """Random ggml IQ2_XXS blocks uint8 [*n, K // 256, 66]: fp16 scales d with |d| in ``scale`` / 200 ..
+    ``scale`` / 100 (either sign when ``signed``), random words. ``n`` is the rows, or a shape of them."""
 
+    lead = (n,) if isinstance(n, int) else tuple(n)
     nb = k // 256
-    d = (torch.rand((n, nb, 1), generator=rng) * 0.5 + 0.5) * (scale / 100)
-    words = torch.randint(0, 256, (n, nb, 64), generator=rng, dtype=torch.int32).to(torch.uint8)
-    return torch.cat([d.to(torch.float16).view(torch.uint8).reshape(n, nb, 2), words], dim=-1).contiguous()
+    d = (torch.rand((*lead, nb, 1), generator=rng) * 0.5 + 0.5) * (scale / 100)
+    if signed:
+        d = d * (torch.randint(0, 2, d.shape, generator=rng) * 2 - 1)
+    words = torch.randint(0, 256, (*lead, nb, 64), generator=rng, dtype=torch.int32).to(torch.uint8)
+    return torch.cat([d.to(torch.float16).view(torch.uint8).reshape(*lead, nb, 2), words], dim=-1).contiguous()
 
 
 def nvfp4(n: int, k: int, rng: torch.Generator, scale: float = 0.02) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -142,9 +148,12 @@ def write(path: Path, *, seed: int = 0, vocab: int = 1024, hidden: int = 512, to
     tensors.update(extra or {})
     names = sorted(tensors)
     half = len(names) // 2
-    for part, chunk in enumerate((names[:half], names[half:])):
-        save_file({n: tensors[n].contiguous() for n in chunk}, str(path / f"model-0000{part + 1}-of-00002.safetensors"),
-                  metadata={"format": "pt"})
+    files = {f"model-0000{part + 1}-of-00002.safetensors": chunk for part, chunk in enumerate((names[:half],
+                                                                                            names[half:]))}
+    for f, chunk in files.items():
+        save_file({n: tensors[n].contiguous() for n in chunk}, str(path / f), metadata={"format": "pt"})
+    (path / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {n: f for f, chunk in files.items() for n in chunk}}))
     (path / "hf_quant_config.json").write_text(json.dumps({"producer": {"name": "modelopt"}, "quantization": {
         "quant_algo": "MIXED_PRECISION", "quantized_layers": formats}}))
     return path

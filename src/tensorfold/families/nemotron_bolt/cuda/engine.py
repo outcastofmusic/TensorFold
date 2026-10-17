@@ -5,8 +5,8 @@ bf16 linear (``b16.matmul``), Nemotron-H's Mamba-2 and attention kernels (the st
 kept rows first) and the keyed sampler. So a draft accepted because it equals ``tokens()[r]`` is the token serial
 decoding samples there, and a drafted reply equals a ``draft: false`` one token for token.
 
-The routed experts go through ``iq2xxs_grouped`` and the shared expert through ``iq2xxs_linear``: the KERNELS part's
-``iq2xxs.py`` when present, else ``fallback.py`` (the same signatures).
+The routed experts go through ``iq2xxs.iq2xxs_grouped`` and the shared expert through ``iq2xxs.iq2xxs_linear``,
+whose decode kernel gives a row the same bits at any row count.
 
 A prompt row's bits never depend on its chunk either: every prompt kernel is chunk-invariant (the experts' in
 ``prompt`` mode, at any row count), so a prompt resumed from a kept ``state`` ends as a fresh prefill does.
@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 
 import torch
 import triton
+import triton.language as tl
 
 from tensorfold.cuda.kernels import prefill_attention
 from tensorfold.families.nemotron_h.cuda import attention as A
@@ -30,16 +31,8 @@ from tensorfold.families.nemotron_h.cuda.engine import sampling_mode
 from tensorfold.families.qwen3_5.cuda import b16
 from tensorfold.families.qwen3_5.cuda import glue as base
 
+from .iq2xxs import iq2xxs_grouped, iq2xxs_linear
 from .weights import Attention, Block, Mamba, MoE, Weights
-
-try:                                    # the KERNELS part's kernels, once merged; the contract's signatures either way
-    from .iq2xxs import iq2xxs_grouped, iq2xxs_linear
-    EXPERTS = "iq2xxs kernels"
-except ModuleNotFoundError as exc:
-    if exc.name != f"{__package__}.iq2xxs":
-        raise
-    from .fallback import iq2xxs_grouped, iq2xxs_linear
-    EXPERTS = "fallback (dequantize the called experts, bf16 linear)"
 
 ROWS = 16            # the window limit
 PREFILL_ROWS = 2048  # rows of a prompt chunk
@@ -72,11 +65,67 @@ def dense(x: torch.Tensor, w: torch.Tensor, prompt: bool) -> torch.Tensor:
     return b16.prompt(x, w) if prompt else b16.matmul(x, w)
 
 
-def relu2(x: torch.Tensor) -> torch.Tensor:
-    """Nemotron's relu(x)^2 in bf16, as transformers' ReLUSquaredActivation rounds it."""
+@triton.jit
+def _relu2(X, OUT, n, BLOCK: tl.constexpr):
+    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    ok = i < n
+    x = tl.load(X + i, mask=ok, other=0.0).to(tl.float32)
+    r = tl.where(x < 0, 0.0, x)                    # NaN and -0 pass as torch.relu passes them
+    tl.store(OUT + i, (r * r).to(tl.bfloat16), mask=ok)
 
-    r = torch.relu(x)
-    return r * r
+
+def relu2(x: torch.Tensor) -> torch.Tensor:
+    """Nemotron's relu(x)^2 in bf16, as transformers' ReLUSquaredActivation rounds it: one kernel on CUDA.
+
+    torch's bf16 r * r multiplies in fp32 and rounds to bf16 once; the kernel does the same, so the bits agree.
+    """
+
+    if not x.is_cuda:
+        r = torch.relu(x)
+        return r * r
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    n = x.numel()
+    _relu2[(triton.cdiv(n, 1024),)](x, out, n, BLOCK=1024, num_warps=4, enable_fp_fusion=False)
+    return out
+
+
+@triton.jit
+def _weighted_sum(Y, W, OUT, L, w_row, K: tl.constexpr, BLOCK: tl.constexpr):
+    """Program (row, column block): acc = fl(y0 w0), then acc = fl(acc + fl(yj wj)) for j = 1 .. K - 1, then bf16."""
+
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    ok = cols < L
+    y = Y + row * K * L + cols
+    w = W + row * w_row
+    acc = tl.load(y, mask=ok, other=0.0).to(tl.float32) * tl.load(w)      # the first product, so -0 survives
+    for j in tl.static_range(1, K):
+        acc = acc + tl.load(y + j * L, mask=ok, other=0.0).to(tl.float32) * tl.load(w + j)
+    tl.store(OUT + row * L + cols, acc.to(tl.bfloat16), mask=ok)
+
+
+def weighted_sum(y: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+    """y bf16 [R, K, L], wts fp32 [R, K] -> bf16 [R, L]: each row's picks summed in pick order, in fp32.
+
+    The CUDA kernel takes the torch loop's steps (a product rounded, then a sum rounded; compiled without FMA
+    contraction) in one launch instead of 3 K, so a row's bits equal the loop's and ignore R.
+    """
+
+    rows, k, width = y.shape
+    if not y.is_cuda:
+        acc = y[:, 0].float() * wts[:, 0:1]
+        for j in range(1, k):                                      # a fixed order, so a row's sum ignores R
+            acc = acc + y[:, j].float() * wts[:, j:j + 1]
+        return acc.to(torch.bfloat16)
+    if wts.dtype != torch.float32 or wts.shape != (rows, k) or wts.stride(1) != 1:
+        raise ValueError(f"weights: fp32 [{rows}, {k}] with unit column stride, not {wts.dtype} {tuple(wts.shape)}")
+    y = y.contiguous()
+    out = torch.empty((rows, width), dtype=torch.bfloat16, device=y.device)
+    block = 1024
+    _weighted_sum[(rows, triton.cdiv(width, block))](y, wts, out, width, wts.stride(0), K=k, BLOCK=block,
+                                                     num_warps=4, enable_fp_fusion=False)
+    return out
 
 
 def latent_moe(moe: MoE, normed: torch.Tensor, *, scaling: float, norm: bool, prompt: bool) -> torch.Tensor:
@@ -94,10 +143,7 @@ def latent_moe(moe: MoE, normed: torch.Tensor, *, scaling: float, norm: bool, pr
     flat_ids = ids.reshape(-1)
     act = relu2(iq2xxs_grouped(pairs, moe.up, flat_ids, prompt=prompt))
     y = iq2xxs_grouped(act, moe.down, flat_ids, prompt=prompt).view(rows, k, -1)
-    acc = y[:, 0].float() * wts[:, 0:1]
-    for j in range(1, k):                                          # a fixed order, so a row's sum ignores R
-        acc = acc + y[:, j].float() * wts[:, j:j + 1]
-    routed = dense(acc.to(torch.bfloat16), moe.fc2, prompt)
+    routed = dense(weighted_sum(y, wts), moe.fc2, prompt)
     shared = iq2xxs_linear(relu2(iq2xxs_linear(normed, moe.shared_up, prompt=prompt)), moe.shared_down, prompt=prompt)
     return routed + shared
 
@@ -122,7 +168,11 @@ class Engine:
         self.max_len, self.max_rows, self.max_chunks = max_len, max_rows, max_len // A.CHUNK
         self.prefill_rows = prefill_rows
         nm = c.pattern.count("M")
-        self.meta = torch.zeros(4, dtype=torch.int32, device=dev)
+        # a window's meta (pos, parity, prev_keep, 0) and token ids reach the GPU in one copy from pinned memory
+        self._host = torch.zeros(4 + max_rows, dtype=torch.int32, pin_memory=True)
+        self._inputs = torch.zeros(4 + max_rows, dtype=torch.int32, device=dev)
+        self._staged = torch.cuda.Event()                 # that copy has read the pinned buffer
+        self.meta = self._inputs[:4]
         self.p_meta = torch.zeros(4, dtype=torch.int32, device=dev)
         self.k_cache = [torch.zeros((max_len, kv, c.head_dim), dtype=torch.bfloat16, device=dev) for kv in c.kv_heads]
         self.v_cache = [torch.zeros_like(k) for k in self.k_cache]
@@ -137,7 +187,6 @@ class Engine:
         for slot, layer in enumerate(self.tap_layers):
             self._tap_slots.setdefault(layer, []).append(slot)
         self._taps: list[torch.Tensor] = []
-        self.hidden = torch.zeros((0, c.hidden), dtype=torch.bfloat16, device=dev)
         self.logits = torch.zeros((max_rows, c.vocab), dtype=torch.bfloat16, device=dev)
         self.sampled = torch.zeros(max_rows, dtype=torch.int32, device=dev)
         self.p_sampled = torch.zeros(1, dtype=torch.int32, device=dev)
@@ -268,10 +317,12 @@ class Engine:
             raise ValueError(f"a window holds 1..{self.max_rows} rows")
         if self.pos + rows > self.max_len:
             raise ValueError("the KV cache is full")
-        self.meta.copy_(torch.tensor([self.pos, self.parity, self.prev_keep, 0], dtype=torch.int32))
-        ids = torch.as_tensor(list(tokens), dtype=torch.int32).to(self.device)
+        self._staged.synchronize()                        # the last window's copy is done with the buffer
+        self._host[:4 + rows] = torch.tensor([self.pos, self.parity, self.prev_keep, 0, *tokens], dtype=torch.int32)
+        self._inputs[:4 + rows].copy_(self._host[:4 + rows], non_blocking=True)
+        self._staged.record()
+        ids = self._inputs[4:4 + rows]
         normed = self._layers(ids, prompt=False)
-        self.hidden = normed
         self.logits[:rows].copy_(b16.matmul(normed, self.w.head))
         if self.masked:
             self.logits[:rows].add_(self.bias[:rows])
@@ -302,11 +353,6 @@ class Engine:
         if not self.tap_layers:
             raise ValueError("this engine was made without tap layers")
         return torch.cat([t[:n] for t in self._taps], dim=1)
-
-    def hidden_rows(self, n: int) -> torch.Tensor:
-        """The last window's or prompt chunk's first ``n`` final-normed hidden rows [n, D] bf16."""
-
-        return self.hidden[:n]
 
     def mask(self, constraint, window) -> None:
         """The next window's sampling masked by a reply's grammar; ``None`` lifts it."""
@@ -359,7 +405,6 @@ class Engine:
         parts = {int(c): {"ssm": torch.empty_like(self.ssm), "conv_base": self.conv_base.clone()} for c in cuts}
         ids = torch.as_tensor(list(tokens), dtype=torch.int32).to(self.device)
         normed = self._layers(ids, prompt=True, parts=parts)
-        self.hidden = normed
         self._rows = rows
         self.pos += rows
         logits = b16.matmul(normed[rows - 1:rows], self.w.head)
@@ -381,24 +426,30 @@ class DecodeResult:
     rounds: int
     drafted: int = 0
     accepted: int = 0
-    widths: list[int] = field(default_factory=list)
+    widths: list[int] = field(default_factory=list)     # rows verified a round: the pending token and its drafts
+    keeps: list[int] = field(default_factory=list)      # tokens kept a round: 1 + accepted drafts
 
     @property
     def tokens_per_second(self) -> float:
         return (len(self.tokens) - 1) / self.seconds if self.seconds else 0.0
 
+    @property
+    def acceptance_length(self) -> float:
+        """Tokens a verify round yields, the README's 'acceptance length' (4.30 on SPEED-Bench at depth 7)."""
+
+        return sum(self.keeps) / len(self.keeps) if self.keeps else 0.0
+
 
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling, *, on_taps: Callable[[torch.Tensor], None] | None = None,
-            constraint=None, stop: Callable[[], bool] | None = None, resume: dict | None = None,
+            constraint=None, resume: dict | None = None,
             keeps: Sequence[int] = (), keep: Callable[[int, dict], None] | None = None) -> int:
     """Commit the prompt in chunks and return its first sampled token (position len(prompt)).
 
     A fresh prompt starts from a reset; ``resume`` (an ``Engine.state`` of a strict prefix) starts at its length.
     ``keep(n, state)`` gets the engine's state after each of ``keeps`` (positions past the start) once ``on_taps``
     has had the taps up to n, so a drafter's context can be kept beside it. ``on_taps`` gets the taps [R, T * D] in
-    order (a drafter's context); ``stop()`` is asked before each chunk and abandons the prompt with
-    ``RequestCancelled``.
+    order (a drafter's context).
     """
 
     prompt = [int(t) for t in prompt]
@@ -419,10 +470,6 @@ def prefill(e: Engine, prompt: Sequence[int], sampling, *, on_taps: Callable[[to
         e.mask(constraint, constraint.window([0], [-1]))
     try:
         for s in range(begin, len(prompt), e.prefill_rows):
-            if stop is not None and stop():
-                from tensorfold.server.cancellation import RequestCancelled
-
-                raise RequestCancelled("the client left while its prompt was filling")
             chunk = prompt[s:s + e.prefill_rows]
             rows = len(chunk)
             here = [p - s for p in points if s < p <= s + rows]
@@ -470,4 +517,5 @@ def serial_decode(e: Engine, pending: int, count: int, sampling, *, stop_eos: bo
     finally:
         e.mask(None, None)
     torch.cuda.synchronize()
-    return DecodeResult(out, time.perf_counter() - start, len(out) - 1, widths=[1] * (len(out) - 1))
+    steps = len(out) - 1
+    return DecodeResult(out, time.perf_counter() - start, steps, widths=[1] * steps, keeps=[1] * steps)

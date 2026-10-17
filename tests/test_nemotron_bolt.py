@@ -45,6 +45,41 @@ def test_a_per_block_kv_head_count_overrides_the_global_one():
     assert Config.parse(t).kv_heads == (4,)
 
 
+def test_q8_0_slices_equal_the_whole_decode():
+    import torch
+
+    from tensorfold.families.nemotron_bolt import quant
+    from tensorfold.families.nemotron_bolt.cuda.weights import dequantize_q8_0_rows
+    from tests.bolt_tiny import q8_0
+
+    gen = torch.Generator().manual_seed(4)
+    packed = q8_0(torch.randn((301, 128), generator=gen), gen).flatten(-2)
+    whole = quant.dequantize_q8_0(packed)
+    for rows in (1, 7, 300, 301, 4096):
+        assert torch.equal(dequantize_q8_0_rows(packed, rows), whole), rows
+
+
+def test_admission_counts_the_drafter_and_the_widest_activation(tiny, tmp_path):
+    import torch
+
+    from tensorfold.families.nemotron_bolt.cuda.app import cache_bytes, chunk_bytes, need_bytes
+    from tensorfold.families.nemotron_bolt.cuda.lilicorr import Drafter, device_bytes
+    from tensorfold.families.nemotron_bolt.cuda.weights import Config
+    from tests.bolt_lilicorr_fakes import write_draft
+
+    c = Config.read(tiny)
+    # the tiny model's widest prompt activation is a routed MoE's 3 x 512, wider than the shared expert's 512; no
+    # tensor is top_k x Mamba's in_proj wide
+    assert chunk_bytes(c, 64) == 64 * (3 * 512 * 2 * 2 + c.proj_dim * 2 + 8 * c.hidden * 2)
+    assert cache_bytes(c, 1024, 16, 64) - chunk_bytes(c, 64) == cache_bytes(c, 1024, 16, 0)
+    draft = write_draft(tmp_path / "draft")
+    loaded = Drafter(draft, embed=lambda ids: torch.zeros((ids.shape[0], 64)), lm_head=lambda h: h, device="cpu")
+    assert device_bytes(draft, fp4=False) == loaded.nbytes()                  # what a CPU load holds, all dense
+    packed = device_bytes(draft)                                              # CUDA: fc and the MLPs stay NVFP4
+    assert 0 < packed < loaded.nbytes()
+    assert need_bytes(tiny, c, 1024, drafter=draft) - need_bytes(tiny, c, 1024) == packed
+
+
 def _f16(b: bytes) -> float:
     return struct.unpack("<e", b)[0]
 
@@ -52,7 +87,7 @@ def _f16(b: bytes) -> float:
 def test_q8_0_is_code_times_scale():
     import torch
 
-    from tensorfold.families.nemotron_bolt.cuda.weights import dequantize_q8_0
+    from tensorfold.families.nemotron_bolt.quant import dequantize_q8_0
 
     gen = torch.Generator().manual_seed(1)
     packed = torch.randint(0, 256, (3, 2 * 34), generator=gen, dtype=torch.int32).to(torch.uint8)
@@ -69,72 +104,14 @@ def test_q8_0_is_code_times_scale():
     assert torch.equal(got, torch.tensor(want, dtype=torch.float32).to(torch.bfloat16).view(3, 64))
 
 
-def _iq2xxs_loop(raw: bytes, nb: int) -> list[float]:
-    """llama.cpp dequantize_row_iq2_xxs, transliterated (fp32 at each step, as the C code rounds)."""
-
-    import numpy as np
-
-    from tensorfold.families.nemotron_bolt.cuda.fallback import GRID
-
-    signs = [i | ((i.bit_count() & 1) << 7) for i in range(128)]
-    f = np.float32
-    out = []
-    for i in range(nb):
-        blk = raw[i * 66:(i + 1) * 66]
-        d = f(_f16(blk[:2]))
-        for ib in range(8):
-            a0, a1 = struct.unpack("<II", blk[2 + 8 * ib:2 + 8 * ib + 8])
-            db = f(f(d * f(f(0.5) + f(a1 >> 28))) * f(0.25))
-            for l in range(4):
-                g = GRID[(a0 >> (8 * l)) & 0xFF]
-                s = signs[(a1 >> (7 * l)) & 127]
-                for j in range(8):
-                    out.append(float(f(f(db * f((g >> (8 * j)) & 0xFF)) * f(-1.0 if s & (1 << j) else 1.0))))
-    return out
-
-
-def test_iq2xxs_matches_llama_cpp():
-    import torch
-
-    from tensorfold.families.nemotron_bolt.cuda.fallback import dequantize_iq2xxs, dequantize_iq2xxs_torch
-
-    gen = torch.Generator().manual_seed(2)
-    packed = torch.randint(0, 256, (2, 3 * 66), generator=gen, dtype=torch.int32).to(torch.uint8)
-    packed.view(2, 3, 66)[..., :2] = torch.tensor([0.00731], dtype=torch.float16).view(torch.uint8)
-    got = dequantize_iq2xxs_torch(packed)
-    want = []
-    for row in range(2):
-        want += _iq2xxs_loop(bytes(packed[row].tolist()), 3)
-    assert got.shape == (2, 768)
-    assert torch.equal(got, torch.tensor(want, dtype=torch.float32).to(torch.bfloat16).view(2, 768))
-    assert torch.equal(dequantize_iq2xxs(packed), got)          # a CPU tensor takes the torch definition
-
-
-def test_grouped_rows_take_their_own_expert():
-    import torch
-
-    from tensorfold.families.nemotron_bolt.cuda.fallback import dequantize_iq2xxs_torch, iq2xxs_grouped, iq2xxs_linear
-    from tests.bolt_tiny import iq2xxs
-
-    gen = torch.Generator().manual_seed(3)
-    table = torch.stack([iq2xxs(64, 512, gen).reshape(64, -1) for _ in range(5)])
-    x = torch.randn((7, 512), generator=gen).to(torch.bfloat16)
-    ids = torch.tensor([4, 0, 4, 2, 2, 2, 1], dtype=torch.int32)
-    got = iq2xxs_grouped(x, table, ids)
-    for r in range(7):
-        w = dequantize_iq2xxs_torch(table[ids[r]])
-        assert torch.equal(got[r], iq2xxs_linear(x[r:r + 1], table[ids[r]])[0])
-        assert torch.allclose(got[r].float(), (x[r].float() @ w.float().T), rtol=2e-2, atol=1e-3)
-
-
 def test_loader_maps_the_checkpoint(tiny):
     import numpy as np
     import torch
     from safetensors import safe_open
 
     from tensorfold.cuda.nvfp4 import format as nvfp4_format
-    from tensorfold.families.nemotron_bolt.cuda.fallback import dequantize_iq2xxs
-    from tensorfold.families.nemotron_bolt.cuda.weights import dequantize_q8_0, load
+    from tensorfold.families.nemotron_bolt.cuda.weights import load
+    from tensorfold.families.nemotron_bolt.quant import dequantize_iq2xxs, dequantize_q8_0
     from tests.bolt_tiny import EXPERTS
 
     w = load(tiny, "cpu")
@@ -177,6 +154,22 @@ def test_loader_names_a_tensor_it_did_not_read(tmp_path):
         load(path, "cpu")
 
 
+def test_a_failed_load_closes_its_files(tmp_path, monkeypatch):
+    from tensorfold.families.nemotron_bolt.cuda import weights
+    from tests.bolt_tiny import write
+
+    path = write(tmp_path / "odd")
+    quant = json.loads((path / "hf_quant_config.json").read_text())
+    quant["quantization"]["quantized_layers"]["language_model.backbone.layers.4.mixer.in_proj"]["quant_algo"] = "Q8_0"
+    (path / "hf_quant_config.json").write_text(json.dumps(quant))
+    closed = []
+    close = weights._Reader.close
+    monkeypatch.setattr(weights._Reader, "close", lambda self: closed.append(1) or close(self))
+    with pytest.raises(ValueError, match="W4A16_NVFP4, not Q8_0"):
+        weights.load(path, "cpu")
+    assert closed == [1]
+
+
 def test_a_truncated_load_reads_only_its_layers(tiny):
     from tensorfold.families.nemotron_bolt.cuda.weights import load, weight_bytes
 
@@ -198,7 +191,7 @@ def test_reference_is_causal_and_taps_the_stream(tiny):
     assert full.shape == (8, 1024) and torch.isfinite(full).all()
     assert torch.allclose(full[:5], head, rtol=1e-4, atol=1e-4)
     assert [t.shape for t in taps] == [(8, 512), (8, 512)]
-    final = reference._rms(taps[1], w.norm_f, w.config.eps) @ w.head.float().T
+    final = reference.rms(taps[1], w.norm_f.float(), w.config.eps) @ w.head.float().T
     assert torch.allclose(final, full, rtol=1e-5, atol=1e-5)      # the last layer's stream is the head's input
 
 

@@ -22,9 +22,10 @@ A ``depth.DepthPolicy`` picks the drafts a round from measured costs and running
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -33,34 +34,24 @@ import torch.nn.functional as F
 
 from tensorfold.engine.exact_sampling import Sampling, uniform_rows
 
-# FP4 (E2M1) magnitudes by code & 7; bit 3 is the sign. ModelOpt packs input 2j in byte j's low nibble.
-_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-NVFP4_GROUP = 16
+from .engine import DecodeResult
+
+NVFP4_GROUP = 16              # inputs an e4m3 scale covers
 LATTICE_FEATURES = 5          # log p, p, log p - max, rank / (k - 1), is-top-1 (vLLM LiLiCorrHead)
 
 
-def dequantize_nvfp4(weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2: torch.Tensor | float,
-                     dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    """ModelOpt NVFP4 [N, K/2] codes, [N, K/16] e4m3 scales, an fp32 tensor scale -> [N, K] dense, one rounding.
+def _nvfp4_rows(weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2, dtype: torch.dtype) -> torch.Tensor:
+    """``quant.dequantize_nvfp4`` a slice of rows at a time, so its int64 gather indices stay near 128 MiB."""
 
-    value = e2m1(code) * float(e4m3 scale) * weight_scale_2, as ModelOpt's ``NVFP4QTensor.dequantize``. The
-    family's ``quant.dequantize_nvfp4`` (the reference part) is the shared definition once it lands; this one
-    serves the drafter until then.
-    """
+    from .. import quant
 
     n, half = weight.shape
     if weight_scale.shape != (n, 2 * half // NVFP4_GROUP):
         raise ValueError(f"NVFP4 scales {tuple(weight_scale.shape)} do not fit codes {tuple(weight.shape)}")
-    mags = torch.tensor(_E2M1, dtype=torch.float32, device=weight.device)
-    table = torch.cat([mags, -mags])
-    s2 = float(weight_scale_2.item()) if isinstance(weight_scale_2, torch.Tensor) else float(weight_scale_2)
     out = torch.empty((n, 2 * half), dtype=dtype, device=weight.device)
-    step = max(1, (1 << 24) // (2 * half))         # rows a pass: its int64 codes stay near 128 MiB
+    step = max(1, (1 << 24) // (2 * half))
     for r in range(0, n, step):
-        w = weight[r:r + step].to(torch.int64)
-        codes = torch.stack([w & 0xF, w >> 4], dim=-1).reshape(w.shape[0], 2 * half)
-        scale = weight_scale[r:r + step].to(torch.float32).repeat_interleave(NVFP4_GROUP, dim=1) * s2
-        out[r:r + step] = (table[codes] * scale).to(dtype)
+        out[r:r + step] = quant.dequantize_nvfp4(weight[r:r + step], weight_scale[r:r + step], weight_scale_2, dtype)
     return out
 
 
@@ -181,7 +172,7 @@ def dense_tensors(raw: Mapping[str, torch.Tensor], dtype: torch.dtype) -> dict[s
         if base is not None and t.dtype == torch.uint8:
             if base + ".weight_scale" not in raw or base + ".weight_scale_2" not in raw:
                 raise ValueError(f"{name}: packed NVFP4 codes without their scales")
-            out[name] = dequantize_nvfp4(t, raw[base + ".weight_scale"], raw[base + ".weight_scale_2"], dtype)
+            out[name] = _nvfp4_rows(t, raw[base + ".weight_scale"], raw[base + ".weight_scale_2"], dtype)
         else:
             out[name] = t.to(dtype)
     return out
@@ -191,6 +182,25 @@ def fp4_kept(name: str) -> bool:
     """The backbone's NVFP4 projections (fc and the MLPs, 0.86B of the 1.11B weights) that stay packed on CUDA."""
 
     return name == "fc.weight" or (name.startswith("layers.") and ".mlp." in name)
+
+
+def device_bytes(model_dir: str | Path, *, fp4: bool = True) -> int:
+    """The bytes a bf16 ``Drafter`` of ``model_dir`` holds (its ``nbytes()``): dense weights, the NVFP4 ones it keeps
+    packed with ``fp4`` (CUDA: ``Fp4Linear`` pads rows to 128) and its window's keys and values."""
+
+    from tensorfold.cuda.capacity import headers
+
+    path = Path(model_dir)
+    c = DraftConfig.from_json(json.loads((path / "config.json").read_text()))
+    stored = headers(path)
+    total = 2 * c.layers * c.kv_heads * c.window * c.head_dim * 2
+    for name, shape in expected_shapes(c).items():
+        if fp4 and fp4_kept(name) and stored.get(name, {}).get("dtype") == "U8":
+            n, k = shape
+            total += -(-n // 128) * 128 * (k // 2 + k // NVFP4_GROUP)
+        else:
+            total += math.prod(shape) * 2
+    return total
 
 
 Packed = tuple[torch.Tensor, torch.Tensor, torch.Tensor]       # NVFP4 codes, e4m3 scales, the fp32 tensor scale
@@ -396,20 +406,27 @@ class Drafter:
         self.context_end += n
 
     # -- the block ------------------------------------------------------------------------------------------------
-    def _attend(self, i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, s: int) -> torch.Tensor:
-        """Block queries [H, n, hd] over the window's context rows and the block (bidirectional), with sinks."""
+    def _mask(self, s: int, n: int) -> torch.Tensor:
+        """[n, ring + n]: which context rows and block rows the block's queries at s .. s + n - 1 read.
+
+        FlashAttention's non-causal window is symmetric, (window - 1, window - 1): |q - k| < window. The real window
+        (1024) covers the whole block; a smaller one masks block keys too.
+        """
+
+        w = self.c.window
+        qpos = torch.arange(s, s + n, device=self.dev)
+        ok_ctx = (self.slot_pos[None, :] >= 0) & (self.slot_pos[None, :] > qpos[:, None] - w)
+        ok_blk = (qpos[:, None] - qpos[None, :]).abs() < w
+        return torch.cat([ok_ctx, ok_blk], dim=1)
+
+    def _attend(self, i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, ok: torch.Tensor) -> torch.Tensor:
+        """Block queries [H, n, hd] over the window's context rows and the block (bidirectional, ``ok``), with sinks."""
 
         c = self.c
         n = q.shape[1]
         g = c.heads // c.kv_heads
         keys = torch.cat([self.kc[i], k], dim=1).float()                                # [KV, ring + n, hd]
         vals = torch.cat([self.vc[i], v], dim=1).float()
-        # FlashAttention's non-causal window is symmetric, (window - 1, window - 1): |q - k| < window. The real
-        # window (1024) covers the whole block; a smaller one masks block keys too.
-        qpos = torch.arange(s, s + n, device=self.dev)
-        ok_ctx = (self.slot_pos[None, :] >= 0) & (self.slot_pos[None, :] > qpos[:, None] - c.window)
-        ok_blk = (qpos[:, None] - qpos[None, :]).abs() < c.window
-        ok = torch.cat([ok_ctx, ok_blk], dim=1)                                          # [n, ring + n]
         scores = torch.einsum("kgnd,kld->kgnl", q.float().view(c.kv_heads, g, n, c.head_dim), keys)
         scores = (scores * c.head_dim ** -0.5).masked_fill(~ok, float("-inf"))
         if c.sinks:
@@ -422,7 +439,7 @@ class Drafter:
         out = torch.einsum("kgnl,kld->kgnd", probs, vals).reshape(c.heads, n, c.head_dim)
         return out.transpose(0, 1).reshape(n, c.heads * c.head_dim).to(self.dt)
 
-    def _layer(self, i: int, x: torch.Tensor, residual: torch.Tensor | None, s: int, cos: torch.Tensor,
+    def _layer(self, i: int, x: torch.Tensor, residual: torch.Tensor | None, ok: torch.Tensor, cos: torch.Tensor,
                sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         c, p, pre = self.c, self.p, f"layers.{i}."
         n = x.shape[0]
@@ -435,7 +452,7 @@ class Drafter:
         q = F.linear(h, p[pre + "self_attn.q_proj.weight"]).view(n, c.heads, c.head_dim)
         q = _rope(_rms(q, p[pre + "self_attn.q_norm.weight"], c.eps).transpose(0, 1), cos, sin)
         k, v = self._kv(i, h, cos, sin)
-        h = F.linear(self._attend(i, q, k, v, s), p[pre + "self_attn.o_proj.weight"])
+        h = F.linear(self._attend(i, q, k, v, ok), p[pre + "self_attn.o_proj.weight"])
         h = _conv(h, coef[:, 1], base[1], c.conv_group)
         residual = (h.float() + residual.float()).to(self.dt)
         h = _rms(residual, p[pre + "post_attention_layernorm.weight"], c.eps)
@@ -455,9 +472,10 @@ class Drafter:
         ids[0] = int(pending)
         x = self.embed(ids).to(self.dt)
         cos, sin = self._cos_sin(s, n)
+        ok = self._mask(s, n)                                     # the same for every layer
         residual = None
         for i in range(c.layers):
-            x, residual = self._layer(i, x, residual, s, cos, sin)
+            x, residual = self._layer(i, x, residual, ok, cos, sin)
         return _rms((x.float() + residual.float()).to(self.dt), self.p["norm.weight"], c.eps)[1:]
 
     # -- the lattice ----------------------------------------------------------------------------------------------
@@ -561,49 +579,24 @@ class Drafter:
         if depth < 1 or self.context_end == 0:
             return []
         ids, log_probs, scores = self.candidates(pending, depth)
-        cand, sc = ids.cpu().numpy(), scores.cpu().numpy()
+        # one transfer for both: the candidate ids and the scores' fp32 bits, as int32
+        both = torch.cat([ids.to(torch.int32).reshape(-1), scores.contiguous().view(torch.int32).reshape(-1)])
+        both = both.cpu().numpy()
+        cand = both[:ids.numel()].reshape(tuple(ids.shape))
+        sc = both[ids.numel():].view(np.float32).reshape(tuple(scores.shape))
         tokens = self.walk(cand, sc, sampling)
         self.last = Proposal(tokens, ids, log_probs, scores)
         return tokens
 
 
 # -- verification ---------------------------------------------------------------------------------------------------
-@dataclass
-class DecodeResult:
-    tokens: list[int]
-    seconds: float
-    rounds: int
-    drafted: int = 0
-    accepted: int = 0
-    widths: list[int] = field(default_factory=list)     # rows verified a round: the pending token and its drafts
-    keeps: list[int] = field(default_factory=list)      # tokens kept a round: 1 + accepted drafts
-
-    @property
-    def tokens_per_second(self) -> float:
-        return (len(self.tokens) - 1) / self.seconds if self.seconds else 0.0
-
-    @property
-    def acceptance_length(self) -> float:
-        """Tokens a verify round yields, the README's 'acceptance length' (4.30 on SPEED-Bench at depth 7)."""
-
-        return sum(self.keeps) / len(self.keeps) if self.keeps else 0.0
-
-
 def _sample(engine, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None) -> list[int]:
-    """The window's tokens from the sampler serial decoding uses: the engine's own when it has one.
-
-    An engine that samples inside ``verify`` (``tokens()``, like Nemotron-H's keyed GPU sampler) wins; then an
-    engine ``sample(logits, positions, sampling)``; then the shared CUDA rule.
-    """
+    """The window's tokens from the sampler serial decoding uses: the engine's keyed sampler inside ``verify``
+    (``tokens()``, Bolt's ``Engine``), else its ``sample(logits, positions, sampling)`` (the tests' fake targets)."""
 
     if hasattr(engine, "tokens"):
         return [int(t) for t in engine.tokens()[:len(positions)]]
-    sample = getattr(engine, "sample", None)
-    if sample is not None:
-        return list(sample(logits, positions, sampling))
-    from tensorfold.cuda.sampling import sample_rows
-
-    return sample_rows(logits, positions, sampling)
+    return list(engine.sample(logits, positions, sampling))
 
 
 OWED = 256             # committed tap rows a drafter may owe before it takes them, drafting or not
@@ -626,8 +619,7 @@ def lilicorr_decode(engine, drafter: Drafter, first: int, count: int, sampling: 
         raise ValueError(f"the drafter holds {drafter.context_end} positions, the engine {engine.pos}")
     depth = drafter.c.block - 1 if depth is None else max(0, min(int(depth), drafter.c.block - 1))
     eos = set(engine.eos)
-    if hasattr(engine, "set_sampling"):
-        engine.set_sampling(sampling)
+    engine.set_sampling(sampling)
     out = [int(first)]
     res = DecodeResult([], 0.0, 0)
     owed: list[torch.Tensor] = []
@@ -682,5 +674,5 @@ def lilicorr_decode(engine, drafter: Drafter, first: int, count: int, sampling: 
     return res
 
 
-__all__ = ["DecodeResult", "DraftConfig", "Drafter", "Proposal", "dense_tensors", "dequantize_nvfp4",
+__all__ = ["DecodeResult", "DraftConfig", "Drafter", "Proposal", "dense_tensors", "device_bytes",
            "expected_shapes", "fp4_kept", "lilicorr_decode", "read_checkpoint"]

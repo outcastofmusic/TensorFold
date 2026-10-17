@@ -15,7 +15,7 @@ from torch import nn
 
 from tensorfold.cuda.nvfp4.format import E2M1, e4m3
 from tensorfold.engine.exact_sampling import Sampling
-from tensorfold.families.nemotron_bolt.cuda import lilicorr
+from tensorfold.families.nemotron_bolt import quant
 from tensorfold.families.nemotron_bolt.cuda.lilicorr import (
     DraftConfig,
     Drafter,
@@ -171,7 +171,7 @@ def test_nvfp4_matches_the_format_tables():
 
     g = torch.Generator().manual_seed(1)
     codes, scale, s2 = nvfp4_pack(8, 64, g)
-    got = lilicorr.dequantize_nvfp4(codes, scale, s2, torch.float32).numpy()
+    got = quant.dequantize_nvfp4(codes, scale, s2, torch.float32).numpy()
     c = codes.numpy().astype(np.int64)
     nib = np.stack([c & 0xF, c >> 4], -1).reshape(8, 64)
     want = E2M1[nib] * np.repeat(e4m3(scale.view(torch.uint8).numpy()), 16, axis=1) * np.float32(0.01)

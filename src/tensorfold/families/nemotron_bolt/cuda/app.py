@@ -22,6 +22,14 @@ def draft_taps(drafter_dir: str | Path) -> tuple[int, ...]:
     return tuple(int(i) for i in ids)
 
 
+def chunk_bytes(c, prefill_rows: int) -> int:
+    """A prompt chunk's largest activations, in bytes: a MoE layer's widest expert rows (top_k routed rows a token,
+    or the shared expert's one) twice over, Mamba's in_proj rows and a few hidden-wide rows."""
+
+    widest = max([k * w for k, w in zip(c.top_k, c.moe_width)] + [c.shared_width])
+    return prefill_rows * (widest * 2 * 2 + c.proj_dim * 2 + 8 * c.hidden * 2)
+
+
 def cache_bytes(c, max_len: int, rows: int, prefill_rows: int) -> int:
     """The engine's KV caches, Mamba states and largest per-chunk activations, in bytes."""
 
@@ -29,9 +37,22 @@ def cache_bytes(c, max_len: int, rows: int, prefill_rows: int) -> int:
     nm = c.pattern.count("M")
     mamba = nm * (c.m_heads * c.m_head_dim * c.m_state * 4 + 3 * c.conv_dim * 2 + 2 * rows * (2 * c.conv_dim * 2
                                                                                                  + c.m_heads * 4))
-    widest = max([*c.moe_width, c.shared_width, c.proj_dim])
-    chunk = prefill_rows * (max(c.top_k, default=1) * widest * 2 * 2 + c.proj_dim * 2 + 8 * c.hidden * 2)
-    return kv + mamba + chunk + rows * c.vocab * 2
+    return kv + mamba + chunk_bytes(c, prefill_rows) + rows * c.vocab * 2
+
+
+def need_bytes(model_dir: str | Path, c, max_len: int, *, drafter: str | Path = "", layers: int | None = None) -> int:
+    """What Bolt holds on the GPU with a ``max_len``-token cache: its weights, caches and chunk activations, the
+    workspace and, with a ``drafter`` folder, the drafter's weights and context caches."""
+
+    from .engine import PREFILL_ROWS, ROWS
+    from .weights import weight_bytes
+
+    need = weight_bytes(model_dir, layers) + cache_bytes(c, max_len, ROWS, PREFILL_ROWS) + WORKSPACE
+    if drafter:
+        from .lilicorr import device_bytes
+
+        need += device_bytes(drafter)
+    return need
 
 
 class BoltEngine:
@@ -45,53 +66,56 @@ class BoltEngine:
         from tensorfold.cuda.capacity import available_bytes
 
         from .engine import PREFILL_ROWS, ROWS, A, Engine
-        from .weights import Config, load, weight_bytes
+        from .weights import Config, load
 
         torch.cuda.set_device(0)
         self.model_dir = Path(model_dir)
         c = Config.read(self.model_dir)
         taps = draft_taps(drafter) if drafter else ()
+        self.drafts = int(drafts)
+        drafting = bool(drafter) and self.drafts > 0
         # the CLI passes the model's own window (or 0, which it reads from no llm_config) when --context is absent
         want = int(context) if context_explicit and context else CONTEXT
         self.max_len = -(-(want + ROWS) // A.CHUNK) * A.CHUNK
-        need = weight_bytes(self.model_dir, layers) + cache_bytes(c, self.max_len, ROWS, PREFILL_ROWS) + WORKSPACE
+        need = need_bytes(self.model_dir, c, self.max_len, drafter=drafter if drafting else "", layers=layers)
         free = available_bytes(torch)                 # a GB10's page cache counts as free; the pool's floor is kept
         gib = 1 << 30
         if need > free:
-            raise ValueError(f"Nemotron Bolt needs {need / gib:.1f} GiB on the GPU for its weights and a "
-                             f"{self.max_len}-token context; {free / gib:.1f} GiB is free above the memory floor. "
-                             f"Free memory or pass a smaller --context")
+            raise ValueError(f"Nemotron Bolt needs {need / gib:.1f} GiB on the GPU for its weights"
+                             f"{' and drafter' if drafting else ''} and a {self.max_len}-token context; "
+                             f"{free / gib:.1f} GiB is free above the memory floor. Free memory or pass a smaller "
+                             f"--context")
         from tensorfold.cuda.markers import resume_points
 
         from .reuse import Store
 
-        # kept prompt states get what the weights and caches leave, at most TF_BOLT_CACHE_GIB
-        budget = min(int(float(os.environ.get("TF_BOLT_CACHE_GIB", "4")) * gib), free - need)
-        self.store = Store(int(os.environ.get("TF_BOLT_CACHE_ENTRIES", "8")), budget)
         self.marks = resume_points(self.model_dir)          # message starts a prefill keeps states at, or None
         started = time.perf_counter()
         self.w = load(self.model_dir, layers=layers)
         self.e = Engine(self.w, max_len=self.max_len, taps=taps)
         self.drafter = None
-        self.drafts = int(drafts)
         # TF_BOLT_DEPTH=fixed drafts ``drafts`` a round; otherwise a round's depth follows acceptance and measured costs
         self.adaptive = os.environ.get("TF_BOLT_DEPTH", "auto") != "fixed"
-        if drafter and self.drafts > 0:
+        if drafting:
             from .depth import Costs
             from .lilicorr import Drafter
 
             self.drafter = Drafter(drafter, embed=self.e.embed_rows, lm_head=self.e.head_logits)
             self.drafts = min(self.drafts, self.drafter.c.block - 1)
             self.costs = Costs(self.drafts + 1)
+        # kept prompt states get what the loaded weights, drafter and caches leave beside a prompt chunk's
+        # activations and the workspace, at most TF_BOLT_CACHE_GIB
+        torch.cuda.empty_cache()
+        room = available_bytes(torch) - chunk_bytes(c, PREFILL_ROWS) - WORKSPACE
+        budget = max(0, min(int(float(os.environ.get("TF_BOLT_CACHE_GIB", "4")) * gib), room))
+        self.store = Store(int(os.environ.get("TF_BOLT_CACHE_ENTRIES", "8")), budget)
         self.eos = tuple(c.eos)
         self.tp, self.rank = 1, 0
-        from .engine import EXPERTS
-
         rule = (f"LiLiCorr drafts ({drafter}), {'up to ' if self.adaptive else ''}{self.drafts} a round"
                 if self.drafter is not None else "serial decoding (no drafter)")
         kept = (f"up to {self.store.entries} prompt states kept in {self.store.budget / gib:.1f} GiB"
                 if self.store.on else "no prompt states kept")
-        print(f"[tensorfold] Nemotron Bolt on CUDA: {len(self.w.blocks)} layers, experts on the {EXPERTS}; {rule}; "
+        print(f"[tensorfold] Nemotron Bolt on CUDA: {len(self.w.blocks)} layers, IQ2_XXS experts; {rule}; "
               f"{self.max_len}-token cache; {kept}; loaded in {time.perf_counter() - started:.1f}s", flush=True)
 
     @property
