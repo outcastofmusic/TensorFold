@@ -349,11 +349,18 @@ def chunk_plan(start: int, n: int, rows: int, points, marks: int = 1) -> list[tu
         raise ValueError(f"a chunk keeps 1 to {MARKS} states, not {marks}")
     points, plan = sorted(p for p in set(points) if start < p <= n), []
     while start < n:
-        here = [p for p in points if start < p <= min(start + rows, n)]
-        end = here[marks - 1] if len(here) > marks else min(start + rows, n)
-        plan.append((start, end, here[:marks]))
+        end, here = cap_points(start, min(start + rows, n), points, marks)
+        plan.append((start, end, here))
         start = end
     return plan
+
+
+def cap_points(start: int, end: int, points, marks: int) -> tuple[int, list[int]]:
+    """A chunk over rows (start, end] and the kept points inside it, ended at its ``marks``-th point when more lie
+    inside (its chain leaves up to ``marks`` states as it passes): (the chunk's end, its points)."""
+
+    here = sorted(p for p in set(points) if start < p <= end)
+    return (here[marks - 1], here[:marks]) if len(here) > marks else (end, here)
 
 
 @torch.no_grad()

@@ -128,6 +128,28 @@ def test_a_pass_keeps_at_most_one_new_state_a_slot(seed):
     assert [kept[i] for i in range(len(lengths))] == [st + [n - 1] for st, n in zip(stops, lengths)]
 
 
+@pytest.mark.parametrize("seed", range(20))
+def test_a_lone_prompts_pieces_are_the_serial_engines_chunks(seed):
+    """One rule caps a chunk's points (``cap_points``): the decoder's pieces of a lone prompt with every other slot
+    free are the serial plan's chunks at MARKS."""
+
+    from tensorfold.cuda.kernels.gdn import MARKS
+    from tensorfold.families.qwen4_exp.cuda.decode import chunk_plan, entry_end
+
+    rng = random.Random(seed)
+    n, rows = rng.randint(300, 9_000), rng.choice([512, 1_024, 4_096])
+    stops = sorted(rng.sample(range(1, n - 1), rng.randint(1, 20)))
+    m = _decoder([n], [stops], slots=MARKS + 1, rows=rows)
+    pieces = []
+    while m.filling:
+        (s, a, k), = m._pieces()
+        pieces.append((a, a + k, m._points(s, a, k)))
+        m.fills[0][2] = a + k
+        if a + k == n:
+            m.filling.remove(s)
+    assert pieces == chunk_plan(0, n, rows, [*stops, entry_end([0] * n)], MARKS)
+
+
 def test_forward_refuses_marks_one_chain_cannot_keep():
     from tensorfold.families.qwen4_exp.cuda.forward import Cut, forward
 
