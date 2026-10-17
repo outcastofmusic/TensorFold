@@ -193,3 +193,16 @@ def test_a_swap_goes_on_when_the_outgoing_model_cannot_write(swap, tmp_path, cap
     assert swapper.enter("glm-5.3-flash") == "glm-5.3-flash"     # nothing listens on the backend port
     assert log.read_text().split() == ["run", "glm-5.3-flash"]
     assert "did not write its kept states" in capsys.readouterr().out
+
+
+def test_every_served_name_has_a_run_sh_target():
+    """swap.py runs `run.sh <target>` for a name: a name whose target run.sh does not dispatch would fail every swap."""
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("swap_names", root / "swap.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    dispatch = re.findall(r"^    ([a-z0-9.-]+)\)\s+ask_swap", (root / "run.sh").read_text(), re.M)
+    assert set(mod.TARGET.values()) == set(dispatch)
+    assert {"qwen3.8-flash-next-fp4", "nemotron-3.5-bolt"} <= set(mod.TARGET)

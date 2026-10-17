@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Serve one model from this checkout on a DGX Spark, with the settings the fork measured as best (README, "Run it").
 #
-#   ./run.sh                   the default: ./run.sh swap qwen-flash-next, both models on one endpoint, Qwen loaded first
+#   ./run.sh                   the default: ./run.sh swap qwen-flash-next, every model on one endpoint, Qwen loaded first
 #   ./run.sh qwen-flash-next   Qwen3.8 Flash Next on 127.0.0.1:30000, with Clef-Flash beside it as the thinking guard
 #   ./run.sh glm-5.3-flash     GLM-5.3 Flash on 127.0.0.1:30000, with its DFlash2 draft model
+#   ./run.sh qwen-flash-next-fp4   Qwen3.8 Flash Next from NVIDIA's FP4-Local checkpoint (QAD NVFP4), Clef-Flash beside it
+#   ./run.sh nemotron-bolt     Nemotron 3.5 Bolt 74B-A9B (24 GB) with its LiLiCorr draft model
 #   ./run.sh swap              one endpoint on 127.0.0.1:30000 that loads whichever model a request names (swap.py)
 #   ./run.sh stop              stop whatever this script started
 #   ./run.sh status            what is running and whether it answers
 #
-# The two models do not fit together: starting one stops the other (21 to 24 s to either). Run ./prepare.sh first.
+# The models do not fit together: starting one stops the other. Run ./prepare.sh first.
 # The server listens on loopback only and checks no API key; put a gateway in front of it to reach it from elsewhere.
 #
 # Settings (environment):
@@ -17,11 +19,13 @@
 #   SWAP_DRAIN=600  SWAP_HOLD=0  SWAP_TIMEOUT=3600  SWAP_PERSIST=120   swap.py's waits, in seconds (its header says what each does)
 #   TF_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 #   EXTRA="..."                more `tensorfold serve` flags
-#   QWEN_MODEL, CLEF_MODEL, GLM_MODEL   another checkpoint folder under $MODELS
+#   QWEN_MODEL, QWEN_FP4_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL   another checkpoint folder under $MODELS
 # Both:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused
 # Qwen:  CONTEXT=262144  PARALLEL=4  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
+# Qwen FP4-Local: Qwen's settings, VISION=0 by default (the image tower run.sh converts belongs to the EXL3 pack)
+# Bolt:  CONTEXT=131072 (a stream's KV is 8 KiB a token)  THINK_BUDGET=8000 (0: none); no disk states, one stream
 set -euo pipefail
 
 MODELS="${MODELS:-$HOME/models}"
@@ -29,7 +33,7 @@ BASE="${TF_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 PORT="${PORT:-30000}"
 CLEF_PORT="${CLEF_PORT:-30001}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
-NAMES="tensorfold-serve clef-serve tensorfold-glm"
+NAMES="tensorfold-serve clef-serve tensorfold-glm tensorfold-bolt"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/tensorfold-run"
 
 die() { echo "run: $*" >&2; exit 1; }
@@ -148,6 +152,7 @@ swap() {
 
 qwen() {
     local model="${QWEN_MODEL:-$MODELS/Qwen3.8-Flash-Next-exl3-3.05bpw}" clef="${CLEF_MODEL:-$MODELS/clef-flash}"
+    local name="${QWEN_NAME:-qwen3.8-flash-next}"
     local tower="$MODELS/Qwen3.8-Flash-Next-exl3-3.05bpw-vision/vision-f16-v3.safetensors"
     [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh qwen-flash-next)"
     IMAGE=$(image)
@@ -164,13 +169,33 @@ qwen() {
     # kept prompt states also go to disk, so a conversation's next turn after a swap or restart reads its state back;
     # Qwen's folder sits beside GLM's checkpoint folders, each holding a subfolder per checkpoint and build
     [ "${STATES:-1}" = 0 ] || flags+=(-v tensorfold-states:/states -e TENSORFOLD_QWEN_STATES=/states/qwen -e "TENSORFOLD_QWEN_STATES_GIB=${STATES_GIB:-64}" -e "TENSORFOLD_QWEN_STATES_TTL_H=${STATES_TTL_H:-72}")
-    serve tensorfold-serve "${flags[@]}" -- "$model" --host 127.0.0.1 --port "$PORT" --name qwen3.8-flash-next \
+    serve tensorfold-serve "${flags[@]}" -- "$model" --host 127.0.0.1 --port "$PORT" --name "$name" \
         --context "${CONTEXT:-262144}" --max-tokens "${CONTEXT:-262144}" --parallel "${PARALLEL:-4}" --kv-dtype "${KV:-int8}" \
         "${vision[@]}" "${guard[@]}" "${budget[@]}" ${EXTRA:-}
     # Clef starts second: it is ready 17 s before Qwen either way, and Qwen's start is the one a switch waits for
     [ "${GUARD:-1}" = 0 ] || serve clef-serve -- "$clef" --host 127.0.0.1 --port "$CLEF_PORT" --name clef --context 16384
     [ "${GUARD:-1}" = 0 ] || wait_ready clef-serve "$CLEF_PORT" || failed clef-serve
     wait_ready tensorfold-serve "$PORT" || failed tensorfold-serve
+}
+
+# NVIDIA's QAD FP4-Local checkpoint through the same path: decode 0.71-0.82x the EXL3 pack's, TrueScore 91.0 against
+# 87.8 (paired +2.3 [-1.1, +6.4]) and planning +1.5 [-0.4, +3.5], 2026-10-17
+qwen_fp4() {
+    QWEN_MODEL="${QWEN_FP4_MODEL:-$MODELS/Qwen3.8-Flash-Next-FP4-Local}" QWEN_NAME=qwen3.8-flash-next-fp4 \
+        VISION="${VISION:-0}" qwen
+}
+
+bolt() {
+    local model="${BOLT_MODEL:-$MODELS/Nemotron-3.5-Bolt-74B-A9B-24GB}" drafter="$MODELS/Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr"
+    [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh nemotron-bolt)"
+    local draft=() budget=()
+    [ -e "$drafter/config.json" ] && draft=(--drafter "$drafter")
+    [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
+    IMAGE=$(image)
+    stop_all
+    serve tensorfold-bolt -- "$model" --host 127.0.0.1 --port "$PORT" --name nemotron-3.5-bolt \
+        --context "${CONTEXT:-131072}" --max-tokens "${CONTEXT:-131072}" "${draft[@]}" "${budget[@]}" ${EXTRA:-}
+    wait_ready tensorfold-bolt "$PORT" || failed tensorfold-bolt
 }
 
 glm() {
@@ -232,9 +257,11 @@ case "${1:-}" in
     "")              swap qwen-flash-next ;;
     qwen-flash-next) ask_swap "$1" || qwen ;;
     glm-5.3-flash)   ask_swap "$1" || glm ;;
+    qwen-flash-next-fp4) ask_swap "$1" || qwen_fp4 ;;
+    nemotron-bolt)   ask_swap "$1" || bolt ;;
     swap)            swap "${2:-}" ;;
     stop)            if swapping; then stop_swap; fi
                      stop_all ;;
     status)          status ;;
-    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

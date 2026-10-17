@@ -29,6 +29,12 @@ thinking guard, and `glm-5.3-flash` gets GLM-5.3 Flash alone. Qwen loads first, 
 it in. `./run.sh qwen-flash-next` or `./run.sh glm-5.3-flash` serves one model with
 no swap endpoint. On this branch the think-loop detector is on (`TENSORFOLD_THINK_LOOP`, [TANDEM-EVAL.md](TANDEM-EVAL.md)).
 
+Two more models swap in the same way once `./prepare.sh qwen-flash-next-fp4` or `./prepare.sh nemotron-bolt` has
+fetched them: `qwen3.8-flash-next-fp4` (NVIDIA's QAD FP4-Local checkpoint, Clef-Flash beside it, text only) and
+`nemotron-3.5-bolt` (Nemotron 3.5 Bolt 74B-A9B with its LiLiCorr draft model, one stream, no kept states yet).
+Measured on 17 Oct 2026 against the EXL3 pack on one Spark, FP4-Local decoded at 0.71 to 0.82x its speed and scored
+TrueScore 91.0 against 87.8, a paired +2.3 [-1.1, +6.4] over 76 scenarios.
+
 `prepare.sh` downloads the checkpoints into `~/models` (set `MODELS` for another place) at the revisions the numbers
 below were measured on, and converts Qwen's image tower once. Downloads run inside the serving image
 (`nvcr.io/nvidia/pytorch:26.07-py3`), so the host needs no Python packages.
