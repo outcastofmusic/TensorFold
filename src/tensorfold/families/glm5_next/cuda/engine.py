@@ -595,6 +595,25 @@ class GlmEngine:
         point = prompt.index(self.user_id) if self.user_id in prompt else 0
         return [point] if max(cut, 0) + MIN_GAP <= point < len(prompt) - 1 else []
 
+    def _stops(self, prompt: list[int], cut: int) -> list[int]:
+        """Where a prefill from ``cut`` keeps states before the prompt's end: the system block's end, and the last user
+        message's start when it lies MIN_GAP past both that and ``cut``.
+
+        A request that shares the history and asks something else (an edited question, a fork, a client's side
+        question) resumes from the second, since the state at the prompt's end already holds the old question. A
+        linear conversation's next turn resumes past it, from its last turn's end or the background pass's state
+        (``warm``), so a prefill seldom passes one. Until a request resumes it, its own turn's end supersedes it and
+        it goes first when the cache is full (``_superseded``); once resumed, it is a branch point (``_use``). Each
+        point is a cut inside its chunk (``decode.prefill``), which adds no pass.
+        """
+        from tensorfold.cuda.markers import MIN_GAP
+
+        points = self._system_end(prompt, cut)
+        if self.user_id not in prompt:
+            return points
+        first, last = prompt.index(self.user_id), len(prompt) - 1 - prompt[::-1].index(self.user_id)
+        return points + ([last] if max(cut, first) + MIN_GAP <= last < len(prompt) - 1 else [])
+
     def _touch_system_end(self, prompt: list[int]) -> None:
         """Count this prompt as a use of its system block's kept state, so a long conversation's turns do not age it out."""
         point = prompt.index(self.user_id) if self.user_id in prompt else 0
@@ -727,7 +746,7 @@ class GlmEngine:
             self._touch_system_end(prompt)
         first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit,
                         keep_at=max(1, len(prompt) - 1) if keeps else None,
-                        stops=self._system_end(prompt, cut) if keeps else (), keep=self._remember)
+                        stops=self._stops(prompt, cut) if keeps else (), keep=self._remember)
         prefill_s = time.perf_counter() - t0
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         if read is not None:

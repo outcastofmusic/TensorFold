@@ -9,6 +9,10 @@ GitHub has the full notes and the measurements behind them.
   the cut's tokens join the running decode as forced drafts, so the reply is not prefilled again. Each cut's prefill
   fell from 6.5 to 6.9 s to 0.18 to 0.47 s on one DGX Spark on 17 Oct 2026. Replies with no cut keep their tokens.
   A single rank only; two ranks keep the old path.
+- **GLM-5.3 Flash resumes a shared history where its last user message starts.** A prompt now keeps a state at
+  that point, so a request that sends the same history with another question resumes there. On 17 Oct 2026, five
+  questions after one 6,059-token history each prefilled the whole prompt. A kept point is now a cut inside its
+  prefill pass, so neither this state nor the system block's adds a pass. Replies keep their tokens.
 
 ## 0.8.0 (16 Oct 2026)
 

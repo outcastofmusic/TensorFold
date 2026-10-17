@@ -692,3 +692,65 @@ def test_three_resends_preserve_every_kept_glm_state(engine, sampling):
                 if live is not None and snap.mtp_len:
                     index = next(i for i, v in enumerate(views) if v.data_ptr() == live.data_ptr())
                     assert torch.equal(stored[index], getattr(ref.st, name)[:snap.mtp_len]), (step, name)
+
+
+def test_prompt_cuts_keep_fresh_states_at_every_point(engine_f, monkeypatch):
+    """Two cuts in one chunk, a point on a chunk's end and a cut in each later chunk: the prompt runs its three passes
+    with the bits of a prefill that keeps nothing, and every kept state equals a fresh prefill of its prefix."""
+    from tensorfold.families.glm5_next.cuda import decode
+
+    _forget(engine_f)
+    e, drafter = engine_f.e, engine_f.drafter
+    prompt = list(range(11, 151))
+    decode.prefill(e, prompt, None, drafter=drafter, rows=64)
+    full = [x.clone() for x in _state(e)]
+    hidden = e.last_hidden.clone()
+    calls, kept = [], []
+    compute = decode.compute
+
+    def counted(*args, **kwargs):
+        calls.append((args[3], [c.point for c in kwargs.get("cuts", ())]))
+        return compute(*args, **kwargs)
+
+    monkeypatch.setattr(decode, "compute", counted)
+    decode.prefill(e, prompt, None, drafter=drafter, keep_at=130, stops=[5, 40, 64, 100], keep=kept.append, rows=64)
+    monkeypatch.setattr(decode, "compute", compute)
+    assert calls == [(64, [5, 40]), (64, [36]), (12, [2])]
+    assert [len(s.ids) for s in kept] == [5, 40, 64, 100, 130]
+    assert torch.equal(e.last_hidden, hidden)
+    for actual, expected in zip(_state(e), full):
+        assert torch.equal(actual, expected)
+    for snap in kept:
+        n = len(snap.ids)
+        decode.prefill(e, prompt[:n], None, drafter=drafter)
+        fresh = decode.take_snapshot(e, prompt[:n], e.last_hidden, mtp=True, drafter=drafter)
+        for name in ("rec", "conv", "pending"):
+            assert torch.equal(getattr(snap, name), getattr(fresh, name)), (n, name)
+        assert (snap.mtp_len, snap.drafter_end) == (fresh.mtp_len, fresh.drafter_end), n
+        if snap.drafter_rows is not None:
+            assert all(torch.equal(a, b) for a, b in zip(snap.drafter_rows, fresh.drafter_rows)), n
+    _forget(engine_f)
+
+
+@pytest.mark.parametrize("sampling", [None, Sampling(29, 1.0, 20, 0.95)], ids=["greedy", "sampled"])
+def test_questions_after_one_history_resume_where_the_last_question_starts(engine, sampling, monkeypatch):
+    """Five different last questions after one history (2026-10-17: 0 of 6,059 tokens cached each time): the first
+    keeps the history's state at the last user message, the next four resume there, and every reply equals a fresh
+    prefill's serial reply."""
+    _forget(engine)
+    monkeypatch.setattr(engine, "user_id", 9)
+    rng = np.random.default_rng(31)
+    system = list(range(11, 31))
+    history = system + [9] + [int(t) for t in rng.integers(10, 1000, size=300)]
+    prompts = [history + [9, 40 + q, 41 + q, 42] for q in range(5)]
+    replies = []
+    for q, prompt in enumerate(prompts):
+        reply, stats = _generate(engine, prompt, sampling, tokens=12)
+        assert stats["cached"] == (len(history) if q else 0), q
+        replies.append(reply)
+    assert any(len(s.ids) == len(history) and s.branched for s in engine.cache)
+    for prompt, reply in zip(prompts, replies):
+        _forget(engine)
+        fresh, stats = _generate(engine, prompt, sampling, tokens=12, draft=False)
+        assert stats["cached"] == 0 and fresh == reply
+    _forget(engine)

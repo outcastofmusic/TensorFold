@@ -75,7 +75,9 @@ is capped to the remaining space. Larger-context restart advice appears only whe
 
 Prompt prefill uses the shared CUDA prefill kernels. Decode uses CUDA graphs, past the dense limit one per
 pool bucket. The engine keeps up to 8 conversations' prompts (`TF_GLM_CACHE_ENTRIES`): when another
-conversation takes the attention caches, a kept prompt's rows are saved. Kept states and saved rows together get
+conversation takes the attention caches, a kept prompt's rows are saved. Besides its end, a prompt keeps the
+states where its system block ends and where its last user message starts, so a request that sends the same history
+with another question resumes from the second. Kept states and saved rows together get
 `TF_GLM_CACHE_GIB` (default 3), or less when the window leaves less memory on either Spark; the startup log says
 when it is less, and the memory estimate includes it. Earlier turns keep their reasoning in the prompt
 (`clear_thinking` false, zai-org's default), so an agent's next user message resumes from its previous tool loop
