@@ -8,6 +8,7 @@ guidance for bringing up a new model; this file holds the work. Dates are 2026.
 | Task | State |
 |---|---|
 | TrueScore 76x2 and planning x4 on Qwen FP4-Local, Qwen EXL3, GLM-5.3 and Nemotron Bolt | FP4-Local 91.0 / planning 89.8, EXL3 87.8 / 89.0, GLM 93.0 / planning running, Bolt next (`tf-runs/truescore-queue.sh`, 17 Oct) |
+| Research Liquid AI's LFM2.5 series for agentic work | Background agent: lineup, Spark fit, upstream TensorFold support, agentic benchmarks |
 | Qwen disk states, and a persist endpoint `swap.py` calls before it stops a model | Background agent on `feat/qwen-disk-states`; its GPU tests run after the benchmarks |
 | GLM regenerate check of the branch-point rule (#735), base against ports | Chained after the benchmarks (`tf-runs/glm-regen.sh`) |
 
