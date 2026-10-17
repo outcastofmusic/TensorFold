@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import torch
 
-from .fallback import dequantize_iq2xxs_torch
+from ..quant import dequantize_iq2xxs
 from .weights import Attention, Mamba, MoE, Weights
 
 
@@ -38,9 +38,9 @@ def moe(m: MoE, x: torch.Tensor, scaling: float, norm: bool) -> torch.Tensor:
     routed = torch.zeros_like(latent)
     for e in torch.unique(idx).tolist():
         rows, slot = (idx == e).nonzero(as_tuple=True)
-        up = latent[rows] @ dequantize_iq2xxs_torch(m.up[e]).float().T
-        routed.index_add_(0, rows, wts[rows, slot][:, None] * (_relu2(up) @ dequantize_iq2xxs_torch(m.down[e]).float().T))
-    shared = _relu2(x @ dequantize_iq2xxs_torch(m.shared_up).float().T) @ dequantize_iq2xxs_torch(m.shared_down).float().T
+        up = latent[rows] @ dequantize_iq2xxs(m.up[e]).float().T
+        routed.index_add_(0, rows, wts[rows, slot][:, None] * (_relu2(up) @ dequantize_iq2xxs(m.down[e]).float().T))
+    shared = _relu2(x @ dequantize_iq2xxs(m.shared_up).float().T) @ dequantize_iq2xxs(m.shared_down).float().T
     return routed @ m.fc2.float().T + shared
 
 

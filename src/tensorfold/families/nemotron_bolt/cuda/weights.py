@@ -17,8 +17,8 @@ from typing import Any
 
 import torch
 
-Q8_BLOCK, Q8_BYTES = 32, 34
-IQ2_BLOCK, IQ2_BYTES = 256, 66
+from ..quant import IQ2XXS_BYTES, Q8_0_BLOCK, Q8_0_BYTES, dequantize_q8_0
+
 KINDS = {"mamba": "M", "attention": "*", "moe": "E"}
 
 
@@ -127,16 +127,14 @@ def dequantize_q8_0_rows(packed: torch.Tensor, rows: int = 8192) -> torch.Tensor
     """uint8 [N, K // 32 * 34] -> bf16 [N, K], ``quant.dequantize_q8_0`` a slice of ``rows`` at a time: the same
     values, with fp32 temporaries of 0.27 GiB instead of the 4 GiB the whole lm_head (131072 x 4096) takes."""
 
-    from .. import quant
-
-    if packed.dtype != torch.uint8 or packed.dim() != 2 or packed.shape[-1] % quant.Q8_0_BYTES:
-        raise ValueError(f"Q8_0 rows are uint8 in blocks of {quant.Q8_0_BYTES} bytes, not {packed.dtype} "
+    if packed.dtype != torch.uint8 or packed.dim() != 2 or packed.shape[-1] % Q8_0_BYTES:
+        raise ValueError(f"Q8_0 rows are uint8 in blocks of {Q8_0_BYTES} bytes, not {packed.dtype} "
                          f"{tuple(packed.shape)}")
     n = packed.shape[0]
-    out = torch.empty((n, packed.shape[1] // quant.Q8_0_BYTES * quant.Q8_0_BLOCK), dtype=torch.bfloat16,
+    out = torch.empty((n, packed.shape[1] // Q8_0_BYTES * Q8_0_BLOCK), dtype=torch.bfloat16,
                       device=packed.device)
     for r in range(0, n, rows):
-        out[r:r + rows] = quant.dequantize_q8_0(packed[r:r + rows])
+        out[r:r + rows] = dequantize_q8_0(packed[r:r + rows])
     return out
 
 
@@ -307,7 +305,7 @@ class Loader:
         kind = self.format(short)
         w = self.tensor(short + ".weight")
         if kind == "Q8_0":
-            return dequantize_q8_0_rows(flat(w, Q8_BYTES))
+            return dequantize_q8_0_rows(flat(w, Q8_0_BYTES))
         if kind in ("BF16", "") and w.dtype in (torch.bfloat16, torch.float16, torch.float32):
             return w.to(torch.bfloat16).contiguous()
         raise ValueError(f"{self.name(short)}: Bolt reads this projection as Q8_0 or bf16, not {kind}")
@@ -316,7 +314,7 @@ class Loader:
         kind = self.format(short)
         if kind != "IQ2_XXS":
             raise ValueError(f"{self.name(short)}: Bolt's experts are IQ2_XXS, not {kind}")
-        return flat(self.tensor(short + ".weight"), IQ2_BYTES)
+        return flat(self.tensor(short + ".weight"), IQ2XXS_BYTES)
 
     def fp4(self, short: str) -> Fp4:
         kind = self.format(short)
@@ -437,7 +435,7 @@ def weight_bytes(model_dir: str | Path, layers: int | None = None) -> int:
         shape, dtype = info["shape"], info["dtype"]
         n = math.prod(shape)
         if formats.get(name.removesuffix(".weight")) == "Q8_0":
-            total += n // Q8_BYTES * Q8_BLOCK * 2
+            total += n // Q8_0_BYTES * Q8_0_BLOCK * 2
         else:
             total += n * (2 if dtype in ("BF16", "F16") else 4 if dtype == "F32" else 1)
     return total

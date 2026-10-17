@@ -111,13 +111,11 @@ class BoltEngine:
         self.store = Store(int(os.environ.get("TF_BOLT_CACHE_ENTRIES", "8")), budget)
         self.eos = tuple(c.eos)
         self.tp, self.rank = 1, 0
-        from .engine import EXPERTS
-
         rule = (f"LiLiCorr drafts ({drafter}), {'up to ' if self.adaptive else ''}{self.drafts} a round"
                 if self.drafter is not None else "serial decoding (no drafter)")
         kept = (f"up to {self.store.entries} prompt states kept in {self.store.budget / gib:.1f} GiB"
                 if self.store.on else "no prompt states kept")
-        print(f"[tensorfold] Nemotron Bolt on CUDA: {len(self.w.blocks)} layers, experts on the {EXPERTS}; {rule}; "
+        print(f"[tensorfold] Nemotron Bolt on CUDA: {len(self.w.blocks)} layers, IQ2_XXS experts; {rule}; "
               f"{self.max_len}-token cache; {kept}; loaded in {time.perf_counter() - started:.1f}s", flush=True)
 
     @property

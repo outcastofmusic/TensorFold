@@ -2,4 +2,4 @@
 
 CONTEXT = 16384       # prompt plus reply tokens when --context is not given
 DRAFTS = 7            # draft tokens a round with the LiLiCorr drafter (its card measures draft length 7)
-WORKSPACE = 2 << 30   # bytes beside the weights and caches: activations and the fallback's dequantized experts
+WORKSPACE = 2 << 30   # bytes beside the weights and caches: activations and loading's temporaries

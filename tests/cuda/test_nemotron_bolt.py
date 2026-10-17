@@ -34,14 +34,6 @@ def _engine(weights, **kw):
     return Engine(weights, max_len=1024, **kw)
 
 
-def test_the_dequant_kernel_is_the_torch_definition():
-    from tensorfold.families.nemotron_bolt.cuda.fallback import dequantize_iq2xxs, dequantize_iq2xxs_torch
-    from tests.bolt_tiny import iq2xxs
-
-    packed = iq2xxs(300, 1024, torch.Generator().manual_seed(4)).reshape(300, -1).cuda()
-    assert torch.equal(dequantize_iq2xxs(packed), dequantize_iq2xxs_torch(packed))
-
-
 def _torch_weighted_sum(y: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
     """The MoE weighted sum as torch ops, one kernel a step: fl(y0 w0), then fl(acc + fl(yj wj)), then bf16."""
 

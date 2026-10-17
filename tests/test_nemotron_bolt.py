@@ -104,73 +104,14 @@ def test_q8_0_is_code_times_scale():
     assert torch.equal(got, torch.tensor(want, dtype=torch.float32).to(torch.bfloat16).view(3, 64))
 
 
-def _iq2xxs_loop(raw: bytes, nb: int) -> list[float]:
-    """llama.cpp dequantize_row_iq2_xxs, transliterated (fp32 at each step, as the C code rounds)."""
-
-    import numpy as np
-
-    from tensorfold.families.nemotron_bolt.cuda.fallback import GRID
-
-    signs = [i | ((i.bit_count() & 1) << 7) for i in range(128)]
-    f = np.float32
-    out = []
-    for i in range(nb):
-        blk = raw[i * 66:(i + 1) * 66]
-        d = f(_f16(blk[:2]))
-        for ib in range(8):
-            a0, a1 = struct.unpack("<II", blk[2 + 8 * ib:2 + 8 * ib + 8])
-            db = f(f(d * f(f(0.5) + f(a1 >> 28))) * f(0.25))
-            for l in range(4):
-                g = GRID[(a0 >> (8 * l)) & 0xFF]
-                s = signs[(a1 >> (7 * l)) & 127]
-                for j in range(8):
-                    out.append(float(f(f(db * f((g >> (8 * j)) & 0xFF)) * f(-1.0 if s & (1 << j) else 1.0))))
-    return out
-
-
-def test_iq2xxs_matches_llama_cpp():
-    import torch
-
-    from tensorfold.families.nemotron_bolt.cuda.fallback import dequantize_iq2xxs, dequantize_iq2xxs_torch
-
-    gen = torch.Generator().manual_seed(2)
-    packed = torch.randint(0, 256, (2, 3 * 66), generator=gen, dtype=torch.int32).to(torch.uint8)
-    packed.view(2, 3, 66)[..., :2] = torch.tensor([0.00731], dtype=torch.float16).view(torch.uint8)
-    got = dequantize_iq2xxs_torch(packed)
-    want = []
-    for row in range(2):
-        want += _iq2xxs_loop(bytes(packed[row].tolist()), 3)
-    assert got.shape == (2, 768)
-    assert torch.equal(got, torch.tensor(want, dtype=torch.float32).to(torch.bfloat16).view(2, 768))
-    assert torch.equal(dequantize_iq2xxs(packed), got)          # a CPU tensor takes the torch definition
-
-
-def test_grouped_rows_take_their_own_expert():
-    import torch
-
-    from tensorfold.families.nemotron_bolt.cuda.fallback import dequantize_iq2xxs_torch, iq2xxs_grouped, iq2xxs_linear
-    from tests.bolt_tiny import iq2xxs
-
-    gen = torch.Generator().manual_seed(3)
-    table = torch.stack([iq2xxs(64, 512, gen).reshape(64, -1) for _ in range(5)])
-    x = torch.randn((7, 512), generator=gen).to(torch.bfloat16)
-    ids = torch.tensor([4, 0, 4, 2, 2, 2, 1], dtype=torch.int32)
-    got = iq2xxs_grouped(x, table, ids)
-    for r in range(7):
-        w = dequantize_iq2xxs_torch(table[ids[r]])
-        assert torch.equal(got[r], iq2xxs_linear(x[r:r + 1], table[ids[r]])[0])
-        assert torch.allclose(got[r].float(), (x[r].float() @ w.float().T), rtol=2e-2, atol=1e-3)
-
-
 def test_loader_maps_the_checkpoint(tiny):
     import numpy as np
     import torch
     from safetensors import safe_open
 
     from tensorfold.cuda.nvfp4 import format as nvfp4_format
-    from tensorfold.families.nemotron_bolt.cuda.fallback import dequantize_iq2xxs
     from tensorfold.families.nemotron_bolt.cuda.weights import load
-    from tensorfold.families.nemotron_bolt.quant import dequantize_q8_0
+    from tensorfold.families.nemotron_bolt.quant import dequantize_iq2xxs, dequantize_q8_0
     from tests.bolt_tiny import EXPERTS
 
     w = load(tiny, "cpu")

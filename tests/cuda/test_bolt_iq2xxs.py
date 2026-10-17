@@ -1,6 +1,5 @@
 """Bolt's IQ2_XXS kernels against a numpy port of llama.cpp's dequantize_row_iq2_xxs, decode and prefill shapes."""
 
-import hashlib
 import json
 import os
 import struct
@@ -13,6 +12,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
 
+from tensorfold.families.nemotron_bolt import quant
 from tensorfold.families.nemotron_bolt.cuda import iq2xxs
 
 DEV = "cuda"
@@ -21,10 +21,10 @@ DEV = "cuda"
 def dequant(packed: np.ndarray) -> np.ndarray:
     """uint8 [..., K / 256 * 66] -> float32 [..., K]: ggml-quants.c dequantize_row_iq2_xxs, block by block."""
 
-    grid = np.array(iq2xxs.GRID, dtype="<u8").view(np.uint8).reshape(256, 8).astype(np.float32)
-    signs = np.array([iq2xxs.ksigns(i) for i in range(128)], dtype=np.uint8)
+    grid = np.array(quant.IQ2XXS_GRID, dtype="<u8").view(np.uint8).reshape(256, 8).astype(np.float32)
+    signs = np.array(quant.KSIGNS_IQ2XS, dtype=np.uint8)
     lead = packed.shape[:-1]
-    blocks = packed.reshape(-1, iq2xxs.BLOCK_BYTES)
+    blocks = packed.reshape(-1, quant.IQ2XXS_BYTES)
     d = blocks[:, :2].copy().view("<f2").astype(np.float32)[:, 0]                       # [B]
     qs = blocks[:, 2:].copy().view("<u4").reshape(-1, 8, 2)                               # [B, ib32, aux32]
     db = d[:, None] * (np.float32(0.5) + (qs[:, :, 1] >> 28).astype(np.float32)) * np.float32(0.25)
@@ -41,10 +41,10 @@ def random_packed(shape: tuple, k: int, seed: int) -> np.ndarray:
 
     rng = np.random.default_rng(seed)
     nb = k // 256
-    raw = rng.integers(0, 256, size=(*shape, nb, iq2xxs.BLOCK_BYTES), dtype=np.uint8)
+    raw = rng.integers(0, 256, size=(*shape, nb, quant.IQ2XXS_BYTES), dtype=np.uint8)
     d = (rng.uniform(1e-3, 2e-2, size=(*shape, nb)) * rng.choice([-1, 1], size=(*shape, nb))).astype("<f2")
     raw[..., :2] = d[..., None].view(np.uint8)
-    return raw.reshape(*shape, nb * iq2xxs.BLOCK_BYTES)
+    return raw.reshape(*shape, nb * quant.IQ2XXS_BYTES)
 
 
 def bf16(a: np.ndarray) -> torch.Tensor:
@@ -63,11 +63,8 @@ def check(out: torch.Tensor, x: torch.Tensor, wq: torch.Tensor) -> None:
     assert exact > 0.97, f"{float(exact):.4f} of outputs equal bf16(ref)"
 
 
-def test_grid_is_llama_cpp_table():
-    blob = struct.pack("<256Q", *iq2xxs.GRID)
-    assert hashlib.sha256(blob).hexdigest() == iq2xxs.GRID_SHA256
-    assert set(blob) == set(iq2xxs.MAGNITUDES)
-    assert iq2xxs.ksigns(1) == 129 and iq2xxs.ksigns(3) == 3 and iq2xxs.ksigns(127) == 255   # ggml-common.h:513
+def test_the_kernels_magnitudes_are_the_grids_bytes():
+    assert set(struct.pack("<256Q", *quant.IQ2XXS_GRID)) == set(iq2xxs.MAGNITUDES)   # the checksum: test_bolt_quant
 
 
 def test_dequant_matches_hand_decoded_block():

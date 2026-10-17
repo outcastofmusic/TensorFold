@@ -5,8 +5,8 @@ bf16 linear (``b16.matmul``), Nemotron-H's Mamba-2 and attention kernels (the st
 kept rows first) and the keyed sampler. So a draft accepted because it equals ``tokens()[r]`` is the token serial
 decoding samples there, and a drafted reply equals a ``draft: false`` one token for token.
 
-The routed experts go through ``iq2xxs_grouped`` and the shared expert through ``iq2xxs_linear``: the KERNELS part's
-``iq2xxs.py`` when present, else ``fallback.py`` (the same signatures).
+The routed experts go through ``iq2xxs.iq2xxs_grouped`` and the shared expert through ``iq2xxs.iq2xxs_linear``,
+whose decode kernel gives a row the same bits at any row count.
 
 A prompt row's bits never depend on its chunk either: every prompt kernel is chunk-invariant (the experts' in
 ``prompt`` mode, at any row count), so a prompt resumed from a kept ``state`` ends as a fresh prefill does.
@@ -31,16 +31,8 @@ from tensorfold.families.nemotron_h.cuda.engine import sampling_mode
 from tensorfold.families.qwen3_5.cuda import b16
 from tensorfold.families.qwen3_5.cuda import glue as base
 
+from .iq2xxs import iq2xxs_grouped, iq2xxs_linear
 from .weights import Attention, Block, Mamba, MoE, Weights
-
-try:                                    # the KERNELS part's kernels, once merged; the contract's signatures either way
-    from .iq2xxs import iq2xxs_grouped, iq2xxs_linear
-    EXPERTS = "iq2xxs kernels"
-except ModuleNotFoundError as exc:
-    if exc.name != f"{__package__}.iq2xxs":
-        raise
-    from .fallback import iq2xxs_grouped, iq2xxs_linear
-    EXPERTS = "fallback (dequantize the called experts, bf16 linear)"
 
 ROWS = 16            # the window limit
 PREFILL_ROWS = 2048  # rows of a prompt chunk
