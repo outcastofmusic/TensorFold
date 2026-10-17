@@ -104,6 +104,11 @@ class FlashNextEngine:
 
         if tp not in (1, 2) or rank not in range(tp):
             raise ValueError(f"rank {rank} of {tp}: Flash Next runs on one GPU or two")
+        from tensorfold.cuda import disk_states
+
+        if tp == 2 and disk_states.configured("QWEN"):
+            raise ValueError("TENSORFOLD_QWEN_STATES: Flash Next keeps prompt states on disk on one GPU only; unset it "
+                             "to serve on two ranks (their kept states then stay in memory)")
         if not 0 <= int(depth) <= MAX_DEPTH:
             raise ValueError(f"MTP drafts a round: 0 to {MAX_DEPTH}, not {depth}")
         if not 0.0 <= float(confidence) <= 1.0:
@@ -276,7 +281,17 @@ class FlashNextEngine:
             torch.cuda.empty_cache()
         warm_s = time.perf_counter() - started
         self._self_check()
-        self.idle = self._idle_graphs()
+        from .disk import open_states
+
+        # TENSORFOLD_QWEN_STATES: kept states also go to disk, written while no request runs
+        self.disk = open_states(model_dir, self.multi.free[0] if self.concurrent else self.e.st,
+                                engine="concurrent" if self.concurrent else "serial",
+                                prefill_rows=self.prefill_rows) if self.depth > 0 else None
+        if self.concurrent:
+            self.multi.disk = self.disk
+            if self.disk is not None:
+                self.scheduler.idle = self.multi.persist
+        self.idle = self._idle_work()
         reread_s = 0.0
         if prefetch and not ple_on_ssd and not locked:
             started = time.perf_counter()
@@ -325,26 +340,35 @@ class FlashNextEngine:
               f"decode graphs captured; idle prompt pieces {self.prefill_rows} rows; "
               f"prompt kernels warmed in {warm_s:.1f}s", flush=True)
 
-    def _idle_graphs(self):
-        """TENSORFOLD_IDLE_GRAPHS=1 (one GPU, one stream, graphs on): a second after each request, capture the decode
-        graphs of the context bucket it ended in and the next one, a capture at a time, so a reply that grows into a
-        new bucket does not stop to capture them; a request waits for at most the capture under way."""
+    def _idle_work(self):
+        """The one-stream engine's work between requests, a second after each: its kept states' disk write
+        (``TENSORFOLD_QWEN_STATES``), and with TENSORFOLD_IDLE_GRAPHS=1 (one GPU, graphs on) the decode graphs of
+        the context bucket the request ended in and the next one, a capture at a time, so a reply that grows into a
+        new bucket does not stop to capture them; a request waits for at most the step under way."""
 
         from tensorfold.env_flags import flag
 
-        if not flag("TENSORFOLD_IDLE_GRAPHS"):
-            return None
-        if self.e is None or self.e.graphs is None or self.tp != 1:
+        graphs = flag("TENSORFOLD_IDLE_GRAPHS")
+        if graphs and (self.e is None or self.e.graphs is None or self.tp != 1):
             print("[tensorfold] TENSORFOLD_IDLE_GRAPHS ignored: idle captures need one GPU, one stream and graphs",
                   flush=True)
+            graphs = False
+        keeps = self.e is not None and self.disk is not None
+        if not graphs and not keeps:
             return None
         import torch
 
         from tensorfold.cuda.idle_work import IdleWork
 
         e = self.e
-        return IdleWork(lambda: e.graphs.idle_steps(e.st.pos + self.depth + 1), delay=1.0,
-                        setup=lambda: torch.cuda.set_device(0))
+
+        def plan():
+            steps = list(e.graphs.idle_steps(e.st.pos + self.depth + 1)) if graphs else []
+            # the write stops between blocks for a request (``IdleWork.waiting``); its next try writes only the rest
+            return steps + ([lambda: self._persist(lambda: bool(work.waiting))] if keeps else [])
+
+        work = IdleWork(plan, delay=1.0, setup=lambda: torch.cuda.set_device(0))
+        return work
 
     def _self_check(self) -> None:
         """TENSORFOLD_SELF_CHECK=1: replay greedy one-row steps through every verify width (self_check.py); any bit
@@ -498,6 +522,39 @@ class FlashNextEngine:
     def _remember(self, ids: list[int], snap: dict) -> None:
         self.cache = [c for c in self.cache if c[0] != ids][-(KEEP_SERIAL - 1):] + [(ids, snap)]
 
+    def persist(self, stop: Callable[[], bool]) -> int:
+        """Write the kept states not on disk yet, once no request runs; the states written (0 without
+        ``TENSORFOLD_QWEN_STATES``). ``stop()`` between blocks leaves the rest for the next try."""
+
+        if getattr(self, "disk", None) is None:
+            return 0
+        if self.scheduler is not None:               # the worker writes, between rounds with no stream live
+            return self.scheduler.call(lambda: self.multi.persist(stop))
+        idle = getattr(self, "idle", None)
+        with idle.busy() if idle is not None else nullcontext():
+            return self._persist(stop)
+
+    def _persist(self, stop: Callable[[], bool]) -> int:
+        """The one-stream engine's write: every kept state's rows are the live state's first rows (``_start_from``)."""
+
+        from .disk import persist
+
+        return persist(self.disk, [(ids, self.e.st, kept["state"], kept["tail"]) for ids, kept in self.cache], stop)
+
+    def _load_disk(self, entry):
+        """Read a state from disk into the live state and keep it as the only one (the read overwrites the rows every
+        other kept state resumes from); None, with the prompt prefilling, when a piece fails its hash."""
+
+        from .disk import load
+
+        self.cache = []
+        resume = load(self.disk, entry, self.e.st)
+        if resume is None:
+            return None
+        hit = (list(entry.ids), resume)
+        self.cache = [hit]
+        return hit
+
     @property
     def supports_logprobs(self) -> bool:
         return self.tp == 1
@@ -626,6 +683,13 @@ class FlashNextEngine:
         """One request on the one-stream engine (or the two ranks' leader)."""
 
         hit = self._resume(prompt) if draft and vision is None else None
+        read = None
+        if draft and vision is None and getattr(self, "disk", None) is not None:
+            entry = self.disk.find(prompt, len(hit[0]) if hit else 0, lambda e: True)
+            if entry is not None:            # a longer prefix on disk than any kept in memory
+                started = time.perf_counter()
+                hit = self._load_disk(entry)
+                read = (len(entry.ids), time.perf_counter() - started) if hit is not None else None
         points = None
         # rank 0 encodes before sharing (a refused image fails here alone), then sends rank 1 the same features
         encoded = self.vision.encode(vision, prompt) if vision is not None else None
@@ -643,8 +707,11 @@ class FlashNextEngine:
         if not draft:
             return self._serial(prompt, max_tokens, sampling, on_tokens, constraint, stop_eos,
                                 probabilities=probabilities, vision=encoded)
-        return self._decode(prompt, max_tokens, sampling, on_tokens, hit, constraint, stop_eos,
-                            probabilities=probabilities, points=points, vision=encoded)
+        stats = self._decode(prompt, max_tokens, sampling, on_tokens, hit, constraint, stop_eos,
+                             probabilities=probabilities, points=points, vision=encoded)
+        if read is not None:
+            stats.update(disk_tokens=read[0], disk_s=round(read[1], 3))
+        return stats
 
     def score_labels(self, prompt_ids, label_ids) -> tuple[list[float], float]:
         """Score the prompt's final row in a fresh state without adding a kept decision prefix."""

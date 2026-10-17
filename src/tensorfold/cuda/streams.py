@@ -47,6 +47,8 @@ class Stream:
     # the same by drafter, {"mtp": [drafted, kept], "copy": [...]}, when the engine counts them (else None)
     drafters: dict | None = None
     cached: int = 0
+    disk_tokens: int = 0                                  # of ``cached``, the tokens a state read from disk resumed
+    disk_s: float = 0.0
     prefill_s: float = 0.0
     started: float = 0.0
     finished: float = 0.0
@@ -86,6 +88,8 @@ class Stream:
                "drafted": self.drafted, "accepted": self.accepted}
         if self.drafters is not None:
             own["drafters"] = {k: list(v) for k, v in self.drafters.items()}
+        if self.disk_tokens:
+            own.update(disk_tokens=self.disk_tokens, disk_s=round(self.disk_s, 3))
         if self.carry is None:
             return own
         both = {k: round(self.carry[k] + own[k], 4) for k in ("prefill_s", "decode_s")}

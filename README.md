@@ -59,6 +59,14 @@ streamed request receives an SSE comment every 5 s while it waits, which keeps c
 `SWAP_HOLD=120` keeps each model loaded for at least that many seconds: with two clients on two models, each request
 otherwise pays a swap.
 
+Both models write their kept prompt states to the `tensorfold-states` Docker volume while no request runs. A
+conversation's next turn after a swap or a restart reads its state back instead of prefilling the whole conversation.
+On GLM, an 11,735-token turn resumed 7,445 tokens from disk in 0.31 s and prefilled in 13.9 s instead of 38.0 s, with
+the cold reply's tokens (2026-10-16). A Qwen state at `--kv-dtype int8` takes 115.7 MB plus 18,304 bytes a token,
+1.03 GB at 50,000 tokens. `STATES=0` keeps states in memory only, `STATES_GIB` (64) caps each model's folder with every build's states in it, and a state unused for `STATES_TTL_H` hours (72) is deleted. Before a
+swap stops a model, `swap.py` asks it to write the states not on disk yet (`POST /internal/persist`) and waits up to
+`SWAP_PERSIST` seconds (120).
+
 | | `./run.sh qwen-flash-next` | `./run.sh glm-5.3-flash` |
 | --- | --- | --- |
 | Model id | `qwen3.8-flash-next` | `glm-5.3-flash` |

@@ -123,7 +123,7 @@ class AbsoluteGrowthTests(unittest.TestCase):
                                     {"_state_changed", "_flush"}, ns)
         cls = source_class("src/tensorfold/families/qwen4_exp/cuda/multi.py", "MultiDecoder",
                            {"_grow", "_is_solo", "_busy", "_evict_kept", "_drop_kept", "_make_room", "_slot_for",
-                            "_remember", "admit", "live", "finish"}, ns)
+                            "_remember", "_on_disk", "admit", "live", "finish"}, ns)
         self.dec = cls()
         self.dec.capacity, self.dec.depth = 81920, 0
         self.dec.free, self.dec.kept, self.dec.streams, self.dec.filling = [first, second], [], {}, []
@@ -133,6 +133,7 @@ class AbsoluteGrowthTests(unittest.TestCase):
         self.dec.solo, self.dec.solo_on, self.dec.planning = None, False, False
         self.dec.link, self.dec.follower = None, None
         self.dec.prefill_rows, self.dec.points, self.dec.vision = 4096, None, None
+        self.dec.disk = None
         live = torch_live(self.torch, capacity.available_bytes)
         self.dec.memory_gate = MemoryGate(live(), reserve=2 * GIB, live=live)
 

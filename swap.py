@@ -13,7 +13,8 @@ Environment: PORT=30000, BACKEND_PORT=30002, SWAP_DEFAULT=qwen3.8-flash-next (fo
 SWAP_DRAIN=600 (seconds a swap waits for running requests before it cuts them off), SWAP_HOLD=0 (seconds a model
 stays loaded before a request for the other one may replace it: with two clients on two models, each then gets a turn
 of that length where otherwise every request would pay a swap), SWAP_TIMEOUT=3600 (seconds the backend may stay
-silent before a request is given up; a non-streamed reply is silent until it is whole).
+silent before a request is given up; a non-streamed reply is silent until it is whole), SWAP_PERSIST=120 (seconds the
+outgoing model may take to write its kept prompt states to disk before run.sh stops it).
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ DEFAULT = os.environ.get("SWAP_DEFAULT", "qwen3.8-flash-next")
 DRAIN = float(os.environ.get("SWAP_DRAIN", "600"))
 HOLD = float(os.environ.get("SWAP_HOLD", "0"))
 TIMEOUT = float(os.environ.get("SWAP_TIMEOUT", "3600"))
+PERSIST = float(os.environ.get("SWAP_PERSIST", "120"))
 MAX_BODY = 64 << 20                     # bytes: a request with images inlined fits
 RUN = str(Path(__file__).resolve().parent / "run.sh")
 HOP = {"connection", "keep-alive", "transfer-encoding", "content-length", "host", "te", "upgrade", "proxy-connection"}
@@ -57,6 +59,30 @@ def loaded() -> str | None:
     except (OSError, ValueError, KeyError, IndexError, http.client.HTTPException):
         return None
     return name if name in TARGET else None
+
+
+def persist(model: str) -> None:
+    """Have the loaded model write its kept prompt states to disk (``POST /internal/persist``) before run.sh stops it,
+    waiting up to PERSIST seconds; a model without disk states answers at once, and a failure only costs the states."""
+
+    start = time.monotonic()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", BACKEND, timeout=PERSIST)
+        conn.request("POST", "/internal/persist", b"", {"Content-Length": "0"})
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+    except (OSError, http.client.HTTPException) as exc:
+        return say(f"{model} did not write its kept states to disk: {exc}")
+    try:
+        got = json.loads(body) if resp.status == 200 else None
+    except ValueError:
+        got = None
+    if not isinstance(got, dict):
+        return say(f"{model} did not write its kept states to disk: HTTP {resp.status} {body[:200]!r}")
+    if got.get("disk"):
+        say(f"{model} wrote {got.get('written', 0)} kept states to disk in {time.monotonic() - start:.1f} s "
+            f"({got.get('states', 0)} there)")
 
 
 class Swapper:
@@ -102,6 +128,9 @@ class Swapper:
                 self.cond.wait(1)
             cut, before = self.running, self.current
         say(f"{before} -> {want}" + (f", cutting off {cut} running requests" if cut else ""))
+        # requests still running hold the engine, so a persist would wait for them: their states are left behind
+        if before is not None and not cut:
+            persist(before)
         start = time.monotonic()
         try:
             code = subprocess.run([RUN, TARGET[want]], env={**os.environ, "PORT": str(BACKEND), "TF_SWAP_CHILD": "1"},

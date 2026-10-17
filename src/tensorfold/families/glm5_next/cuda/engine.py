@@ -332,21 +332,14 @@ class GlmEngine:
         """``TENSORFOLD_GLM_STATES``: the folder kept states also go to (``disk``), on one rank; None without it.
         ``TENSORFOLD_GLM_STATES_GIB`` (64) caps what it holds."""
 
-        root = os.environ.get("TENSORFOLD_GLM_STATES", "").strip()
-        if not root or self.comm is not None or self.cache_entries <= 0:
+        if not os.environ.get("TENSORFOLD_GLM_STATES", "").strip() or self.comm is not None or self.cache_entries <= 0:
             return None
         import tensorfold
+        from tensorfold.cuda import disk_states
 
         from .decode import _row_views
-        from .disk import DiskStates, fingerprint
 
-        def digest(paths) -> str:
-            h = hashlib.sha256()
-            for path in paths:
-                if path.is_file():
-                    h.update(path.name.encode() + path.read_bytes())
-            return h.hexdigest()
-
+        digest = disk_states.digest
         here = Path(__file__).resolve().parent
         code = sorted([*here.glob("*.py"), *here.glob("*.cu"), *here.glob("*.cpp"), *here.glob("*.h")])
         folders = [self.model_dir] + ([Path(drafter)] if drafter else [])
@@ -356,11 +349,7 @@ class GlmEngine:
                                  for f in folders],
                  "views": [(list(v.shape[1:]), str(v.dtype)) for v in _row_views(st, 4, 4)],
                  "states": [list(st.rec.shape[1:]), str(st.rec.dtype), list(st.conv.shape), str(st.conv.dtype)]}
-        budget = int(float(os.environ.get("TENSORFOLD_GLM_STATES_GIB", "64")) * (1 << 30))
-        disk = DiskStates(Path(root), fingerprint(parts), budget)
-        print(f"[tensorfold] kept states on disk: {disk.dir} ({len(disk.entries)} states, up to {budget >> 30} GiB)",
-              flush=True)
-        return disk
+        return disk_states.from_env("GLM", parts)
 
     def persist(self, stop: Callable[[], bool]) -> int:
         """Write the kept states not on disk yet, newest first, while no request runs; the states written. A state
@@ -369,7 +358,7 @@ class GlmEngine:
         if self.disk is None:
             return 0
         from .decode import _row_views
-        from .disk import MIN_TOKENS
+        from tensorfold.cuda.disk_states import MIN_TOKENS
 
         written = 0
         for snap in reversed(list(self.cache)):
@@ -398,7 +387,7 @@ class GlmEngine:
         piece fails its hash. Every other state's rows are saved or dropped first: the read overwrites them all."""
 
         from .decode import Snapshot, _row_views
-        from .disk import StateError
+        from tensorfold.cuda.disk_states import StateError
 
         n, m = len(entry.ids), max(entry.mtp_len, 0)
         self._take_over([])

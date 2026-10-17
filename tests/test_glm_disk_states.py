@@ -1,4 +1,4 @@
-"""GLM's kept prompt states on disk (``glm5_next.cuda.disk``): written in blocks, shared blocks stored once, every
+"""GLM's kept prompt states on disk (``tensorfold.cuda.disk_states``): written in blocks, shared blocks stored once, every
 piece checked on its way back, the budget kept least recently used first."""
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ pytestmark = pytest.mark.torch
 
 @pytest.fixture
 def disk():
-    return importlib.import_module("tensorfold.families.glm5_next.cuda.disk")
+    return importlib.import_module("tensorfold.cuda.disk_states")
 
 
 def rows(n, seed=0, dtype=None):

@@ -704,6 +704,25 @@ class App:
                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
                 "stats": stats, "calls_streamed": streamed}
 
+    def persist(self) -> dict[str, Any]:
+        """Write every kept prompt state not on disk yet and answer once they are (``POST /internal/persist``, which
+        swap.py sends before it stops this server); at once when the engine keeps its states in memory only."""
+
+        disk = getattr(self.engine, "disk", None)
+        if disk is None:
+            return {"disk": False, "written": 0}
+        started = time.perf_counter()
+        turns = None if getattr(self.engine, "concurrent", False) else self._turns()
+        if turns is not None:                       # after the request under way, before a waiting background one
+            turns.take(False)
+        try:
+            written = self.engine.persist(lambda: False)
+        finally:
+            if turns is not None:
+                turns.give()
+        return {"disk": True, "written": int(written), "states": len(disk.entries),
+                "seconds": round(time.perf_counter() - started, 3)}
+
     def _prompt_ids(self) -> PromptIds:
         """The rendered prompts' pieces kept between requests (``prompt_ids``), made on first use."""
 
