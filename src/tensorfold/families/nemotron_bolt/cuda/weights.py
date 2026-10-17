@@ -229,6 +229,7 @@ class Weights:
     blocks: list[Block]
     norm_f: torch.Tensor        # (D,) bf16
     head: torch.Tensor          # (V, D) bf16
+    head_q8: torch.Tensor | None = None   # (V, D // 32 * 34) uint8: the stored Q8_0 head, kept for the drafter
     extra: dict = field(default_factory=dict)
 
 
@@ -364,7 +365,7 @@ class Loader:
                    shared_up=self.iq2(p + "shared_experts.up_proj"),
                    shared_down=self.iq2(p + "shared_experts.down_proj"), top_k=top_k)
 
-    def load(self, layers: int | None = None) -> Weights:
+    def load(self, layers: int | None = None, q8_head: bool = False) -> Weights:
         c = self.c
         count = len(c.pattern) if layers is None else int(layers)
         blocks: list[Block] = []
@@ -386,8 +387,14 @@ class Loader:
             for i in range(count, len(c.pattern)):
                 self.r.skip(self.name(f"backbone.layers.{i}."))
             c = _truncated(c, count)
+        packed = None
+        if q8_head and self.format("lm_head") == "Q8_0":
+            packed = flat(self.tensor("lm_head.weight"), Q8_0_BYTES)
+            head = dequantize_q8_0_rows(packed)
+        else:
+            head = self.bf16("lm_head")
         w = Weights(config=c, embed=self.tensor("backbone.embeddings.weight").to(torch.bfloat16), blocks=blocks,
-                    norm_f=self.tensor("backbone.norm_f.weight").to(torch.bfloat16), head=self.bf16("lm_head"))
+                    norm_f=self.tensor("backbone.norm_f.weight").to(torch.bfloat16), head=head, head_q8=packed)
         # the omni checkpoint's vision, audio and projector tensors sit outside the language model's root
         left = [n for n in self.r.unused() if n.startswith(self.root) and not n.startswith(TEXT_ONLY_SKIPS)]
         if left:
@@ -404,15 +411,17 @@ def _truncated(c: Config, layers: int) -> Config:
                    moe_width=c.moe_width[:nm])
 
 
-def load(model_dir: str | Path, device: str = "cuda", *, raw: bool = False, layers: int | None = None) -> Weights:
+def load(model_dir: str | Path, device: str = "cuda", *, raw: bool = False, layers: int | None = None,
+         q8_head: bool = False) -> Weights:
     """The language model of the checkpoint in ``model_dir`` (its first ``layers`` layers when given).
 
-    ``raw`` keeps the NVFP4 projections' stored tensors beside their kernels' layout, for references and tests.
+    ``raw`` keeps the NVFP4 projections' stored tensors beside their kernels' layout, for references and tests;
+    ``q8_head`` keeps a Q8_0 lm_head's stored bytes beside its bf16 copy (``head_q8``), for the drafter.
     """
 
     loader = Loader(Path(model_dir), device, raw)
     try:
-        return loader.load(layers)
+        return loader.load(layers, q8_head)
     finally:
         loader.r.close()
 

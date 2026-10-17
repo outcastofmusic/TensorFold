@@ -13,13 +13,14 @@ VOCAB = 300
 HIDDEN = 64
 
 
-def tiny_config(*, window: int = 6, block: int = 8, top_k: int = 4, sinks: bool = True) -> dict:
+def tiny_config(*, window: int = 6, block: int = 8, top_k: int = 4, sinks: bool = True, hidden: int = HIDDEN,
+                vocab: int = VOCAB, inter: int = 96) -> dict:
     """config.json of a draft at the real checkpoint's layout, shrunk: 2 layers, 3 taps, a 6-position window."""
 
     return {
-        "architectures": ["LiLiCorrDraftModel"], "block_size": block, "hidden_size": HIDDEN, "num_hidden_layers": 2,
-        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "intermediate_size": 96,
-        "rms_norm_eps": 1e-6, "vocab_size": VOCAB, "rope_theta": 10000.0, "sliding_window": window,
+        "architectures": ["LiLiCorrDraftModel"], "block_size": block, "hidden_size": hidden, "num_hidden_layers": 2,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "intermediate_size": inter,
+        "rms_norm_eps": 1e-6, "vocab_size": vocab, "rope_theta": 10000.0, "sliding_window": window,
         "dflash_config": {
             "mask_token_id": 7, "target_layer_ids": [0, 2, 3], "use_swa": True, "swa_window_size": window,
             "causal": False, "attention_sink_bias": sinks, "projector_type": "lilicorr", "lilicorr_enabled": True,

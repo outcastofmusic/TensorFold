@@ -41,10 +41,10 @@ def cache_bytes(c, max_len: int, rows: int, prefill_rows: int) -> int:
 
 
 def need_bytes(model_dir: str | Path, c, max_len: int, *, drafter: str | Path = "", layers: int | None = None,
-               graphs: bool = False) -> int:
+               graphs: bool = False, draft_q8: bool = False) -> int:
     """What Bolt holds on the GPU with a ``max_len``-token cache: its weights, caches and chunk activations, the
-    workspace, with a ``drafter`` folder the drafter's weights and context caches, and with ``graphs`` the window
-    graphs (their pool, the drafter's tap rows they keep, their nodes)."""
+    workspace, with a ``drafter`` folder the drafter's weights and context caches (and with ``draft_q8`` its packed
+    Q8_0 head), and with ``graphs`` the window graphs (their pool, the drafter's tap rows they keep, their nodes)."""
 
     from .engine import PREFILL_ROWS, ROWS
     from .weights import weight_bytes
@@ -54,11 +54,24 @@ def need_bytes(model_dir: str | Path, c, max_len: int, *, drafter: str | Path = 
         from .lilicorr import device_bytes
 
         need += device_bytes(drafter)
+        if draft_q8 and head_is_q8(model_dir):
+            from .q8_head import head_bytes
+
+            need += head_bytes(c)
     if graphs:
         from .graphs import graph_bytes
 
         need += graph_bytes(c, max_len, ROWS, len(draft_taps(drafter)) if drafter else 0)
     return need
+
+
+def head_is_q8(model_dir: str | Path) -> bool:
+    """Whether the checkpoint stores its lm_head as Q8_0 (Bolt's 24 GB export does)."""
+
+    from .weights import quant_layers
+
+    return any(name.rsplit(".", 1)[-1] == "lm_head" and kind == "Q8_0"
+               for name, kind in quant_layers(Path(model_dir)).items())
 
 
 class BoltEngine:
@@ -82,11 +95,14 @@ class BoltEngine:
         self.drafts = int(drafts)
         drafting = bool(drafter) and self.drafts > 0
         graphs = flag("TF_BOLT_GRAPHS", default=True)     # 0 runs every verify window eagerly
+        # the drafter's candidates from the checkpoint's Q8_0 head (0.54 GiB a block pass reads, not 1 GiB); 0 shares
+        # the verify's bf16 head. Drafts and acceptance only: a reply token is always the verify's sample
+        draft_q8 = drafting and flag("TF_BOLT_DRAFT_Q8", default=True)
         # the CLI passes the model's own window (or 0, which it reads from no llm_config) when --context is absent
         want = int(context) if context_explicit and context else CONTEXT
         self.max_len = -(-(want + ROWS) // A.CHUNK) * A.CHUNK
         need = need_bytes(self.model_dir, c, self.max_len, drafter=drafter if drafting else "", layers=layers,
-                          graphs=graphs)
+                          graphs=graphs, draft_q8=draft_q8)
         free = available_bytes(torch)                 # a GB10's page cache counts as free; the pool's floor is kept
         gib = 1 << 30
         if need > free:
@@ -100,16 +116,21 @@ class BoltEngine:
 
         self.marks = resume_points(self.model_dir)          # message starts a prefill keeps states at, or None
         started = time.perf_counter()
-        self.w = load(self.model_dir, layers=layers)
+        self.w = load(self.model_dir, layers=layers, q8_head=draft_q8)
         self.e = Engine(self.w, max_len=self.max_len, taps=taps, graphs=graphs)
         self.drafter = None
         # TF_BOLT_DEPTH=fixed drafts ``drafts`` a round; otherwise a round's depth follows acceptance and measured costs
         self.adaptive = os.environ.get("TF_BOLT_DEPTH", "auto") != "fixed"
         if drafting:
+            from functools import partial
+
             from .depth import Costs
             from .lilicorr import Drafter
+            from .q8_head import logits
 
-            self.drafter = Drafter(drafter, embed=self.e.embed_rows, lm_head=self.e.head_logits)
+            # the drafter's head: the packed Q8_0 one where the checkpoint has it and TF_BOLT_DRAFT_Q8 is on
+            self.draft_head = self.e.head_logits if self.w.head_q8 is None else partial(logits, packed=self.w.head_q8)
+            self.drafter = Drafter(drafter, embed=self.e.embed_rows, lm_head=self.draft_head)
             self.drafts = min(self.drafts, self.drafter.c.block - 1)
             self.costs = Costs(self.drafts + 1)
         # greedy windows of every size a round can verify are captured now; other sampling modes on first use
@@ -127,7 +148,8 @@ class BoltEngine:
         self.store = Store(int(os.environ.get("TF_BOLT_CACHE_ENTRIES", "8")), budget)
         self.eos = tuple(c.eos)
         self.tp, self.rank = 1, 0
-        rule = (f"LiLiCorr drafts ({drafter}), {'up to ' if self.adaptive else ''}{self.drafts} a round"
+        rule = (f"LiLiCorr drafts ({drafter}), {'up to ' if self.adaptive else ''}{self.drafts} a round, "
+                f"{'a Q8_0' if self.w.head_q8 is not None else 'the bf16'} draft head"
                 if self.drafter is not None else "serial decoding (no drafter)")
         kept = (f"up to {self.store.entries} prompt states kept in {self.store.budget / gib:.1f} GiB"
                 if self.store.on else "no prompt states kept")
