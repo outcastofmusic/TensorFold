@@ -9,13 +9,13 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 
 | Task | State |
 |---|---|
+| Code review since 0.8.0 (`8c405e56..7891345f`) | Six reviews done, triage in `docs/reviews/2026-10-17.md`. Ops fixes committed (`7891345f`). Five fix agents running: `fix/review-glm`, `fix/review-qwen`, `fix/review-bolt`, `fix/review-lfm2`, and the gateway branches. Then the CPU suite, GPU tests after bench2, merge, and "Last reviewed" moves to the merge |
 | Benchmark round 2 (`tf-runs/bench2.sh`) | LFM2.5-24B and Super VL TrueScore + planning; GLM and Bolt planning with thinking on; long-context pilot on FP4-Local. Then production restarts on the new `fork/dev` |
 
 ## To do
 
 | Task | Notes |
 |---|---|
-| Code review of everything since 0.8.0 | Review `8c405e56..fork/dev` (and the gateway branches `feat/empty-retry`, `feat/check-eval`) for bugs, poor engineering, over-complicated code, dead or duplicated code (e.g. the two LFM2 conv/attention paths, `lfm2` and `lfm2_moe`), and optimizations. Constraints: no change to business logic or replies (drafted == serial, resumed == fresh, golden checks hold) and no speed regression (re-run the speed checks that cover each touched path: bench_openai for Qwen, the Bolt depth test, d1 latency, LFM2.5 decode and prefill). Review first, then fixes in separate commits, each with the CPU suite and the matching GPU tests |
 | Deploy the gateway empty-reply retry | Built `2a9ea81` on `feat/empty-retry` (`~/workspace/gateway-empty-retry`), go tests pass. Deploy: merge into `~/mini-llm-gateway`, add `"reseed": {"qwen3.8-flash-next": {"retries": 1, "hold_reasoning_bytes": 4096}}` to gateway.json, Ctrl-C and `just serve` in its tmux pane. Waiting for your go |
 | Evaluate the gateway's shadow checks: real-model run | Case set built (`feat/check-eval`, `70b666d`, `~/workspace/gateway-check-eval`): 158 labelled cases, runner, fake-engine run done. Provisional: side_requests and arg_loop act; empty_retry (fire only on finish stop), retry (only with Retry-After) and repeated_call (exempt command and wait tools) tweak; tool_repair and reasoning_loop stay shadow. Run the real-model commands in CHECK-EVAL.md when a model is up, then label results and decide |
 | Run the long-context set | Built in `spark-bench-ext` (`lc_ext.py`, `run_lc.py`): 72 measurement scenarios (recall with near-duplicate distractors, aggregation over 2-4 facts, superseded values in long tool transcripts) at 16k/64k/128k, 468 unit tests pass. Pilot the 27-scenario dev set (`--scenario-ids lc`) on one model first, then `lcm` x3: about 4.5 h for Qwen and 10.5 h for GLM without prefix reuse. GLM's 98,304 window leaves 8,400 tokens at 128k |
