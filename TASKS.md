@@ -11,7 +11,7 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 |---|---|
 | Follow-up 2 and d1 part of 4: LFM2.5 fast short prefill, prompt reuse, decode graphs; d1 one head matmul | Agent on `perf/lfm2-prompts` |
 | Follow-up 4: Qwen persists only the longest state per chain; GLM and Qwen reuse already-written blocks; scheduler `submit` liveness | Agent on `perf/disk-states` |
-| Follow-ups 1 and 3: Bolt decode CUDA graphs and a drafter-only Q8_0 head | Agent on `perf/bolt-graphs` from `feat/integration` 8d7db0d3 |
+| Follow-ups 1 and 3: Bolt decode CUDA graphs and a drafter-only Q8_0 head | Built on `perf/bolt-graphs` (`20201633`, `1b52dad4`), CPU 4,745 passed; expected serial 40-60 tok/s against 29. Not merged until its GPU run passes: `tf-runs/gpu-graphs/run.sh` after bench2 |
 | Code review since 0.8.0 (`8c405e56..7891345f`) | All fixes merged into `feat/integration` (`1bd20c09`): ops, GLM, Bolt, LFM2, Qwen and disk states; CPU 4,794 passed. Gateway branches fixed separately. Waiting for the GPU tests after bench2, then `fork/dev` and "Last reviewed" |
 | Benchmark round 2 (`tf-runs/bench2.sh`) | LFM2.5-24B and Super VL TrueScore + planning; GLM and Bolt planning with thinking on; long-context pilot on FP4-Local. Then production restarts on the new `fork/dev` |
 
