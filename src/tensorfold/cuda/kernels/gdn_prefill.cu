@@ -1,15 +1,34 @@
-// Prefill chain: steps never depend on where a chunk starts, so any chunking gives the same bits (not verify's).
+// Prefill chain: steps never depend on where a chunk starts, so any chunking gives the same bits (not verify's), and a
+// mark's state is the register state a chain ending at its row would store.
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
 constexpr int DK = 128;
 constexpr int DV = 128;
+constexpr int MARKS = 4;
+
+// States a chain also leaves after its first row[i] rows (rising, inside the chain), as a chain ending there would;
+// unused rows are -1, which no step reaches.
+struct Marks {
+    float* out[MARKS];
+    int row[MARKS];
+};
+
+// a[i] by constant indices only, so the kernel reads its Marks from parameter space instead of a stack copy
+template <typename T>
+__device__ __forceinline__ T pick(const T (&a)[MARKS], int i) {
+    T r = a[0];
+#pragma unroll
+    for (int j = 1; j < MARKS; ++j) r = i == j ? a[j] : r;
+    return r;
+}
 
 __device__ __forceinline__ float4 widen(uint2 w) {
     const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(&w.x);
@@ -73,11 +92,19 @@ struct Prefetch {
     }
 };
 
+__device__ __forceinline__ void store_state(float* to, int head, int row, int half, const float (&s)[64]) {
+    float* s1 = to + (static_cast<size_t>(head) * DV + row) * DK;
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+        *reinterpret_cast<float4*>(s1 + 8 * j + 4 * half) = make_float4(s[4 * j], s[4 * j + 1], s[4 * j + 2],
+                                                                        s[4 * j + 3]);
+}
+
 template <typename QK, int ROWS, int STEPS>
 __global__ void __launch_bounds__(2 * ROWS) chain_kernel(
         const QK* __restrict__ q, const QK* __restrict__ k, const __nv_bfloat16* __restrict__ v,
         const float* __restrict__ g, const float* __restrict__ beta, const float* __restrict__ state,
-        float* __restrict__ last, __nv_bfloat16* __restrict__ y, int W, int hk, int hv) {
+        float* __restrict__ last, __nv_bfloat16* __restrict__ y, int W, int hk, int hv, const Marks marks) {
     __shared__ float4 ks[STEPS][DK / 4], qs[STEPS][DK / 4];
     __shared__ float gs[STEPS], bs[STEPS];
     __shared__ __align__(16) __nv_bfloat16 vs[STEPS][ROWS];
@@ -91,6 +118,7 @@ __global__ void __launch_bounds__(2 * ROWS) chain_kernel(
         s[4 * j] = t.x; s[4 * j + 1] = t.y; s[4 * j + 2] = t.z; s[4 * j + 3] = t.w;
     }
     Prefetch<QK, 2 * ROWS, ROWS, STEPS> pf;                // each stage's loads in flight during the one before
+    int mark = 0, at = marks.row[0];
     pf.fetch(q, k, v, g, beta, 0, W, hk, hv, head, key_head, blockIdx.y * ROWS);
     for (int t0 = 0; t0 < W; t0 += STEPS) {
         const int n = min(STEPS, W - t0);
@@ -134,25 +162,26 @@ __global__ void __launch_bounds__(2 * ROWS) chain_kernel(
             float out = (o[0] + o[1]) + (o[2] + o[3]);
             out = out + __shfl_xor_sync(0xffffffffu, out, 1);
             if (half == 0) y[vat] = __float2bfloat16_rn(out);
+            if (t0 + tt + 1 == at) {
+                store_state(pick(marks.out, mark), head, row, half, s);
+                at = ++mark < MARKS ? pick(marks.row, mark) : -1;
+            }
         }
     }
-    float* s1 = last + (static_cast<size_t>(head) * DV + row) * DK;
-#pragma unroll
-    for (int j = 0; j < 16; ++j)
-        *reinterpret_cast<float4*>(s1 + 8 * j + 4 * half) = make_float4(s[4 * j], s[4 * j + 1], s[4 * j + 2],
-                                                                        s[4 * j + 3]);
+    store_state(last, head, row, half, s);
 }
 
 template <typename QK, int ROWS>
 void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g, const at::Tensor& beta,
-            const at::Tensor& state, at::Tensor& last, at::Tensor& y) {
+            const at::Tensor& state, at::Tensor& last, at::Tensor& y, const Marks& marks) {
     constexpr int STEPS = 32;
     const int W = q.size(0), hk = q.size(1), hv = v.size(1);
     const dim3 grid(hv, DV / ROWS);
     chain_kernel<QK, ROWS, STEPS><<<grid, 2 * ROWS, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const QK*>(q.data_ptr()), reinterpret_cast<const QK*>(k.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()), g.data_ptr<float>(), beta.data_ptr<float>(),
-        state.data_ptr<float>(), last.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), W, hk, hv);
+        state.data_ptr<float>(), last.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), W, hk, hv,
+        marks);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -160,13 +189,20 @@ void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const
 
 // Fewer heads than SMs: a block takes 64 value rows, not 128, so the chunk still fills the GPU.
 void gdn_prefill_cuda(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
-                      const at::Tensor& beta, const at::Tensor& state, at::Tensor& last, at::Tensor& y, int sms) {
+                      const at::Tensor& beta, const at::Tensor& state, at::Tensor& last, at::Tensor& y, int sms,
+                      const std::vector<at::Tensor>& outs, const std::vector<int64_t>& rows) {
+    Marks marks{};
+    for (int i = 0; i < MARKS; ++i) {
+        const bool used = i < static_cast<int>(rows.size());
+        marks.out[i] = used ? outs[i].data_ptr<float>() : nullptr;
+        marks.row[i] = used ? static_cast<int>(rows[i]) : -1;
+    }
     const bool wide = v.size(1) >= sms;
     if (q.scalar_type() == at::kFloat) {
-        if (wide) launch<float, 128>(q, k, v, g, beta, state, last, y);
-        else launch<float, 64>(q, k, v, g, beta, state, last, y);
+        if (wide) launch<float, 128>(q, k, v, g, beta, state, last, y, marks);
+        else launch<float, 64>(q, k, v, g, beta, state, last, y, marks);
     } else {
-        if (wide) launch<__nv_bfloat16, 128>(q, k, v, g, beta, state, last, y);
-        else launch<__nv_bfloat16, 64>(q, k, v, g, beta, state, last, y);
+        if (wide) launch<__nv_bfloat16, 128>(q, k, v, g, beta, state, last, y, marks);
+        else launch<__nv_bfloat16, 64>(q, k, v, g, beta, state, last, y, marks);
     }
 }

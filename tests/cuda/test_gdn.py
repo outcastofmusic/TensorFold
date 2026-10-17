@@ -258,3 +258,33 @@ def test_prefill_chain_rows_do_not_depend_on_chunking(keys, hv):
     ref = gdn.tree(q, k, v, g, beta, gdn.plan([list(range(-1, rows - 1))], "cuda"), state=state, final=ref_last)
     assert ((whole.float() - ref.float()).norm() / ref.float().norm()).item() < 1e-2
     assert ((last - ref_last).norm() / ref_last.norm()).item() < 1e-4
+
+
+@pytest.mark.parametrize("keys", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("hv", [6, 48])
+@pytest.mark.parametrize("marks", [[1], [299], [31, 32, 33], [1, 64, 65, 298], [7, 100, 200]])
+def test_prefill_marks_are_the_states_of_chains_that_end_there(keys, hv, marks):
+    """A mark's state equals bit for bit the final state of a chain over the rows before it; outputs and the final
+    state equal a chain without marks."""
+
+    rows = 300
+    q, k, v, g, beta, state = _inputs(rows, kh=2, hv=hv, dv=128, keys=keys)
+    last, plain_last = torch.empty_like(state), torch.empty_like(state)
+    plain = gdn.chain(q, k, v, g, beta, state, plain_last)
+    outs = [torch.full_like(state, float("nan")) for _ in marks]
+    y = gdn.chain(q, k, v, g, beta, state, last, outs, marks)
+    assert torch.equal(y, plain) and torch.equal(last, plain_last)
+    for m, out in zip(marks, outs):
+        want = torch.empty_like(state)
+        gdn.chain(*(x[:m].contiguous() for x in (q, k, v, g, beta)), state, want)
+        assert torch.equal(out.view(torch.int32), want.view(torch.int32)), m
+
+
+def test_prefill_marks_must_rise_inside_the_chain():
+    q, k, v, g, beta, state = _inputs(16, kh=2, hv=6, dv=128)
+    last = torch.empty_like(state)
+    for rows in ([0], [16], [5, 5], [6, 5], [1, 2, 3, 4, 5]):
+        with pytest.raises(RuntimeError, match="mark"):
+            gdn.chain(q, k, v, g, beta, state, last, [torch.empty_like(state) for _ in rows], rows)
+    with pytest.raises(RuntimeError, match="marks"):
+        gdn.chain(q, k, v, g, beta, state, last, [torch.empty_like(state)[:, :64]], [3])

@@ -8,7 +8,8 @@ void gdn_tree_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, cons
 void gdn_replay_cuda(const at::Tensor&, int, int, const at::Tensor&, const at::Tensor&, const at::Tensor&, int, int,
                      int, bool);
 void gdn_prefill_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-                      const at::Tensor&, at::Tensor&, at::Tensor&, int);
+                      const at::Tensor&, at::Tensor&, at::Tensor&, int, const std::vector<at::Tensor>&,
+                      const std::vector<int64_t>&);
 
 static void check_rows(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
                        const at::Tensor& beta) {
@@ -102,20 +103,28 @@ at::Tensor replay(const at::Tensor& table, int64_t layers, int64_t streams, cons
     return in_place ? at::empty({0}, table.options().dtype(at::kFloat)) : out;
 }
 
-// A prompt chunk as one chain from ``state``: outputs (W, Hv, 128) bf16, the last row's state into ``last``.
+// A prompt chunk as one chain from ``state``: outputs (W, Hv, 128) bf16, the last row's state into ``last``, and the
+// state after the first ``rows[i]`` rows into ``marks[i]`` (up to four, rising, strictly inside the chain).
 at::Tensor prefill(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
-                   const at::Tensor& beta, const at::Tensor& state, at::Tensor& last) {
+                   const at::Tensor& beta, const at::Tensor& state, at::Tensor& last,
+                   const std::vector<at::Tensor>& marks, const std::vector<int64_t>& rows) {
     check_rows(q, k, v, g, beta);
     TORCH_CHECK(v.size(2) == 128, "value heads of 128");
     TORCH_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type() == at::kFloat && state.dim() == 3 &&
                 state.size(0) == v.size(1) && state.size(1) == 128 && state.size(2) == 128, "invalid state");
     TORCH_CHECK(last.is_cuda() && last.is_contiguous() && last.sizes() == state.sizes() &&
                 last.scalar_type() == at::kFloat, "last: a state-shaped fp32 tensor");
+    TORCH_CHECK(marks.size() == rows.size() && rows.size() <= 4, "up to four marks, one row each");
+    for (size_t i = 0; i < rows.size(); ++i) {
+        TORCH_CHECK(rows[i] > (i ? rows[i - 1] : 0) && rows[i] < q.size(0), "mark rows rise strictly inside the chain");
+        TORCH_CHECK(marks[i].is_cuda() && marks[i].is_contiguous() && marks[i].sizes() == state.sizes() &&
+                    marks[i].scalar_type() == at::kFloat, "marks: state-shaped fp32 tensors");
+    }
     c10::cuda::CUDAGuard guard(q.device());
     auto y = at::empty({q.size(0), v.size(1), v.size(2)}, v.options());
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, q.get_device());
-    if (q.size(0) > 0) gdn_prefill_cuda(q, k, v, g, beta, state, last, y, sms);
+    if (q.size(0) > 0) gdn_prefill_cuda(q, k, v, g, beta, state, last, y, sms, marks, rows);
     return y;
 }
 

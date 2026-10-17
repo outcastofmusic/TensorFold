@@ -9,6 +9,7 @@ from typing import Sequence
 import numpy as np
 import torch
 
+from tensorfold.cuda.kernels.gdn import MARKS
 from tensorfold.cuda.logprobs import capture
 
 from tensorfold.cuda.sampling import comm_gather, nucleus_rows, sample_rows
@@ -339,42 +340,64 @@ def prefill_begin(e: Engine, prompt: Sequence[int], *, mtp: bool = True, resume:
     return st.pos
 
 
+def chunk_plan(start: int, n: int, rows: int, points, marks: int = 1) -> list[tuple[int, int, list[int]]]:
+    """(start, end, kept points in (start, end]) for chunks of up to ``rows`` over prompt rows [start, n). A chunk
+    keeps up to ``marks`` (at most MARKS) new states, its chain leaving those inside it as it passes, so a further
+    point ends it there. Admission counts one new state a chunk on the serial engine: ``marks`` 1."""
+
+    if not 1 <= marks <= MARKS:
+        raise ValueError(f"a chunk keeps 1 to {MARKS} states, not {marks}")
+    points, plan = sorted(p for p in set(points) if start < p <= n), []
+    while start < n:
+        here = [p for p in points if start < p <= min(start + rows, n)]
+        end = here[marks - 1] if len(here) > marks else min(start + rows, n)
+        plan.append((start, end, here[:marks]))
+        start = end
+    return plan
+
+
 @torch.no_grad()
-def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, *, mtp: bool = True,
-                  keep_at: int | None = None, end: int | None = None) -> torch.Tensor | None:
-    """Commit up to ``e.prefill_rows`` rows from ``start`` (the last chunk returns its logits); a chunk holding ``keep_at`` sets ``e.kept``."""
+def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, *, mtp: bool = True, points: Sequence[int] = (),
+                  end: int | None = None) -> tuple[torch.Tensor | None, dict[int, dict]]:
+    """Commit up to ``e.prefill_rows`` rows from ``start`` (the last chunk returns its logits); each of ``points`` in
+    (start, end], up to MARKS inside, maps to what a fresh prefill of prompt[:point] leaves: {"state", "tail"}."""
 
     w, st, pb = e.w, e.st, e.pbuf
     end = min(start + e.prefill_rows, len(prompt) if end is None else end)
     chunk = list(prompt[start:end])
     R = len(chunk)
     final = end == len(prompt)
-    point = keep_at - start if keep_at is not None and start < keep_at <= end else 0     # the kept point's row
-    cut = Cut(point) if 0 < point < R else None           # inside the chunk, not at its end
+    rows = sorted({p - start for p in points})
+    if any(not 0 < r <= R for r in rows):
+        raise ValueError(f"kept points {sorted(points)} lie outside the chunk ({start}, {end}]")
+    cuts = [Cut(r) for r in rows if r < R]                # inside the chunk, not at its end
     # only the prompt's last row is sampled: the head runs on the final chunk alone
-    logits = forward(w, st, pb, chunk, logits=final, cut=cut)
+    logits = forward(w, st, pb, chunk, logits=final, cuts=cuts)
     last = logits.clone() if final else None
     e.last_streams = pb.streams[R - 1:R].clone()
     use_mtp = _absorbs(e, mtp)
-    if point:                    # before the MTP head writes the streams: the point's tail, its state inside the chunk
-        mtp_len = st.mtp_len + point - 1 if use_mtp else st.mtp_len       # every row but the point's last
-        tail = pb.streams[point - 1:point].clone() if use_mtp else None
-        snap = cut_snapshot(w, st, pb, cut, mtp_len) if cut is not None else None
+    at, found = {cut.row: cut for cut in cuts}, {}
+    for r in rows:               # before the MTP head writes the streams: a point's tail, its state inside the chunk
+        mtp_len = st.mtp_len + r - 1 if use_mtp else st.mtp_len           # every row but the point's last
+        tail = pb.streams[r - 1:r].clone() if use_mtp else None
+        found[start + r] = (cut_snapshot(w, st, pb, at[r], mtp_len) if r in at else None, mtp_len, tail)
     nxt = list(prompt[start + 1:end + 1])
     if use_mtp and nxt:
         mtp_forward(w, st, pb, nxt, pb.streams[:len(nxt)])
         st.set_mtp_len(st.mtp_len + len(nxt))
     commit(w, st, pb, R, R)
-    if point:                                            # as a fresh prefill of prompt[:keep_at] leaves it
-        e.kept = {"state": snap if snap is not None else {**st.snapshot(), "mtp_len": mtp_len}, "tail": tail}
-    return last
+    # as a fresh prefill of prompt[:point] leaves it; a point that ends the chunk is the committed state
+    return last, {p: {"state": snap if snap is not None else {**st.snapshot(), "mtp_len": mtp_len}, "tail": tail}
+                  for p, (snap, mtp_len, tail) in found.items()}
 
 
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True,
             resume: dict | None = None, constraint=None, probabilities=None, keep_at: int | None = None,
-            stops: Sequence[int] = (), keep=None, vision=None) -> int:
-    """Commit the prompt in chunks and sample the first token (``resume`` equals a fresh run); ``e.kept`` resumes prompt[:keep_at]."""
+            stops: Sequence[int] = (), keep=None, vision=None, marks: int = 1) -> int:
+    """Commit the prompt in chunks and sample the first token (``resume`` equals a fresh run); ``e.kept`` resumes prompt[:keep_at].
+
+    A chunk keeps up to ``marks`` of the states at ``stops`` and ``keep_at`` (chunk_plan)."""
 
     if vision is not None and (resume is not None or keep_at is not None or stops or keep is not None):
         raise ValueError("an image prompt prefills from its start and keeps no token-only snapshot")
@@ -384,19 +407,15 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
     if keep_at is not None and not start <= keep_at <= len(prompt):
         raise ValueError(f"keep_at {keep_at} is outside the prefilled range [{start}, {len(prompt)}]")
     saved = e.kept = resume if keep_at == start else None
-    stops = sorted({p for p in stops if start < p < len(prompt)})
-    while start < len(prompt):
-        end = min(start + e.prefill_rows, next((p for p in stops if p > start), len(prompt)))
-        if keep_at is not None and start < keep_at < end and end in stops:
-            end = keep_at
-        point = keep_at if keep_at is not None and start < keep_at <= end else end if end in stops else None
-        last = prefill_chunk(e, prompt, start, mtp=mtp, keep_at=point, end=end)
-        if point is not None:
+    points = {p for p in stops if start < p < len(prompt)} | ({keep_at} if keep_at is not None else set())
+    for start, end, here in chunk_plan(start, len(prompt), e.prefill_rows, points, marks):
+        last, kept = prefill_chunk(e, prompt, start, mtp=mtp, points=here, end=end)
+        for point, k in kept.items():
+            e.kept = k
             if point == keep_at:
-                saved = e.kept
+                saved = k
             if keep is not None:
-                keep(point, e.kept["state"], e.kept["tail"])
-        start = end
+                keep(point, k["state"], k["tail"])
     if keep_at is not None:
         e.kept = saved
     image_rows.finish(e.st)

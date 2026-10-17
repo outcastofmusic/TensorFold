@@ -19,7 +19,7 @@ def _decoder():
     owner = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "PromptPasses")
     body = [node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name in methods]
     nodes.append(ast.ClassDef(name="Decoder", bases=[], keywords=[], body=body, decorator_list=[], type_params=[]))
-    namespace = {"PREFILL_ROWS": 2048, "ENDS": 16}
+    namespace = {"PREFILL_ROWS": 2048, "ENDS": 16, "MARKS": 4, "entry_end": lambda prompt: max(1, len(prompt) - 1)}
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(root / "multi_fill.py"), "exec"), namespace)
     dec = namespace["Decoder"]()
     dec.streams = {0: SimpleNamespace(done=False)}
@@ -51,13 +51,18 @@ def test_actual_piece_rows_use_the_floor_without_turning_it_into_a_ceiling(round
     dec.round_s, dec.row_s = round_s, row_s
     streams = [SimpleNamespace(sid=1, prompt=list(range(100))), SimpleNamespace(sid=2, prompt=list(range(4096)))]
     dec._order = lambda: streams
+    dec.filling, dec.slots = streams, [None, None]
     dec.fills = {stream.sid: [SimpleNamespace(stops=[]), False, 0, None] for stream in streams}
     pieces = dec._pieces()
     assert [(stream.sid, start, rows) for stream, start, rows in pieces] == [(1, 0, 100), (2, 0, width - 100)]
     assert sum(rows for _, _, rows in pieces) == width
-    dec.fills[2][0].stops = [200]
-    pieces = dec._pieces()
-    assert sum(rows for _, _, rows in pieces) == 300
+    dec.fills[2][0].stops = [200]                     # every slot fills: a piece keeps one state, here inside it
+    assert dec._pieces() == pieces
+    dec.fills[2][0].stops = [150, 200]                # a second point ends it
+    assert sum(rows for _, _, rows in dec._pieces()) == 250
+    dec.slots = [None] * 4                            # two spare slots: the piece keeps three states
+    dec.fills[2][0].stops = [150, 200, 250, 300]
+    assert sum(rows for _, _, rows in dec._pieces()) == 350
 
 
 def test_shared_prompt_row_floors_host():

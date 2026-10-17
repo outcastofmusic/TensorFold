@@ -74,15 +74,15 @@ def test_order_uses_remaining_rows_and_preserves_oldest_equal_prompt():
     assert [s.sid for s in m._order()] == [0, 2, 1]
 
 
-def test_pieces_keep_message_boundaries_and_live_row_limits():
+def test_pieces_keep_message_points_within_the_slots_and_live_row_limits():
     m = _decoder([(9_000, False), (3_000, False)])
     m.prefill_rows, m.share, m.round_s, m.row_s = 4_096, 0.0, None, None
-    m.streams = {7: SimpleNamespace(done=False)}
+    m.streams, m.slots = {7: SimpleNamespace(done=False)}, [None] * 3
     for fill in m.fills.values():
         fill[0] = SimpleNamespace(stops=[])
-    m.fills[1][0].stops = [800]
+    m.fills[1][0].stops = [800, 1_000, 1_600]           # one spare slot: two states, the second ending the piece
     pieces = m._pieces()
-    assert [(s.sid, a, n) for s, a, n in pieces] == [(1, 0, 800), (0, 0, 1_248)]
+    assert [(s.sid, a, n) for s, a, n in pieces] == [(1, 0, 1_000), (0, 0, 1_048)]
     m.streams.clear()
     assert sum(n for _, _, n in m._pieces()) == 4_096
 
