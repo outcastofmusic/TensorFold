@@ -157,7 +157,7 @@ def test_a_background_state_supersedes_none_of_its_turns_own_states():
     user = 9
 
     def snap(ids, born=-1):
-        return NS(ids=list(ids), born=born)
+        return NS(ids=list(ids), born=born, branched=False)
 
     turn = snap([user, 1, 2])                        # the turn's own prompt state, which a regenerate resumes from
     warmed = snap([user, 1, 2, 3, 4, 5], born=3)     # the background pass after that turn

@@ -163,6 +163,14 @@ def calibrates(calibrate: bool, *, eager: bool, serial_only: bool) -> bool:
     return bool(calibrate and not eager and not serial_only and os.environ.get("TF_GLM_CALIBRATE", "1") != "0")
 
 
+def _extended(c, others) -> bool:
+    """Whether a later turn's kept state among ``others`` extends ``c``'s prompt (a background pass's counts as its
+    turn's, ``born``)."""
+    n = len(c.ids)
+    return any(d is not c and (d.born if d.born >= 0 else len(d.ids)) > n and len(d.ids) > n and d.ids[:n] == c.ids
+               for d in others)
+
+
 class GlmEngine:
     """GLM on one local GPU or two NCCL ranks, with explicit startup/work contracts."""
 
@@ -617,17 +625,23 @@ class GlmEngine:
         """The oldest kept turn end that a later kept prompt of its conversation extends, or None.
 
         Only a regenerated or edited turn resumes from one, so it goes before another conversation's states and
-        before a system block's end, which holds no user message. "Later" is in use order (the cache's, newest last):
-        a turn resumed after the turn that extends it is a branch point in use, and the stale branch goes first.
+        before a system block's end, which holds no user message. "Later" is in use order (the cache's, newest last).
+        A branch point, a turn resumed again after a later turn extended it (a re-sent, edited or forked turn, an agent
+        that restarts each step from one history), is never superseded: every continuation keeps a longer state past
+        it, and freeing it first made each next continuation prefill the whole history again (upstream #735).
         A background pass's state counts as the turn it was kept for (``born``): it supersedes none of that turn's
         own states, which a regenerated turn resumes from, until a later turn's do.
         """
         for i, c in enumerate(self.cache):
-            n = len(c.ids)
-            if self.user_id in c.ids and any((d.born if d.born >= 0 else len(d.ids)) > n and len(d.ids) > n
-                                             and d.ids[:n] == c.ids for d in self.cache[i + 1:]):
+            if not c.branched and self.user_id in c.ids and _extended(c, self.cache[i + 1:]):
                 return c
         return None
+
+    def _use(self, hit) -> None:
+        """A request resumes ``hit``: it becomes the newest, and a branch point if a later turn already extends it."""
+        if hit in self.cache:
+            hit.branched = hit.branched or _extended(hit, self.cache)
+            self.cache[:] = [c for c in self.cache if c is not hit] + [hit]
 
     def _take_over(self, keep: list[int]) -> None:
         """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike."""
@@ -701,6 +715,8 @@ class GlmEngine:
         from .decode import load_rows
 
         cut = len(hit.ids) if hit is not None else 0
+        if hit is not None:
+            self._use(hit)
         self._take_over(list(hit.ids) if hit is not None else [])
         if hit is not None and hit.rows is not None:
             load_rows(self.e, hit)

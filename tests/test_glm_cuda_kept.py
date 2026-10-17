@@ -17,6 +17,7 @@ class Snap:
     def __init__(self, ids, need, states=5):
         self.ids, self.need, self.states, self.rows, self.nbytes = list(ids), need, states, None, 0
         self.born = -1                     # decode.Snapshot's: a request's own state
+        self.branched = False
 
 
 @pytest.fixture
@@ -121,11 +122,37 @@ def test_earlier_turn_ends_go_before_another_conversations_states(kept):
 
 
 def test_a_turn_resumed_after_its_later_turn_is_not_the_superseded_one(kept):
-    """Back to turn one after turn two: the stale turn two goes first, not the branch point just used."""
+    """Back to turn one after turn two: turn one is a branch point, and stale turn two goes first."""
     engine, snap, _ = kept
     engine.user_id = 7
     one, two = snap([1, 7, 2], 10), snap([1, 7, 2, 7, 3], 10)
     engine.cache = [one, two]
     assert engine._superseded() is one                   # a linear conversation: turn one is behind turn two
-    engine.cache = [two, one]                            # turn one resumed again, so it is the newest
-    assert engine._superseded() is None
+    engine._use(one)                                     # turn one resumed again
+    assert engine.cache == [two, one] and one.branched and engine._superseded() is None
+
+
+def test_a_history_every_continuation_resumes_stays_a_branch_point(kept):
+    """An agent restarting each step from one history: each step keeps a longer state past it (upstream #735)."""
+    engine, snap, _ = kept
+    engine.user_id = 7
+    history = snap([1, 7, 2], 10)
+    engine.cache = [history, snap([1, 7, 2, 7, 3], 10)]  # the first step's state extends the history
+    for step in (4, 5, 6):
+        engine._use(history)
+        engine.cache.append(snap([1, 7, 2, 7, step], 10))
+        assert engine._superseded() is not history       # each step's own state goes first, never the shared history
+    assert history.branched
+
+
+def test_a_conversation_that_only_grows_still_frees_its_old_turns_first(kept):
+    engine, snap, _ = kept
+    engine.user_id = 7
+    one = snap([1, 7, 2], 10)
+    engine.cache = [one]
+    engine._use(one)                                     # turn two resumes turn one: nothing extends it yet
+    two = snap([1, 7, 2, 7, 3], 10)
+    engine.cache.append(two)
+    engine._use(two)                                     # turn three resumes turn two
+    engine.cache.append(snap([1, 7, 2, 7, 3, 7, 4], 10))
+    assert not one.branched and not two.branched and engine._superseded() is one

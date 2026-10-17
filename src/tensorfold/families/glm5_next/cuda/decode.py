@@ -249,6 +249,7 @@ class Snapshot:
     nbytes: int = 0
     drafter_rows: list | None = None  # a ring drafter's window rows before drafter_end, copied when taken
     born: int = -1                # a background pass's state: the length of the turn it was kept for (-1: its own)
+    branched: bool = False        # resumed again after a later turn extended it: freed only as least recently used
 
 
 def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
