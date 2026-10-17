@@ -30,8 +30,11 @@ class Costs:
     def _avg(self, old: float | None, new: float) -> float:
         return new if old is None else old + self.weight * (new - old)
 
-    def record(self, rows: int, verify_ms: float, block_ms: float | None, rest_ms: float) -> None:
-        self.verify[rows] = self._avg(self.verify[rows], verify_ms)
+    def record(self, rows: int, verify_ms: float | None, block_ms: float | None, rest_ms: float) -> None:
+        """One round's parts; a ``None`` part was not measured (a window that captured its CUDA graph)."""
+
+        if verify_ms is not None:
+            self.verify[rows] = self._avg(self.verify[rows], verify_ms)
         if block_ms is not None:
             self.block = self._avg(self.block, block_ms)
         self.rest = self._avg(self.rest, rest_ms)
@@ -99,8 +102,9 @@ class DepthPolicy:
         self.serial = 0
         return max((d for d in speed if d), key=speed.get)
 
-    def done(self, drafts: int, accepted: int, verify_ms: float, block_ms: float, rest_ms: float) -> None:
-        """Follow a round: ``drafts`` verified, ``accepted`` of them kept, and its measured parts."""
+    def done(self, drafts: int, accepted: int, verify_ms: float | None, block_ms: float, rest_ms: float) -> None:
+        """Follow a round: ``drafts`` verified, ``accepted`` of them kept, and its measured parts (``verify_ms`` None
+        for a window that captured its graph, which would otherwise price that row count above its replays)."""
 
         self.costs.record(1 + drafts, verify_ms, block_ms if drafts else None, rest_ms)
         if drafts:

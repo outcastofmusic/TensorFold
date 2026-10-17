@@ -663,7 +663,8 @@ def lilicorr_decode(engine, drafter: Drafter, first: int, count: int, sampling: 
         res.keeps.append(keep)
         stop = on_tokens is not None and on_tokens(new)
         if policy is not None:
-            policy.done(len(drafts), keep - 1, 1e3 * (t2 - t1), 1e3 * (t1 - t0), 1e3 * (time.perf_counter() - t2))
+            verify_ms = None if getattr(engine, "captured", False) else 1e3 * (t2 - t1)
+            policy.done(len(drafts), keep - 1, verify_ms, 1e3 * (t1 - t0), 1e3 * (time.perf_counter() - t2))
         if stop:
             break
     pay()

@@ -40,9 +40,11 @@ def cache_bytes(c, max_len: int, rows: int, prefill_rows: int) -> int:
     return kv + mamba + chunk_bytes(c, prefill_rows) + rows * c.vocab * 2
 
 
-def need_bytes(model_dir: str | Path, c, max_len: int, *, drafter: str | Path = "", layers: int | None = None) -> int:
+def need_bytes(model_dir: str | Path, c, max_len: int, *, drafter: str | Path = "", layers: int | None = None,
+               graphs: bool = False) -> int:
     """What Bolt holds on the GPU with a ``max_len``-token cache: its weights, caches and chunk activations, the
-    workspace and, with a ``drafter`` folder, the drafter's weights and context caches."""
+    workspace, with a ``drafter`` folder the drafter's weights and context caches, and with ``graphs`` the window
+    graphs (their pool, the drafter's tap rows they keep, their nodes)."""
 
     from .engine import PREFILL_ROWS, ROWS
     from .weights import weight_bytes
@@ -52,6 +54,10 @@ def need_bytes(model_dir: str | Path, c, max_len: int, *, drafter: str | Path = 
         from .lilicorr import device_bytes
 
         need += device_bytes(drafter)
+    if graphs:
+        from .graphs import graph_bytes
+
+        need += graph_bytes(c, max_len, ROWS, len(draft_taps(drafter)) if drafter else 0)
     return need
 
 
@@ -64,6 +70,7 @@ class BoltEngine:
         import torch
 
         from tensorfold.cuda.capacity import available_bytes
+        from tensorfold.env_flags import flag
 
         from .engine import PREFILL_ROWS, ROWS, A, Engine
         from .weights import Config, load
@@ -74,10 +81,12 @@ class BoltEngine:
         taps = draft_taps(drafter) if drafter else ()
         self.drafts = int(drafts)
         drafting = bool(drafter) and self.drafts > 0
+        graphs = flag("TF_BOLT_GRAPHS", default=True)     # 0 runs every verify window eagerly
         # the CLI passes the model's own window (or 0, which it reads from no llm_config) when --context is absent
         want = int(context) if context_explicit and context else CONTEXT
         self.max_len = -(-(want + ROWS) // A.CHUNK) * A.CHUNK
-        need = need_bytes(self.model_dir, c, self.max_len, drafter=drafter if drafting else "", layers=layers)
+        need = need_bytes(self.model_dir, c, self.max_len, drafter=drafter if drafting else "", layers=layers,
+                          graphs=graphs)
         free = available_bytes(torch)                 # a GB10's page cache counts as free; the pool's floor is kept
         gib = 1 << 30
         if need > free:
@@ -92,7 +101,7 @@ class BoltEngine:
         self.marks = resume_points(self.model_dir)          # message starts a prefill keeps states at, or None
         started = time.perf_counter()
         self.w = load(self.model_dir, layers=layers)
-        self.e = Engine(self.w, max_len=self.max_len, taps=taps)
+        self.e = Engine(self.w, max_len=self.max_len, taps=taps, graphs=graphs)
         self.drafter = None
         # TF_BOLT_DEPTH=fixed drafts ``drafts`` a round; otherwise a round's depth follows acceptance and measured costs
         self.adaptive = os.environ.get("TF_BOLT_DEPTH", "auto") != "fixed"
@@ -103,10 +112,17 @@ class BoltEngine:
             self.drafter = Drafter(drafter, embed=self.e.embed_rows, lm_head=self.e.head_logits)
             self.drafts = min(self.drafts, self.drafter.c.block - 1)
             self.costs = Costs(self.drafts + 1)
+        # greedy windows of every size a round can verify are captured now; other sampling modes on first use
+        warmed = self.e.warm(range(1, self.drafts + 2 if self.drafter is not None else 2))
         # kept prompt states get what the loaded weights, drafter and caches leave beside a prompt chunk's
-        # activations and the workspace, at most TF_BOLT_CACHE_GIB
+        # activations, the workspace and the window graphs other sampling modes capture later, at most
+        # TF_BOLT_CACHE_GIB
         torch.cuda.empty_cache()
         room = available_bytes(torch) - chunk_bytes(c, PREFILL_ROWS) - WORKSPACE
+        if graphs:
+            from .graphs import graph_bytes
+
+            room -= graph_bytes(c, self.max_len, ROWS, len(taps))
         budget = max(0, min(int(float(os.environ.get("TF_BOLT_CACHE_GIB", "4")) * gib), room))
         self.store = Store(int(os.environ.get("TF_BOLT_CACHE_ENTRIES", "8")), budget)
         self.eos = tuple(c.eos)
@@ -115,8 +131,10 @@ class BoltEngine:
                 if self.drafter is not None else "serial decoding (no drafter)")
         kept = (f"up to {self.store.entries} prompt states kept in {self.store.budget / gib:.1f} GiB"
                 if self.store.on else "no prompt states kept")
+        shown = f"{warmed} window graphs captured" if graphs else "eager windows (TF_BOLT_GRAPHS=0)"
         print(f"[tensorfold] Nemotron Bolt on CUDA: {len(self.w.blocks)} layers, IQ2_XXS experts; {rule}; "
-              f"{self.max_len}-token cache; {kept}; loaded in {time.perf_counter() - started:.1f}s", flush=True)
+              f"{self.max_len}-token cache; {kept}; {shown}; loaded in {time.perf_counter() - started:.1f}s",
+              flush=True)
 
     @property
     def context_window(self) -> int:

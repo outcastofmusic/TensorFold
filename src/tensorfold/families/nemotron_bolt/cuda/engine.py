@@ -10,6 +10,8 @@ whose decode kernel gives a row the same bits at any row count.
 
 A prompt row's bits never depend on its chunk either: every prompt kernel is chunk-invariant (the experts' in
 ``prompt`` mode, at any row count), so a prompt resumed from a kept ``state`` ends as a fresh prefill does.
+
+A window replays as a CUDA graph (``graphs``) once its row count, sampling mode and mask have run eagerly once.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from tensorfold.families.nemotron_h.cuda.engine import sampling_mode
 from tensorfold.families.qwen3_5.cuda import b16
 from tensorfold.families.qwen3_5.cuda import glue as base
 
+from .graphs import Captured, WindowGraphs
 from .iq2xxs import iq2xxs_grouped, iq2xxs_linear
 from .weights import Attention, Block, Mamba, MoE, Weights
 
@@ -139,7 +142,9 @@ def latent_moe(moe: MoE, normed: torch.Tensor, *, scaling: float, norm: bool, pr
     ids, wts = route(normed, moe, scaling=scaling, norm=norm)
     k = moe.top_k
     latent = dense(normed, moe.fc1, prompt)
-    pairs = latent.repeat_interleave(k, dim=0)                     # row r's k copies, in pick order
+    # row r's k copies, in pick order: an expand's copy, which (unlike some torch versions' repeat_interleave) never
+    # asks the GPU for a size, so a window graph can hold it
+    pairs = latent.unsqueeze(1).expand(rows, k, latent.shape[1]).reshape(rows * k, latent.shape[1])
     flat_ids = ids.reshape(-1)
     act = relu2(iq2xxs_grouped(pairs, moe.up, flat_ids, prompt=prompt))
     y = iq2xxs_grouped(act, moe.down, flat_ids, prompt=prompt).view(rows, k, -1)
@@ -154,7 +159,7 @@ class Engine:
     STATE = ("ssm", "conv_base", "raw", "xc", "dt")
 
     def __init__(self, w: Weights, *, max_len: int = 8192, max_rows: int = ROWS, prefill_rows: int = PREFILL_ROWS,
-                 taps: Sequence[int] = ()):
+                 taps: Sequence[int] = (), graphs: bool = True):
         if max_rows > ROWS:
             raise ValueError(f"windows hold at most {ROWS} rows")
         if max_len % A.CHUNK:
@@ -196,6 +201,8 @@ class Engine:
         self._ready = torch.cuda.Event()
         self.pos = self.parity = self.prev_keep = 0
         self._rows = 0
+        self.graphs = WindowGraphs() if graphs else None
+        self.captured = False                     # the last window captured its graph (its time is not a replay's)
 
     # -- state ---------------------------------------------------------------------------------------------------
     def reset(self) -> None:
@@ -321,17 +328,73 @@ class Engine:
         self._host[:4 + rows] = torch.tensor([self.pos, self.parity, self.prev_keep, 0, *tokens], dtype=torch.int32)
         self._inputs[:4 + rows].copy_(self._host[:4 + rows], non_blocking=True)
         self._staged.record()
-        ids = self._inputs[4:4 + rows]
-        normed = self._layers(ids, prompt=False)
+        self._window(rows)
+        self._ready.record()
+        self.parity ^= 1
+        self._rows = rows
+        return self.logits[:rows]
+
+    def _forward(self, rows: int) -> None:
+        """One window from the staged ids and ``meta``: its logits and samples into the engine's buffers."""
+
+        normed = self._layers(self._inputs[4:4 + rows], prompt=False)
         self.logits[:rows].copy_(b16.matmul(normed, self.w.head))
         if self.masked:
             self.logits[:rows].add_(self.bias[:rows])
         # row r samples position pos + r + 1 with the keyed sampler: the same token serial decoding samples there
         S.sample(self.logits[:rows], self.meta, self.params, self.sampled[:rows])
-        self._ready.record()
-        self.parity ^= 1
-        self._rows = rows
-        return self.logits[:rows]
+
+    def _window(self, rows: int) -> None:
+        """Replay the window's graph; without one, run it eagerly and capture its graph for the next such window."""
+
+        self.captured = False
+        if self.graphs is None:
+            self._forward(rows)
+            return
+        key = (self.mode, self.masked)
+        hit = self.graphs.get(key, rows)
+        if hit is not None:
+            hit.graph.replay()
+            self._taps = list(hit.taps)
+            return
+        self._forward(rows)
+        eager = self._taps
+        self.graphs.add(key, rows, Captured(self._capture(rows), self._taps))
+        self._taps = eager
+        self.captured = True
+
+    def _capture(self, rows: int) -> torch.cuda.CUDAGraph:
+        import gc
+
+        if self.graphs.pool is None:
+            self.graphs.pool = torch.cuda.graph_pool_handle()
+        g = torch.cuda.CUDAGraph()
+        # a collection during capture could destroy an old graph (cuGraphExecDestroy), which invalidates the capture
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with torch.cuda.graph(g, pool=self.graphs.pool, capture_error_mode="thread_local"):
+                self._forward(rows)
+        finally:
+            if enabled:
+                gc.enable()
+        return g
+
+    @torch.no_grad()
+    def warm(self, rows: Sequence[int], sampling=None) -> int:
+        """Capture the graphs of windows of ``rows`` rows in ``sampling``'s mode on a scratch state, then reset, so a
+        request's first windows replay; returns the graphs captured. The engine must hold no request."""
+
+        if self.graphs is None:
+            return 0
+        before = self.graphs.captures
+        self.set_sampling(sampling)
+        self.reset()
+        for r in rows:
+            self.verify([0] * int(r))
+        self._ready.synchronize()
+        self.reset()
+        return self.graphs.captures - before
 
     def tokens(self) -> list[int]:
         """The last window's sampled tokens: row r is the token at position pos + r + 1."""
