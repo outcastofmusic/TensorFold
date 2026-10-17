@@ -1,15 +1,25 @@
 """LFM2-MoE's routed experts: picks from sigmoid scores, then SwiGLU experts in their stored block FP8 layout.
 
-``pairs`` runs a few rows (decode) in two Triton kernels, a program a (row, pick) pair and a slice of outputs: it reads
-the picked experts' e4m3 bytes once, sums each 128-input block in fp32 and scales the block's sum by its stored scale,
-so no expert is dequantized and nothing waits on the host. ``grouped`` runs prompt chunks (and every call on the CPU):
-it orders the pairs by expert, decodes each used expert's linears to fp32 in turn into one reused buffer (a byte read,
-a float written: ``dense``) and multiplies its rows in fp32. Both
-round as transformers' bf16 forward does: gate and up to bf16, silu(gate) to bf16, its product with up to bf16, the
-down projection to bf16, each pick's output times its weight to bf16; the picks then add in fp32 in pick order.
+Three paths compute the same products and differ only in summation order:
+
+- ``pairs`` runs a few rows (decode) in two Triton kernels, a program a (row, pick) pair and a slice of outputs: it
+  reads the picked experts' e4m3 bytes, sums each 128-input block in fp32 and scales the block's sum by its stored
+  scale, so no expert is dequantized and nothing waits on the host. Each pair reads its expert in full.
+- ``dot`` runs prompt chunks on the tensor cores: the pairs sorted by expert in tiles of up to ``BM`` rows (a schedule
+  built on the device, ``schedule``), each tile reading its expert's e4m3 bytes once as bf16 (exact) and summing each
+  128-input block with ``tl.dot`` in fp32 before the block's scale. A used expert's bytes are read about once a chunk.
+- ``grouped`` decodes each used expert's linears to fp32 in turn into one reused buffer (a byte read, a float written:
+  ``dense``) and multiplies its rows in fp32: the CPU's path, and the prompt path ``TF_LFM2_PROMPT_KERNEL=fp32`` keeps
+  as the reference.
+
+All three round as transformers' bf16 forward does: gate and up to bf16, silu(gate) to bf16, its product with up to
+bf16, the down projection to bf16, each pick's output times its weight to bf16; the picks then add in fp32 in pick
+order.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 import triton
@@ -20,6 +30,8 @@ from .weights import Experts, Moe
 BN = 32             # outputs a program
 BK = 128            # inputs a step: one FP8 block's width
 BR = 32             # rows a ``_decode`` program writes, within one 128-row block
+DOT_BN = 64         # outputs a ``dot`` program: within one 128-row scale block
+KERNELS = ("auto", "pairs", "dot", "fp32")       # TF_LFM2_PROMPT_KERNEL's values
 
 
 def route(x: torch.Tensor, moe: Moe, top_k: int, scaling: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -149,6 +161,141 @@ def pairs(x: torch.Tensor, ids: torch.Tensor, ex: Experts) -> torch.Tensor:
     return out
 
 
+@triton.jit
+def _mma(a, b, WIDE: tl.constexpr):
+    """a @ b in fp32 sums; ``WIDE`` (Triton's interpreter, whose tl.dot multiplies bf16 operands' raw bits) widens
+    the operands to fp32 first, which holds every bf16 and e4m3 value exactly."""
+
+    if WIDE:
+        return tl.dot(a.to(tl.float32), b.to(tl.float32))
+    return tl.dot(a, b)
+
+
+@triton.jit
+def _dot_gate_up(X, ORDER, TILE_E, TILE_START, TILE_STOP, W, S, ACT, x_stride, TOPK: tl.constexpr,
+                 D: tl.constexpr, I: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                 FP8: tl.constexpr, WIDE: tl.constexpr):
+    """Program (tile, output block): ``_gate_up``'s ACT rows for a tile of up to BM pairs of one expert, on tl.dot."""
+
+    t = tl.program_id(0)
+    nb = tl.program_id(1)
+    e = tl.load(TILE_E + t).to(tl.int64)
+    if e < 0:                                   # past the chunk's tiles: the grid is sized without a host sync
+        return
+    m = tl.load(TILE_START + t) + tl.arange(0, BM)
+    valid = m < tl.load(TILE_STOP + t)
+    p = tl.load(ORDER + m, mask=valid, other=0).to(tl.int64)
+    r = p // TOPK
+    n = nb * BN + tl.arange(0, BN)
+    kk = tl.arange(0, BK)
+    gate_rows = e * 2 * I + n
+    up_rows = gate_rows + I
+    acc_g = tl.zeros((BM, BN), tl.float32)
+    acc_u = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, D, BK):
+        x = tl.load(X + r[:, None] * x_stride + k0 + kk[None, :], mask=valid[:, None], other=0.0)
+        wg = tl.load(W + gate_rows[None, :] * D + k0 + kk[:, None])          # [BK, BN]
+        wu = tl.load(W + up_rows[None, :] * D + k0 + kk[:, None])
+        if FP8:
+            sg = tl.load(S + (e * (2 * I // BK) + (nb * BN) // BK) * (D // BK) + k0 // BK)
+            su = tl.load(S + (e * (2 * I // BK) + (I + nb * BN) // BK) * (D // BK) + k0 // BK)
+            # e4m3 -> bf16 is exact; each 128-input block sums in fp32 before its scale, as in ``_gate_up``
+            acc_g += _mma(x, wg.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16), WIDE) * sg
+            acc_u += _mma(x, wu.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16), WIDE) * su
+        else:
+            acc_g += _mma(x, wg, WIDE)
+            acc_u += _mma(x, wu, WIDE)
+    g = acc_g.to(tl.bfloat16).to(tl.float32)
+    u = acc_u.to(tl.bfloat16).to(tl.float32)
+    silu = (g / (1.0 + tl.exp(-g))).to(tl.bfloat16).to(tl.float32)
+    tl.store(ACT + p[:, None] * I + n[None, :], (silu * u).to(tl.bfloat16), mask=valid[:, None])
+
+
+@triton.jit
+def _dot_down(ACT, ORDER, TILE_E, TILE_START, TILE_STOP, W, S, OUT, D: tl.constexpr, I: tl.constexpr,
+              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, FP8: tl.constexpr, WIDE: tl.constexpr):
+    """Program (tile, output block): ``_down``'s OUT rows for a tile of up to BM pairs of one expert, on tl.dot."""
+
+    t = tl.program_id(0)
+    nb = tl.program_id(1)
+    e = tl.load(TILE_E + t).to(tl.int64)
+    if e < 0:
+        return
+    m = tl.load(TILE_START + t) + tl.arange(0, BM)
+    valid = m < tl.load(TILE_STOP + t)
+    p = tl.load(ORDER + m, mask=valid, other=0).to(tl.int64)
+    n = nb * BN + tl.arange(0, BN)
+    kk = tl.arange(0, BK)
+    rows = e * D + n
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, I, BK):
+        a = tl.load(ACT + p[:, None] * I + k0 + kk[None, :], mask=valid[:, None], other=0.0)
+        w = tl.load(W + rows[None, :] * I + k0 + kk[:, None])
+        if FP8:
+            s = tl.load(S + (e * (D // BK) + (nb * BN) // BK) * (I // BK) + k0 // BK)
+            acc += _mma(a, w.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16), WIDE) * s
+        else:
+            acc += _mma(a, w, WIDE)
+    tl.store(OUT + p[:, None] * D + n[None, :], acc.to(tl.bfloat16), mask=valid[:, None])
+
+
+def tile_rows(pairs: int, experts: int) -> int:
+    """Rows a ``dot`` tile takes: the pairs an expert gets on average, as 16, 32 or 64 (tl.dot's shapes)."""
+
+    mean = pairs / max(1, experts)
+    return 16 if mean <= 16 else 32 if mean <= 32 else 64
+
+
+def schedule(flat: torch.Tensor, experts: int, bm: int) -> tuple[torch.Tensor, ...]:
+    """Tiles of up to ``bm`` pairs of one expert, built on the device with no host sync.
+
+    Returns (order, expert, start, stop): ``order`` the pair indices sorted by expert (stable), and for each of
+    ``len(flat) // bm + experts`` tiles (a bound on the tiles any picks need) its expert (-1 past the last tile) and
+    its slots ``order[start:stop]``.
+    """
+
+    flat = flat.long()
+    counts = torch.zeros(experts, dtype=torch.long, device=flat.device).scatter_add_(0, flat, torch.ones_like(flat))
+    tiles = (counts + bm - 1) // bm
+    tile_end = tiles.cumsum(0)
+    seg_end = counts.cumsum(0)
+    t = torch.arange(len(flat) // bm + experts, device=flat.device)
+    owner = torch.searchsorted(tile_end, t, right=True)
+    e = owner.clamp(max=experts - 1)
+    start = seg_end[e] - counts[e] + (t - (tile_end[e] - tiles[e])) * bm
+    stop = torch.minimum(seg_end[e], start + bm)
+    expert = torch.where(owner < experts, owner, torch.full_like(owner, -1)).to(torch.int32)
+    order = torch.argsort(flat, stable=True).to(torch.int32)
+    return order, expert, start.to(torch.int32), stop.to(torch.int32)
+
+
+def dot(x: torch.Tensor, ids: torch.Tensor, ex: Experts, bm: int = 0) -> torch.Tensor:
+    """``pairs``' result on the tensor cores, a tile of up to ``bm`` pairs of one expert a program (``tile_rows``
+    when 0): x [R, D] bf16, ids [R, k] -> [R * k, D] bf16."""
+
+    rows, top_k = ids.shape
+    d, width = x.shape[1], ex.width
+    if d % BK or width % BK:
+        raise ValueError(f"experts of width {width} over {d} inputs are not whole {BK}-input blocks")
+    bm = bm or tile_rows(rows * top_k, ex.count)
+    order, expert, start, stop = schedule(ids.reshape(-1), ex.count, bm)
+    act = torch.empty((rows * top_k, width), dtype=torch.bfloat16, device=x.device)
+    out = torch.empty((rows * top_k, d), dtype=torch.bfloat16, device=x.device)
+    fp8 = ex.fp8
+    s13 = ex.s13 if fp8 else act                    # unread without FP8
+    s2 = ex.s2 if fp8 else act
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    tiles = expert.shape[0]
+    wide = os.environ.get("TRITON_INTERPRET") == "1"
+    _dot_gate_up[(tiles, width // DOT_BN)](x, order, expert, start, stop, ex.w13, s13, act, x.stride(0), TOPK=top_k,
+                                           D=d, I=width, BM=bm, BN=DOT_BN, BK=BK, FP8=fp8, WIDE=wide, num_warps=4,
+                                           num_stages=2)
+    _dot_down[(tiles, d // DOT_BN)](act, order, expert, start, stop, ex.w2, s2, out, D=d, I=width, BM=bm,
+                                    BN=DOT_BN, BK=BK, FP8=fp8, WIDE=wide, num_warps=4, num_stages=2)
+    return out
+
+
 def grouped(x: torch.Tensor, ids: torch.Tensor, ex: Experts, work: torch.Tensor | None = None) -> torch.Tensor:
     """``pairs``' result by expert: each used expert's w13, then its w2, decoded to fp32 in ``work`` (at least
     ``ex.w13[0].numel()`` floats; made when None) and its rows multiplied in fp32."""
@@ -185,12 +332,28 @@ def combine(outs: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return acc.to(torch.bfloat16)
 
 
-def moe(x: torch.Tensor, m: Moe, top_k: int, scaling: float, *, few: int,
-        work: torch.Tensor | None = None) -> torch.Tensor:
-    """The MoE block's output [R, D] bf16; up to ``few`` rows on CUDA take ``pairs``, the rest ``grouped`` (in
-    ``work``)."""
+def path(kernel: str, rows: int, few: int, pairs_rows: int) -> str:
+    """The expert path a CUDA call of ``rows`` rows takes under TF_LFM2_PROMPT_KERNEL=``kernel``: up to ``few`` rows
+    (decode) always ``pairs``; ``auto`` keeps ``pairs`` up to ``pairs_rows`` rows, then ``dot``; ``fp32`` runs the
+    reference ``grouped``."""
+
+    if kernel not in KERNELS:
+        raise ValueError(f"TF_LFM2_PROMPT_KERNEL={kernel!r}: one of {', '.join(KERNELS)}")
+    if rows <= few:
+        return "pairs"
+    if kernel == "auto":
+        return "pairs" if rows <= pairs_rows else "dot"
+    return "grouped" if kernel == "fp32" else kernel
+
+
+def moe(x: torch.Tensor, m: Moe, top_k: int, scaling: float, *, few: int, work: torch.Tensor | None = None,
+        kernel: str = "auto", pairs_rows: int = 0) -> torch.Tensor:
+    """The MoE block's output [R, D] bf16 on ``path``'s kernels (on the CPU always ``grouped``, in ``work``)."""
 
     ids, weights = route(x, m, top_k, scaling)
-    if x.is_cuda and x.shape[0] <= few:
+    way = path(kernel, x.shape[0], few, pairs_rows) if x.is_cuda else "grouped"
+    if way == "pairs":
         return combine(pairs(x, ids, m.experts), weights)
+    if way == "dot":
+        return combine(dot(x, ids, m.experts), weights)
     return combine(grouped(x, ids, m.experts, work), weights)

@@ -107,6 +107,32 @@ def test_the_grouped_path_keeps_its_bits(weights):
     assert torch.equal(X.grouped(x, ids, ex), grouped_by_dequantize(x, ids, ex))
 
 
+@pytest.mark.parametrize("rows", [17, 64, 300])
+def test_the_tensor_core_kernel_equals_the_grouped_path(weights, rows):
+    """``dot`` at every tile height against the fp32 reference path: products exact, sums in another order."""
+
+    from tensorfold.families.lfm2_moe.cuda import experts as X
+
+    g = torch.Generator().manual_seed(rows)
+    for ex in (weights.blocks[2].moe.experts, weights.blocks[4].moe.experts):
+        x = torch.randn(rows, weights.config.hidden, generator=g).to(torch.bfloat16).cuda()
+        ids = torch.randint(0, ex.count, (rows, 2), generator=g).cuda()
+        want = X.grouped(x, ids, ex)
+        for bm in (16, 32, 64):
+            assert _close(X.dot(x, ids, ex, bm), want, 0.01), bm
+
+
+def test_the_prompt_kernels_give_one_reply(weights, monkeypatch):
+    """A 300-token prompt through each TF_LFM2_PROMPT_KERNEL: the same last-row logits within bf16 noise."""
+
+    ids = torch.randint(10, 500, (300,), generator=torch.Generator().manual_seed(1)).tolist()
+    out = {}
+    for kernel in ("fp32", "auto", "pairs", "dot"):
+        monkeypatch.setenv("TF_LFM2_PROMPT_KERNEL", kernel)
+        out[kernel] = _engine(weights).forward(ids, prompt=True)
+    assert all(_close(out[k], out["fp32"], 0.02) for k in out)
+
+
 def test_the_engine_computes_the_reference_on_its_own_picks(tiny, weights, monkeypatch):
     from tests.lfm2_moe_tiny import Picks, reference_logits
 
@@ -259,6 +285,18 @@ def test_the_real_grouped_path_keeps_its_bits(big):
     x = torch.randn(512, big.w.config.hidden, generator=g).to(torch.bfloat16).cuda()
     ids = torch.randint(0, ex.count, (512, 4), generator=g).cuda()
     assert torch.equal(X.grouped(x, ids, ex, big.e.decoded), grouped_by_dequantize(x, ids, ex))
+
+
+@real
+def test_the_real_tensor_core_kernel_equals_the_grouped_path(big):
+    from tensorfold.families.lfm2_moe.cuda import experts as X
+
+    ex = big.w.blocks[2].moe.experts
+    g = torch.Generator().manual_seed(4)
+    for rows in (64, 512, 2048):
+        x = torch.randn(rows, big.w.config.hidden, generator=g).to(torch.bfloat16).cuda()
+        ids = torch.randint(0, ex.count, (rows, 4), generator=g).cuda()
+        assert _close(X.dot(x, ids, ex), X.grouped(x, ids, ex, big.e.decoded), 0.01), rows
 
 
 @real

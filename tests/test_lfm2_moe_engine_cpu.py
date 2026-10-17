@@ -199,6 +199,44 @@ def test_the_grouped_path_keeps_its_bits(weights, tmp_path):
         assert torch.equal(X.grouped(x, ids, ex), lfm2_moe_tiny.grouped_by_dequantize(x, ids, ex))
 
 
+def test_the_tile_schedule_covers_every_pair_once_in_tiles_of_one_expert():
+    import torch
+
+    from tensorfold.families.lfm2_moe.cuda import experts as X
+
+    g = torch.Generator().manual_seed(6)
+    for picks, experts, bm in ((torch.randint(0, 8, (75,), generator=g), 8, 16), (torch.tensor([3] * 40), 8, 16),
+                               (torch.randint(0, 64, (8,), generator=g), 64, 64)):
+        order, expert, start, stop = X.schedule(picks, experts, bm)
+        assert expert.shape[0] == len(picks) // bm + experts
+        seen = []
+        for e, a, b in zip(expert.tolist(), start.tolist(), stop.tolist()):
+            if e < 0:
+                continue
+            slots = order[a:b].long()
+            assert 0 < b - a <= bm and (picks[slots] == e).all()
+            seen += slots.tolist()
+        assert sorted(seen) == list(range(len(picks)))
+        used = [e for e in expert.tolist() if e >= 0]
+        assert used == sorted(used)                         # tiles by expert, then -1 past the last
+
+
+def test_the_prompt_kernel_choice():
+    from tensorfold.families.lfm2_moe.cuda.experts import path
+
+    assert [path("auto", r, 16, 64) for r in (1, 16, 17, 64, 65, 2048)] == ["pairs"] * 4 + ["dot"] * 2
+    assert [path("fp32", r, 16, 64) for r in (16, 17)] == ["pairs", "grouped"]
+    assert path("pairs", 2048, 16, 64) == "pairs" and path("dot", 17, 16, 64) == "dot"
+    with pytest.raises(ValueError, match="TF_LFM2_PROMPT_KERNEL"):
+        path("fast", 1, 16, 64)
+
+
+def test_an_unknown_prompt_kernel_is_refused_at_startup(weights, monkeypatch):
+    monkeypatch.setenv("TF_LFM2_PROMPT_KERNEL", "tc")
+    with pytest.raises(ValueError, match="TF_LFM2_PROMPT_KERNEL='tc'"):
+        _engine(weights)
+
+
 KERNELS = r"""
 import torch
 from tensorfold.families.lfm2_moe.checkpoint import dequantize
@@ -225,10 +263,18 @@ for ex in (fp8, plain):
         gate, lin = (x[p // 2].double() @ up.t()).chunk(2)
         exact.append((torch.nn.functional.silu(gate) * lin) @ down.t())
     exact = torch.stack(exact)
-    for out, limit in ((X.pairs(x, ids, ex), 0.03), (X.grouped(x, ids, ex), 0.01)):
+    for out, limit in ((X.pairs(x, ids, ex), 0.03), (X.grouped(x, ids, ex), 0.01), (X.dot(x, ids, ex), 0.03)):
         err = float((out.double() - exact).abs().max() / exact.abs().max())
         assert err < limit, err
     print("ok")
+# the tensor-core path over several tiles an expert (16-row tiles), an unused expert and tiles past the last
+x = torch.randn(40, D, generator=g).to(torch.bfloat16)
+ids = torch.randint(0, E - 1, (40, 2), generator=g)
+want = X.pairs(x, ids, fp8).double()
+for bm in (16, 32):
+    err = float((X.dot(x, ids, fp8, bm).double() - want).abs().max() / want.abs().max())
+    assert err < 0.03, (bm, err)
+print("ok")
 codes = torch.tensor([b for b in range(256) if b & 0x7F != 0x7F], dtype=torch.uint8)
 w = codes[torch.randint(0, len(codes), (256, 384), generator=g)]
 s = torch.rand(2, 3, generator=g) * 1e-2
@@ -242,7 +288,8 @@ print("ok")
 def test_the_expert_kernels_compute_each_pick_s_swiglu_in_triton_s_interpreter(tmp_path):
     """Against fp64 with no rounding: the interpreter truncates to bf16 where a GPU rounds, so its three roundings
     cost up to 1.8% of the largest output here, the grouped path's 0.5%; a wrong expert or block scale costs 100%.
-    The block decode kernel gives ``dequantize``'s bits."""
+    The tensor-core kernel follows the decode kernel over many tiles. The block decode kernel gives ``dequantize``'s
+    bits."""
 
     pytest.importorskip("triton")
     root = Path(__file__).resolve().parents[1]
@@ -250,7 +297,7 @@ def test_the_expert_kernels_compute_each_pick_s_swiglu_in_triton_s_interpreter(t
     run = subprocess.run([sys.executable, "-c", KERNELS], check=False, env=env, capture_output=True, text=True,
                          timeout=240, cwd=tmp_path)
     assert run.returncode == 0, run.stderr[-2000:]
-    assert run.stdout.count("ok") == 3
+    assert run.stdout.count("ok") == 4
 
 
 REAL = Path(os.environ.get("TF_LFM2_MOE_MODEL", "/home/agis/models/LFM2.5-24B-A2B-FP8"))

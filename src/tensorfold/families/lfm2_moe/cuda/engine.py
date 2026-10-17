@@ -12,13 +12,14 @@ tests drive this same code against the fp32 reference.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import torch
 
-from . import DECODE_ROWS, PREFILL_ROWS
+from . import DECODE_ROWS, PAIRS_ROWS, PREFILL_ROWS
 from . import experts as X
 from .weights import Attention, Block, Conv, Weights
 
@@ -62,6 +63,9 @@ class Engine:
         dev = self.device = w.device
         self.cuda = dev.type == "cuda"
         self.max_len, self.prefill_rows = max_len, prefill_rows
+        # the expert kernels of prompt chunks (experts.path): TF_LFM2_PROMPT_KERNEL=fp32 keeps the reference path
+        self.prompt_kernel = os.environ.get("TF_LFM2_PROMPT_KERNEL", "auto").strip() or "auto"
+        X.path(self.prompt_kernel, 1, 0, 0)            # refuses an unknown value at startup
         self.slot = {layer: j for j, layer in enumerate(c.attention_layers)}
         self.slot.update({layer: j for j, layer in enumerate(c.conv_layers)})
         na, nc = len(c.attention_layers), len(c.conv_layers)
@@ -149,7 +153,8 @@ class Engine:
 
     def _ffn(self, b: Block, x: torch.Tensor, prompt: bool) -> torch.Tensor:
         if b.moe is not None:
-            return X.moe(x, b.moe, self.c.top_k, self.c.scaling, few=DECODE_ROWS, work=self.decoded)
+            return X.moe(x, b.moe, self.c.top_k, self.c.scaling, few=DECODE_ROWS, work=self.decoded,
+                         kernel=self.prompt_kernel, pairs_rows=PAIRS_ROWS)
         g, u = b.w13(x, prompt).chunk(2, dim=-1)
         act = (torch.nn.functional.silu(g.float()).to(torch.bfloat16).float() * u.float()).to(torch.bfloat16)
         return b.w2(act, prompt)

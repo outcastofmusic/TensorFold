@@ -53,7 +53,7 @@ prompt states.
 | Attention q/k/v (stacked), out, dense FFN | `Fp8BlockLinear`, the lane matmul over the stored e4m3 bytes |
 | Conv in/out projections, tied head | `b16` (bf16) |
 | Routed experts, decode (up to 16 rows) | `cuda/experts.py`'s Triton kernels: a program a (row, pick) and 32 outputs, fp32 sums a 128-input block, times the block's scale |
-| Routed experts, prompt chunks | each used expert decoded to fp32 once a chunk, its rows multiplied in fp32 |
+| Routed experts, prompt chunks | the decode kernels up to 16 rows (`PAIRS_ROWS`), then `dot`: pairs sorted by expert into 16-, 32- or 64-row tiles on the device, each tile reading its expert's e4m3 bytes once as bf16 on `tl.dot`, fp32 sums a 128-input block, times the block's scale. `TF_LFM2_PROMPT_KERNEL=fp32` keeps the previous path (each used expert decoded to fp32, its rows multiplied in fp32) as the reference; `pairs` and `dot` force one path |
 | Norms | Qwen's row-invariant `add_rmsnorm` |
 | Attention | `prefill_attention` for prompts; Nemotron-H's 512-key chunked kernel for decode |
 | Sampling | Nemotron-H's keyed sampler: (seed, position, logits) decides a token |
