@@ -149,6 +149,40 @@ def dequantized_copy(src: Path, dst: Path) -> Path:
     return dst
 
 
+def e4m3_codes(rows: int, cols: int, seed: int):
+    """Random e4m3 bytes [rows, cols] over every finite code (subnormals and both zeros included, no NaN)."""
+
+    codes = torch.tensor([b for b in range(256) if b & 0x7F != 0x7F], dtype=torch.uint8)
+    pick = torch.randint(0, len(codes), (rows, cols), generator=torch.Generator().manual_seed(seed))
+    return codes[pick]
+
+
+def grouped_by_dequantize(x, ids, ex):
+    """The grouped path as it was before its one-buffer decode: each expert through ``dequantize``, then the same
+    fp32 GEMMs."""
+
+    from tensorfold.families.lfm2_moe.checkpoint import dequantize
+
+    rows, top_k = ids.shape
+    flat = ids.reshape(-1)
+    order = torch.argsort(flat, stable=True)
+    out = torch.empty((rows * top_k, x.shape[1]), dtype=torch.bfloat16, device=x.device)
+    start = 0
+    for e, n in enumerate(torch.bincount(flat, minlength=ex.count).tolist()):
+        if not n:
+            continue
+        slots = order[start:start + n]
+        start += n
+        if ex.fp8:
+            w13, w2 = dequantize(ex.w13[e], ex.s13[e]), dequantize(ex.w2[e], ex.s2[e])
+        else:
+            w13, w2 = ex.w13[e].float(), ex.w2[e].float()
+        g, u = (x[slots // top_k].float() @ w13.t()).to(torch.bfloat16).float().chunk(2, dim=-1)
+        act = (torch.nn.functional.silu(g).to(torch.bfloat16).float() * u).to(torch.bfloat16)
+        out[slots] = (act.float() @ w2.t()).to(torch.bfloat16)
+    return out
+
+
 class Picks:
     """Record the engine's picks by MoE layer; replay them into the reference, noting each differing pick's margin."""
 

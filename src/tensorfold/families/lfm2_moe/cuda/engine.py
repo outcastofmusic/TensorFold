@@ -69,6 +69,9 @@ class Engine:
                         for _ in range(na)]
         self.v_cache = [torch.zeros_like(k) for k in self.k_cache]
         self.conv_state = torch.zeros((nc, c.conv_taps - 1, c.hidden), dtype=torch.bfloat16, device=dev)
+        # one fp32 buffer a prompt chunk's experts decode into in turn: w13 [2I, D] is the wider of an expert's two
+        self.decoded = torch.empty(max((b.moe.experts.w13[0].numel() for b in w.blocks if b.moe is not None),
+                                       default=0), dtype=torch.float32, device=dev)
         self.inv_freq = (1.0 / (c.theta ** (torch.arange(0, c.head_dim, 2, dtype=torch.float32) / c.head_dim))).to(dev)
         self.meta = torch.zeros(4, dtype=torch.int32, device=dev)
         self.sampled = torch.zeros(1, dtype=torch.int32, device=dev)
@@ -146,7 +149,7 @@ class Engine:
 
     def _ffn(self, b: Block, x: torch.Tensor, prompt: bool) -> torch.Tensor:
         if b.moe is not None:
-            return X.moe(x, b.moe, self.c.top_k, self.c.scaling, few=DECODE_ROWS)
+            return X.moe(x, b.moe, self.c.top_k, self.c.scaling, few=DECODE_ROWS, work=self.decoded)
         g, u = b.w13(x, prompt).chunk(2, dim=-1)
         act = (torch.nn.functional.silu(g.float()).to(torch.bfloat16).float() * u.float()).to(torch.bfloat16)
         return b.w2(act, prompt)

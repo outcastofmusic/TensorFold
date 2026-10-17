@@ -65,13 +65,6 @@ class Experts:
     def fp8(self) -> bool:
         return self.s13 is not None
 
-    def dense(self, e: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Expert ``e``'s (w13, w2) in fp32: e4m3 x scale, exact."""
-
-        if not self.fp8:
-            return self.w13[e].float(), self.w2[e].float()
-        return dequantize(self.w13[e], self.s13[e]), dequantize(self.w2[e], self.s2[e])
-
     def nbytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in (self.w13, self.w2, self.s13, self.s2) if t is not None)
 

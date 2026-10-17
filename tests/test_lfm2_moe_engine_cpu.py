@@ -169,8 +169,39 @@ def test_stacked_fp8_linears_keep_each_part_s_block_scales(tiny):
     assert lin.n == want.shape[0] and torch.equal(got, want)
 
 
+def test_an_expert_decodes_to_dequantize_s_bits_in_the_buffer_it_is_given():
+    import torch
+
+    from tensorfold.families.lfm2_moe.checkpoint import dequantize
+    from tensorfold.families.lfm2_moe.cuda import experts as X
+
+    w = lfm2_moe_tiny.e4m3_codes(384, 256, 1)
+    s = torch.rand(3, 2, generator=torch.Generator().manual_seed(2)) * 1e-2
+    work = torch.full((384 * 256 + 7,), float("nan"))
+    got = X.dense(w, s, work)
+    assert got.data_ptr() == work.data_ptr() and got.shape == (384, 256)
+    assert torch.equal(got, dequantize(w, s))
+    bf16 = torch.randn(256, 128).to(torch.bfloat16)
+    assert torch.equal(X.dense(bf16, None, work), bf16.float())
+
+
+def test_the_grouped_path_keeps_its_bits(weights, tmp_path):
+    import torch
+
+    from tensorfold.families.lfm2_moe.cuda import experts as X
+    from tensorfold.families.lfm2_moe.cuda.weights import load
+
+    g = torch.Generator().manual_seed(3)
+    bf16 = load(lfm2_moe_tiny.write(tmp_path / "bf16", fp8=False), "cpu")
+    for ex in (weights.blocks[2].moe.experts, bf16.blocks[2].moe.experts):
+        x = torch.randn(40, weights.config.hidden, generator=g).to(torch.bfloat16)
+        ids = torch.randint(0, ex.count, (40, 2), generator=g)
+        assert torch.equal(X.grouped(x, ids, ex), lfm2_moe_tiny.grouped_by_dequantize(x, ids, ex))
+
+
 KERNELS = r"""
 import torch
+from tensorfold.families.lfm2_moe.checkpoint import dequantize
 from tensorfold.families.lfm2_moe.cuda import experts as X
 from tensorfold.families.lfm2_moe.cuda.weights import Experts
 from tests.lfm2_moe_tiny import fp8_blocks
@@ -189,7 +220,8 @@ ids = torch.tensor([[0, 2], [3, 1], [2, 0]])
 for ex in (fp8, plain):
     exact = []
     for p, e in enumerate(ids.reshape(-1).tolist()):
-        up, down = (w.double() for w in ex.dense(e))
+        up, down = (X.dense(w[e], None if s is None else s[e]).double()
+                    for w, s in ((ex.w13, ex.s13), (ex.w2, ex.s2)))
         gate, lin = (x[p // 2].double() @ up.t()).chunk(2)
         exact.append((torch.nn.functional.silu(gate) * lin) @ down.t())
     exact = torch.stack(exact)
@@ -197,12 +229,20 @@ for ex in (fp8, plain):
         err = float((out.double() - exact).abs().max() / exact.abs().max())
         assert err < limit, err
     print("ok")
+codes = torch.tensor([b for b in range(256) if b & 0x7F != 0x7F], dtype=torch.uint8)
+w = codes[torch.randint(0, len(codes), (256, 384), generator=g)]
+s = torch.rand(2, 3, generator=g) * 1e-2
+out = torch.full((256, 384), float("nan"))
+X.decode_blocks(w, s, out)
+assert torch.equal(out, dequantize(w, s))
+print("ok")
 """
 
 
 def test_the_expert_kernels_compute_each_pick_s_swiglu_in_triton_s_interpreter(tmp_path):
     """Against fp64 with no rounding: the interpreter truncates to bf16 where a GPU rounds, so its three roundings
-    cost up to 1.8% of the largest output here, the grouped path's 0.5%; a wrong expert or block scale costs 100%."""
+    cost up to 1.8% of the largest output here, the grouped path's 0.5%; a wrong expert or block scale costs 100%.
+    The block decode kernel gives ``dequantize``'s bits."""
 
     pytest.importorskip("triton")
     root = Path(__file__).resolve().parents[1]
@@ -210,7 +250,7 @@ def test_the_expert_kernels_compute_each_pick_s_swiglu_in_triton_s_interpreter(t
     run = subprocess.run([sys.executable, "-c", KERNELS], check=False, env=env, capture_output=True, text=True,
                          timeout=240, cwd=tmp_path)
     assert run.returncode == 0, run.stderr[-2000:]
-    assert run.stdout.count("ok") == 2
+    assert run.stdout.count("ok") == 3
 
 
 REAL = Path(os.environ.get("TF_LFM2_MOE_MODEL", "/home/agis/models/LFM2.5-24B-A2B-FP8"))
