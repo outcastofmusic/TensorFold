@@ -206,6 +206,7 @@ Ordered by what they buy a box that swaps between four models.
 | A swap saves states before it stops a model | `swap.py` drains requests for up to 600 s, then stops the container. GLM writes only while idle | The swap asks the model to persist and waits for it |
 | GLM keeps states at message starts | A shared 6,059-token history resumed 0 of 5 times | Add message-start stops to GLM's prefill, as Qwen has |
 | Bolt reuses prompts and runs concurrent streams | One sequence, every request prefills in full | Port upstream Nemotron's prompt reuse (1.0.5), concurrent rounds and batched drafting (1.0.9) |
+| Nemotron 3.5 Super VL (120B-A12B) as a fifth swap model | Upstream TensorFold 1.0.12 serves it on CUDA from NVIDIA's NVFP4 checkpoint on one or two GB10s, with MTP drafts and RADIO images | Size it (sections 1 to 4), then port the family or run the upstream native binary behind `swap.py`, and benchmark it with the other four |
 | A long-context eval | TrueScore has 1 LC and 1 LCH scenario | Recall with distractors and multi-step questions at 16k, 64k and 128k, paired across models |
 | GLM's window | It runs at 98,304 tokens of a native 1,048,576 because its start-up estimate fills 101.1 of 105.4 GiB, and it has no int8 KV | Measure KV bytes per token, then try int8 KV with a quality check |
 | Behaviour past the window | Untested per engine and through the gateway | Test refusal, truncation and client compaction |
