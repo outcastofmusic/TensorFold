@@ -325,7 +325,7 @@ def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tenso
     return gather(w, b, R)
 
 
-def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut | None = None) -> torch.Tensor:
+def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cuts: Sequence[Cut] = ()) -> torch.Tensor:
     c = w.cfg
     k = layer.kda
     li = st.kda_index[layer.index]
@@ -337,18 +337,23 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
     mm(b, fa, k.fb, None if pre else qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
     mm(b, ga, k.gb, None if pre else qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
     cur = st.cur[li]
-    if cut is None:
+    if not cuts:
         out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
                             k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
                             st.rec[1 - cur, li])
     else:
-        n = cut.point
-        first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
-                              k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
-        _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
-        rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
-                             k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
-        out = torch.cat((first, rest))
+        # the chain runs piece by piece, each from the last cut's state and conv window: every piece's rows are those
+        # of the whole chunk, and each cut keeps the state a prefill ending at its row leaves
+        pieces, conv, rec, a = [], st.conv[li], st.rec[cur, li], 0
+        for cut in cuts:
+            n = cut.point
+            pieces.append(kda_mod.chain(p[a:n], k.b_off, b.ka[a:n], b.kg[a:n], conv, k.conv, rec, k.a_log,
+                                        k.dt_bias, k.norm, c.eps, c.lower, n - a, b.kscratch, cut.rec[li]).clone())
+            _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
+            conv, rec, a = cut.conv[li], cut.rec[li], n
+        pieces.append(kda_mod.chain(p[a:], k.b_off, b.ka[a:R], b.kg[a:R], conv, k.conv, rec, k.a_log, k.dt_bias,
+                                    k.norm, c.eps, c.lower, R - a, b.kscratch, st.rec[1 - cur, li]))
+        out = torch.cat(pieces)
     if pre:                              # a prompt chunk keeps every row: the layer commits now
         st.cur[li] = 1 - cur
         _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
@@ -514,7 +519,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
 
 
 def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
-                  host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None) -> None:
+                  host_pos: int | None = None, sparse_np: int | None = None, cuts: Sequence[Cut] = ()) -> None:
     c = w.cfg
     x = b.x[:R]
     h = layer.attn_hc
@@ -522,7 +527,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
     if layer.kind == "kda":
         with prof.timed("kda"):
-            g = kda_block(layer, w, st, b, R, cut)
+            g = kda_block(layer, w, st, b, R, cuts)
     else:
         di = st.dsa_index[layer.index]
         with prof.timed("dsa (total)"):
@@ -562,15 +567,16 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
 
 
 def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
-            host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None):
+            host_pos: int | None = None, sparse_np: int | None = None, cuts: Sequence[Cut] = ()):
     """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention."""
 
-    if cut is not None and (not b.prefill or not 0 < cut.point < R):
-        raise ValueError("a prompt cut must lie inside a prefill chunk")
+    points = [cut.point for cut in cuts]
+    if cuts and (not b.prefill or not 0 < points[0] or points[-1] >= R or points != sorted(set(points))):
+        raise ValueError("prompt cuts must lie inside a prefill chunk, in increasing order")
     c = w.cfg
     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
     for layer in w.layers:
-        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, cut)
+        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, cuts)
         for slot in b.tap_at.get(layer.index, ()):
             glue.stream_mean(b.x[:R], b.taps[slot][:R])
     glue.stream_mean(b.x[:R], b.hidden[:R])

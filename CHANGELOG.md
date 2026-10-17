@@ -26,6 +26,10 @@ GitHub has the full notes and the measurements behind them.
 - **A swap writes the outgoing model's kept states to disk first.** `POST /internal/persist` writes every kept state
   not on disk yet and answers once they are there, at once when states stay in memory. `swap.py` sends it after the
   running requests finish and before `run.sh` stops the model, and waits up to `SWAP_PERSIST` seconds (120).
+- **GLM-5.3 Flash resumes a shared history where its last user message starts.** A prompt now keeps a state at
+  that point, so a request that sends the same history with another question resumes there. On 17 Oct 2026, five
+  questions after one 6,059-token history each prefilled the whole prompt. A kept point is now a cut inside its
+  prefill pass, so neither this state nor the system block's adds a pass. Replies keep their tokens.
 
 ## 0.8.0 (16 Oct 2026)
 
