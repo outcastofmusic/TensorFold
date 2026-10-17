@@ -6,6 +6,7 @@
 #   ./run.sh glm-5.3-flash     GLM-5.3 Flash on 127.0.0.1:30000, with its DFlash2 draft model
 #   ./run.sh qwen-flash-next-fp4   Qwen3.8 Flash Next from NVIDIA's FP4-Local checkpoint (QAD NVFP4), Clef-Flash beside it
 #   ./run.sh nemotron-bolt     Nemotron 3.5 Bolt 74B-A9B (24 GB) with its LiLiCorr draft model
+#   ./run.sh lfm2-24b          Liquid's LFM2.5-24B-A2B (block FP8, 24.75 GB): tool routing and sub-agents
 #   ./run.sh swap              one endpoint on 127.0.0.1:30000 that loads whichever model a request names (swap.py)
 #   ./run.sh stop              stop whatever this script started
 #   ./run.sh status            what is running and whether it answers
@@ -19,13 +20,15 @@
 #   SWAP_DRAIN=600  SWAP_HOLD=0  SWAP_TIMEOUT=3600  SWAP_PERSIST=120   swap.py's waits, in seconds (its header says what each does)
 #   TF_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 #   EXTRA="..."                more `tensorfold serve` flags
-#   QWEN_MODEL, QWEN_FP4_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL   another checkpoint folder under $MODELS
+#   QWEN_MODEL, QWEN_FP4_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL   another checkpoint folder under $MODELS
 # Both:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused
 # Qwen:  CONTEXT=262144  PARALLEL=4  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
 # Qwen FP4-Local: Qwen's settings, VISION=0 by default (the image tower run.sh converts belongs to the EXL3 pack)
 # Bolt:  CONTEXT=131072 (a stream's KV is 8 KiB a token)  THINK_BUDGET=8000 (0: none); no disk states, one stream
+# LFM2:  CONTEXT=131072 (KV 20 KiB a token)  THINK_BUDGET=8000 (0: none); one stream, no drafts, no disk states.
+#        LFM Open License v1.0: commercial use is licensed only under US$10M annual revenue
 set -euo pipefail
 
 MODELS="${MODELS:-$HOME/models}"
@@ -33,7 +36,7 @@ BASE="${TF_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 PORT="${PORT:-30000}"
 CLEF_PORT="${CLEF_PORT:-30001}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
-NAMES="tensorfold-serve clef-serve tensorfold-glm tensorfold-bolt"
+NAMES="tensorfold-serve clef-serve tensorfold-glm tensorfold-bolt tensorfold-lfm2"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/tensorfold-run"
 
 die() { echo "run: $*" >&2; exit 1; }
@@ -198,6 +201,20 @@ bolt() {
     wait_ready tensorfold-bolt "$PORT" || failed tensorfold-bolt
 }
 
+# Liquid's sampling (generation_config.json: temperature 0.1, top_k 50) with top_p 1.0 where the server's default is
+# 0.95; its repetition penalty (1.05) has no keyed rule on the CUDA engines and is not applied
+lfm2() {
+    local model="${LFM2_MODEL:-$MODELS/LFM2.5-24B-A2B-FP8}"
+    [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh lfm2-24b)"
+    local budget=()
+    [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
+    IMAGE=$(image)
+    stop_all
+    serve tensorfold-lfm2 -- "$model" --host 127.0.0.1 --port "$PORT" --name lfm2.5-24b-a2b \
+        --context "${CONTEXT:-131072}" --max-tokens "${CONTEXT:-131072}" --top-p 1.0 "${budget[@]}" ${EXTRA:-}
+    wait_ready tensorfold-lfm2 "$PORT" || failed tensorfold-lfm2
+}
+
 glm() {
     # The hybrid (Sushi's routed experts on Mosaic 12L's dense part) over Mosaic 12L: TrueScore 93.6 against 86.5,
     # paired difference +2.7 [-1.1, +7.3] over 76 scenarios, decode 5-7% slower (2026-10-13)
@@ -259,9 +276,10 @@ case "${1:-}" in
     glm-5.3-flash)   ask_swap "$1" || glm ;;
     qwen-flash-next-fp4) ask_swap "$1" || qwen_fp4 ;;
     nemotron-bolt)   ask_swap "$1" || bolt ;;
+    lfm2-24b)        ask_swap "$1" || lfm2 ;;
     swap)            swap "${2:-}" ;;
     stop)            if swapping; then stop_swap; fi
                      stop_all ;;
     status)          status ;;
-    *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
