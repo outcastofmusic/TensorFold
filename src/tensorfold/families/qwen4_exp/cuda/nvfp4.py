@@ -190,6 +190,31 @@ def _fp8_bytes(weight_scale: torch.Tensor) -> torch.Tensor:
     return weight_scale.contiguous().view(torch.uint8)
 
 
+def csf_scale(fixed: torch.Tensor, exceptions: torch.Tensor) -> torch.Tensor:
+    """A CSF-coded e4m3 scale matrix (``weight_scale_encoding: csf``) -> the (N, K/16) bytes it encodes, exactly.
+
+    ``fixed`` uint8 [N/16, 16 * (1 + K/32)] holds per 16-row slab one base byte a row, then a nibble a scale
+    (low first): byte = base + nibble. ``exceptions`` uint32 words replace the bytes no nibble reaches: position (row-major) in
+    bits 0..23, the byte in bits 24..31. vLLM's ``decode_nvfp4_csf_scale`` (csf_scales.py) defines the format.
+    """
+
+    if fixed.dtype != torch.uint8 or fixed.dim() != 2 or fixed.shape[1] % 16:
+        raise ValueError(f"a CSF fixed stream is uint8 [N/16, 16 * (1 + K/32)], not {fixed.dtype} {list(fixed.shape)}")
+    rows = fixed.shape[0] * 16
+    cols = (fixed.shape[1] // 16 - 1) * 2
+    bases = fixed[:, :16].reshape(rows, 1).to(torch.int32)
+    if bool((bases > 240).any()):
+        raise ValueError("CSF row bases must be in 0..240")
+    packed = fixed[:, 16:].reshape(rows, cols // 2).to(torch.int32)
+    out = (bases + torch.stack((packed & 0xF, packed >> 4), dim=-1).reshape(rows, cols)).reshape(-1)
+    words = exceptions.reshape(-1).view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    positions = words & 0xFFFFFF
+    if positions.numel() and int(positions.max()) >= rows * cols:
+        raise ValueError("a CSF exception's position is outside its scale matrix")
+    out[positions] = (words >> 24).to(torch.int32)
+    return out.to(torch.uint8).view(torch.float8_e4m3fn).reshape(rows, cols)
+
+
 def make_fp4(words: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2) -> FP4:
     """One linear from the checkpoint: (N, K/2) codes, (N, K/16) e4m3 scales and the tensor scale, kept as shipped."""
 
