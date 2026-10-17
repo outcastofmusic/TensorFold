@@ -1,9 +1,13 @@
 """GLM call arguments read in linear time and equal to the regex they replace (upstream #883)."""
 
 import random
+import re
 import time
 
-from tensorfold.server.tools import _GLM_ARG_RE, _glm_args, parse_glm_tool_call_block
+from tensorfold.server.tools import _glm_args, parse_glm_tool_call_block
+
+# the regex _glm_args replaced, which the server no longer carries
+_GLM_ARG_RE = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
 
 PIECES = ["<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>", " ", "\n", "k", "v1", "<", ">", "arg"]
 
