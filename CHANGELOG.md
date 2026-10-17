@@ -9,6 +9,11 @@ GitHub has the full notes and the measurements behind them.
   FP4-Local and `nemotron-3.5-bolt` loads Nemotron 3.5 Bolt with LiLiCorr drafts; `prepare.sh` fetches both at pinned
   revisions. The default stays Qwen3.8 Flash Next's EXL3 pack. `lfm2.5-24b-a2b` loads Liquid's LFM2.5-24B-A2B in block FP8.
 - **d1-3B decision sidecar.** Liquid's d1-3B answers `/v1/systemone` and `/v1/decisions` (yes/no, choice, score) in 25.9 ms a question on the GB10; `D1=1` starts it beside every model but GLM on :30003.
+- **Qwen writes only the kept states a restart resumes from.** Each slot's shortest state (its system block's end)
+  and its longest go to disk, and the states between them stay in memory only. Each state skipped saves its 115.7 MB
+  DeltaNet piece: at two such states a turn, a 30-turn conversation writes 6.9 GB less. After a restart, a
+  regenerated or edited earlier turn resumes from the longest state on disk it extends and prefills the rest.
+  `TENSORFOLD_QWEN_STATES_ALL=1` (`STATES_ALL=1` in `run.sh`) writes every kept state as before.
 - **Kept states on disk are pruned.** A state unused for 72 hours (`TENSORFOLD_<GLM|QWEN>_STATES_TTL_H`) is deleted, and so is
   an older build's or checkpoint's folder whose newest state is that old. `_STATES_GIB` now caps the whole folder:
   past it, older builds' folders go least recently used first, then the current build's oldest states. A folder

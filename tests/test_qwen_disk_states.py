@@ -229,6 +229,62 @@ def test_a_full_disk_ends_the_pass_with_a_line(tmp_path, capsys, monkeypatch):
     assert "No space left" in capsys.readouterr().out
 
 
+def chain(st, *lengths, pos=None):
+    """Kept entries of one conversation on slot ``st``: prefixes of one prompt, shortest first."""
+
+    out = []
+    for n in lengths:
+        snap, tail = kept(n, seed=n)
+        if pos is not None and n in pos:
+            snap["pos"] = pos[n]
+        out.append((list(range(n)), st, snap, tail))
+    return out
+
+
+def test_only_each_slots_shortest_and_longest_states_are_written(tmp_path):
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    d, st = store(tmp_path), noise(slot(capacity=2100))
+    assert disk.persist(d, chain(st, 1100, 1500, 1800, 2000), lambda: False) == 2
+    assert sorted(len(e.ids) for e in d.entries) == [1100, 2000]
+
+
+def test_a_state_below_min_tokens_still_counts_as_the_slots_shortest(tmp_path):
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    d, st = store(tmp_path), noise(slot(capacity=2100))
+    assert disk.persist(d, chain(st, 300, 1100, 2000), lambda: False) == 1    # 300 is the system block's end
+    assert [len(e.ids) for e in d.entries] == [2000]
+
+
+def test_a_longer_state_on_another_slot_or_one_not_written_supersedes_nothing(tmp_path):
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    d, a, b = store(tmp_path), noise(slot(capacity=2100)), noise(slot(capacity=2100), seed=1)
+    entries = chain(b, 1050, 1300) + chain(a, 1600)          # 1600 extends 1300, on another slot
+    assert disk.persist(d, entries, lambda: False) == 3
+    d = store(tmp_path / "other")
+    entries = chain(a, 1050, 1300, 1600, pos={1600: 1599})   # 1600 is not written, so 1300 is the longest written
+    assert disk.persist(d, entries, lambda: False) == 2
+    assert sorted(len(e.ids) for e in d.entries) == [1050, 1300]
+
+
+def test_states_all_writes_every_kept_state(tmp_path, monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda import disk
+
+    monkeypatch.setenv("TENSORFOLD_QWEN_STATES_ALL", "1")
+    d, st = store(tmp_path), noise(slot(capacity=2100))
+    assert disk.persist(d, chain(st, 1100, 1500, 2000), lambda: False) == 3
+
+
+def test_the_serial_engine_writes_only_its_shortest_and_longest_states(tmp_path):
+    d, st = store(tmp_path), noise(slot(capacity=2100))
+    e, _ = engine(d, st)
+    e.cache = [(ids, {"state": snap, "tail": tail}) for ids, _, snap, tail in chain(st, 1100, 1500, 2000)]
+    assert e.persist(lambda: False) == 2
+    assert sorted(len(x.ids) for x in d.entries) == [1100, 2000]
+
+
 # -- the concurrent decoder ------------------------------------------------------------------------------
 def decoder(monkeypatch, d, slots):
     """A bare ``MultiDecoder`` on host slots: admission runs as written, the prompt's first rows are recorded."""

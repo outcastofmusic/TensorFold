@@ -24,7 +24,7 @@
 #   TF_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 #   EXTRA="..."                more `tensorfold serve` flags
 #   QWEN_MODEL, QWEN_FP4_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL, D1_MODEL   another checkpoint folder under $MODELS
-# Qwen, Qwen FP4, GLM:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused
+# Qwen, Qwen FP4, GLM:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused;  Qwen: STATES_ALL=0: each slot's shortest and longest state go to disk (1: every kept state)
 # Qwen:  CONTEXT=262144  PARALLEL=4  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
@@ -214,7 +214,7 @@ qwen() {  # [served name] [clef_first: 1 starts Clef before Qwen]
         serve clef-serve -- "$clef" --host 127.0.0.1 --port "$CLEF_PORT" --name clef --context 16384
         wait_ready clef-serve "$CLEF_PORT" || failed clef-serve
     fi
-    [ "${STATES:-1}" = 0 ] || flags+=(-v tensorfold-states:/states -e TENSORFOLD_QWEN_STATES=/states/qwen -e "TENSORFOLD_QWEN_STATES_GIB=${STATES_GIB:-64}" -e "TENSORFOLD_QWEN_STATES_TTL_H=${STATES_TTL_H:-72}")
+    [ "${STATES:-1}" = 0 ] || flags+=(-v tensorfold-states:/states -e TENSORFOLD_QWEN_STATES=/states/qwen -e "TENSORFOLD_QWEN_STATES_GIB=${STATES_GIB:-64}" -e "TENSORFOLD_QWEN_STATES_TTL_H=${STATES_TTL_H:-72}" -e "TENSORFOLD_QWEN_STATES_ALL=${STATES_ALL:-0}")
     serve tensorfold-serve "${flags[@]}" -- "$model" --host 127.0.0.1 --port "$PORT" --name "$name" \
         --context "${CONTEXT:-262144}" --max-tokens "${CONTEXT:-262144}" --parallel "${PARALLEL:-4}" --kv-dtype "${KV:-int8}" \
         "${vision[@]}" "${guard[@]}" "${budget[@]}" ${EXTRA:-}

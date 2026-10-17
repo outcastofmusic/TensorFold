@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from tensorfold.cuda import disk_states
+from tensorfold.env_flags import flag
 
 # the environment the prompt kernels read: a state written under other values may not be the bits this run computes
 KERNEL_FLAGS = ("TENSORFOLD_PREFILL_ROWS", "TF_QMMF_FUSED_ROWS", "TF_FLASH_STAGE_AHEAD")
@@ -94,14 +95,36 @@ def open_states(model_dir: Path, st, *, engine: str, prefill_rows: int) -> disk_
     return disk_states.from_env("QWEN", parts)
 
 
+def _writable(ids, snap) -> bool:
+    return len(ids) >= disk_states.MIN_TOKENS and snap["pos"] == len(ids)
+
+
+def _extended(entry: tuple, kept: Sequence[tuple]) -> bool:
+    """Whether a restart has no use for ``entry``: a longer writable entry on its slot extends it, and it is not the
+    slot's shortest, the system block's end that a new conversation resumes from (``prefixes._superseded``)."""
+
+    ids, st = entry[0], entry[1]
+    chain = [k for k in kept if k[1] is st]
+    if len(ids) <= min(len(k[0]) for k in chain):
+        return False
+    return any(len(k[0]) > len(ids) and k[0][:len(ids)] == ids and _writable(k[0], k[2]) for k in chain)
+
+
 def persist(disk: disk_states.DiskStates, kept: Sequence[tuple], stop: Callable[[], bool]) -> int:
     """Write the kept states of ``MIN_TOKENS`` or more not on disk yet, newest first; the states written. Runs while
-    no request does, so every kept entry's rows are in its slot; a full or failing disk ends the pass with a line."""
+    no request does, so every kept entry's rows are in its slot; a full or failing disk ends the pass with a line.
 
+    Each slot's shortest and longest states go to disk, and none between them unless ``TENSORFOLD_QWEN_STATES_ALL=1``:
+    each holds a 115.7 MB DeltaNet piece, and only a regenerated or edited earlier turn resumes from one. After a
+    restart such a turn resumes from the longest state on disk that it extends and prefills the rest."""
+
+    every = flag("TENSORFOLD_QWEN_STATES_ALL")
+    kept = list(kept)
     written = 0
-    for ids, st, snap, tail in reversed(list(kept)):
+    for entry in reversed(kept):
+        ids, st, snap, tail = entry
         n, m = len(ids), int(snap["mtp_len"])
-        if n < disk_states.MIN_TOKENS or snap["pos"] != n or disk.has(ids):
+        if not _writable(ids, snap) or disk.has(ids) or not every and _extended(entry, kept):
             continue
         if stop():
             break
