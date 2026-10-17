@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 
 import torch
 import triton
+import triton.language as tl
 
 from tensorfold.cuda.kernels import prefill_attention
 from tensorfold.families.nemotron_h.cuda import attention as A
@@ -72,11 +73,67 @@ def dense(x: torch.Tensor, w: torch.Tensor, prompt: bool) -> torch.Tensor:
     return b16.prompt(x, w) if prompt else b16.matmul(x, w)
 
 
-def relu2(x: torch.Tensor) -> torch.Tensor:
-    """Nemotron's relu(x)^2 in bf16, as transformers' ReLUSquaredActivation rounds it."""
+@triton.jit
+def _relu2(X, OUT, n, BLOCK: tl.constexpr):
+    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    ok = i < n
+    x = tl.load(X + i, mask=ok, other=0.0).to(tl.float32)
+    r = tl.where(x < 0, 0.0, x)                    # NaN and -0 pass as torch.relu passes them
+    tl.store(OUT + i, (r * r).to(tl.bfloat16), mask=ok)
 
-    r = torch.relu(x)
-    return r * r
+
+def relu2(x: torch.Tensor) -> torch.Tensor:
+    """Nemotron's relu(x)^2 in bf16, as transformers' ReLUSquaredActivation rounds it: one kernel on CUDA.
+
+    torch's bf16 r * r multiplies in fp32 and rounds to bf16 once; the kernel does the same, so the bits agree.
+    """
+
+    if not x.is_cuda:
+        r = torch.relu(x)
+        return r * r
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    n = x.numel()
+    _relu2[(triton.cdiv(n, 1024),)](x, out, n, BLOCK=1024, num_warps=4, enable_fp_fusion=False)
+    return out
+
+
+@triton.jit
+def _weighted_sum(Y, W, OUT, L, w_row, K: tl.constexpr, BLOCK: tl.constexpr):
+    """Program (row, column block): acc = fl(y0 w0), then acc = fl(acc + fl(yj wj)) for j = 1 .. K - 1, then bf16."""
+
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    ok = cols < L
+    y = Y + row * K * L + cols
+    w = W + row * w_row
+    acc = tl.load(y, mask=ok, other=0.0).to(tl.float32) * tl.load(w)      # the first product, so -0 survives
+    for j in tl.static_range(1, K):
+        acc = acc + tl.load(y + j * L, mask=ok, other=0.0).to(tl.float32) * tl.load(w + j)
+    tl.store(OUT + row * L + cols, acc.to(tl.bfloat16), mask=ok)
+
+
+def weighted_sum(y: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+    """y bf16 [R, K, L], wts fp32 [R, K] -> bf16 [R, L]: each row's picks summed in pick order, in fp32.
+
+    The CUDA kernel takes the torch loop's steps (a product rounded, then a sum rounded; compiled without FMA
+    contraction) in one launch instead of 3 K, so a row's bits equal the loop's and ignore R.
+    """
+
+    rows, k, width = y.shape
+    if not y.is_cuda:
+        acc = y[:, 0].float() * wts[:, 0:1]
+        for j in range(1, k):                                      # a fixed order, so a row's sum ignores R
+            acc = acc + y[:, j].float() * wts[:, j:j + 1]
+        return acc.to(torch.bfloat16)
+    if wts.dtype != torch.float32 or wts.shape != (rows, k) or wts.stride(1) != 1:
+        raise ValueError(f"weights: fp32 [{rows}, {k}] with unit column stride, not {wts.dtype} {tuple(wts.shape)}")
+    y = y.contiguous()
+    out = torch.empty((rows, width), dtype=torch.bfloat16, device=y.device)
+    block = 1024
+    _weighted_sum[(rows, triton.cdiv(width, block))](y, wts, out, width, wts.stride(0), K=k, BLOCK=block,
+                                                     num_warps=4, enable_fp_fusion=False)
+    return out
 
 
 def latent_moe(moe: MoE, normed: torch.Tensor, *, scaling: float, norm: bool, prompt: bool) -> torch.Tensor:
@@ -94,10 +151,7 @@ def latent_moe(moe: MoE, normed: torch.Tensor, *, scaling: float, norm: bool, pr
     flat_ids = ids.reshape(-1)
     act = relu2(iq2xxs_grouped(pairs, moe.up, flat_ids, prompt=prompt))
     y = iq2xxs_grouped(act, moe.down, flat_ids, prompt=prompt).view(rows, k, -1)
-    acc = y[:, 0].float() * wts[:, 0:1]
-    for j in range(1, k):                                          # a fixed order, so a row's sum ignores R
-        acc = acc + y[:, j].float() * wts[:, j:j + 1]
-    routed = dense(acc.to(torch.bfloat16), moe.fc2, prompt)
+    routed = dense(weighted_sum(y, wts), moe.fc2, prompt)
     shared = iq2xxs_linear(relu2(iq2xxs_linear(normed, moe.shared_up, prompt=prompt)), moe.shared_down, prompt=prompt)
     return routed + shared
 

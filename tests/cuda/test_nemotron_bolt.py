@@ -42,6 +42,59 @@ def test_the_dequant_kernel_is_the_torch_definition():
     assert torch.equal(dequantize_iq2xxs(packed), dequantize_iq2xxs_torch(packed))
 
 
+def _torch_weighted_sum(y: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+    """The MoE weighted sum as torch ops, one kernel a step: fl(y0 w0), then fl(acc + fl(yj wj)), then bf16."""
+
+    acc = y[:, 0].float() * wts[:, 0:1]
+    for j in range(1, y.shape[1]):
+        acc = acc + y[:, j].float() * wts[:, j:j + 1]
+    return acc.to(torch.bfloat16)
+
+
+def _awkward_bf16(shape, g: torch.Generator) -> torch.Tensor:
+    """Random bf16 with -0, +0, subnormals (bit patterns 0x0001..0x007f, either sign) and large values mixed in."""
+
+    x = (torch.randn(shape, generator=g) * 4).to(torch.bfloat16)
+    bits = x.view(torch.int16)
+    pick = torch.randint(0, 8, shape, generator=g)
+    sub = torch.randint(1, 0x80, shape, generator=g, dtype=torch.int16)
+    sign = torch.randint(0, 2, shape, generator=g, dtype=torch.int16) * -0x8000
+    bits = torch.where(pick == 0, sub | sign, bits)                                  # subnormals
+    bits = torch.where(pick == 1, torch.full_like(bits, -0x8000), bits)              # -0
+    bits = torch.where(pick == 2, torch.zeros_like(bits), bits)                      # +0
+    big = (torch.randn(shape, generator=g) * 1e30).to(torch.bfloat16).view(torch.int16)
+    return torch.where(pick == 3, big, bits).view(torch.bfloat16)
+
+
+@pytest.mark.parametrize("rows,k,width", [(1, 9, 1024), (16, 9, 1024), (2048, 9, 1024), (7, 3, 256), (5, 1, 100),
+                                          (3, 9, 1000)])
+def test_weighted_sum_is_the_torch_steps_bit_for_bit(rows, k, width):
+    from tensorfold.families.nemotron_bolt.cuda.engine import weighted_sum
+
+    g = torch.Generator().manual_seed(rows * 13 + k)
+    y = _awkward_bf16((rows, k, width), g).cuda()
+    wide = torch.rand((rows, k + 2), generator=g) * 2.5                              # the router's [R, NS] buffer
+    if rows > 1:
+        wide[-1, 0] = -0.0                                                           # a -0 weight, off row 0
+    wide[-1, -3] = 1e-39                                                             # an fp32 subnormal weight
+    wts = wide.cuda()[:, :k]
+    y[0, :, :8] = -0.0                                                               # row 0: -0 products sum to -0
+    got = weighted_sum(y, wts)
+    want = _torch_weighted_sum(y, wts)
+    assert got.shape == (rows, width) and got.dtype == torch.bfloat16
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))              # bits: -0 differs from +0
+    assert (got[0, :8].view(torch.int16) == -0x8000).all()
+
+
+@pytest.mark.parametrize("shape", [(1, 2560), (9, 2560), (4096, 2560), (3, 1000)])
+def test_relu2_is_relu_then_square_bit_for_bit(shape):
+    from tensorfold.families.nemotron_bolt.cuda.engine import relu2
+
+    x = _awkward_bf16(shape, torch.Generator().manual_seed(shape[0])).cuda()
+    r = torch.relu(x)
+    assert torch.equal(relu2(x).view(torch.int16), (r * r).view(torch.int16))
+
+
 def test_prefill_and_decode_follow_the_reference(weights):
     from tensorfold.families.nemotron_bolt.cuda import reference
     from tensorfold.families.nemotron_bolt.cuda.engine import prefill
