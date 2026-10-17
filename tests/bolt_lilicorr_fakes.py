@@ -131,3 +131,52 @@ def serial(prompt: Sequence[int], count: int, sampling: Sampling | None, *, stop
         t.commit(1)
         out.append(tok)
     return out
+
+
+class FakeEngine(FakeTarget):
+    """``FakeTarget`` with ``Engine``'s prefill side: prompt chunks, a state that exists only at the committed end (or
+    at a chunk's cuts), ``state`` / ``restore``, and logits that also read the whole history, as a recurrent state."""
+
+    max_rows = 16
+
+    def __init__(self, *, prefill_rows: int = 64, eos: tuple[int, ...] = (), seed: int = 3) -> None:
+        self.table3 = torch.randn((VOCAB, VOCAB), generator=torch.Generator().manual_seed(seed + 1))
+        super().__init__([0], eos=eos, seed=seed)
+        self.prefill_rows = prefill_rows
+        self.sampling = None
+        self.chunks: list[int] = []         # every prompt chunk's rows, in order
+        self.reset()
+
+    def _logits(self, tokens: list[int]) -> torch.Tensor:
+        hist = self.ids + list(tokens)
+        sums = np.cumsum(hist)[len(self.ids):] % VOCAB
+        return super()._logits(tokens) + self.table3[torch.as_tensor(sums)]
+
+    def reset(self) -> None:
+        self.ids, self.window, self._pending = [], [], None
+
+    def restore(self, st: dict) -> None:
+        self.reset()
+        self.ids = list(st["ids"])
+
+    def set_sampling(self, sampling: Sampling | None) -> None:
+        self.sampling = sampling
+
+    def prefill_chunk(self, tokens: Sequence[int], cuts: Sequence[int] = ()) -> dict[int, dict]:
+        tokens = [int(t) for t in tokens]
+        assert 1 <= len(tokens) <= self.prefill_rows and all(0 < c < len(tokens) for c in cuts)
+        logits = self._logits(tokens)
+        parts = {int(c): {"ids": self.ids + tokens[:c]} for c in cuts}
+        self.ids = self.ids + tokens
+        self.window = tokens
+        self._pending = self.sample(logits[-1:], [self.pos], self.sampling)[0]
+        self.chunks.append(len(tokens))
+        return parts
+
+    def prefill_token(self) -> int:
+        return self._pending
+
+    def state(self, n: int, part: dict | None = None) -> dict:
+        if part is None and n != self.pos:
+            raise ValueError(f"no state at {n}: the engine is at {self.pos}")
+        return {"ids": list(part["ids"] if part is not None else self.ids), "pos": n}

@@ -6,7 +6,8 @@ call runs the decode kernel (16-column tiles of the call's distinct experts, eac
 row's bits there do not depend on the call's other rows or their number, so a verify window of up to 512 rows (56
 tokens of 9 experts) equals serial one-token steps bit for bit. More rows run the prefill kernel (64-row tiles of
 one expert, rows sorted by expert on the GPU, no host sync), whose sums can differ from the decode kernel's by one
-bf16 rounding.
+bf16 rounding. A ``prompt`` call runs the prefill kernel at any row count: a prompt row's bits then never depend on
+the chunk it came in, so a prompt resumed from a kept state equals a fresh prefill.
 """
 
 from __future__ import annotations
@@ -157,7 +158,7 @@ def _blocks(w: torch.Tensor, dims: int) -> torch.Tensor:
     return w.contiguous()
 
 
-def iq2xxs_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+def iq2xxs_linear(x: torch.Tensor, w: torch.Tensor, *, prompt: bool = False) -> torch.Tensor:
     """x bf16 [R, K], w uint8 [N, K / 256 * 66] (or the checkpoint's [N, K / 256, 66]) -> bf16 [R, N]."""
 
     w = _blocks(w, 2)
@@ -166,14 +167,14 @@ def iq2xxs_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     rows, n = x.shape[0], w.shape[0]
     out = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
     tab = _tables(x.device)
-    if rows <= DECODE_ROWS:
+    if rows <= DECODE_ROWS and not prompt:
         _ext().decode(x, w3, None, None, min(4, max(1, -(-rows // 16))), tab, out)
     else:
         _ext().prefill(x, w3, None, None, None, -(-rows // PREFILL_ROWS), tab, out)
     return out
 
 
-def iq2xxs_grouped(x: torch.Tensor, w: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+def iq2xxs_grouped(x: torch.Tensor, w: torch.Tensor, ids: torch.Tensor, *, prompt: bool = False) -> torch.Tensor:
     """x bf16 [R, K], w uint8 [E, N, K / 256 * 66] (or [E, N, K / 256, 66]), ids int32 [R] in [0, E) -> bf16 [R, N].
 
     Row r uses expert ids[r]; an id outside [0, E) reads outside w.
@@ -187,7 +188,7 @@ def iq2xxs_grouped(x: torch.Tensor, w: torch.Tensor, ids: torch.Tensor) -> torch
     ids = ids.to(device=x.device, dtype=torch.int32).contiguous()
     out = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
     tab = _tables(x.device)
-    if rows <= DECODE_ROWS:
+    if rows <= DECODE_ROWS and not prompt:
         plan = torch.empty((2 + 2 * experts + rows,), dtype=torch.int32, device=x.device) if rows > PLAN_ROWS else None
         _ext().decode(x, w, ids, plan, min(4, max(1, -(-rows // 16))), tab, out)
         return out

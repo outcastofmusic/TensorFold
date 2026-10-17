@@ -7,6 +7,9 @@ decoding samples there, and a drafted reply equals a ``draft: false`` one token 
 
 The routed experts go through ``iq2xxs_grouped`` and the shared expert through ``iq2xxs_linear``: the KERNELS part's
 ``iq2xxs.py`` when present, else ``fallback.py`` (the same signatures).
+
+A prompt row's bits never depend on its chunk either: every prompt kernel is chunk-invariant (the experts' in
+``prompt`` mode, at any row count), so a prompt resumed from a kept ``state`` ends as a fresh prefill does.
 """
 
 from __future__ import annotations
@@ -89,13 +92,13 @@ def latent_moe(moe: MoE, normed: torch.Tensor, *, scaling: float, norm: bool, pr
     latent = dense(normed, moe.fc1, prompt)
     pairs = latent.repeat_interleave(k, dim=0)                     # row r's k copies, in pick order
     flat_ids = ids.reshape(-1)
-    act = relu2(iq2xxs_grouped(pairs, moe.up, flat_ids))
-    y = iq2xxs_grouped(act, moe.down, flat_ids).view(rows, k, -1)
+    act = relu2(iq2xxs_grouped(pairs, moe.up, flat_ids, prompt=prompt))
+    y = iq2xxs_grouped(act, moe.down, flat_ids, prompt=prompt).view(rows, k, -1)
     acc = y[:, 0].float() * wts[:, 0:1]
     for j in range(1, k):                                          # a fixed order, so a row's sum ignores R
         acc = acc + y[:, j].float() * wts[:, j:j + 1]
     routed = dense(acc.to(torch.bfloat16), moe.fc2, prompt)
-    shared = iq2xxs_linear(relu2(iq2xxs_linear(normed, moe.shared_up)), moe.shared_down)
+    shared = iq2xxs_linear(relu2(iq2xxs_linear(normed, moe.shared_up, prompt=prompt)), moe.shared_down, prompt=prompt)
     return routed + shared
 
 
@@ -154,6 +157,27 @@ class Engine:
         self.pos = self.parity = self.prev_keep = 0
         self._rows = 0
 
+    def state(self, n: int, part: dict | None = None) -> dict:
+        """A copy of the committed state after positions 0 .. n - 1: the Mamba states (``part``, a prompt chunk's at an
+        inner cut, else the live ones at n == pos) and the attention rows, which are the caches' first n rows."""
+
+        if self.prev_keep or not 0 < n <= self.pos or (part is None and n != self.pos):
+            raise ValueError(f"no committed Mamba state at {n} (the engine is at {self.pos})")
+        ssm, conv = (part["ssm"], part["conv_base"]) if part is not None else (self.ssm.clone(), self.conv_base.clone())
+        return {"ssm": ssm, "conv_base": conv, "k": [k[:n].clone() for k in self.k_cache],
+                "v": [v[:n].clone() for v in self.v_cache], "pos": n}
+
+    def restore(self, st: dict) -> None:
+        """The engine as a fresh prefill of the kept state's positions leaves it."""
+
+        self.reset()
+        n = int(st["pos"])
+        self.ssm.copy_(st["ssm"])
+        self.conv_base.copy_(st["conv_base"])
+        for dst, src in zip(self.k_cache + self.v_cache, st["k"] + st["v"]):
+            dst[:n].copy_(src)
+        self.pos = n
+
     def set_sampling(self, sampling) -> None:
         """The request's sampling: seed, temperature and top-p live on the device for the keyed sampler."""
 
@@ -161,14 +185,21 @@ class Engine:
         self.mode = sampling_mode(sampling)
 
     # -- one layer ----------------------------------------------------------------------------------------------
-    def _mamba(self, m: Mamba, normed: torch.Tensor, rows: int, j: int, prompt: bool) -> torch.Tensor:
+    def _mamba(self, m: Mamba, normed: torch.Tensor, rows: int, j: int, prompt: bool, parts: dict) -> torch.Tensor:
         c = self.c
         params = {"heads": c.m_heads, "head_dim": c.m_head_dim, "groups": c.m_groups, "state_dim": c.m_state,
                   "lo": c.dt_min, "hi": c.dt_max}
         if prompt:
             proj = m.in_proj.prefill(normed)
             M.conv_rows(proj, self.conv_base[j], self.p_xc[:rows], m.conv_w, m.conv_b, rows, xd=c.xd)
-            y = M.scan_rows(proj, self.p_xc[:rows], self.ssm[j], m.a, m.d, m.dt_bias, rows, **params)
+            ys, a = [], 0
+            for b in [*sorted(parts), rows]:      # a scan step's bits ignore where its run starts: split at the cuts
+                ys.append(M.scan_rows(proj[a:], self.p_xc[a:b], self.ssm[j], m.a, m.d, m.dt_bias, b - a, **params))
+                if b in parts:
+                    parts[b]["ssm"][j].copy_(self.ssm[j])
+                    M.commit_conv_rows(proj, parts[b]["conv_base"][j], b, xd=c.xd)
+                a = b
+            y = ys[0] if len(ys) == 1 else torch.cat(ys)
         else:
             proj = m.in_proj(normed)
             M.conv(proj, self.conv_base[j], self.raw[j], self.xc[j], m.conv_w, m.conv_b, self.meta, rows, xd=c.xd)
@@ -191,16 +222,17 @@ class Engine:
                                  head_dim=c.head_dim, max_chunks=self.max_chunks)
         return dense(out, a.o, prompt)
 
-    def _block(self, blk: Block, normed: torch.Tensor, rows: int, js: list[int], prompt: bool) -> torch.Tensor:
+    def _block(self, blk: Block, normed: torch.Tensor, rows: int, js: list[int], prompt: bool,
+               parts: dict) -> torch.Tensor:
         if blk.kind == "M":
             js[0] += 1
-            return self._mamba(blk.mamba, normed, rows, js[0] - 1, prompt)
+            return self._mamba(blk.mamba, normed, rows, js[0] - 1, prompt, parts)
         if blk.kind == "*":
             js[1] += 1
             return self._attention(blk.attn, normed, rows, js[1] - 1, prompt)
         return latent_moe(blk.moe, normed, scaling=self.c.scaling, norm=self.c.norm_topk, prompt=prompt)
 
-    def _layers(self, ids: torch.Tensor, prompt: bool) -> torch.Tensor:
+    def _layers(self, ids: torch.Tensor, prompt: bool, parts: dict | None = None) -> torch.Tensor:
         """Every layer over the rows ``ids``: the final-normed hidden rows; each tap layer's stream into ``_taps``."""
 
         w, c = self.w, self.c
@@ -213,7 +245,7 @@ class Engine:
             x, normed, _ = base.add_rmsnorm(x, delta, blk.norm, c.eps)
             for slot in self._tap_slots.get(i - 1, ()):       # the stream after layer i - 1
                 self._taps[slot] = x
-            delta = self._block(blk, normed, rows, js, prompt)
+            delta = self._block(blk, normed, rows, js, prompt, parts or {})
         h, normed, _ = base.add_rmsnorm(x, delta, w.norm_f, c.eps)
         for slot in self._tap_slots.get(len(w.blocks) - 1, ()):
             self._taps[slot] = h
@@ -311,16 +343,22 @@ class Engine:
 
     # -- prompt chunks ------------------------------------------------------------------------------------------
     @torch.no_grad()
-    def prefill_chunk(self, tokens: Sequence[int]) -> None:
-        """Commit a prompt chunk at positions pos .. and sample the token after its last row into ``prefill_token``."""
+    def prefill_chunk(self, tokens: Sequence[int], cuts: Sequence[int] = ()) -> dict[int, dict]:
+        """Commit a prompt chunk at positions pos .. and sample the token after its last row into ``prefill_token``.
+
+        Returns the Mamba states after each of ``cuts`` (rows inside the chunk), for ``state``.
+        """
 
         rows = len(tokens)
         if not 1 <= rows <= self.prefill_rows or self.pos + rows > self.max_len:
             raise ValueError("a prompt chunk must fit the chunk buffers and the KV cache")
         if self.prev_keep:
             raise RuntimeError("a prompt chunk runs from a committed state (no window rows left to replay)")
+        if any(not 0 < int(c) < rows for c in cuts):
+            raise ValueError("a cut lies inside the chunk")
+        parts = {int(c): {"ssm": torch.empty_like(self.ssm), "conv_base": self.conv_base.clone()} for c in cuts}
         ids = torch.as_tensor(list(tokens), dtype=torch.int32).to(self.device)
-        normed = self._layers(ids, prompt=True)
+        normed = self._layers(ids, prompt=True, parts=parts)
         self.hidden = normed
         self._rows = rows
         self.pos += rows
@@ -329,6 +367,7 @@ class Engine:
             logits = logits + self.bias[:1]
         S.sample(logits, self._meta_at(self.pos - 1), self.params, self.p_sampled)
         self._ready.record()
+        return parts
 
     def prefill_token(self) -> int:
         self._ready.synchronize()
@@ -351,30 +390,52 @@ class DecodeResult:
 
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling, *, on_taps: Callable[[torch.Tensor], None] | None = None,
-            constraint=None, stop: Callable[[], bool] | None = None) -> int:
-    """Reset, commit the prompt in chunks and return its first sampled token (position len(prompt)).
+            constraint=None, stop: Callable[[], bool] | None = None, resume: dict | None = None,
+            keeps: Sequence[int] = (), keep: Callable[[int, dict], None] | None = None) -> int:
+    """Commit the prompt in chunks and return its first sampled token (position len(prompt)).
 
-    ``on_taps`` gets each chunk's taps [R, T * D] in order (a drafter's context); ``stop()`` is asked before each
-    chunk and abandons the prompt with ``RequestCancelled``.
+    A fresh prompt starts from a reset; ``resume`` (an ``Engine.state`` of a strict prefix) starts at its length.
+    ``keep(n, state)`` gets the engine's state after each of ``keeps`` (positions past the start) once ``on_taps``
+    has had the taps up to n, so a drafter's context can be kept beside it. ``on_taps`` gets the taps [R, T * D] in
+    order (a drafter's context); ``stop()`` is asked before each chunk and abandons the prompt with
+    ``RequestCancelled``.
     """
 
     prompt = [int(t) for t in prompt]
     if not prompt:
         raise ValueError("prefill needs at least one token")
-    e.reset()
+    begin = 0 if resume is None else int(resume["pos"])
+    if not 0 <= begin < len(prompt):
+        raise ValueError("a resumed prompt must extend the kept positions")
+    points = sorted({int(p) for p in keeps if begin < int(p) <= len(prompt)})
+    if points and keep is None:
+        raise ValueError("kept positions need a callback")
+    if resume is None:
+        e.reset()
+    else:
+        e.restore(resume)
     e.set_sampling(sampling)
     if constraint is not None:                           # a reply's grammar masks the first token's row
         e.mask(constraint, constraint.window([0], [-1]))
     try:
-        for s in range(0, len(prompt), e.prefill_rows):
+        for s in range(begin, len(prompt), e.prefill_rows):
             if stop is not None and stop():
                 from tensorfold.server.cancellation import RequestCancelled
 
                 raise RequestCancelled("the client left while its prompt was filling")
             chunk = prompt[s:s + e.prefill_rows]
-            e.prefill_chunk(chunk)
-            if on_taps is not None:
-                on_taps(e.tap_rows(len(chunk)))
+            rows = len(chunk)
+            here = [p - s for p in points if s < p <= s + rows]
+            parts = e.prefill_chunk(chunk, cuts=[q for q in here if q < rows])
+            taps = e.tap_rows(rows) if on_taps is not None else None
+            done = 0
+            for q in here:
+                if taps is not None:
+                    on_taps(taps[done:q])
+                done = q
+                keep(s + q, e.state(s + q, parts.get(q)))
+            if taps is not None and done < rows:
+                on_taps(taps[done:])
         pending = e.prefill_token()
     finally:
         if constraint is not None:

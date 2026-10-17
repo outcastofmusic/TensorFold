@@ -7,7 +7,7 @@ uint16 words; each run of 32 weights reads two uint32, the first holding four gr
 sign indices and a 4-bit scale s, and weight j of a run of 8 is d * (0.5 + s) * 0.25 * grid[j] * sign[j] in fp32.
 A CUDA tensor dequantizes in a Triton kernel with the same fp32 operations in the same order, so both give the same
 bits. Decode rows (up to ``DECODE_ROWS``) run ``b16.matmul``, whose rows never depend on the row count, so a window
-row gets the serial step's bits; more rows run ``b16.prompt``.
+row gets the serial step's bits; more rows, and every ``prompt`` call, run ``b16.prompt``.
 """
 
 from __future__ import annotations
@@ -170,23 +170,23 @@ def dequantize_iq2xxs(packed: torch.Tensor) -> torch.Tensor:
     return out.view(*packed.shape[:-1], k)
 
 
-def _linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+def _linear(x: torch.Tensor, w: torch.Tensor, prompt: bool = False) -> torch.Tensor:
     """x [R, K] @ w [N, K]^T in bf16: the row-invariant linear for decode rows, the prompt mma for more."""
 
     if x.device.type != "cuda":
         return (x.float() @ w.float().t()).to(torch.bfloat16)
     from tensorfold.families.qwen3_5.cuda import b16
 
-    return b16.matmul(x, w) if x.shape[0] <= DECODE_ROWS else b16.prompt(x, w)
+    return b16.matmul(x, w) if x.shape[0] <= DECODE_ROWS and not prompt else b16.prompt(x, w)
 
 
-def iq2xxs_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+def iq2xxs_linear(x: torch.Tensor, w: torch.Tensor, *, prompt: bool = False) -> torch.Tensor:
     """bf16 [R, K] times IQ2_XXS uint8 [N, K // 256 * 66] -> bf16 [R, N]."""
 
-    return _linear(x, dequantize_iq2xxs(w))
+    return _linear(x, dequantize_iq2xxs(w), prompt)
 
 
-def iq2xxs_grouped(x: torch.Tensor, w: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+def iq2xxs_grouped(x: torch.Tensor, w: torch.Tensor, ids: torch.Tensor, *, prompt: bool = False) -> torch.Tensor:
     """bf16 [R, K], IQ2_XXS uint8 [E, N, K // 256 * 66], int32 [R] -> bf16 [R, N]: row r times expert ids[r].
 
     Only the experts ``ids`` names are dequantized, one at a time, so a call never holds a whole table in bf16.
@@ -202,6 +202,6 @@ def iq2xxs_grouped(x: torch.Tensor, w: torch.Tensor, ids: torch.Tensor) -> torch
     start = 0
     for e, n in zip(experts.tolist(), counts.tolist()):
         picked = order[start:start + n]
-        out[picked] = _linear(x[picked], dequantize_iq2xxs(w[e]))
+        out[picked] = _linear(x[picked], dequantize_iq2xxs(w[e]), prompt)
         start += n
     return out
