@@ -129,6 +129,16 @@ def test_a_reply_that_names_the_other_format_s_opener_keeps_its_own_calls():
         "]" + P.CALL_CLOSE
 
 
+@pytest.mark.parametrize("parameters", ["a string", ["city"], {"properties": ["city"]}, None])
+def test_a_tool_whose_parameters_are_not_an_object_takes_keyword_calls(parameters):
+    tools = [{"type": "function", "function": {"name": "get_weather", "parameters": parameters}}]
+    text = f"{P.CALL_OPEN}[get_weather(city='a')]{P.CALL_CLOSE}"
+    _, calls = reply_text.parse_tool_calls(text, tools)
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "a"}
+    content, calls = reply_text.parse_tool_calls(f"{P.CALL_OPEN}[get_weather('a')]{P.CALL_CLOSE}", tools)
+    assert calls is None and P.CALL_OPEN in content
+
+
 def test_a_call_cut_by_the_end_token_is_closed_when_it_parses():
     assert reply_text.close_call(f"x {P.CALL_OPEN}[get_weather(city='a')]", TOOLS) == P.CALL_CLOSE
     assert reply_text.close_call(f"x {P.CALL_OPEN}[get_weather(city='a')", TOOLS) == "]" + P.CALL_CLOSE

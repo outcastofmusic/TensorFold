@@ -9,7 +9,7 @@ from typing import Any
 
 from tensorfold.server import pythonic_calls
 from tensorfold.server.stopping import StopPolicy
-from tensorfold.server.tools import parse_glm_tool_call_block
+from tensorfold.server.tools import parse_glm_tool_call_block, tool_spec_name
 from tensorfold.tool_parameters import closed_json, decode_parameter, parameter_schemas
 
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
@@ -101,11 +101,6 @@ def _hide(text: str, opener: str, closer: str, finished: bool) -> str:
         pos = end + len(closer)
 
 
-def _tool_name(tool: dict[str, Any]) -> str:
-    fn = tool.get("function") if isinstance(tool, dict) else None
-    return str((fn or tool).get("name") or "").strip() if isinstance(tool, dict) else ""
-
-
 def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int | None = None) -> tuple[str, list[dict[str, Any]] | None]:
     """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..``, JSON or LFM2 calls.
 
@@ -127,7 +122,7 @@ def _parse_tagged(text: str, tools: list[dict[str, Any]],
                   max_calls: int | None) -> tuple[str, list[dict[str, Any]] | None]:
     """The ``<tool_call>`` blocks' calls (Qwen, GLM or JSON inside)."""
 
-    known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
+    known = {tool_spec_name(t).lower(): tool_spec_name(t) for t in tools}
     schemas = parameter_schemas(tools)
     calls: list[dict[str, Any]] = []
     residue: list[str] = []

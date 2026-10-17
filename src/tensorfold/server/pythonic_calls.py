@@ -13,18 +13,18 @@ import json
 import uuid
 from typing import Any
 
+from tensorfold.server.tools import tool_spec_name
+
 CALL_OPEN, CALL_CLOSE = "<|tool_call_start|>", "<|tool_call_end|>"
 _NAMES = {"true": True, "false": False, "null": None, "True": True, "False": False, "None": None}
 
 
-def _tool_name(tool: dict[str, Any]) -> str:
-    fn = tool.get("function") if isinstance(tool, dict) else None
-    return str((fn or tool).get("name") or "").strip() if isinstance(tool, dict) else ""
-
-
 def _parameters(tool: dict[str, Any]) -> list[str]:
+    """The tool's parameter names in its schema's order; none when its spec is not an object with properties."""
+
     fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
-    props = (fn.get("parameters") or {}).get("properties") or {}
+    params = fn.get("parameters")
+    props = params.get("properties") if isinstance(params, dict) else None
     return list(props) if isinstance(props, dict) else []
 
 
@@ -92,7 +92,7 @@ def parse_block(body: str, tools: list[dict[str, Any]]) -> list[tuple[str, dict[
     except SyntaxError as exc:
         raise ValueError(f"not a Python list of calls: {exc}") from None
     items = tree.elts if isinstance(tree, ast.List) else [tree]
-    order = {_tool_name(t).lower(): _parameters(t) for t in tools}
+    order = {tool_spec_name(t).lower(): _parameters(t) for t in tools}
     calls: list[tuple[str, dict[str, Any]]] = []
     for item in items:
         if not (isinstance(item, ast.Call) and isinstance(item.func, ast.Name) and item.func.id.startswith("_tf")):
@@ -117,7 +117,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *,
 
     if not tools:
         return text, None
-    known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
+    known = {tool_spec_name(t).lower(): tool_spec_name(t) for t in tools}
     calls: list[dict[str, Any]] = []
     residue: list[str] = []
     at = 0
