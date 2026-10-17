@@ -180,9 +180,11 @@ Production serves from this box while experiments run.
   through Calibration. On 17 Oct FP4-Local beat the EXL3 pack by +2.3 [-1.1, +6.4] on TrueScore and +1.5 [-0.4, +3.5] on
   planning. Both intervals include zero.
 - Measure quantization loss against the full-precision model on its maker's API. Z.ai's coding endpoint serves
-  `glm-5.3-flash` with `"thinking": {"type": "disabled"}` in `SPARK_BENCH_EXTRA_BODY`. The local quantized GLM scored 93.0
-  against the API's 91.1, a paired +1.7 [-1.7, +5.3]: no loss measured. The API's speed scores (Resp, Eff) measure the
-  service and do not compare with local runs.
+  `glm-5.3-flash`, but `"thinking": {"type": "disabled"}` did not hold: it returned reasoning in 56 of 152 TrueScore replies
+  and 159 of 160 planning replies (17 Oct). The local quantized GLM, thinking off, scored 93.0 against the API's 91.1,
+  a paired +1.7 [-1.7, +5.3], so the quantized model lost nothing measurable even against a partly thinking reference.
+  Count reasoning tokens per reply before comparing an API arm with a thinking-off arm. The API's speed scores (Resp,
+  Eff) measure the service and do not compare with local runs.
 - Production health: `GET :30002/health` gives `requests_running`, which is the reliable signal that a disconnect freed
   the GPU. Log lines matched the wrong request once.
 
