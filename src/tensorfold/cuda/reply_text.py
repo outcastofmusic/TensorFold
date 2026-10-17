@@ -9,6 +9,7 @@ from typing import Any
 
 from tensorfold.server import pythonic_calls
 from tensorfold.server.stopping import StopPolicy
+from tensorfold.server.text import hide_tool_calls  # noqa: F401  (the CUDA server's, with the Mac's four formats)
 from tensorfold.server.tools import parse_glm_tool_call_block, tool_spec_name
 from tensorfold.tool_parameters import closed_json, decode_parameter, parameter_schemas
 
@@ -17,13 +18,6 @@ _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNOR
 _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
 _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
 
-
-
-def _partial_tag(text: str, tag: str) -> int:
-    for k in range(min(len(tag) - 1, len(text)), 0, -1):
-        if text.endswith(tag[:k]):
-            return k
-    return 0
 
 
 class StreamDecoder:
@@ -75,30 +69,6 @@ class StopStrings:
         """The text before the first match; ``partial`` also holds back an end that may begin one (the Mac's rule)."""
 
         return StopPolicy.visible(self, text, partial=partial)
-
-
-def hide_tool_calls(text: str, *, finished: bool) -> str:
-    """The text without its tool-call blocks: Qwen's ``<tool_call>`` and LFM2's ``<|tool_call_start|>``."""
-
-    for opener, closer in ((pythonic_calls.CALL_OPEN, pythonic_calls.CALL_CLOSE), (_CALL_OPEN, _CALL_CLOSE)):
-        text = _hide(text, opener, closer, finished)
-    return text
-
-
-def _hide(text: str, opener: str, closer: str, finished: bool) -> str:
-    out: list[str] = []
-    pos = 0
-    while True:
-        start = text.find(opener, pos)
-        if start < 0:
-            tail = text[pos:]
-            out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, opener))])
-            return "".join(out)
-        out.append(text[pos:start])
-        end = text.find(closer, start)
-        if end < 0:
-            return "".join(out)
-        pos = end + len(closer)
 
 
 def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int | None = None) -> tuple[str, list[dict[str, Any]] | None]:
