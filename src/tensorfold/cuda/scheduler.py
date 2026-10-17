@@ -81,12 +81,7 @@ class Scheduler:
         box: queue.Queue = queue.Queue()
         self.jobs.append((fn, box))
         self.waiting.wake()
-        while True:
-            try:
-                kind, value = box.get(timeout=1.0)
-                break
-            except queue.Empty:
-                self._alive()
+        kind, value = self._get(box)
         if kind == "error":
             raise value
         return value
@@ -94,6 +89,17 @@ class Scheduler:
     def _alive(self) -> None:
         if not self.thread.is_alive():
             raise RuntimeError("the scheduler's worker thread has stopped; restart the server")
+
+    def _get(self, box: queue.Queue):
+        """The worker's next item in ``box``; RuntimeError once the worker has stopped and nothing more can come."""
+
+        while True:
+            stopped = not self.thread.is_alive()     # before the wait: a worker that stopped put its last item first
+            try:
+                return box.get(timeout=1.0)
+            except queue.Empty:
+                if stopped:
+                    self._alive()
 
     def close(self) -> None:
         """Stop the worker once idle and let go of the decoder (its thread held it, and its weights, until now)."""
@@ -108,8 +114,10 @@ class Scheduler:
                splice: Any = None) -> dict:
         """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats.
 
-        ``splice`` (a decoder with ``splices``) runs on the worker with each round's new tokens before they commit."""
+        ``splice`` (a decoder with ``splices``) runs on the worker with each round's new tokens before they commit.
+        RuntimeError once the worker thread has stopped."""
 
+        self._alive()
         box: queue.Queue = queue.Queue()
         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
                         constraint=constraint, background=background, probabilities=probabilities, splice=splice)
@@ -117,7 +125,7 @@ class Scheduler:
         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
         self.waiting.put((stream, box))
         while True:
-            kind, value = box.get()
+            kind, value = self._get(box)
             if kind == "tokens":
                 if not cancel[0] and emit(value):
                     cancel[0] = True                 # the client left: the stream ends after its next round
@@ -129,6 +137,7 @@ class Scheduler:
     def submit_many(self, requests: list[dict]) -> list[dict]:
         """Queue isolated one-shot requests atomically and return ordered stats, draining errors too."""
 
+        self._alive()
         boxes = []
         for r in requests:
             box: queue.Queue = queue.Queue()
@@ -140,7 +149,7 @@ class Scheduler:
         results, error = [], None
         for _, box in boxes:
             while True:
-                kind, value = box.get()
+                kind, value = self._get(box)
                 if kind == "tokens":
                     continue
                 if kind == "error":

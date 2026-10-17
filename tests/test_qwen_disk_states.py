@@ -645,6 +645,35 @@ def test_a_call_fails_at_once_when_the_worker_is_gone():
         sched.call(lambda: 1)
 
 
+@pytest.mark.timeout(30)
+def test_a_request_fails_at_once_when_the_worker_is_gone():
+    from tensorfold.cuda.scheduler import Scheduler
+
+    sched = Scheduler(Decoder(), max_streams=2)
+    sched.close()
+    with pytest.raises(RuntimeError, match="worker thread has stopped"):
+        sched.submit([1, 2], 1, None, True, lambda new: False)
+    with pytest.raises(RuntimeError, match="worker thread has stopped"):
+        sched.submit_many([{"prompt": [1, 2], "count": 1, "sampling": None}])
+
+
+@pytest.mark.timeout(30)
+def test_a_request_fails_when_the_worker_dies_under_it(monkeypatch):
+    from tensorfold.cuda.scheduler import Scheduler
+
+    class Dying(Decoder):
+        def finish(self, done):
+            raise KeyError("a stream")           # the worker thread ends with the stream's reply never sent
+
+    died = []
+    monkeypatch.setattr(threading, "excepthook", died.append)
+    sched = Scheduler(Dying(), max_streams=2)
+    got = []
+    with pytest.raises(RuntimeError, match="worker thread has stopped"):
+        sched.submit([1, 2], 3, None, True, got.extend)
+    assert got == [7] and not sched.thread.is_alive() and died[0].exc_type is KeyError
+
+
 def test_a_call_runs_on_the_worker_and_raises_there_errors_here():
     from tensorfold.cuda.scheduler import Scheduler
 
