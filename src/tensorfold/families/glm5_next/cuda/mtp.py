@@ -6,8 +6,8 @@ from typing import Sequence
 
 import torch
 
-from . import glue, qmm
-from .forward import Buffers, State, check_room, dsa_block, mm, moe_block
+from . import glue
+from .forward import Buffers, State, check_room, dsa_block, group_sums, mm, moe_block
 from .weights import Weights
 
 
@@ -44,7 +44,7 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool = 
         b.me[0].zero_()
     glue.rmsnorm(b.me[:n], m.enorm, c.eps, b.mcat[:n, :D])
     glue.rmsnorm(b.hin[:n], m.hnorm, c.eps, b.mcat[:n, D:])
-    mm(b, b.mcat[:n], m.eh, None if b.prefill else qmm.group_sums(b.mcat[:n], b.mxs[:n]), b.mx[:n])
+    mm(b, b.mcat[:n], m.eh, None if b.prefill else group_sums(m.eh, b.mcat[:n], b.mxs[:n]), b.mx[:n])
     layer = m.layer
     glue.rmsnorm(b.mx[:n], layer.in_norm, c.eps, b.normed[:n], b.xs[:n])
     g = dsa_block(layer, w, st.mtp_kc, st.mtp_vc, st.mtp_pos_dev, b, n, nch,
