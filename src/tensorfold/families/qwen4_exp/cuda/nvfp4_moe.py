@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -58,8 +58,8 @@ class MoE4:
     routed_experts: nvx.Experts4
     shared: Expert4
     kernel: str = "nvfp4"
-    prompt_tile: int = field(default_factory=tile_mode)    # read once, when the layer loads
-    shared_decode: str = field(default_factory=shared_decode)
+    prompt_tile: int = 2           # tile_mode() and shared_decode(): ``weights.load`` sets the values the engine read
+    shared_decode: str = "prompt"
 
     capturable = True     # the plan stays on the device
 

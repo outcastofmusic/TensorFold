@@ -56,8 +56,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
                  share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
-                 copy: bool = True, spec=None, count_drafters: bool = False, end_anchor: bool = False) -> None:
+                 copy: bool = True, spec=None, count_drafters: bool = False, end_anchor: bool = False,
+                 first_early: bool = True) -> None:
         self.link = self.follower = None
+        self.first_early = bool(first_early)         # TF_FLASH_FIRST_EARLY, read at startup (engine.first_early)
         # staircut.py's Speculation: each stream's chain depth and plain rounds (None: the fixed confidence cut)
         self.spec = spec if w.comm is None else None
         self.traces: dict[int, tuple] = {}      # stream id -> its next window's (probs, MTP steps, draft ms, alone)

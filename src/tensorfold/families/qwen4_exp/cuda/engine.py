@@ -42,6 +42,19 @@ def lone_graphs() -> bool:
     return os.environ.get("TENSORFOLD_LONE_GRAPHS", "0").strip().lower() in ("1", "on", "true", "yes")
 
 
+FIRST_EARLY = "TF_FLASH_FIRST_EARLY"
+
+
+def first_early() -> bool:
+    """Whether a prompt's first token goes out before its first drafts are made (TF_FLASH_FIRST_EARLY=0: after them,
+    as before). The drafts and the copy index over the prompt depend only on the token, so the reply is the same.
+    Read once at startup and kept by the concurrent decoder (``MultiDecoder.first_early``)."""
+
+    from tensorfold.env_flags import flag
+
+    return flag(FIRST_EARLY, True)
+
+
 def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True, qsa_cuda: bool = True) -> None:
     """Load each applicable extension after admission and before resident weights consume the pool."""
 
@@ -81,13 +94,18 @@ class FlashNextEngine:
         import torch
 
         from .copy_drafts import enabled as copy_enabled
+        from .nvfp4_moe import shared_decode, tile_mode
         from .qsa import mode as qsa_mode
 
         from .exl3_pack import admission, extra_files, is_exl3
 
         from tensorfold.families import quant_method, read_config
 
-        qsa_cuda = qsa_mode() == "cuda"      # TF_FLASHNEXT_QSA: an unknown value stops the start before any read
+        # the kernel flags, read once here: an unknown value stops the start before any read
+        qsa_cuda = qsa_mode() == "cuda"                  # TF_FLASHNEXT_QSA
+        self.first_early = first_early()                 # TF_FLASH_FIRST_EARLY
+        # TF_FLASHNEXT_PROMPT_EXPERT_TILE and TF_FP4_SHARED_DECODE: every NVFP4 layer's expert kernels
+        self.prompt_tile, self.shared_decode = tile_mode(), shared_decode()
         exl3 = is_exl3(model_dir)
         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU: drop --tp "
@@ -173,7 +191,8 @@ class FlashNextEngine:
         try:
             w = load(model_dir, mtp=self.depth > 0, tp=(rank, 2) if tp == 2 else None,
                      draft_vocab=draft_vocab if self.depth > 0 else None, ple_on_ssd=ple_on_ssd,
-                     table_reads=reads if prefetch and not ple_on_ssd else None)
+                     table_reads=reads if prefetch and not ple_on_ssd else None, prompt_tile=self.prompt_tile,
+                     shared_decode=self.shared_decode)
         except BaseException:
             wait(reads)                               # a failed load leaves no table read behind it
             raise
@@ -240,7 +259,7 @@ class FlashNextEngine:
                                           kv_dtype=self.kv_dtype, share=share, vision=self.vision,
                                           prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=lone,
                                           spec=self.spec, count_drafters=self.count_drafters,
-                                          end_anchor=self.end_anchor)
+                                          end_anchor=self.end_anchor, first_early=self.first_early)
                 self.scheduler = Scheduler(self.multi, max_streams=streams)
             else:
                 self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,

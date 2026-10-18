@@ -53,16 +53,6 @@ def test_the_tile_flag_rejects_any_other_value(monkeypatch, value):
         nvfp4_moe.tile_mode()
 
 
-def test_a_layer_reads_the_flag_when_it_loads(monkeypatch):
-    monkeypatch.setenv(nvfp4_moe.TILE_ENV, "1")
-    layer = nvfp4_moe.MoE4(None, None)
-    monkeypatch.setenv(nvfp4_moe.TILE_ENV, "0")
-    assert layer.prompt_tile == 1                                  # a later change does not reach a loaded layer
-    monkeypatch.setenv(nvfp4_moe.TILE_ENV, "yes")
-    with pytest.raises(ValueError, match=nvfp4_moe.TILE_ENV):
-        nvfp4_moe.MoE4(None, None)                                 # a typo fails the load
-
-
 @pytest.mark.parametrize("value, mode", [(None, "prompt"), ("", "prompt"), ("qmmf", "qmmf"), ("prompt", "prompt"),
                                          (" prompt ", "prompt")])
 def test_the_shared_decode_flag_reads_qmmf_or_prompt(monkeypatch, value, mode):
@@ -80,14 +70,23 @@ def test_the_shared_decode_flag_rejects_any_other_value(monkeypatch, value):
         nvfp4_moe.shared_decode()
 
 
-def test_a_layer_reads_the_shared_decode_flag_when_it_loads(monkeypatch):
-    monkeypatch.setenv(nvfp4_moe.SHARED_DECODE_ENV, "prompt")
-    layer = nvfp4_moe.MoE4(None, None)
+@pytest.mark.parametrize("env, value", [(nvfp4_moe.TILE_ENV, "yes"), (nvfp4_moe.SHARED_DECODE_ENV, "lane")])
+def test_a_flag_typo_stops_the_engine_and_the_loader_before_any_read(monkeypatch, tmp_path, env, value):
+    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
+    from tensorfold.families.qwen4_exp.cuda.weights import load
+
+    monkeypatch.setenv(env, value)
+    with pytest.raises(ValueError, match=env):
+        FlashNextEngine(tmp_path / "missing")                      # no checkpoint there: the flag fails first
+    with pytest.raises(ValueError, match=env):
+        load(tmp_path / "missing", "cpu")
+
+
+def test_a_layer_takes_the_values_it_is_given_and_not_the_environment(monkeypatch):
+    monkeypatch.setenv(nvfp4_moe.TILE_ENV, "0")
     monkeypatch.setenv(nvfp4_moe.SHARED_DECODE_ENV, "qmmf")
-    assert layer.shared_decode == "prompt"                         # a later change does not reach a loaded layer
-    monkeypatch.setenv(nvfp4_moe.SHARED_DECODE_ENV, "lane")
-    with pytest.raises(ValueError, match=nvfp4_moe.SHARED_DECODE_ENV):
-        nvfp4_moe.MoE4(None, None)                                 # a typo fails the load
+    layer = nvfp4_moe.MoE4(None, None)
+    assert (layer.prompt_tile, layer.shared_decode) == (2, "prompt")    # the defaults; weights.load sets the flags'
 
 
 @pytest.mark.parametrize("mode, rows, prompt, faces", [

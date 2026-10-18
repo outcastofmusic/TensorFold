@@ -6,6 +6,8 @@ MIT); recorded router picks (her --plans replay) are not covered here."""
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -189,8 +191,7 @@ def test_a_prompt_chunk_through_moe_is_the_same_with_the_tile_off_or_on(monkeypa
         monkeypatch.setattr(nvx, name, lambda *a, _real=real, **kw: (tiles.append(kw["tile"]), _real(*a, **kw)))
     got = {}
     for mode in ("0", "1", "2"):
-        monkeypatch.setenv(nvfp4_moe.TILE_ENV, mode)
-        ex = nvfp4_moe.MoE4(base.routed_experts, base.shared)      # reads the flag as a loading layer does
+        ex = replace(base, prompt_tile=nvfp4_moe.TILE_MODES[mode])  # the flag's value, as weights.load sets it
         buf = moe_mod.MoEBuffers(rows, cfg, DEV, prefill=True)
         tiles.clear()
         nvfp4_moe.moe(x, None, router, ex, buf, cfg)
