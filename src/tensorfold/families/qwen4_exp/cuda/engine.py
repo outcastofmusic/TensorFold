@@ -151,7 +151,7 @@ class FlashNextEngine:
                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
         self.prefill_rows, prompt_workspace = (PREFILL_ROWS, 0) if exl3 else (chunk, 0) if chunk else prompt_plan(
             self.capacity_plan, config(model_dir), torch.cuda.get_device_capability(), world=tp, vision=vision,
-            fp8=prompt_precision.fp8())
+            fp8=prompt_precision.fp8(), mtp=mtp)
         if prompt_workspace:
             peak = self.capacity_plan["total_bytes_estimate"] / 2**30
             print(f"[tensorfold] {self.prefill_rows}-row idle prompt workspace {prompt_workspace / 2**30:.2f} GiB; "
