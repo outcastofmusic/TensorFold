@@ -16,6 +16,13 @@ def multi_fill():
     return multi_fill
 
 
+@pytest.fixture
+def engine():
+    from tensorfold.families.qwen4_exp.cuda import engine
+
+    return engine
+
+
 class Slot:
     """The engine a joined stream drafts on: its sample is the first token; ``events`` records the order."""
 
@@ -27,12 +34,13 @@ class Slot:
         return [self.first]
 
 
-def decoder(prompt, count, first, events, *, copy=True, mtp=True, emit=None, error=None):
+def decoder(prompt, count, first, events, *, copy=True, mtp=True, emit=None, error=None, early=True):
     from tensorfold.cuda.streams import Stream
     from tensorfold.families.qwen4_exp.cuda.multi import MultiDecoder
 
     d = object.__new__(MultiDecoder)
     d.w, d.depth, d.confidence, d.eos, d.copy = SimpleNamespace(comm=None, meta={}), 6, 0.7, (2,), copy
+    d.first_early = early
     d.follower = d.link = None
     d.arrived, d.streams = (lambda: False), {}
     d._remember = lambda *args: events.append("remember")
@@ -73,18 +81,33 @@ def test_the_first_token_goes_out_before_the_drafts(drafts):
     assert d.streams == {0: s} and d.filling == [] and 0 not in d.fills
 
 
-def test_the_old_order_drafts_first_and_both_orders_leave_the_same_stream(drafts, monkeypatch, multi_fill):
+def test_the_old_order_drafts_first_and_both_orders_leave_the_same_stream(drafts, monkeypatch, engine):
     got = {}
     for value in ("1", "0"):
-        monkeypatch.setenv(multi_fill.FIRST_EARLY, value)
+        monkeypatch.setenv(engine.FIRST_EARLY, value)
         events = []
         prompt = [5, 6, 7, 8, 9, 10, 11, 12] * 3           # a repeated tail: the copy index drafts nothing yet
-        d, s = decoder(prompt, 8, 13, events)
+        d, s = decoder(prompt, 8, 13, events, early=engine.first_early())
         join(d, s)
         got[value] = (events, s.out, s.drafts, s.drafter, s.copies.ctx, s.copies.chain(6), s.context, s.done)
     assert got["1"][0] == ["sample", ("emit", [13]), "draft"]
     assert got["0"][0] == ["sample", "draft", ("emit", [13])]
     assert got["1"][1:] == got["0"][1:]
+
+
+def test_the_decoder_keeps_the_flag_it_was_started_with(drafts, monkeypatch, engine):
+    events = []
+    monkeypatch.setenv(engine.FIRST_EARLY, "0")
+    d, s = decoder(list(range(100, 140)), 8, 7, events, early=True)
+    monkeypatch.setenv(engine.FIRST_EARLY, "ture")          # read at startup only: a later value is not seen
+    join(d, s)
+    assert events == ["sample", ("emit", [7]), "draft"]
+
+
+def test_a_flag_typo_stops_the_engine_before_it_reads_the_model(monkeypatch, tmp_path, engine):
+    monkeypatch.setenv(engine.FIRST_EARLY, "ture")
+    with pytest.raises(ValueError, match=engine.FIRST_EARLY):
+        engine.FlashNextEngine(tmp_path / "missing")          # no checkpoint there: the flag fails first
 
 
 def test_a_copy_chain_is_drafted_after_the_first_token_too(drafts):

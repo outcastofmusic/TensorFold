@@ -305,6 +305,16 @@ def test_parallel_calls_still_return_every_gemma_and_dsml_call(first, second):
     assert content == "" and len(calls) == 2
 
 
+def test_the_single_call_filter_hides_the_streaming_hider_s_envelopes_but_the_tag_one():
+    from tensorfold.server.text import _CALLS
+    from tensorfold.server.tool_policy import _FIXED
+
+    assert set(_FIXED) == {("<|tool_call_start|>", "<|tool_call_end|>", ()),
+                           ("<|tool_call>", "<tool_call|>", ("call:", ":")),
+                           ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>", ("<｜DSML｜invoke",))}
+    assert {o for o, _, _ in _FIXED} | {"<tool_call>"} == {o for o, _ in _CALLS}
+
+
 @pytest.mark.parametrize("envelope", [GEMMA_CALL, GEMMA_BARE_CALL, DSML_CALL])
 def test_single_call_hides_an_envelope_split_at_every_boundary(envelope):
     from tensorfold.server.tool_policy import ToolCallPolicy

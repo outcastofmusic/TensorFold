@@ -56,8 +56,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
                  share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
-                 copy: bool = True, spec=None, count_drafters: bool = False, end_anchor: bool = False) -> None:
+                 copy: bool = True, spec=None, count_drafters: bool = False, end_anchor: bool = False,
+                 first_early: bool = True) -> None:
         self.link = self.follower = None
+        self.first_early = bool(first_early)         # TF_FLASH_FIRST_EARLY, read at startup (engine.first_early)
         # staircut.py's Speculation: each stream's chain depth and plain rounds (None: the fixed confidence cut)
         self.spec = spec if w.comm is None else None
         self.traces: dict[int, tuple] = {}      # stream id -> its next window's (probs, MTP steps, draft ms, alone)
@@ -111,6 +113,12 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
 
     def _drop_kept(self, st: State) -> None:
         self.kept = [k for k in self.kept if k[1] is not st]
+
+    def _give_back(self, st: State) -> None:
+        """A failed admission's slot: no kept state points at it any more, and it is free again."""
+
+        self._drop_kept(st)
+        self.free.append(st)
 
     def _grow(self, st: State, rows: int, *, alone: bool = False, protect: State | None = None) -> bool:
         """Grow caches while the gate has room; one stream may use its startup allowance within an explicit cap."""
@@ -347,16 +355,14 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                     self._remember(list(s.prompt[:s.cached]), st, resume["state"], resume["tail"])
                 raise
             except Exception:                    # the request fails; its slot goes back, as below
-                self._drop_kept(st)
-                self.free.append(st)
+                self._give_back(st)
                 raise
             if entry is not None:
                 read = time.perf_counter()
                 try:
                     resume = self._load_disk(entry, st)
                 except Exception:
-                    self._drop_kept(st)
-                    self.free.append(st)
+                    self._give_back(st)
                     raise
                 s.cached, s.disk_tokens = (len(entry.ids),) * 2 if resume is not None else (0, 0)
                 s.disk_s = time.perf_counter() - read
@@ -366,8 +372,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             begin = prefill_begin(e, s.prompt, mtp=mtp, resume=resume)
             image_rows.begin(e, s, self.vision)
         except Exception:
-            self._drop_kept(st)
-            self.free.append(st)
+            self._give_back(st)
             raise
         if self.w.comm is not None:
             e.stops = list(s.stops)

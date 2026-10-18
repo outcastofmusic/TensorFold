@@ -237,6 +237,12 @@ def test_an_unknown_prompt_kernel_is_refused_at_startup(weights, monkeypatch):
         _engine(weights)
 
 
+def test_the_cpu_engine_holds_the_fp32_path_s_decode_buffer(weights, monkeypatch):
+    monkeypatch.setenv("TF_LFM2_PROMPT_KERNEL", "auto")            # the CPU runs grouped under any value
+    widest = max(b.moe.experts.w13[0].numel() for b in weights.blocks if b.moe is not None)
+    assert _engine(weights).decoded.numel() == widest
+
+
 KERNELS = r"""
 import torch
 from tensorfold.families.lfm2_moe.checkpoint import dequantize

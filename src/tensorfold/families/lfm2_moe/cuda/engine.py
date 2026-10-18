@@ -77,9 +77,11 @@ class Engine:
                         for _ in range(na)]
         self.v_cache = [torch.zeros_like(k) for k in self.k_cache]
         self.conv_state = torch.zeros((nc, c.conv_taps - 1, c.hidden), dtype=torch.bfloat16, device=dev)
-        # one fp32 buffer a prompt chunk's experts decode into in turn: w13 [2I, D] is the wider of an expert's two
-        self.decoded = torch.empty(max((b.moe.experts.w13[0].numel() for b in w.blocks if b.moe is not None),
-                                       default=0), dtype=torch.float32, device=dev)
+        # one fp32 buffer a prompt chunk's experts decode into in turn: w13 [2I, D] is the wider of an expert's two.
+        # Only the fp32 path (``grouped``: always on the CPU, TF_LFM2_PROMPT_KERNEL=fp32 on CUDA) reads it.
+        self.decoded = (torch.empty(max((b.moe.experts.w13[0].numel() for b in w.blocks if b.moe is not None),
+                                        default=0), dtype=torch.float32, device=dev)
+                        if not self.cuda or self.prompt_kernel == "fp32" else None)
         self.inv_freq = (1.0 / (c.theta ** (torch.arange(0, c.head_dim, 2, dtype=torch.float32) / c.head_dim))).to(dev)
         self.meta = torch.zeros(4, dtype=torch.int32, device=dev)       # meta[0]: the call's first position
         self.sampled = torch.zeros(1, dtype=torch.int32, device=dev)

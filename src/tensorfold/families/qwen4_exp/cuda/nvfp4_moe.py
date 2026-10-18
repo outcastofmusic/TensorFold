@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
 from tensorfold.cuda.nvfp4 import experts as nvx
+from tensorfold.env_flags import choice
 
 from . import nvfp4
 
@@ -18,12 +18,7 @@ TILE_MODES = {"0": 0, "1": 1, "2": 2}     # off; gate/up only; gate/up and down
 def tile_mode() -> int:
     """TF_FLASHNEXT_PROMPT_EXPERT_TILE: which faces of prompt chunks run the shared-memory tile (unset: 2, both)."""
 
-    value = os.environ.get(TILE_ENV, "").strip()
-    if not value:
-        return 2
-    if value not in TILE_MODES:
-        raise ValueError(f"{TILE_ENV}: 0 (off), 1 (gate/up) or 2 (gate/up and down), not {value!r}")
-    return TILE_MODES[value]
+    return TILE_MODES[choice(TILE_ENV, tuple(TILE_MODES), "2")]
 
 
 SHARED_DECODE_ENV = "TF_FP4_SHARED_DECODE"
@@ -38,12 +33,7 @@ def shared_decode() -> str:
     take the prompt GEMM either way. ``prompt`` is the default: on FP4-Local (GB10, 18 Oct) its 16-row tile gave
     1.059x decode with the old replies' bytes, against 1.064x for ``qmmf``, whose replies differ."""
 
-    value = os.environ.get(SHARED_DECODE_ENV, "").strip()
-    if not value:
-        return "prompt"
-    if value not in SHARED_DECODE_MODES:
-        raise ValueError(f"{SHARED_DECODE_ENV}: qmmf (the lane matmul) or prompt (the prompt GEMM), not {value!r}")
-    return value
+    return choice(SHARED_DECODE_ENV, SHARED_DECODE_MODES, "prompt")      # lower case only: QMMF raises
 
 
 def tile_faces(mode: int, rows: int, prompt: bool) -> tuple[bool, bool]:
@@ -68,8 +58,8 @@ class MoE4:
     routed_experts: nvx.Experts4
     shared: Expert4
     kernel: str = "nvfp4"
-    prompt_tile: int = field(default_factory=tile_mode)    # read once, when the layer loads
-    shared_decode: str = field(default_factory=shared_decode)
+    prompt_tile: int = 2           # tile_mode() and shared_decode(): ``weights.load`` sets the values the engine read
+    shared_decode: str = "prompt"
 
     capturable = True     # the plan stays on the device
 

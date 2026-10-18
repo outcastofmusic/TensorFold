@@ -30,8 +30,12 @@ def _plain(name: str, w: torch.Tensor) -> torch.Tensor:
 
 
 def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: tuple[int, int] | None = None,
-         draft_vocab: int | str | None = None, ple_on_ssd: bool = False, table_reads: list | None = None) -> Weights:
-    """Load rank ``tp``'s shares; ``draft_vocab`` selects default/file ids or ids below N, None scores all ids."""
+         draft_vocab: int | str | None = None, ple_on_ssd: bool = False, table_reads: list | None = None,
+         prompt_tile: int | None = None, shared_decode: str | None = None) -> Weights:
+    """Load rank ``tp``'s shares; ``draft_vocab`` selects default/file ids or ids below N, None scores all ids.
+
+    ``prompt_tile`` and ``shared_decode`` set every NVFP4 layer's expert kernels (``nvfp4_moe``); None reads their
+    flags here, before any weight."""
 
     import time
     from dataclasses import replace
@@ -41,6 +45,10 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     model_dir = Path(model_dir)
     if exl3.is_exl3(model_dir):                       # an EXL3 pack: its own loader, the same dataclasses
         return exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab, table_reads=table_reads)
+    from . import nvfp4_moe
+
+    prompt_tile = nvfp4_moe.tile_mode() if prompt_tile is None else prompt_tile
+    shared_decode = nvfp4_moe.shared_decode() if shared_decode is None else shared_decode
     full = Config.read(model_dir)
     rank, world = tp if tp is not None else (0, 1)
     cfg = full if world == 1 else replace(full, heads=full.heads // world, kv_heads=full.kv_heads // world,
@@ -245,8 +253,6 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     def moe_nvfp4(name: str) -> MoEW:
         """The NVFP4 checkpoint's MoE: FP4 routed experts (bf16 in the MTP layer), the bf16 shared expert and gate."""
 
-        from . import nvfp4_moe
-
         router = raw(name + ".gate.weight").to(torch.bfloat16)
         sgate = raw(name + ".shared_expert_gate.weight").to(torch.bfloat16).reshape(full.hidden).contiguous()
         router = torch.cat([router, sgate[None]]).contiguous()
@@ -322,7 +328,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
             if world > 1:
                 gu, dn = gu[:, lo:hi], dn[:, :, dlo * gs:dhi * gs]
             moe4 = nvfp4_moe.moe4_from_bf16(gu, dn, shared)
-        return MoEW(router, moe4)
+        return MoEW(router, replace(moe4, prompt_tile=prompt_tile, shared_decode=shared_decode))
 
     def attention(name: str) -> AttnW:
         hd = full.head_dim

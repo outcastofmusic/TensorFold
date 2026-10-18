@@ -81,7 +81,8 @@ class Config:
         if gen.is_file():
             eos = json.loads(gen.read_text()).get("eos_token_id", eos)
         limit = c.get("time_step_limit") or (0.0, float("inf"))     # the checkpoint's CUDA path and vLLM clamp here
-        return cls(dt_floor=config_float(limit[0]), dt_ceil=config_float(limit[1]),hidden=c["hidden_size"], vocab=c["vocab_size"], blocks=blocks, heads=c["num_attention_heads"],
+        return cls(dt_floor=config_float(limit[0]), dt_ceil=config_float(limit[1]), hidden=c["hidden_size"],
+                   vocab=c["vocab_size"], blocks=blocks, heads=c["num_attention_heads"],
                    kv_heads=c["num_key_value_heads"], head_dim=c["head_dim"], m_heads=c["mamba_num_heads"],
                    m_head_dim=c["mamba_head_dim"], m_groups=c["n_groups"], m_state=c["ssm_state_size"],
                    conv_kernel=c["conv_kernel"], latent=c["moe_latent_size"],

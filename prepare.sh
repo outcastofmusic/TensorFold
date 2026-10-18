@@ -103,16 +103,22 @@ super() {
         echo "prepare: native server already at $dir"
         return
     fi
+    # Unpacked beside $dir and moved into place only once the binary is there: an interrupted unpack leaves no
+    # $dir for a rerun to skip. The trap removes the temp folder on any exit, die included.
     local tmp
-    tmp=$(mktemp -d)
+    tmp=$(mktemp -d "$MODELS/.tensorfold-$v-native.XXXXXX")
+    trap "rm -rf $(printf %q "$tmp")" EXIT
     echo "prepare: TensorFold $v native server -> $dir"
     curl -fsSL -o "$tmp/native.tar.gz" "https://github.com/ashhart/TensorFold/releases/download/v$v/tensorfold-$v-linux-aarch64.tar.gz" \
-        || { rm -rf "$tmp"; die "downloading the TensorFold $v archive failed"; }
+        || die "downloading the TensorFold $v archive failed"
     echo "${NATIVE[1]}  $tmp/native.tar.gz" | sha256sum -c --quiet \
-        || { rm -rf "$tmp"; die "the TensorFold $v archive does not match its pinned sha256"; }
-    tar -xzf "$tmp/native.tar.gz" -C "$MODELS"
+        || die "the TensorFold $v archive does not match its pinned sha256"
+    tar -xzf "$tmp/native.tar.gz" -C "$tmp" || die "unpacking the TensorFold $v archive failed"
+    [ -x "$tmp/${dir##*/}/bin/tensorfold-native" ] || die "the TensorFold $v archive has no ${dir##*/}/bin/tensorfold-native"
+    rm -rf "$dir"                                  # an earlier unpack's broken folder, if any
+    mv "$tmp/${dir##*/}" "$dir"
     rm -rf "$tmp"
-    [ -x "$dir/bin/tensorfold-native" ] || die "$dir has no bin/tensorfold-native after unpacking"
+    trap - EXIT
 }
 
 glm() {

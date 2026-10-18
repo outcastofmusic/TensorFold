@@ -6,6 +6,7 @@ together == alone, and resumed == fresh."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -108,9 +109,8 @@ def _moe4(dev: str = "cuda"):
 def test_decode_rows_take_the_flags_kernel_and_prompt_rows_the_prompt_gemm(monkeypatch, mode):
     from tensorfold.cuda import moe as moe_mod
 
-    monkeypatch.setenv(ENV, mode)
     ex, cfg, router = _moe4()
-    assert ex.shared_decode == mode
+    ex = replace(ex, shared_decode=mode)                  # the flag's value, as weights.load sets it
     x = (torch.randn(8, cfg.hidden_size, device="cuda") * 0.5).to(torch.bfloat16)
     ni = ex.width
 
@@ -156,7 +156,7 @@ _LOADED: dict[str, object] = {}
 
 
 def _weights(tiny: Path, mode: str, monkeypatch):
-    """The tiny checkpoint loaded under TF_FP4_SHARED_DECODE=mode (the flag is read when a layer loads)."""
+    """The tiny checkpoint loaded under TF_FP4_SHARED_DECODE=mode (``load`` reads the flag before any weight)."""
 
     from tensorfold.families.qwen4_exp.cuda.weights import load
 

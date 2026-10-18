@@ -404,22 +404,17 @@ void launch_tile(const at::Tensor& x, int x_stride, int slots, const at::Tensor&
                  int n, float limit, int skip, int64_t max_units) {
   constexpr int WARPS = tile::WARPS;
   constexpr int SMEM = tile::smem_bytes<M, S>();
+  // Both configs (34,816 and 19,200 bytes) launch under the default 48 KiB of dynamic shared memory, without the
+  // cudaFuncSetAttribute opt-in. A config past it needs that opt-in, raised only, as 6f19c352 does for IQ2_XXS.
+  static_assert(SMEM <= 48 * 1024, "nvfp4 expert tile: this config needs more than 48 KiB of shared memory");
   const auto kernel = nvfp4_expert_tile_kernel<M, EPI, RTMAX, S>;
-  // The dynamic shared-memory opt-in is one ceiling per kernel that the last cudaFuncSetAttribute sets (48 KiB until
-  // then), so it is only ever raised: setting a smaller value would lower it under another caller (6f19c352).
   static std::mutex lock;
-  static std::map<std::pair<int, const void*>, int> ceiling;
   static std::map<std::pair<int, const void*>, int> blocks_per_sm;
   const int device = x.get_device();
   const auto key = std::make_pair(device, reinterpret_cast<const void*>(kernel));
   int per_sm = 0;
   {
     const std::lock_guard<std::mutex> hold(lock);
-    auto top = ceiling.emplace(key, 48 * 1024).first;
-    if (SMEM > top->second) {
-      C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
-      top->second = SMEM;
-    }
     const auto hit = blocks_per_sm.find(key);
     if (hit != blocks_per_sm.end()) {
       per_sm = hit->second;

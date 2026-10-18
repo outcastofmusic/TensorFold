@@ -362,7 +362,7 @@ def _launch_select(scratch: AttnScratch, pos0: torch.Tensor, rows: int, blocks: 
 
     top = scratch.budget // scratch.ratio
     width = triton.next_power_of_2(blocks)
-    if not qsa.tiled(blocks, scratch.fast, SELECT_REGS):
+    if not qsa.tiled(blocks, width, scratch.fast, SELECT_REGS):
         _select[(rows,)](scratch.scores, pos0, scratch.ids, scratch.nk, scratch.sparse, scratch.nb,
                          RATIO=scratch.ratio, TOP=top, IDW=scratch.idw, BLOCK=width, num_warps=16)
         return

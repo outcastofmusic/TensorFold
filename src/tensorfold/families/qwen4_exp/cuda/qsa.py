@@ -6,11 +6,12 @@ the TensorFold contributors' ``attention._scores`` and ``attention._select_tiles
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from pathlib import Path
 
 import torch
+
+from tensorfold.env_flags import choice
 
 ENV = "TF_FLASHNEXT_QSA"
 MODES = ("cuda", "torch")
@@ -19,15 +20,10 @@ TILES_FROM = 8192            # prompt rows with this many blocks (32,768 keys) o
 
 
 def mode() -> str:
-    """TF_FLASHNEXT_QSA: ``cuda`` (unset: the default) or ``torch``; anything else raises."""
+    """TF_FLASHNEXT_QSA: ``cuda`` (qsa_scores.cu and the tiled select; unset: the default) or ``torch`` (the Triton
+    kernels), in any case; anything else raises."""
 
-    value = os.environ.get(ENV, "").strip().lower()
-    if not value:
-        return "cuda"
-    if value not in MODES:
-        raise ValueError(f"{ENV}: cuda (qsa_scores.cu and the tiled select) or torch (the Triton kernels), "
-                         f"not {value!r}")
-    return value
+    return choice(ENV, MODES, "cuda", ignore_case=True)
 
 
 def fits(index_heads: int, index_dim: int) -> bool:
@@ -43,12 +39,11 @@ def fast(prefill: bool, index_heads: int, index_dim: int) -> bool:
     return prefill and mode() == "cuda" and fits(index_heads, index_dim)
 
 
-def tiled(blocks: int, fast: bool, regs: int) -> bool:
-    """``_select_tiles`` (rather than ``_select``) for rows of up to ``blocks`` blocks: past ``_select``'s ``regs``
-    register width always, and from TILES_FROM blocks on a ``fast`` (prompt, flag cuda) scratch. Both list the same
-    blocks."""
+def tiled(blocks: int, width: int, fast: bool, regs: int) -> bool:
+    """``_select_tiles`` (rather than ``_select``) for rows of up to ``blocks`` blocks: when ``_select``'s ``width``
+    (the next power of two from ``blocks``) passes its ``regs`` register width always, and from TILES_FROM blocks on a
+    ``fast`` (prompt, flag cuda) scratch. Both list the same blocks."""
 
-    width = 1 << max(0, blocks - 1).bit_length()
     return width > regs or (fast and blocks >= TILES_FROM)
 
 

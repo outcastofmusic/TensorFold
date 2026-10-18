@@ -16,7 +16,7 @@ _CALLS = (("<tool_call>", "</tool_call>"), ("<|tool_call>", "<tool_call|>"),
           ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"), ("<|tool_call_start|>", "<|tool_call_end|>"))
 _CLOSERS = dict(_CALLS)
 # How each family's call payload starts after its opener and any whitespace, for openers another family's prose may
-# name (as tool_policy's ``_FIXED``): Gemma 4's ``call:NAME{..}`` (the 26B writes a bare ``:NAME{..}``) and DSML's
+# name (tool_policy's ``_FIXED`` reads both tables): Gemma 4's ``call:NAME{..}`` (the 26B writes a bare ``:NAME{..}``) and DSML's
 # invokes. Qwen's and GLM's ``<tool_call>`` and LFM2's list can start with a bare name, which no lead tells from prose.
 _LEADS = {"<|tool_call>": ("call:", ":"), "<｜DSML｜tool_calls>": ("<｜DSML｜invoke",)}
 _SPACE = re.compile(r"\s*")

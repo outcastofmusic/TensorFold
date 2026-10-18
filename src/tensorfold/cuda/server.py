@@ -534,7 +534,8 @@ class App:
         # calls stream as argument deltas while written (as on the Mac); one-call requests keep the end parser
         calls_stream = ToolCallStreamer(tools) if tools and not policy.single else None
         answer_raw = [""]
-        own_opener = call_opener(self._call_probe()) if tools else None    # the template's calls hide at once
+        # the template's calls hide at once; a one-call request filters with ToolCallPolicy instead
+        own_opener = self._call_opener() if tools and not policy.single else None
 
         def visible(finished: bool) -> tuple[str, str]:
             raw = stream.final() if finished else stream.text
@@ -788,6 +789,14 @@ class App:
             except Exception:  # noqa: BLE001 - a template that renders no calls: the opener alone
                 self._probe_text = ""
         return self._probe_text
+
+    def _call_opener(self) -> str | None:
+        """The opener of this template's own calls (``call_opener`` of the probe), None when it renders none (read
+        once)."""
+
+        if not hasattr(self, "_opener"):
+            self._opener = call_opener(self._call_probe())
+        return self._opener
 
     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:
         """The gate a required tool call needs, from this template's call markup and the rendered prompt."""

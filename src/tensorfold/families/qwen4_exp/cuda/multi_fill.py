@@ -9,7 +9,6 @@ import torch
 from tensorfold.cuda.kernels.gdn import MARKS
 from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.streams import Stream
-from tensorfold.env_flags import flag
 
 from . import image_rows
 from .copy_drafts import CopyIndex
@@ -23,14 +22,6 @@ from .prompt_plan import pass_limit
 
 PASS_MIN = 512
 FILL_GUARD = 8
-FIRST_EARLY = "TF_FLASH_FIRST_EARLY"
-
-
-def first_early() -> bool:
-    """Whether a prompt's first token goes out before its first drafts are made (TF_FLASH_FIRST_EARLY=0: after them,
-    as before). The drafts and the copy index over the prompt depend only on the token, so the reply is the same."""
-
-    return flag(FIRST_EARLY, True)
 
 
 class PromptPasses:
@@ -217,7 +208,7 @@ class PromptPasses:
             waited = time.perf_counter()
             torch.cuda.synchronize()
             spent += (time.perf_counter() - waited) / len(pieces)
-        early = first_early()
+        early = self.first_early
         joined, head = [], 0
         for (s, a, n), last in zip(pieces, lasts):
             s.prefill_s += spent
