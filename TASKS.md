@@ -9,7 +9,7 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 
 | Task | State |
 |---|---|
-| Qwen variants: Mia's Zig recipe on FP4-Local | A/B on one tool (18 Oct, `tf-runs/mia-qwen/RESULTS.md`, both --parallel 5): decode equal within 3% (code greedy 68.0 against 67.9 tok/s, 277 against 279 at 5 streams); cold prefill Mia 2,125 / 2,158 / 1,965 tok/s at 4k / 32k / 131k against ours 1,303 / 1,461 / 1,433. Expert tile ported and merged (`edebf0f6`): bytes equal, prefill 1.11-1.13x. At --parallel 1 our first token arrives at the end of prefill; at --parallel 5 it arrives 0.6-1.8 s later and 32k prefill is about 10% slower: cause under investigation (`perf/qwen-first-token`). Tie-breaker TrueScore running (`tf-runs/tiebreak.sh`) |
+| Qwen variants: close the prefill gap to Mia | Merged: expert tile (`edebf0f6`, prefill 1.11-1.13x, same bytes) and first token before drafting (`9e6635b7`, ttft 4k 2.32 to 2.09 s, 32k 19.01 to 18.09 s, same token ids; the done line's prefill now counts the last pass). Same-session --parallel 5 against --parallel 1: equal at 4k and 32k, 6% slower at 131k (82.5 against 77.9 s); the earlier 13-18% at 32k was session noise. Remaining gap to Mia's 18 Oct numbers: 1.08x at 4k, 1.19x at 32k, 1.24x at 131k. Next: nsys on one Qwen prefill chunk and one decode step, and the launch-gap microbench (`tf-runs/megakernel/REPORT.md` idea 1) |
 
 ## To do
 
@@ -40,6 +40,7 @@ Order (18 Oct): the pipeline code changes above, then the Qwen3.8 variants (Mia'
 
 | Task | Result |
 |---|---|
+| Qwen FP4-Local vs EXL3 tie-breaker (18 Oct) | EXL3 stays the default. Pooled 76x4 a arm: FP4-Local - EXL3 +2.3 [-0.9, +6.4]; same session +2.3 [-1.2, +6.6]. Each arm repeated within 0.3 across days (FP4 90.3 / 90.6, EXL3 88.1 / 88.3). The interval is set by scenario spread, so more repeats will not narrow it. FP4-Local stays a swap target for planning (Q94 against 92) at 0.71-0.82x the decode speed and 23 GiB more memory |
 | Code review since 0.8.0 (`8c405e56..7891345f`) | `docs/reviews/2026-10-17.md`. Fixes merged; GPU tests found two defects in them, both fixed on 18 Oct: the IQ2_XXS shared-memory ceiling cache (688bc309, fixed by `6f19c352`) and a stale GLM ring test (`a2dedd3d`) |
 | Bolt follow-ups: decode CUDA graphs and a drafter-only Q8_0 head | Merged (`e6bf4fb9`). Graphs add under 1% (serial 30.9 to 31.3 tok/s): decode was not launch-bound. The Q8_0 head lengthens accepted runs: drafted greedy code 36.5 to 45.1, chat 34.5 to 46.1, tools 49.1 to 60.4, long 37.2 to 46.4, prose 30.9 to 33.2 tok/s. Golden 94/96, drafted == serial 10/10 |
 | LFM2.5 follow-ups: tensor-core prompt kernel, prompt reuse, decode graphs; d1 one head matmul | Merged (`0d5afcab`). Prefill 1k 1,228 to 4,802 tok/s, 16k 1,792 to 3,982. `PAIRS_ROWS` 64 from the timing tool (`1985f992`). LFM2 24/24, d1 6/6. Paired TrueScore against the old build still to run |
