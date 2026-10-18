@@ -12,6 +12,7 @@ import time
 import urllib.request
 
 LENGTHS = (2048, 8192, 16384, 32768, 65536)
+WARM = 1024              # the warm-up prompt's length: built once, left out of the summary
 REPS = 3
 ASK = "\nSay in one sentence what the code above does."
 
@@ -26,6 +27,17 @@ def corpus() -> str:
     return "".join(f"# {p.relative_to(root)}\n{p.read_text(errors='ignore')}\n" for p in files)
 
 
+def checked(lengths: tuple[int, ...], chars: int) -> tuple[int, ...]:
+    """``lengths`` without WARM, which the warm-up prompt already measures. A rep's start offset is taken modulo
+    ``chars - 20 * length``, so each length must stay under chars / 20; anything else raises."""
+
+    bad = [n for n in lengths if not 0 < 20 * n < chars]
+    if bad:
+        raise ValueError(f"prompt lengths 1 to {(chars - 1) // 20:,} tokens fit this corpus ({chars:,} characters), "
+                         f"not {', '.join(map(str, bad))}")
+    return tuple(n for n in lengths if n != WARM)
+
+
 def build(model_dir: str, out: str, lengths: tuple[int, ...] = LENGTHS) -> None:
     from pathlib import Path
 
@@ -33,9 +45,10 @@ def build(model_dir: str, out: str, lengths: tuple[int, ...] = LENGTHS) -> None:
 
     from tensorfold.cuda.server import ChatTemplate
 
+    text = corpus()
+    lengths = checked(lengths, len(text))
     tok = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
     template = ChatTemplate(Path(model_dir))
-    text = corpus()
 
     def messages(nonce: str, start: int, chars: int):
         return [{"role": "user", "content": f"Request {nonce}.\n" + text[start:start + chars] + ASK}]
@@ -44,9 +57,9 @@ def build(model_dir: str, out: str, lengths: tuple[int, ...] = LENGTHS) -> None:
         return len(tok.encode(template.render(m, tools=None, enable_thinking=False), add_special_tokens=False).ids)
 
     items = []
-    for length in (1024,) + tuple(lengths):
-        for rep in range(1 if length == 1024 else REPS):
-            nonce = f"{length}-{rep}" if length != 1024 else "warm"
+    for length in (WARM,) + lengths:
+        for rep in range(1 if length == WARM else REPS):
+            nonce = f"{length}-{rep}" if length != WARM else "warm"
             start = (rep * 1_000_003 + length * 7) % (len(text) - 20 * length)
             lo, hi = 0, 8 * length
             while lo < hi:                               # the most characters that stay within the length
@@ -90,7 +103,7 @@ def run(url: str, model: str, prompts: str, out: str) -> None:
         rows.append(r)
         print(json.dumps(r), flush=True)
     summary = []
-    for length in sorted({it["length"] for it in items} - {1024}):
+    for length in sorted({it["length"] for it in items} - {WARM}):
         rs = [r for r in rows if r["length"] == length]
         t = statistics.median(r["ttft_s"] for r in rs)
         n = statistics.median(r["prompt_tokens"] or 0 for r in rs)
