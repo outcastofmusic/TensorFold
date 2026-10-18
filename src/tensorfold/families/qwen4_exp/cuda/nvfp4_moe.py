@@ -26,6 +26,25 @@ def tile_mode() -> int:
     return TILE_MODES[value]
 
 
+SHARED_DECODE_ENV = "TF_FP4_SHARED_DECODE"
+SHARED_DECODE_MODES = ("qmmf", "prompt")
+
+
+def shared_decode() -> str:
+    """TF_FP4_SHARED_DECODE: the kernel of a decode window's MXFP8 shared expert (unset: qmmf).
+
+    Decode windows keep bf16 slots (``moe_prefill``), which once sent their shared expert to the prompt GEMM. ``qmmf``
+    runs it on the lane matmul like every other decode linear; ``prompt`` keeps the prompt GEMM's bits. Prompt rows
+    take the prompt GEMM either way."""
+
+    value = os.environ.get(SHARED_DECODE_ENV, "").strip()
+    if not value:
+        return "qmmf"
+    if value not in SHARED_DECODE_MODES:
+        raise ValueError(f"{SHARED_DECODE_ENV}: qmmf (the lane matmul) or prompt (the prompt GEMM), not {value!r}")
+    return value
+
+
 def tile_faces(mode: int, rows: int, prompt: bool) -> tuple[bool, bool]:
     """(gate/up, down) on the tile kernel: prompt buffers of at least ``nvx.TILE_ROWS`` rows, as ``mode`` allows."""
 
@@ -49,6 +68,7 @@ class MoE4:
     shared: Expert4
     kernel: str = "nvfp4"
     prompt_tile: int = field(default_factory=tile_mode)    # read once, when the layer loads
+    shared_decode: str = field(default_factory=shared_decode)
 
     capturable = True     # the plan stays on the device
 
@@ -122,8 +142,11 @@ def moe4_from_experts(gate: list, up: list, down: list, shared: tuple) -> MoE4:
     return moe4_from_checkpoint(stack(gate), stack(up), stack(down), shared)
 
 
-def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, buf, cfg) -> None:
-    """Route rows x [R, D] and run their experts into buf (the shared ``moe`` contract); ``xs`` unused: no biases."""
+def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, buf, cfg, *,
+        decode: bool = False) -> None:
+    """Route rows x [R, D] and run their experts into buf (the shared ``moe`` contract); ``xs`` unused: no biases.
+
+    ``decode``: a decode window's rows, whose bf16 slots alone do not tell them from a prompt's."""
 
     from tensorfold.cuda import experts as grouped
     from tensorfold.cuda import moe as moe_mod
@@ -131,13 +154,14 @@ def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, 
     rows, top_k = x.shape[0], int(cfg.num_experts_per_tok)
     prompt = buf.y.dtype != torch.float32                  # a prompt's buffers keep bf16 slots
     gu_tile, dn_tile = tile_faces(ex.prompt_tile, rows, prompt)
+    shared_prompt = prompt and not (decode and ex.shared_decode == "qmmf")
     moe_mod.router(x, router_rows, buf.logits[:rows])
     moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, nvx.TILE_ITEM if gu_tile else nvx.PREFILL_TILE)
     nvx.gate_up(x, ex.routed_experts, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed, tile=gu_tile)
-    buf.act[:rows, top_k] = ex.shared_act(x, prompt)
+    buf.act[:rows, top_k] = ex.shared_act(x, shared_prompt)
     if dn_tile != gu_tile:                                 # mode 1: down regroups in its own kernel's items
         grouped.route(buf.pick[:rows], buf.plan, nvx.TILE_ITEM if dn_tile else nvx.PREFILL_TILE)
     nvx.down(buf.act.view(-1, ex.width), ex.routed_experts, buf.plan, buf.y.view(-1, ex.dims), rows, skip=ex.routed,
              tile=dn_tile)
-    buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], prompt, not prompt)
+    buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], shared_prompt, not prompt)
     return buf
