@@ -292,9 +292,11 @@ super() {
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
     [ "${D1:-0}" = 0 ] || IMAGE=$(image)          # only d1 runs this checkout's image
     stop_all
+    # 1.1.0 allocates its prompt cache up front (16 GiB by default: 49 snapshot slots plus copied rows), where 1.0.12 only
+    # capped it; at 6 GiB Super leaves room for d1 beside it (18 Oct: 20 GiB available alone with the default)
     serve_native tensorfold-super -- "$model" --host 127.0.0.1 --port "$PORT" --name nemotron-3.5-super \
         --context "${CONTEXT:-131072}" --max-tokens "${CONTEXT:-131072}" --precision checkpoint --vision \
-        "${budget[@]}" ${EXTRA:-}
+        --prompt-cache-gib "${SUPER_PROMPT_CACHE_GIB:-6}" "${budget[@]}" ${EXTRA:-}
     wait_ready tensorfold-super "$PORT" || failed tensorfold-super
     d1
 }
