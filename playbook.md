@@ -54,7 +54,7 @@ we do not run yet. Add the test when you reach that row.
 | 2.5 | Read per-module widths and refuse what no kernel reads, at load | A mixed-rate layer is refused at load, never at its first forward, which may be a graph capture (c7e0075f). Never cast an unsupported format: an MXFP8 head cast to bf16 decoded "fluent garbage" (upstream 3d7a1478) |
 | 2.6 | Normalize norm conventions per tensor class | Layer 0's norms match the reference. EXL3 and NVFP4 store centred RMSNorms as gamma-1 (upstream 5b4b3438). Clef needed +1 (837a86e1). Zero-centred MTP norms gave 0 of 127 drafts accepted (upstream edb8fc03) |
 | 2.7 | Merge end tokens from `config.json`, `generation_config.json` and the tokenizer's chat end | The union is in the family's EOS list, with a `test_<family>_eos.py`. A config that held only 248044 dropped `<|im_end|>` 248046 and replies ran past the turn |
-| 2.8 | Read the sampling defaults in `generation_config.json` | Each key the CLI drops is restated in `run.sh` **(gap: warn on dropped keys)**. The CLI reads 5 keys, so LFM2.5's `repetition_penalty` 1.05 is not applied |
+| 2.8 | Read the sampling defaults in `generation_config.json` | Each key the CLI drops is restated in `run.sh`. The CLI reads 5 keys and warns at startup on each sampling key it drops (83d56781, `tests/test_hub_and_checks.py`). LFM2.5's `repetition_penalty` 1.05 draws that warning and is not applied |
 | 2.9 | Read the model card's serve command | The authors' precision is known (FP4-Local: 4-bit weights, 16-bit decode activations, 4-bit prefill activations) |
 | 2.10 | Run the family's `detect`, `require_readable` and `check()` on the real folder | They pass on the CPU before any GPU time |
 
@@ -128,15 +128,15 @@ All four equalities compare token SHA-256 or `torch.equal` on rows and states.
 
 | # | Do | Pass when |
 |---|---|---|
-| 8.1 | Round-trip the tokenizer and diff ids against HF on an adversarial text set (whitespace, emoji, CJK, added tokens) | Equal ids and decoded text **(gap: no such test. llama.cpp's `CHK_TXT` is the model)** |
-| 8.2 | Check BOS handling | One BOS, never two **(gap)** |
-| 8.3 | Render the template against transformers | Byte-equal with thinking on and off, tools, tool results, a late system message and templates that rewrite earlier turns. Add the model to `tests/test_prompt_parity.py` (Bolt, LFM2 and FP4-Local are missing) |
+| 8.1 | Round-trip the tokenizer and diff ids against HF on an adversarial text set (whitespace, emoji, CJK, added tokens) | Equal ids and decoded text. `tests/test_tokenizer_parity.py` checks 39 `CHK_TXT`-style texts plus each checkpoint's added tokens on the five served checkpoints (519fc9a0) |
+| 8.2 | Check BOS handling | One BOS, never two. `tests/test_tokenizer_parity.py` checks each BOS or template prefix token on the five served checkpoints (519fc9a0) |
+| 8.3 | Render the template against transformers | Byte-equal with thinking on and off, tools, tool results, a late system message and templates that rewrite earlier turns. Add the model to `tests/test_prompt_parity.py`. Bolt, LFM2.5 and FP4-Local joined it in 519fc9a0. LFM2.5 with thinking off is a strict xfail: the Mac path renders `<think></think>` and CUDA `<think>` |
 | 8.4 | Compare `/tokenize` with `apply_chat_template` ids | Equal (Qwen: 4 of 4) |
 | 8.5 | Test the thinking switch on the served route | Count reasoning tokens a reply. Z.ai's switch returned reasoning in 56 of 152 and 159 of 160 replies |
 | 8.6 | Set a thinking budget | `--thinking-budget 8000` in `run.sh`. Unbudgeted GLM turns ran 17,410 and 21,193 tokens, one past 998 s |
 | 8.7 | Check reasoning markup | No `<think>`, `</think>` or channel text in `content`, streamed or not, thinking on or off |
-| 8.8 | Parse the model's own tool envelope | Calls arrive as `tool_calls`, streamed and not, single and parallel, and with `parallel_tool_calls: false` (LFM2 leaked there, 4b395750). Gemma 4 and DeepSeek-V4 still leak **(open task)** |
-| 8.9 | Feed the parser hostile text | Another model's opener inside prose keeps the real calls (ba00b9d8). Non-object `parameters` gets no 500 (a42d5222). Parse time stays linear (6.1 s at 8,000 keys before 05dd2367) |
+| 8.8 | Parse the model's own tool envelope | Calls arrive as `tool_calls`, streamed and not, single and parallel, and with `parallel_tool_calls: false` (LFM2 leaked there, 4b395750. Gemma 4 and DeepSeek-V4 leaked there, 9d420f42) |
+| 8.9 | Feed the parser hostile text | Another model's opener inside prose keeps the real calls (ba00b9d8) and the streamed text after it (1200f819, `tests/test_tool_call_mentions.py`). Non-object `parameters` gets no 500 (a42d5222). Parse time stays linear (6.1 s at 8,000 keys before 05dd2367) |
 | 8.10 | Repair only what then parses strictly | A call cut by the end token, or missing `<arg_key>`, is closed only if the result parses whole (d45e5cb4) |
 | 8.11 | Decode typed arguments by schema | Python-spelled `False` becomes a boolean. Upstream `lockDoors(unlock="False")` unlocked the doors |
 | 8.12 | Write a streamed leak test | With tools and thinking on, `content` holds no markup and the reply ends on an EOS from 2.7 **(gap)** |
@@ -251,7 +251,7 @@ by one stream at the window you want.
 | KV a token | 8 KiB | about 18 KiB | 8 KiB (9 with MTP) | 20 KiB |
 | At 262,144 tokens | 2 GiB | about 4.5 GiB | 2 GiB | 5 GiB |
 | Recurrent state | about 160 MiB | DeltaNet, same order | Mamba, not measured | not measured |
-| Weights | 23.2 GiB | 52 to 78 GiB by checkpoint | 74.2 GiB | 24.75 GB |
+| Weights | 23.2 GiB | 52 to 78 GiB by checkpoint | 74.2 GiB with the image tower (load log, 18 Oct) | 24.75 GB |
 
 A small state can hold dozens of long streams only if the engine serves them. On 17 Oct Bolt, GLM and LFM2.5 served one
 stream, so their aggregate decode stayed flat at 20, 26-30 and 42 tok/s while Qwen and Super VL scaled to 143-181 at 8
@@ -376,7 +376,7 @@ every cross ratio is below 1 and the mean below 0.98. Its stage ladder for a new
 | Buffer sizing | Upstream "!!!!" past 2,051 tokens, empty replies past 12k from an unwritten `offsets[e+1]` | Long prompts |
 | Kernel state | 688bc309 cached a per-kernel shared-memory ceiling per size | Full GPU test files |
 | Templates and thinking | Guard window overflowed Clef's 16,384 (4762edaa). Sessions never closed (cd0653f7). GLM had no budget (2c1c9a49). Upstream: Jinja `capitalize` missing, "No user query found", `medium` rendered Max | Live runs, client sessions |
-| Tool calls | `<arg_key>` lost or call cut by the end token (d45e5cb4). Quadratic parse (05dd2367). LFM2 markup leak (4b395750). Opener in prose stole calls (ba00b9d8). Upstream: unoffered tool gave empty replies and agent loops | Clients, review |
+| Tool calls | `<arg_key>` lost or call cut by the end token (d45e5cb4). Quadratic parse (05dd2367). LFM2, Gemma 4 and DSML markup leaks (4b395750, 9d420f42). Opener in prose stole calls (ba00b9d8) and hid the rest of the stream (1200f819). Upstream: unoffered tool gave empty replies and agent loops | Clients, review |
 | Stops | GLM's four decode loops ignored stop (c40e7e7d). A gate failing on the first token ran an extra round (ee825918) | Client sessions |
 | Prompt reuse | Copy drafts never fired (e773dbdb). Lone graph slot dropped graphs 25 of 25 (cc097995). Oldest-first eviction lost conversations (ba0db4b2). Branch point evicted (844e2dd6). In-chunk cuts lost the DFlash2 window (3bde5bbe) | Served probes, review |
 | Disk states | `length` finish never persisted (b3801bd1). Fingerprint gaps (27b8c2a2). Read failure leaked a slot (bc0a381c). A 64 GiB folder a build never deleted (bd1c8276) | GPU tests, review |
@@ -408,10 +408,10 @@ RoPE or YaRN check against HF at 32k or 128k either **(gap)**.
 | Model | TrueScore 76x2 | Planning x4 (Q) | Decode, 1 stream | Prefill 8k | Weights | Decision |
 |---|---:|---:|---:|---:|---:|---|
 | Qwen3.8 Flash Next EXL3 3.05 bpw | 87.8 | 89.0 (92) | 55-58 | 877 | 54.8 GiB | Production default, with Clef and vision |
-| Qwen3.8 Flash Next FP4-Local | 91.0 | 89.8 (94) | 43-44 | 1,857 | 77.6 GiB | Swap target. Tie-breaker against EXL3 pending (+2.3 [-1.1, +6.4]) |
+| Qwen3.8 Flash Next FP4-Local | 91.0 | 89.8 (94) | 43-44 | 1,857 | 77.6 GiB | Swap target. EXL3 stays the default after the 18 Oct tie-breaker: FP4-Local - EXL3 +2.3 [-0.9, +6.4], pooled 76x4 |
 | GLM-5.3 Flash local hybrid | 93.0 | 60.5 (58), 99.0 on 13 with thinking on | 29-30 | 414 | 101.1 GiB | Swap target. Planning to re-rank with thinking on |
 | Nemotron 3.5 Bolt | 92.0 | 38.3 (27) | 22-24 | 2,139 | 23.2 GiB | Swap target. Graphs pending, dropped braces to check |
-| Nemotron 3.5 Super VL NVFP4 (native 1.0.12) | 94.1 | 62.6 (59) | 32-33 | 1,844 | 74.2 GiB | Candidate. Needs a native target in `run.sh` |
+| Nemotron 3.5 Super VL NVFP4 (native 1.0.12) | 94.1 | 62.6 (59) | 32-33 | 1,844 | 74.2 GiB | Swap target, `run.sh nemotron-3.5-super` (c55dc1ff) |
 | LFM2.5-24B-A2B FP8 (always thinks) | 91.7 | 58.6 (62) | 47-53 | 699 | 24.75 GB | Swap target. Prompt kernel 2.2-5.6x faster on `perf/lfm2-prompts` |
 | GLM-5.3 Flash, Z.ai API | 91.1 | 72.5 (77) | n/a | n/a | n/a | Reference only. Thinking-off switch did not hold |
 | Muse Spark Open | n/a | n/a | n/a | n/a | 175.6 GB smallest | Rejected: does not fit, AA 39 |

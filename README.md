@@ -169,7 +169,9 @@ servers with these flags. `./run.sh glm-5.3-flash` serves GLM with `--thinking-b
   changes a small part of it.
 - **[MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)**
   is the recipe the Qwen3.8 Flash Next setup follows. Its patch 0007 showed that copy drafts pay at 6 drafts a round,
-  which led to the copy-draft fix here.
+  which led to the copy-draft fix here. The fork ports code from four of its patches under the MIT licence: 0002's
+  indexer scores kernel, 0005's tiled-select threshold, 0008's vision rotary and image features, and 0014's prompt
+  expert tile. `THIRD_PARTY_NOTICES.md` links each one.
 - **[sxuff/glm53-flash-single-gb10](https://github.com/sxuff/glm53-flash-single-gb10)** supplied the four patches
   that run GLM-5.3 Flash on a single GB10. The fork ports them from v0.6.5 onto `python-0.6`.
 - **[Cloudflare/clef](https://huggingface.co/Cloudflare/clef)** and Clef-Flash are the decision models behind the

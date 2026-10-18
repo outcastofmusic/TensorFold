@@ -5,7 +5,8 @@
 // and 16 pairs at a time, reading weights and inputs from global memory. nvfp4_expert_tile_kernel (prompt chunks of
 // 1,024+ rows, 64-pair items) shares an item's input rows among a CTA's four warps through shared memory and serves up
 // to four 16-row tiles from each decoded weight fragment. The tile kernel is ported from MiaAI-Lab's Qwen3.8 Flash Next
-// recipe, patch 0014 (fn_experts_tile.cu, MIT licence), itself built on the TensorFold contributors' kernels.
+// recipe, patch 0014 (fn_experts_tile.cu, MIT licence, Copyright (c) 2026 MiaAI-Lab), itself built on the TensorFold
+// contributors' kernels.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>

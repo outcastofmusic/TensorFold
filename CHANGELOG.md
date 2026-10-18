@@ -5,6 +5,19 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **Qwen3.8 Flash Next FP4-Local decodes 1.059x faster with the same replies.** Decode rows of the shared expert ran
+  the prompt GEMM on 128x128 blocks, 3.9 ms a serial token. They now take a 16x64 tile with six stages, whose bits
+  equal the other tiles'. On 18 Oct 2026 at `--parallel 4 --kv-dtype int8`, decode ran 1.042-1.071x faster on code
+  and 1.048-1.074x on chat, and greedy replies stayed byte-equal. `TF_FP4_SHARED_DECODE=qmmf` takes the lane matmul
+  instead (1.064x, replies change), and any other value than `prompt` or `qmmf` fails the load.
+- **Under `--parallel`, Qwen3.8 Flash Next sends a prompt's first token before its first drafts.** The copy index
+  and up to six MTP draft steps ran first. Median time to first token at `--parallel 5` went from 2.32 to 2.09 s at
+  4k, 19.01 to 18.09 s at 32k and 82.47 to 82.53 s at 131k on 18 Oct 2026, with the same tokens.
+  `TF_FLASH_FIRST_EARLY=0` restores the old order. The done line's prefill now includes the prompt's last pass.
+- **GLM-5.3 Flash runs 40% fewer device operations a decode window.** Packed projections read and write rows in
+  place, and decode skips group sums no kernel reads: 2,712 operations fell to 1,613 a one-row window. Decode ran
+  0.6-1.2% faster in 4 of 4 cells on 18 Oct 2026, and served replies stayed identical. `TF_GLM_PACKED_COPIES=1`
+  restores the copies.
 - **Qwen3.8 Flash Next prompt chunks score sparse-attention blocks in a row-tiled CUDA kernel.** The Triton indexer
   read every pooled block key once per row, so its cost grew 1.6 ms a 2,048-row chunk per 1k tokens of context: 50 ms
   at 30k and an estimated 215 ms at 131k. `qsa_scores.cu` stages 64 blocks' keys and 32 rows' queries in shared
@@ -28,6 +41,25 @@ GitHub has the full notes and the measurements behind them.
   TrueScore 94.1 and planning 62.6 with thinking off, was ready in 44 s and left 40 GiB available (2026-10-18).
   `prepare.sh` fetches the checkpoint and the sha256-pinned release archive. `swap.py` takes a 404 from
   `/internal/persist` as a model without disk states. The default stays Qwen3.8 Flash Next's EXL3 pack.
+- **A direct `run.sh <target>` under the swap endpoint no longer stalls the swap.** It held `run.lock` for the whole
+  swap, while the swap's own `run.sh`, the process that loads the model, waited on that lock for up to 4,620 s and
+  requests queued. Only the process that loads a model now takes the lock.
+- **A reply that names another model's tool-call opener keeps its text and its calls.** Streamed text hid every
+  family's opener, so a Qwen reply that wrote `<|tool_call>`, `<｜DSML｜tool_calls>` or `<|tool_call_start|>` in prose
+  lost all text after it. The stream now hides the serving template's own opener, and Gemma 4's and DeepSeek-V4's
+  only when their call payload follows. A Qwen or GLM reply that named `<|tool_call_start|>` also lost its real
+  `<tool_call>` calls on the CUDA server.
+- **`parallel_tool_calls: false` hides LFM2's, Gemma 4's and DeepSeek-V4's call markup.** The filter knew only
+  XML-like envelopes, so these families streamed their calls as content after the first one.
+- **A tool whose `parameters` is not an object no longer fails an LFM2 request.** The Pythonic parser raised after
+  generation and the client got a 500. Keyword calls to such a tool now parse.
+- **The CLI warns at startup on each `generation_config.json` sampling key it drops.** It reads `temperature`,
+  `top_k`, `top_p`, `min_p` and `do_sample`. LFM2.5-24B-A2B sets `repetition_penalty` 1.05, which no sampler applies.
+  Sampling is unchanged.
+- **Non-streamed replies on kept connections no longer wait 40 ms.** Every app now sets TCP_NODELAY, which only the
+  d1 app set before, so a reply's body no longer waits out the client's delayed ACK.
+- **`TENSORFOLD_REQUEST_LOG` is 0600 even when the file already exists.** A log an older build created stayed 0644,
+  so other users could read the prompts in it. A log the server cannot chmod is still written, with one warning.
 - **d1-3B decision sidecar.** Liquid's d1-3B answers `/v1/systemone` and `/v1/decisions` (yes/no, choice, score) in 25.9 ms a question on the GB10; `D1=1` starts it beside every model but GLM on :30003.
 - **Qwen writes only the kept states a restart resumes from.** Each slot's shortest state (its system block's end)
   and its longest go to disk, and the states between them stay in memory only. Each state skipped saves its 115.7 MB
