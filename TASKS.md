@@ -11,7 +11,7 @@ Standing rule (18 Oct): keep every code change that gives a clear, measured win 
 
 | Task | State |
 |---|---|
-| Qwen variants: close the prefill gap to Mia | Merged: expert tile (`edebf0f6`, prefill 1.11-1.13x, same bytes) and first token before drafting (`9e6635b7`, ttft 4k 2.32 to 2.09 s, 32k 19.01 to 18.09 s, same token ids; the done line's prefill now counts the last pass). Same-session --parallel 5 against --parallel 1: equal at 4k and 32k, 6% slower at 131k (82.5 against 77.9 s); the earlier 13-18% at 32k was session noise. Remaining gap to Mia's 18 Oct numbers: 1.08x at 4k, 1.19x at 32k, 1.24x at 131k. Next: nsys on one Qwen prefill chunk and one decode step, and the launch-gap microbench (`tf-runs/megakernel/REPORT.md` idea 1) |
+| Qwen variants: close the prefill gap to Mia | nsys side by side (18 Oct, `tf-runs/profile-mia/`): steady 2,048-row chunk 1,059 ms ours against 948 Mia at 32k (+11.7%), all GPU kernel time in the hyper-connection path; host idle 0.2%. In progress (`perf/fp4-hc-fusions`): HC down split-K fused (+71 ms a chunk), HC up+mix fused (+33 ms), HC write-back+norm gate extended to bf16 HC (+13 ms), all bit-identical, from Mia patch 0008: expected 32k 1,891 to about 2,125 tok/s. Next: gate/up expert tile 5,369 against Mia's 4,690 us with identical code (+33 ms, cause unknown: plan order, X layout or flags); shared expert on a second stream (about 22 ms). Both bit-identical. We lead on the MXFP8 prompt kernel (-32 ms) and copies (-32 ms) |
 
 ## To do
 
