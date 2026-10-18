@@ -77,6 +77,12 @@ Requests run one at a time. A request reads its state once however many question
 not fit one forward's token budget (`TENSORFOLD_LFM2_TOKEN_BUDGET`, at most the context) continue in a second forward
 over the same state.
 
+`TF_D1_HEAD` picks how a request reads its option logits after the forward, while the choice is measured
+(docs/reviews/2026-10-18.md). `union`, the default, multiplies every question's row by the head rows of all their
+options at once. `per_question` multiplies each question's row by its own options' rows and reads all results back
+once, which gives `per_question_sync`'s bits. `per_question_sync`, the code before b585b8fb, reads each question back
+on its own.
+
 ## Memory beside the big models
 
 d1 starts after the model answers, so a model's startup admission never counts it. It admits itself against what the

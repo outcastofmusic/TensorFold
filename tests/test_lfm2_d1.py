@@ -203,9 +203,10 @@ def test_engine_answers_three_questions_in_one_forward(engine):
     assert out["usage"] == {"input_tokens": read, "output_tokens": 0}
 
 
-def test_a_request_s_questions_read_the_head_once(engine, monkeypatch):
-    """Every question's options from one head matmul over the union of their tokens."""
+def test_a_request_s_questions_read_the_head_once(tiny, monkeypatch):
+    """Every question's options from one head matmul over the union of their tokens (TF_D1_HEAD=union)."""
 
+    engine = _head_engine(tiny, monkeypatch, "union")
     calls: list[tuple[int, int]] = []
     own = engine.model.logits
 
@@ -231,6 +232,51 @@ def test_a_question_reads_the_same_alone_and_beside_others(engine, tiny):
     apart = split.decide(STATE, {"refund": NOUL, "team": TEAM, "urgency": URGENCY})["answers"]
     assert apart["team"]["choice"] == together["team"]["choice"]
     assert abs(apart["refund"]["noul"] - together["refund"]["noul"]) < 2e-2
+
+
+def _head_engine(tiny, monkeypatch, head):
+    monkeypatch.setenv("TF_D1_HEAD", head)
+    return Engine(tiny, device="cpu")
+
+
+def test_head_choice_defaults_to_union_and_refuses_unknown_values(tiny, monkeypatch):
+    monkeypatch.delenv("TF_D1_HEAD", raising=False)
+    assert Engine(tiny, device="cpu").head == "union"
+    with pytest.raises(ValueError, match="TF_D1_HEAD='fused': one of union, per_question, per_question_sync"):
+        _head_engine(tiny, monkeypatch, "fused")
+
+
+@pytest.mark.parametrize("head,reads", [("union", 1), ("per_question", 1), ("per_question_sync", 3)])
+def test_each_head_choice_reads_back_as_named(tiny, monkeypatch, head, reads):
+    engine = _head_engine(tiny, monkeypatch, head)
+    f = engine.fmt
+    groups = [f.readout(question(q)) for q in (NOUL, TEAM, URGENCY)]
+    hidden = engine._rows(f.encode(f.prefix(STATE)), [f.encode(f.suffix(question(q))) for q in (NOUL, TEAM, URGENCY)])
+    calls = []
+    own = torch.Tensor.tolist
+
+    def counted(self):
+        calls.append(tuple(self.shape))
+        return own(self)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", counted)
+    scores = engine._scores(hidden, groups)
+    assert len(calls) == reads and [len(s) for s in scores] == [len(g) for g in groups]
+
+
+def test_per_question_gives_per_question_sync_s_bits(tiny, monkeypatch):
+    f = Format(lfm2_tiny.tokenizer())
+    questions = [NOUL, TEAM, URGENCY, {"type": "choice", "instructions": "Which colour?",
+                                       "criteria": {"red": None, "green": None, "blue": None, "grey": None}}]
+    groups = [f.readout(question(q)) for q in questions]
+    got = {}
+    for head in ("union", "per_question", "per_question_sync"):
+        engine = _head_engine(tiny, monkeypatch, head)
+        hidden = engine._rows(f.encode(f.prefix(STATE)), [f.encode(f.suffix(question(q))) for q in questions])
+        got[head] = engine._scores(hidden, groups)
+    assert got["per_question"] == got["per_question_sync"]          # float equality, every logit
+    for a, b in zip(got["union"], got["per_question_sync"]):
+        assert all(math.isclose(x, y, abs_tol=5e-2) for x, y in zip(a, b))
 
 
 def test_engine_answers_match_transformers_on_the_full_prompt(engine, tiny):
