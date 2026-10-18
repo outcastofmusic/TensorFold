@@ -94,7 +94,8 @@ lfm2() {
 }
 
 # The archive has no libturbojpeg, so the server refuses JPEG images until lib/ holds libjpeg-turbo 3.1.4.1's
-# libturbojpeg.so.0; PNG and WebP serve without it
+# libturbojpeg.so.0. PNG serves without it, and WebP does not serve: 1.0.12 refuses it by name, and 1.1.0 needs
+# libwebp 1.6.0's libwebpdecoder, which the archive does not ship
 super() {
     fetch "${SUPER[@]}"
     local v=${NATIVE[0]} dir
