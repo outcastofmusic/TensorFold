@@ -5,6 +5,10 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **GLM-5.3 on CUDA reads a `swiglu_limit` of 0 or null as no clamp.** The reference skips the clamp at 0, but the
+  CUDA config passed 0 to kernels that clamp every gate and up to it, so each MLP's output was 0, and a null failed
+  the load. Both now reach the kernels as inf, which keeps every value that is not NaN. A positive limit reaches
+  them unchanged, and both served checkpoints set 10.0, so served replies keep their bits.
 - **A reply full of unclosed tool-call openers parses in milliseconds.** The lazy envelope regexes searched the rest
   of the reply again from every opener without a closer, holding the GIL: 2,000 unclosed openers in 1 MB took 7.5-10 s
   in each of the four formats (`<tool_call>`, `<NAME:tool_call>`, Gemma's `<|tool_call>` and DSML). A forward scan
