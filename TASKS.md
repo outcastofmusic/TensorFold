@@ -9,7 +9,7 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 
 | Task | State |
 |---|---|
-| Qwen variants: Mia's Zig recipe on FP4-Local | Analysis done (`tf-runs/mia-qwen/ANALYSIS.md`): port patch 0014's shared-memory expert tile (`fn_experts_tile.cu`, same bits as our `nvfp4_expert_kernel`, +13-15% prefill on Zig), then 4,096-row prompt chunks for NVFP4 and n-gram read-ahead. Skip fp8 KV (under 3% capacity), fair fill and the repeat cache (we have both). Our FP4-Local prefill 1,857 tok/s at 8k against Mia's 2,583 (different tools, 1.4x). Next: A/B both engines with one tool on :31005, nsys on our 16k prefill, then port the tile |
+| Qwen variants: Mia's Zig recipe on FP4-Local | A/B on one tool (18 Oct, `tf-runs/mia-qwen/RESULTS.md`, both --parallel 5): decode equal within 3% (code greedy 68.0 against 67.9 tok/s, 277 against 279 at 5 streams); cold prefill Mia 2,125 / 2,158 / 1,965 tok/s at 4k / 32k / 131k against ours 1,303 / 1,461 / 1,433. Expert tile ported and merged (`edebf0f6`): bytes equal, prefill 1.11-1.13x. At --parallel 1 our first token arrives at the end of prefill; at --parallel 5 it arrives 0.6-1.8 s later and 32k prefill is about 10% slower: cause under investigation (`perf/qwen-first-token`). Tie-breaker TrueScore running (`tf-runs/tiebreak.sh`) |
 
 ## To do
 
@@ -17,7 +17,6 @@ Order (18 Oct): the pipeline code changes above, then the Qwen3.8 variants (Mia'
 
 | Task | Notes |
 |---|---|
-| Qwen FP4-Local vs EXL3 tie-breaker | Two more TrueScore repeats each (76x2 more, about 1.5 h each) to halve the CI on today's +2.3 [-1.1, +6.4]. Lead holds clear of zero: FP4-Local for planning and hard reasoning; near zero: EXL3 stays the default |
 | Bolt's dropped closing braces | 35 of 160 Bolt planning replies end `...}]` + fence without the object's `}` and score 0 (other models 0 of 160). Replay with `return_token_ids` to tell the model from the detokenizer |
 | Tool-call markup with parallel_tool_calls false | Gemma 4's `<|tool_call>` and DeepSeek-V4's DSML envelopes still stream as content; `server/tool_policy.py`'s `_FIXED` table can take them |
 | Next review: shared prompt-state store | LFM2.5's reuse imports Bolt's `Store`/`keep_points` from `nemotron_bolt/cuda/reuse.py`; move them to a shared module (e.g. `tensorfold/cuda/kept_states.py`) once both branches are merged |
