@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from tensorfold.server.messages import _normalize_tool_call_arguments, late_system_role, normalize_messages
@@ -13,6 +14,15 @@ CHANNEL_MARKERS = ("<|channel>thought", "<channel|>")
 # (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, LFM2's Pythonic list
 _CALLS = (("<tool_call>", "</tool_call>"), ("<|tool_call>", "<tool_call|>"),
           ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"), ("<|tool_call_start|>", "<|tool_call_end|>"))
+_CLOSERS = dict(_CALLS)
+# How each family's call payload starts after its opener and any whitespace, for openers another family's prose may
+# name (as tool_policy's ``_FIXED``): Gemma 4's ``call:NAME{..}`` (the 26B writes a bare ``:NAME{..}``) and DSML's
+# invokes. Qwen's and GLM's ``<tool_call>`` and LFM2's list can start with a bare name, which no lead tells from prose.
+_LEADS = {"<|tool_call>": ("call:", ":"), "<｜DSML｜tool_calls>": ("<｜DSML｜invoke",)}
+_SPACE = re.compile(r"\s*")
+# a conversation whose assistant turn calls ``tfprobe_fn``: a template renders it in its own call markup
+CALL_PROBE = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "", "tool_calls": [
+    {"id": "call_0", "type": "function", "function": {"name": "tfprobe_fn", "arguments": {}}}]}]
 
 
 def _partial_tag(text: str, tag: str) -> int:
@@ -76,25 +86,57 @@ def think_markers(tokenizer: Any) -> tuple[str, str]:
     return CHANNEL_MARKERS if isinstance(close, int) and close >= 0 and close != unk else THINK_MARKERS
 
 
-def hide_tool_calls(text: str, *, finished: bool) -> str:
-    """Hide tool-call blocks and partial opening tags while streaming so visible text only grows and calls arrive as deltas."""
+def hide_tool_calls(text: str, *, finished: bool, opener: str | None = None) -> str:
+    """Hide tool-call blocks and partial opening tags while streaming so visible text only grows and calls arrive as deltas.
+
+    ``opener`` is the serving template's own call opener (``call_opener``), None when unknown. Its blocks hide as
+    soon as they open. Another family's opener in the reply is usually prose that names it, so it hides only once
+    its payload starts as that family writes it (``_LEADS``). An opener without leads (``<tool_call>``, LFM2's)
+    cannot be told from prose and hides only while the serving family is unknown. A finished reply that ends in
+    another family's opener ends in prose, unless the family is unknown."""
 
     out: list[str] = []
     pos = 0
+    at = {o: text.find(o) for o, _ in _CALLS}           # each opener's next place; a find only ever moves forward
     while True:
-        found = [(text.find(opener, pos), opener, closer) for opener, closer in _CALLS]
-        found = [f for f in found if f[0] >= 0]
+        for o, where in at.items():
+            if 0 <= where < pos:
+                at[o] = text.find(o, pos)
+        found = [(where, o) for o, where in at.items() if where >= 0]
         if not found:
             tail = text[pos:]
-            held = 0 if finished else max(_partial_tag(tail, opener) for opener, _ in _CALLS)
+            held = 0 if finished else max(_partial_tag(tail, o) for o, _ in _CALLS)
             out.append(tail[: len(tail) - held])
             return "".join(out)
-        start, opener, closer = min(found)
+        start, found_opener = min(found)
+        after = start + len(found_opener)
+        leads = _LEADS.get(found_opener, ())
+        if found_opener != opener and (leads or opener is not None):
+            body = _SPACE.match(text, after).end()
+            payload = text[body:body + max((len(lead) for lead in leads), default=0)]
+            if not leads or not payload.startswith(leads):
+                if (not finished or opener is None) and body + len(payload) == len(text) and any(
+                        lead.startswith(payload) for lead in leads):
+                    # whitespace or a partial lead: wait for more, or (family unknown) a call the reply ended in
+                    out.append(text[pos:start])
+                    return "".join(out)
+                out.append(text[pos:after])                             # prose that names the opener
+                pos = after
+                continue
         out.append(text[pos:start])
-        end = text.find(closer, start + len(opener))
+        end = text.find(_CLOSERS[found_opener], after)
         if end < 0:
             return "".join(out)
-        pos = end + len(closer)
+        pos = end + len(_CLOSERS[found_opener])
+
+
+def call_opener(rendered: str) -> str | None:
+    """The opener of a template's calls, from ``CALL_PROBE`` rendered by it; None when it renders no known opener."""
+
+    from tensorfold.engine.call_gate import call_format
+
+    form = call_format(rendered, CALL_PROBE[1]["tool_calls"][0]["function"]["name"], [o for o, _ in _CALLS])
+    return form[0] if form else None
 
 
 def render_prompt_ids(

@@ -375,6 +375,7 @@ class ChatApp(RequestOptions, PromptBlocks, DecisionRequests):
         from tensorfold.engine.tool_draft import ToolCallStreamer
 
         calls_stream = ToolCallStreamer(tools) if (tools and on_delta is not None) else None
+        own_opener = self._call_opener() if calls_stream is not None else None
         visible_text = IncrementalText(self.tokenizer, self.tokenizer_lock)
         replay: list[int] = []        # tokens a preempted job already delivered, owed again by its rerun
         preemptions = 0
@@ -427,7 +428,7 @@ class ChatApp(RequestOptions, PromptBlocks, DecisionRequests):
                 if piece:
                     streamed_reasoning = reasoning_so_far
                     on_delta({"reasoning_content": piece})
-            shown = hide_tool_calls(answer, finished=False) if calls_stream is not None else answer
+            shown = hide_tool_calls(answer, finished=False, opener=own_opener) if calls_stream is not None else answer
             visible = streaming_visible_text(shown)
             delta = visible[len(streamed):]
             if delta:
@@ -448,7 +449,8 @@ class ChatApp(RequestOptions, PromptBlocks, DecisionRequests):
             reasoning = reasoning_text.strip() or None
         else:
             content, reasoning = parse_harmony_output(text)
-        stops.flush(on_delta, content, reasoning, streamed, streamed_reasoning, calls_stream is not None)
+        stops.flush(on_delta, content, reasoning, streamed, streamed_reasoning, calls_stream is not None,
+                    opener=own_opener)
         stream = job.stream
         seconds = max(0.0, job.finished_at - job.submitted_at)
         decode_seconds = max(0.0, job.finished_at - job.prefilled_at) if job.prefilled_at else 0.0
