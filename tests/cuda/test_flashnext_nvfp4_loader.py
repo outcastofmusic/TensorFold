@@ -356,8 +356,8 @@ def test_graph_replay_follows_each_steps_experts(tmp_path: Path, monkeypatch) ->
     picks: list[tuple] = []
     real = nvfp4_moe.moe
 
-    def recording(x, xs, router_rows, ex, buf, cfg):
-        out = real(x, xs, router_rows, ex, buf, cfg)
+    def recording(x, xs, router_rows, ex, buf, cfg, **kw):
+        out = real(x, xs, router_rows, ex, buf, cfg, **kw)
         top = buf.logits[:x.shape[0], :ex.routed].float().topk(2, dim=-1).indices.sort(dim=-1).values
         picks.extend(tuple(r) for r in top.tolist())
         return out
