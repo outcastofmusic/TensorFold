@@ -135,3 +135,12 @@ in `src/tensorfold/families/qwen4_exp/cuda/qsa.py` are ported from MiaAI-Lab's
 [engine patch 0005](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/656879fd752749bbd11a6e1a065a326c00940911/patches/0005-engine.patch)
 (`qsa_tiles_from`), MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in
 `LICENSES/MiaAI-Lab-MIT.txt`. Both build on the TensorFold contributors' `attention._scores` and `_select_tiles`.
+
+## Flash Next bf16 hyper-connection prompt kernels
+
+The kernels `_b16mm_ks` in `src/tensorfold/families/qwen4_exp/cuda/bf16.py` and `_hc_up_mix` in
+`src/tensorfold/families/qwen4_exp/cuda/hc_b16.py` are ported from MiaAI-Lab's
+[kernel spec tools patch 0008](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/656879fd752749bbd11a6e1a065a326c00940911/patches/0008-kernel-spec-tools.patch)
+(`prompt_mm.py`), MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in
+`LICENSES/MiaAI-Lab-MIT.txt`. Both build on the TensorFold contributors' `bf16._b16mm`, `bf16._reduce` and
+`glue._hc_mix`.

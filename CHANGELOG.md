@@ -5,6 +5,17 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **Qwen3.8 Flash Next FP4-Local prompt chunks run the bf16 hyper-connections in fewer kernels, with the same
+  bytes.** In a 32,768-token prefill on 18 Oct 2026, the 98 HC read-outs of a 2,048-row chunk took 102 ms for the
+  down projection and its split-K reduce, 72 ms for the up projection and the stream mix, and 105 ms for the
+  write-back and the norm. Chunks of more than 16 rows now sum the down projection's 32 K slices inside each program
+  (no fp32 partials and no reduce launch from 129 rows), run the up projection and the mix as one kernel, and take the
+  checked write-back + norm kernel that the 4-bit HC already used. Each kernel makes the old kernels' roundings and
+  adds in the same order. MiaAI-Lab's engine ran the same three steps in 31, 39 and 89 ms in that profile.
+  `TF_FLASHNEXT_HC_FUSE=1` (default) takes them, `0` restores the separate kernels, and any other value stops the
+  start. Decode windows and the final read-out keep the separate kernels. The down-projection and up-mix kernels are
+  ported from MiaAI-Lab's Qwen3.8 Flash Next recipe, patch 0008 (MIT licence), which builds on the TensorFold
+  contributors' `bf16._b16mm` and `glue._hc_mix`.
 - **GLM-5.3 on CUDA reads a `swiglu_limit` of 0 or null as no clamp.** The reference skips the clamp at 0, but the
   CUDA config passed 0 to kernels that clamp every gate and up to it, so each MLP's output was 0, and a null failed
   the load. Both now reach the kernels as inf, which keeps every value that is not NaN. A positive limit reaches
