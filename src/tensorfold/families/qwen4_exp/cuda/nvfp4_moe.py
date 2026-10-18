@@ -2,13 +2,35 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 
 import torch
 
 from tensorfold.cuda.nvfp4 import experts as nvx
 
 from . import nvfp4
+
+TILE_ENV = "TF_FLASHNEXT_PROMPT_EXPERT_TILE"
+TILE_MODES = {"0": 0, "1": 1, "2": 2}     # off; gate/up only; gate/up and down
+
+
+def tile_mode() -> int:
+    """TF_FLASHNEXT_PROMPT_EXPERT_TILE: which faces of prompt chunks run the shared-memory tile (unset: 2, both)."""
+
+    value = os.environ.get(TILE_ENV, "").strip()
+    if not value:
+        return 2
+    if value not in TILE_MODES:
+        raise ValueError(f"{TILE_ENV}: 0 (off), 1 (gate/up) or 2 (gate/up and down), not {value!r}")
+    return TILE_MODES[value]
+
+
+def tile_faces(mode: int, rows: int, prompt: bool) -> tuple[bool, bool]:
+    """(gate/up, down) on the tile kernel: prompt buffers of at least ``nvx.TILE_ROWS`` rows, as ``mode`` allows."""
+
+    on = prompt and rows >= nvx.TILE_ROWS
+    return on and mode >= 1, on and mode == 2
 
 
 @dataclass
@@ -26,6 +48,7 @@ class MoE4:
     routed_experts: nvx.Experts4
     shared: Expert4
     kernel: str = "nvfp4"
+    prompt_tile: int = field(default_factory=tile_mode)    # read once, when the layer loads
 
     capturable = True     # the plan stays on the device
 
@@ -102,14 +125,19 @@ def moe4_from_experts(gate: list, up: list, down: list, shared: tuple) -> MoE4:
 def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, buf, cfg) -> None:
     """Route rows x [R, D] and run their experts into buf (the shared ``moe`` contract); ``xs`` unused: no biases."""
 
+    from tensorfold.cuda import experts as grouped
     from tensorfold.cuda import moe as moe_mod
 
     rows, top_k = x.shape[0], int(cfg.num_experts_per_tok)
-    moe_mod.router(x, router_rows, buf.logits[:rows])
-    moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, nvx.PREFILL_TILE)
     prompt = buf.y.dtype != torch.float32                  # a prompt's buffers keep bf16 slots
-    nvx.gate_up(x, ex.routed_experts, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed)
+    gu_tile, dn_tile = tile_faces(ex.prompt_tile, rows, prompt)
+    moe_mod.router(x, router_rows, buf.logits[:rows])
+    moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, nvx.TILE_ITEM if gu_tile else nvx.PREFILL_TILE)
+    nvx.gate_up(x, ex.routed_experts, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed, tile=gu_tile)
     buf.act[:rows, top_k] = ex.shared_act(x, prompt)
-    nvx.down(buf.act.view(-1, ex.width), ex.routed_experts, buf.plan, buf.y.view(-1, ex.dims), rows, skip=ex.routed)
+    if dn_tile != gu_tile:                                 # mode 1: down regroups in its own kernel's items
+        grouped.route(buf.pick[:rows], buf.plan, nvx.TILE_ITEM if dn_tile else nvx.PREFILL_TILE)
+    nvx.down(buf.act.view(-1, ex.width), ex.routed_experts, buf.plan, buf.y.view(-1, ex.dims), rows, skip=ex.routed,
+             tile=dn_tile)
     buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], prompt, not prompt)
     return buf

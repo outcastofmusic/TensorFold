@@ -5,6 +5,13 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **Qwen3.8 Flash Next FP4-Local prompt chunks of 1,024+ rows run the routed experts in a shared-memory tile.** A
+  CTA's four warps share an item's input rows through shared memory, and each decoded weight fragment serves up to
+  four 16-row tiles on 64-pair items. The output bits equal the 16-pair kernel's, which decode and shorter chunks
+  keep. `TF_FLASHNEXT_PROMPT_EXPERT_TILE=2` (default) takes it for gate/up and down, `1` for gate/up only, `0` turns
+  it off, and any other value fails at load. MiaAI-Lab measured +13-15% cold prefill from this kernel in their Zig
+  engine. The kernel is ported from MiaAI-Lab's Qwen3.8 Flash Next recipe, patch 0014 (MIT licence), which builds on
+  the TensorFold contributors' expert kernels.
 - **`run.sh` and the swap endpoint serve three more models.** `qwen3.8-flash-next-fp4` loads NVIDIA's Qwen3.8 Flash Next
   FP4-Local and `nemotron-3.5-bolt` loads Nemotron 3.5 Bolt with LiLiCorr drafts; `prepare.sh` fetches both at pinned
   revisions. The default stays Qwen3.8 Flash Next's EXL3 pack. `lfm2.5-24b-a2b` loads Liquid's LFM2.5-24B-A2B in block FP8.
