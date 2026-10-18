@@ -122,8 +122,9 @@ class AbsoluteGrowthTests(unittest.TestCase):
         ns["Alone"] = source_class("src/tensorfold/families/qwen4_exp/cuda/multi_solo.py", "Alone",
                                     {"_state_changed", "_flush"}, ns)
         cls = source_class("src/tensorfold/families/qwen4_exp/cuda/multi.py", "MultiDecoder",
-                           {"_grow", "_is_solo", "_busy", "_evict_kept", "_drop_kept", "_make_room", "_slot_for",
-                            "_remember", "_on_disk", "admit", "live", "finish"}, ns)
+                           {"_grow", "_is_solo", "_busy", "_evict_kept", "_drop_kept", "_give_back", "_make_room",
+                            "_slot_for", "_remember", "_on_disk", "admit", "live", "finish"}, ns)
+        self.ns = ns
         self.dec = cls()
         self.dec.capacity, self.dec.depth = 81920, 0
         self.dec.free, self.dec.kept, self.dec.streams, self.dec.filling = [first, second], [], {}, []
@@ -225,6 +226,19 @@ class AbsoluteGrowthTests(unittest.TestCase):
         self.assertEqual(self.dec.kept[0][0], prefix)
         self.assertFalse(self.dec.filling)
         self.assertEqual(self.dec.memory_gate.held, 0)
+
+    def test_a_prompt_that_fails_to_begin_gives_its_slot_back(self):
+        def fail(*args, **kw):
+            raise RuntimeError("begin")
+
+        self.ns["prefill_begin"] = fail
+        initial_free = {id(st) for st in self.dec.free}
+        with self.assertRaisesRegex(RuntimeError, "begin"):
+            self.dec.admit(Stream([1] * 5000, 10))
+        self.assertEqual({id(st) for st in self.dec.free}, initial_free)
+        self.assertEqual(len(self.dec.free), len(initial_free))
+        self.assertFalse(self.dec.filling)
+        self.assertEqual(self.dec.kept, [])
 
     def test_the_gate_reserve_can_fail_when_a_truly_alone_growth_still_fits_the_cap(self):
         st = self.dec.free[0]
