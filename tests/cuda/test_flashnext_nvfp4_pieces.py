@@ -62,18 +62,26 @@ def _bits(t: torch.Tensor) -> bytes:
     return t.contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
 
 
-def _same_snap(a: dict, b: dict) -> bool:
-    return (a["pos"] == b["pos"] and a["mtp_len"] == b["mtp_len"]
-            and all(_bits(a[k]) == _bits(b[k]) for k in ("rec", "conv", "ple_tail"))
-            and (a["ple_history"] is None) == (b["ple_history"] is None)
-            and (a["ple_history"] is None or a["ple_history"].tolist() == b["ple_history"].tolist()))
+def _snap_diff(a: dict, b: dict) -> list[str]:
+    """The snapshot fields whose bytes differ, [] when none: rec and conv name their DeltaNet layers, ple_tail its
+    window rows (the last ``row`` rows came from the piece, the rest from the committed tail)."""
+
+    def rows(x: torch.Tensor, y: torch.Tensor) -> list[int]:
+        return [i for i in range(x.shape[0]) if _bits(x[i]) != _bits(y[i])]
+
+    diff = [f"{k} {a[k]} != {b[k]}" for k in ("pos", "mtp_len") if a[k] != b[k]]
+    diff += [f"{k} {rows(a[k], b[k])}" for k in ("rec", "conv", "ple_tail") if _bits(a[k]) != _bits(b[k])]
+    ha, hb = a["ple_history"], b["ple_history"]
+    if (ha is None) != (hb is None) or (ha is not None and ha.tolist() != hb.tolist()):
+        diff.append(f"ple_history {None if ha is None else ha.tolist()} != {None if hb is None else hb.tolist()}")
+    return diff
 
 
 def _assert_same_state(a: State, b: State) -> None:
     """Committed rows, recurrent states and every cache row up to the position, codes and scales alike."""
 
     assert a.pos == b.pos and a.mtp_len == b.mtp_len
-    assert _same_snap(a.snapshot(), b.snapshot())
+    assert _snap_diff(a.snapshot(), b.snapshot()) == []
     for la, lb in zip(a.kc, b.kc):
         for name in ("k", "v", "ks", "vs"):
             x, y = getattr(la, name), getattr(lb, name)
@@ -121,11 +129,11 @@ def test_a_state_kept_inside_a_piece_resumes_to_the_fresh_prefill_at_both_widths
     for rows, e in engines.items():
         prefill(e, prompt, None, keep_at=cut)
         kept[rows] = e.kept
-    assert _same_snap(kept[2048]["state"], kept[4096]["state"])
-    assert _bits(kept[2048]["tail"]) == _bits(kept[4096]["tail"])
     prefill(fresh, prompt[:cut], None)                           # what a fresh prefill of the kept rows leaves
-    assert _same_snap(kept[4096]["state"], fresh.st.snapshot())
-    assert _bits(kept[4096]["tail"]) == _bits(fresh.last_streams)
+    snap = fresh.st.snapshot()
+    # each width against the fresh prefill, so a failure says whether 2,048-row pieces alone already differ
+    assert {rows: _snap_diff(k["state"], snap) for rows, k in kept.items()} == {rows: [] for rows in WIDTHS}
+    assert all(_bits(k["tail"]) == _bits(fresh.last_streams) for k in kept.values())
     want = _bits(_last_logits(fresh, prompt))
     reference = fresh.st
     for rows, e in engines.items():
