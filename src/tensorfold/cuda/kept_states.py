@@ -1,12 +1,12 @@
-"""Kept prompt states for Nemotron 3.5 Bolt: a prompt resumes from the longest kept prefix instead of prefilling it.
+"""Kept prompt states in GPU memory, for Nemotron 3.5 Bolt and LFM2-MoE: a prompt resumes from the longest kept
+prefix instead of prefilling it.
 
-A kept state is a copy (``Engine.state``) of the Mamba ssm and conv states after its last row and of its attention
-rows, with the LiLiCorr drafter's context (``Drafter.snapshot``: its ring of tap rows, anchor and ``context_end``)
-when the prefill fed one. A Mamba state exists only after the last row a pass committed, so a prefill takes states
-as it passes their positions (``keep_points``): the message starts ``tensorfold.cuda.markers`` finds, and the prompt
-end less one token, since a next turn sent back without its reasoning renders that last token differently. Only
-prompt rows are kept: decode and prefill bits differ, and every prompt kernel is chunk-invariant, so a resumed
-prompt ends in the state a fresh prefill reaches.
+A kept state is a family engine's copy of its state after a prompt position (``Engine.state``, whose contents each
+family defines), with a drafter's context when the prefill fed one. A recurrent state exists only after the last row a
+pass committed, so a prefill takes states as it passes their positions (``keep_points``): the message starts
+``tensorfold.cuda.markers`` finds, and the prompt end less one token, since a next turn sent back without its reasoning
+renders that last token differently. Only prompt rows are kept: decode and prefill bits differ, and each family's
+prompt kernels are chunk-invariant, so a resumed prompt ends in the state a fresh prefill reaches.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def keep_points(prompt: Sequence[int], begin: int, marks: Callable[[Sequence[int
 class Kept:
     ids: tuple[int, ...]
     state: dict                    # Engine.state
-    drafter: dict | None           # Drafter.snapshot, None when the prefill fed no drafter
+    drafter: dict | None           # a drafter's context, None when the prefill fed no drafter
     nbytes: int
 
     def starts(self, prompt: Sequence[int]) -> bool:

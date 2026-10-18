@@ -49,8 +49,8 @@ class Lfm2MoeEngine:
             raise ValueError(f"LFM2-MoE needs {need / gib:.1f} GiB on the GPU for its weights and a {self.max_len}-"
                              f"token context; {free / gib:.1f} GiB is free above the memory floor. Free memory or "
                              f"pass a smaller --context")
+        from tensorfold.cuda.kept_states import Store
         from tensorfold.cuda.markers import resume_points
-        from tensorfold.families.nemotron_bolt.cuda.reuse import Store
 
         self.marks = resume_points(self.model_dir)          # message starts a prefill keeps states at, or None
         started = time.perf_counter()
@@ -83,7 +83,7 @@ class Lfm2MoeEngine:
         keeps nothing. One stream: requests take turns, so the store needs no lock.
         """
 
-        from tensorfold.families.nemotron_bolt.cuda.reuse import keep_points
+        from tensorfold.cuda.kept_states import keep_points
 
         from .engine import prefill, serial_decode
 

@@ -110,9 +110,8 @@ class BoltEngine:
                              f"{' and drafter' if drafting else ''} and a {self.max_len}-token context; "
                              f"{free / gib:.1f} GiB is free above the memory floor. Free memory or pass a smaller "
                              f"--context")
+        from tensorfold.cuda.kept_states import Store
         from tensorfold.cuda.markers import resume_points
-
-        from .reuse import Store
 
         self.marks = resume_points(self.model_dir)          # message starts a prefill keeps states at, or None
         started = time.perf_counter()
@@ -178,8 +177,9 @@ class BoltEngine:
         ``keep_points``; ``draft: false``, the reference, prefills afresh and keeps nothing.
         """
 
+        from tensorfold.cuda.kept_states import keep_points
+
         from .engine import prefill, serial_decode
-        from .reuse import keep_points
 
         prompt = [int(t) for t in prompt]
         max_tokens = self._limit(prompt, max_tokens)
@@ -192,6 +192,8 @@ class BoltEngine:
             self.drafter.reset()
         begin = len(hit.ids) if hit is not None else 0
 
+        # a kept state: the Mamba ssm and conv states and the attention rows (Engine.state), with the LiLiCorr
+        # drafter's context (Drafter.snapshot: its ring of tap rows, anchor and context_end) when the prefill fed one
         def keep(n: int, state: dict) -> None:
             self.store.add(prompt[:n], state, self.drafter.snapshot() if drafting else None)
 
