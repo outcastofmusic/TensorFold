@@ -188,15 +188,20 @@ def for_model(model_dir: str | Path, vocab_size: int, stop_ids: Sequence[int]) -
 
 
 def vocab_size(model_dir: str | Path) -> int | None:
-    """The checkpoint's logits width from ``config.json`` (``text_config`` first), or None."""
+    """The checkpoint's logits width from ``config.json``, or None: ``text_config``, then ``llm_config`` (Nemotron
+    Omni's text model, as Bolt's ``nemotron_h_omni`` config has it), then the top level (upstream #951, #953).
+
+    A value that is not an int from 1 to xgrammar's C ``int`` maximum falls through to the next place; a JSON
+    ``true`` is a Python bool, which ``isinstance(.., int)`` would take as 1."""
 
     path = Path(model_dir) / "config.json"
     if not path.is_file():
         return None
     config = json.loads(path.read_text())
-    for part in (config.get("text_config") or {}, config):
-        if isinstance(part.get("vocab_size"), int):
-            return int(part["vocab_size"])
+    for part in (config.get("text_config"), config.get("llm_config"), config):
+        value = part.get("vocab_size") if isinstance(part, dict) else None
+        if type(value) is int and 0 < value < 2**31:
+            return value
     return None
 
 

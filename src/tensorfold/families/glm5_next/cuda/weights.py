@@ -7,6 +7,7 @@ plain tensors retain stored dtype and norms retain their uncentered gamma.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -33,6 +34,16 @@ Projection = Q4 | B16 | Exl3Linear | PlainLinear | ComposedLinear | Affine6
 PACKED_EXPERT_K2 = (4, 6)
 # (layer, half-bits) -> expert projections loaded at that width; read back by the loader census
 EXPERT_K2_CENSUS: dict = {}
+
+
+def swiglu_limit(value: Any) -> float:
+    """config.json's ``swiglu_limit`` as every SwiGLU kernel takes it: a positive clamp, or inf for none.
+
+    The reference skips the clamp at 0 or null (families/glm5_next/mlp.py's ``if limit:``), but glue.swiglu and both
+    EXL3 epilogues clamp unconditionally, so a 0 cut every gate and up to 0. Against inf the clamp keeps every
+    non-NaN value, and a positive limit reaches the kernels as before. Absent stays transformers' default, 10.0."""
+
+    return float(value) if value is not None and float(value) > 0 else math.inf
 
 
 def bits_of(quant: dict) -> float:
@@ -77,7 +88,7 @@ class Config:
     index_dim: int
     index_topk: int
     kpool: int
-    limit: float
+    limit: float               # SwiGLU clamp: positive, or inf for none (``swiglu_limit`` 0 or null), see ``swiglu_limit``
     kinds: list[str]           # per layer: "kda" or "dsa"
     mlp_kinds: list[str]       # per layer: "dense" or "moe"
     eos: tuple[int, ...]
@@ -132,7 +143,7 @@ class Config:
             hc_iters=int(t.get("hc_sinkhorn_iters", 20)), hc_eps=float(t.get("hc_eps", 1e-6)),
             index_heads=int(t.get("index_n_heads", 32)), index_dim=int(t.get("index_head_dim", 128)),
             index_topk=int(t.get("index_topk", 2048)), kpool=int(t.get("index_kpool", 4)),
-            limit=float(t.get("swiglu_limit", 10.0)), kinds=kinds, mlp_kinds=mlp_kinds, eos=eos,
+            limit=swiglu_limit(t.get("swiglu_limit", 10.0)), kinds=kinds, mlp_kinds=mlp_kinds, eos=eos,
             mtp_layers=int(t.get("num_nextn_predict_layers", 0)), group_size=int(quant.get("group_size", 64)),
             # stacked EXL3 experts make the checkpoint the packed adapter's, whatever its dense tensors' format
             bits=bits_of(quant), quant="exl3" if stacked else str(quant.get("quant_method") or "mlx").lower(),

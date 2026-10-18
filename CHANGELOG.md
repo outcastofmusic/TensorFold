@@ -5,6 +5,19 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **GLM-5.3 on CUDA reads a `swiglu_limit` of 0 or null as no clamp.** The reference skips the clamp at 0, but the
+  CUDA config passed 0 to kernels that clamp every gate and up to it, so each MLP's output was 0, and a null failed
+  the load. Both now reach the kernels as inf, which keeps every value that is not NaN. A positive limit reaches
+  them unchanged, and both served checkpoints set 10.0, so served replies keep their bits.
+- **A reply full of unclosed tool-call openers parses in milliseconds.** The lazy envelope regexes searched the rest
+  of the reply again from every opener without a closer, holding the GIL: 2,000 unclosed openers in 1 MB took 7.5-10 s
+  in each of the four formats (`<tool_call>`, `<NAME:tool_call>`, Gemma's `<|tool_call>` and DSML). A forward scan
+  now finds each closer once, under 5 ms on the same replies, and returns the same calls and text on 30,000 random
+  replies. Ports upstream TensorFold e6cd4d94 (#913), which fixed the namespaced form.
+- **Nemotron 3.5 Bolt accepts `response_format` and guided requests.** Its `nemotron_h_omni` config keeps
+  `vocab_size` under `llm_config`, and the grammar read only `text_config` and the top level, so every structured
+  request got a 400. The grammar now reads `text_config`, `llm_config`, then the top level, and skips a value that
+  is a bool, not positive, or past 2^31 - 1. Ports upstream TensorFold 80559ad2 and 022344e9 (#951, #953).
 - **Qwen3.8 Flash Next FP4-Local decodes 1.059x faster with the same replies.** Decode rows of the shared expert ran
   the prompt GEMM on 128x128 blocks, 3.9 ms a serial token. They now take a 16x64 tile with six stages, whose bits
   equal the other tiles'. On 18 Oct 2026 at `--parallel 4 --kv-dtype int8`, decode ran 1.042-1.071x faster on code

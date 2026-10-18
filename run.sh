@@ -286,7 +286,9 @@ super() {
     NATIVE="${NATIVE:-$MODELS/tensorfold-1.0.12-linux-aarch64}"
     [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh nemotron-3.5-super)"
     [ -x "$NATIVE/bin/tensorfold-native" ] || die "no native server at $NATIVE/bin/tensorfold-native (run ./prepare.sh nemotron-3.5-super)"
-    [ -e "$NATIVE/lib/libturbojpeg.so.0" ] || echo "run: no $NATIVE/lib/libturbojpeg.so.0, so the server refuses JPEG images (PNG and WebP serve)" >&2
+    # WebP never serves on this binary: 1.0.12 refuses it by name, and 1.1.0 decodes it only through libwebp 1.6.0's
+    # libwebpdecoder, which the release archive does not ship
+    [ -e "$NATIVE/lib/libturbojpeg.so.0" ] || echo "run: no $NATIVE/lib/libturbojpeg.so.0, so the server refuses JPEG images (PNG serves)" >&2
     local budget=()
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
     [ "${D1:-0}" = 0 ] || IMAGE=$(image)          # only d1 runs this checkout's image

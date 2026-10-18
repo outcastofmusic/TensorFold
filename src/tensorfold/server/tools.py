@@ -86,14 +86,11 @@ def active_tool_specs(tools: Any, tool_choice: Any) -> list[dict[str, Any]]:
     return specs
 
 
-_TOOL_CALL_BLOCK_RE = re.compile(
-    r"<tool_call>\s*(.*?)\s*</tool_call>",
-    re.IGNORECASE | re.DOTALL,
-)
-_NAMESPACED_TOOL_CALL_BLOCK_RE = re.compile(
-    r"<([A-Za-z_][\w.-]*):tool_call>\s*(.*?)\s*</\1:tool_call>",
-    re.IGNORECASE | re.DOTALL,
-)
+# A call envelope's opener and closer; ``_blocks`` pairs them. The namespaced closer's NAME must equal its opener's.
+_CALL_OPEN_RE = re.compile(r"<tool_call>", re.IGNORECASE)
+_CALL_CLOSE_RE = re.compile(r"</tool_call>", re.IGNORECASE)
+_NAMESPACED_OPEN_RE = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>", re.IGNORECASE)
+_NAMESPACED_CLOSE_RE = re.compile(r"</([\w.-]*):tool_call>", re.IGNORECASE)
 _TOOL_FUNCTION_BLOCK_RE = re.compile(
     r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$",
     re.IGNORECASE | re.DOTALL,
@@ -104,12 +101,13 @@ _TOOL_PARAMETER_BLOCK_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 # Gemma 4: <|tool_call>call:NAME{key:value,...}<tool_call|>, and the 26B's bare :NAME{...}. Keys bare, strings between <|"|>.
-_GEMMA_TOOL_CALL_BLOCK_RE = re.compile(r"<\|tool_call>\s*(.*?)\s*<tool_call\|>", re.DOTALL)
+_GEMMA_OPEN_RE, _GEMMA_CLOSE_RE = re.compile(r"<\|tool_call>"), re.compile(r"<tool_call\|>")
 _GEMMA_CALL_RE = re.compile(r"^(?:call)?:([\w.-]+)\s*(\{.*\})$", re.DOTALL)
 _GEMMA_STRING_RE = re.compile(r'<\|"\|>(.*?)<\|"\|>', re.DOTALL)
 _GEMMA_KEY_RE = re.compile(r"(?<=[{,])\s*([A-Za-z_][\w-]*)\s*:")
 # DeepSeek-V4's DSML: one <｜DSML｜tool_calls> block holds invokes of named parameters, string="false" ones as JSON
 _DSML_BLOCK_RE = re.compile(r"<｜DSML｜tool_calls>(.*?)</｜DSML｜tool_calls>", re.DOTALL)
+_DSML_OPEN_RE, _DSML_CLOSE_RE = re.compile(r"<｜DSML｜tool_calls>"), re.compile(r"</｜DSML｜tool_calls>")
 _DSML_INVOKE_RE = re.compile(r'<｜DSML｜invoke name="([^"]*)">(.*?)</｜DSML｜invoke>', re.DOTALL)
 _DSML_PARAM_RE = re.compile(r'<｜DSML｜parameter name="([^"]*)" string="(true|false)">(.*?)</｜DSML｜parameter>', re.DOTALL)
 _JSON_FENCE_RE = re.compile(
@@ -389,13 +387,56 @@ def _parse_bare_json_tool_calls(text: str, known: dict[str, str], *, max_calls: 
     return calls or None
 
 
+def _namespace(m: re.Match[str]) -> str:
+    """A namespaced opener's or closer's NAME as the old regex's ``\\1`` under IGNORECASE compared it: each
+    character's simple lowercase. ``str.lower`` differs only for U+0130, which it writes as two characters."""
+
+    return "".join("i" if ch == "\u0130" else ch.lower() for ch in m.group(1))
+
+
+def _blocks(text: str, opener: re.Pattern[str], closer: re.Pattern[str],
+            key=lambda m: "") -> list[tuple[int, int, str]]:
+    """(start, end, body) of each block that runs from an ``opener`` match to the first ``closer`` match after it
+    with the same ``key``, in order; an opener inside an earlier block is part of it.
+
+    This is what the lazy regex ``opener\\s*(.*?)\\s*closer`` found (upstream #913), but that regex searched the rest
+    of the reply again from every opener without a closer: 2,000 of them in 1 MB took 10 s, holding the GIL. Here
+    each closer is found once, and each key's list is passed in order."""
+
+    closers: dict[str, list[tuple[int, int]]] = {}
+    for m in closer.finditer(text):
+        closers.setdefault(key(m), []).append(m.span())
+    passed: dict[str, int] = {}
+    found: list[tuple[int, int, str]] = []
+    at = 0
+    for m in opener.finditer(text):
+        if m.start() < at:
+            continue
+        name = key(m)
+        spans, e = closers.get(name, []), passed.get(name, 0)
+        while e < len(spans) and spans[e][0] < m.end():
+            e += 1
+        passed[name] = e
+        if e < len(spans):
+            found.append((m.start(), spans[e][1], text[m.end():spans[e][0]]))
+            at = spans[e][1]
+    return found
+
+
+def tool_call_blocks(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, body) of each ``<tool_call>`` ... ``</tool_call>`` block in ``text`` (any case), in order."""
+
+    return _blocks(text, _CALL_OPEN_RE, _CALL_CLOSE_RE)
+
+
 def _envelopes(text: str) -> list[tuple[int, int, str]]:
     """(start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it."""
 
-    found = sorted([(m.start(), m.end(), m.group(1).strip()) for m in _TOOL_CALL_BLOCK_RE.finditer(text)]
-                   + [(m.start(), m.end(), m.group(2).strip()) for m in _NAMESPACED_TOOL_CALL_BLOCK_RE.finditer(text)]
-                   + [(m.start(), m.end(), m.group(1).strip()) for m in _GEMMA_TOOL_CALL_BLOCK_RE.finditer(text)]
-                   + [(m.start(), m.end(), m.group(0)) for m in _DSML_BLOCK_RE.finditer(text)])
+    found = sorted([(s, e, body.strip()) for s, e, body in tool_call_blocks(text)]
+                   + [(s, e, body.strip()) for s, e, body in
+                      _blocks(text, _NAMESPACED_OPEN_RE, _NAMESPACED_CLOSE_RE, _namespace)]
+                   + [(s, e, body.strip()) for s, e, body in _blocks(text, _GEMMA_OPEN_RE, _GEMMA_CLOSE_RE)]
+                   + [(s, e, text[s:e]) for s, e, _ in _blocks(text, _DSML_OPEN_RE, _DSML_CLOSE_RE)])
     kept: list[tuple[int, int, str]] = []
     for envelope in found:
         if not kept or envelope[0] >= kept[-1][1]:
