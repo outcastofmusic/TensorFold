@@ -204,8 +204,8 @@ def test_a_kept_prompt_point_resumes_the_rings_drafts_round_by_round(engine_ring
     assert _same(_rounds(drafter, first, 2), resumed)
 
 
-def test_a_kept_point_its_chunk_wrote_past_keeps_no_ring_window(engine_ring):
-    """Past the ring's slack behind the chunk's end the kept point's window is gone: DFlash2 won't resume from it."""
+def test_a_kept_point_past_the_rings_slack_keeps_its_window(engine_ring):
+    """A cut more than the ring's slack before its chunk's end keeps its window, as one just inside the slack does."""
 
     from tensorfold.families.glm5_next.cuda import decode
 
@@ -213,10 +213,9 @@ def test_a_kept_point_its_chunk_wrote_past_keeps_no_ring_window(engine_ring):
     rows, slack = e.prefill_rows, drafter.ring - drafter.window
     prompt = [int(t) for t in np.random.default_rng(43).integers(0, 1000, size=rows)]
     kept = []
-    decode.prefill(e, prompt, None, drafter=drafter, keep_at=rows - slack, keep=kept.append)
-    assert kept[-1].drafter_end == -1 and kept[-1].drafter_rows is None
-    decode.prefill(e, prompt, None, drafter=drafter, keep_at=rows - slack + 1, keep=kept.append)
-    assert kept[-1].drafter_end == rows - slack + 1 and kept[-1].drafter_rows is not None
+    for at in (rows - slack, rows - slack + 1):
+        decode.prefill(e, prompt, None, drafter=drafter, keep_at=at, keep=kept.append)
+        assert kept[-1].drafter_end == at and kept[-1].drafter_rows is not None
 
 
 def test_identical_resends_and_a_turn_keep_the_rings_window_through_the_engine(engine_ring):
