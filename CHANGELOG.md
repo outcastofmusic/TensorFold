@@ -15,6 +15,11 @@ GitHub has the full notes and the measurements behind them.
 - **`run.sh` and the swap endpoint serve three more models.** `qwen3.8-flash-next-fp4` loads NVIDIA's Qwen3.8 Flash Next
   FP4-Local and `nemotron-3.5-bolt` loads Nemotron 3.5 Bolt with LiLiCorr drafts; `prepare.sh` fetches both at pinned
   revisions. The default stays Qwen3.8 Flash Next's EXL3 pack. `lfm2.5-24b-a2b` loads Liquid's LFM2.5-24B-A2B in block FP8.
+- **`run.sh` and the swap endpoint serve Nemotron 3.5 Super VL.** `nemotron-3.5-super` runs upstream TensorFold's
+  native 1.0.12 server on NVIDIA's NVFP4 checkpoint with `--precision checkpoint` at 131,072 tokens. It scored
+  TrueScore 94.1 and planning 62.6 with thinking off, was ready in 44 s and left 40 GiB available (2026-10-18).
+  `prepare.sh` fetches the checkpoint and the sha256-pinned release archive. `swap.py` takes a 404 from
+  `/internal/persist` as a model without disk states. The default stays Qwen3.8 Flash Next's EXL3 pack.
 - **d1-3B decision sidecar.** Liquid's d1-3B answers `/v1/systemone` and `/v1/decisions` (yes/no, choice, score) in 25.9 ms a question on the GB10; `D1=1` starts it beside every model but GLM on :30003.
 - **Qwen writes only the kept states a restart resumes from.** Each slot's shortest state (its system block's end)
   and its longest go to disk, and the states between them stay in memory only. Each state skipped saves its 115.7 MB

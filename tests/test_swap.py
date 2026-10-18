@@ -195,6 +195,40 @@ def test_a_swap_goes_on_when_the_outgoing_model_cannot_write(swap, tmp_path, cap
     assert "did not write its kept states" in capsys.readouterr().out
 
 
+class _NoPersist(BaseHTTPRequestHandler):
+    """Upstream's native server: no /internal/persist route, so a 404 like any unknown path."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        body = json.dumps({"error": {"message": f"unknown path {self.path}"}}).encode()
+        self.send_response(404)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_a_swap_from_a_server_without_a_persist_route_goes_on_quietly(swap, tmp_path, capsys):
+    log = tmp_path / "order"
+    run = tmp_path / "run.sh"
+    run.write_text(f"#!/bin/sh\necho run $1 >> {log}\n")
+    run.chmod(0o755)
+    swap.RUN = str(run)
+    backend = _serve(_NoPersist)
+    swap.BACKEND = backend.server_address[1]
+    try:
+        swapper = swap.Swapper()
+        swapper.current = "nemotron-3.5-super"
+        assert swapper.enter("qwen3.8-flash-next") == "qwen3.8-flash-next"
+    finally:
+        backend.shutdown()
+    assert log.read_text().split() == ["run", "qwen-flash-next"]
+    assert "kept states" not in capsys.readouterr().out
+
+
 def test_every_served_name_has_a_run_sh_target():
     """swap.py runs `run.sh <target>` for a name: a name whose target run.sh does not dispatch would fail every swap."""
     import re
@@ -205,7 +239,7 @@ def test_every_served_name_has_a_run_sh_target():
     spec.loader.exec_module(mod)
     dispatch = re.findall(r"^    ([a-z0-9.-]+)\)\s+ask_swap", (root / "run.sh").read_text(), re.M)
     assert set(mod.TARGET.values()) == set(dispatch)
-    assert {"qwen3.8-flash-next-fp4", "nemotron-3.5-bolt", "lfm2.5-24b-a2b"} <= set(mod.TARGET)
+    assert {"qwen3.8-flash-next-fp4", "nemotron-3.5-bolt", "lfm2.5-24b-a2b", "nemotron-3.5-super"} <= set(mod.TARGET)
 
 
 def _run_logger(swap, tmp_path):

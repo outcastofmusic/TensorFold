@@ -33,7 +33,7 @@ from pathlib import Path
 
 TARGET = {"qwen3.8-flash-next": "qwen-flash-next", "glm-5.3-flash": "glm-5.3-flash",    # served name: run.sh target
           "qwen3.8-flash-next-fp4": "qwen-flash-next-fp4", "nemotron-3.5-bolt": "nemotron-bolt",
-          "lfm2.5-24b-a2b": "lfm2-24b"}
+          "lfm2.5-24b-a2b": "lfm2-24b", "nemotron-3.5-super": "nemotron-3.5-super"}
 ALIAS = {target: name for name, target in TARGET.items()}
 PORT = int(os.environ.get("PORT", "30000"))
 BACKEND = int(os.environ.get("BACKEND_PORT", "30002"))
@@ -65,7 +65,8 @@ def loaded() -> str | None:
 
 def persist(model: str) -> None:
     """Have the loaded model write its kept prompt states to disk (``POST /internal/persist``) before run.sh stops it,
-    waiting up to PERSIST seconds; a model without disk states answers at once, and a failure only costs the states."""
+    waiting up to PERSIST seconds; a model without disk states answers at once, upstream's native server (Super) has
+    no such route and answers 404, and a failure only costs the states."""
 
     start = time.monotonic()
     try:
@@ -76,6 +77,8 @@ def persist(model: str) -> None:
         conn.close()
     except (OSError, http.client.HTTPException) as exc:
         return say(f"{model} did not write its kept states to disk: {exc}")
+    if resp.status == 404:                      # no such route, as {"disk": false}: nothing to write
+        return
     try:
         got = json.loads(body) if resp.status == 200 else None
     except ValueError:

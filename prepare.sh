@@ -11,6 +11,8 @@
 #                                 LFM Open License v1.0: commercial use only below US$10M annual revenue
 #   ./prepare.sh lfm2-24b         Liquid's LFM2.5-24B-A2B in block FP8 (24.75 GB; LFM Open License v1.0: commercial
 #                                 use only under US$10M annual revenue)
+#   ./prepare.sh nemotron-3.5-super   Nemotron 3.5 Super VL 120B-A12B NVFP4 (75.1 GB) and upstream TensorFold's native
+#                                 1.0.12 server for linux-aarch64 (9.8 MB), which serves it in place of this checkout
 #
 # Needs Docker with the NVIDIA runtime. Downloads run inside the serving image, so the host needs no Python packages.
 # A gated or rate-limited download reads HF_TOKEN from the environment. Reruns resume and skip what is complete.
@@ -44,6 +46,9 @@ BOLT=(nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB c6cc2e8ffa353403213d6b9b18aaf
 BOLT_DRAFT=(nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr abd478065678ee83a93821c4b3f512da24e4cecb Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr)
 D1=(LiquidAI/d1-3B 051bcc464b01b9f92942b364d9586b0ef5912432 d1-3B)
 LFM2=(LiquidAI/LFM2.5-24B-A2B-FP8 f54bf39547fd5b7955abb9fe8d1b151e31fbbddb LFM2.5-24B-A2B-FP8)
+SUPER=(nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 82d93699acd3be9e4617c53360fe5b3f5dbeb1b3 NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)
+# upstream's release archive (version, sha256): its bin/ and lib/ are what run.sh's NATIVE points at
+NATIVE=(1.0.12 437eb0ca6fa102ffcbee8ffe3ad8053b7e45d227e80b6981b7973869f396a612)
 
 die() { echo "prepare: $*" >&2; exit 1; }
 
@@ -88,6 +93,28 @@ lfm2() {
     fetch "${LFM2[@]}"
 }
 
+# The archive has no libturbojpeg, so the server refuses JPEG images until lib/ holds libjpeg-turbo 3.1.4.1's
+# libturbojpeg.so.0; PNG and WebP serve without it
+super() {
+    fetch "${SUPER[@]}"
+    local v=${NATIVE[0]} dir
+    dir="$MODELS/tensorfold-$v-linux-aarch64"
+    if [ -x "$dir/bin/tensorfold-native" ]; then
+        echo "prepare: native server already at $dir"
+        return
+    fi
+    local tmp
+    tmp=$(mktemp -d)
+    echo "prepare: TensorFold $v native server -> $dir"
+    curl -fsSL -o "$tmp/native.tar.gz" "https://github.com/ashhart/TensorFold/releases/download/v$v/tensorfold-$v-linux-aarch64.tar.gz" \
+        || { rm -rf "$tmp"; die "downloading the TensorFold $v archive failed"; }
+    echo "${NATIVE[1]}  $tmp/native.tar.gz" | sha256sum -c --quiet \
+        || { rm -rf "$tmp"; die "the TensorFold $v archive does not match its pinned sha256"; }
+    tar -xzf "$tmp/native.tar.gz" -C "$MODELS"
+    rm -rf "$tmp"
+    [ -x "$dir/bin/tensorfold-native" ] || die "$dir has no bin/tensorfold-native after unpacking"
+}
+
 glm() {
     fetch "${GLM[@]}"
     [ -n "$GLM_DRAFTER_REV" ] || die "no pinned revision for $GLM_DRAFTER_REPO: set GLM_DRAFTER_REV to a commit"
@@ -123,8 +150,9 @@ case "$what" in
     nemotron-bolt)   need=25 ;;
     d1)              need=7 ;;
     lfm2-24b)        need=26 ;;
+    nemotron-3.5-super) need=76 ;;
     all)             need=$((100 + glm_need)) ;;
-    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, nemotron-bolt, lfm2-24b, d1, or nothing for the first two)" ;;
+    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, nemotron-bolt, lfm2-24b, nemotron-3.5-super, d1, or nothing for the first two)" ;;
 esac
 free=$(df -BG --output=avail "$MODELS" | tail -1 | tr -dc 0-9)
 [ "$free" -ge "$need" ] || echo "prepare: $MODELS has $free GB free and a first download needs $need GB" >&2
@@ -136,6 +164,7 @@ case "$what" in
     nemotron-bolt)   bolt ;;
     d1)              fetch "${D1[@]}" ;;
     lfm2-24b)        lfm2 ;;
+    nemotron-3.5-super) super ;;
     all)             qwen; glm ;;
 esac
 echo "prepare: done. Start a model with ./run.sh <target> (./run.sh help lists them), or ./run.sh for the swap endpoint"
