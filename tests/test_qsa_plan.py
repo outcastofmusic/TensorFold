@@ -1,0 +1,124 @@
+"""The prompt indexer's CPU side: TF_FLASHNEXT_QSA's values, which scratches take qsa_scores.cu, and which select runs
+at which block counts. tests/cuda/test_qsa_scores.py checks the kernels' bytes and lists on the GPU."""
+
+from __future__ import annotations
+
+import pytest
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("triton")
+
+from tensorfold.families.qwen4_exp.cuda import attention as att  # noqa: E402
+from tensorfold.families.qwen4_exp.cuda import attn_multi, qsa  # noqa: E402
+
+
+@pytest.mark.parametrize("value, mode", [(None, "cuda"), ("", "cuda"), ("cuda", "cuda"), ("torch", "torch"),
+                                         (" CUDA ", "cuda"), ("Torch", "torch")])
+def test_the_flag_reads_cuda_by_default_or_torch(monkeypatch, value, mode):
+    if value is None:
+        monkeypatch.delenv(qsa.ENV, raising=False)
+    else:
+        monkeypatch.setenv(qsa.ENV, value)
+    assert qsa.mode() == mode
+
+
+@pytest.mark.parametrize("value", ["triton", "1", "0", "off", "cuda,torch"])
+def test_an_unknown_flag_value_raises_naming_the_flag(monkeypatch, value):
+    monkeypatch.setenv(qsa.ENV, value)
+    with pytest.raises(ValueError, match=qsa.ENV):
+        qsa.mode()
+
+
+def test_an_unknown_flag_value_stops_the_engine_before_it_reads_the_model(monkeypatch, tmp_path):
+    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
+
+    monkeypatch.setenv(qsa.ENV, "fast")
+    with pytest.raises(ValueError, match=qsa.ENV):
+        FlashNextEngine(tmp_path / "missing")          # no checkpoint there: the flag fails first
+
+
+def test_the_kernel_covers_the_shipped_indexer_only():
+    assert qsa.fits(4, 128)                            # FP4-Local and EXL3 3.05bpw: indexer_n_heads 4, head_dim 128
+    assert not qsa.fits(8, 128) and not qsa.fits(4, 64)
+
+
+@pytest.mark.parametrize("value, prefill, heads, dim, fast", [
+    (None, True, 4, 128, True), ("cuda", True, 4, 128, True), ("torch", True, 4, 128, False),
+    (None, False, 4, 128, False),                      # decode windows keep the Triton kernels
+    (None, True, 8, 128, False),                       # an indexer the kernel does not cover
+])
+def test_prompt_buffers_take_the_cuda_kernels_with_the_flag(monkeypatch, value, prefill, heads, dim, fast):
+    if value is None:
+        monkeypatch.delenv(qsa.ENV, raising=False)
+    else:
+        monkeypatch.setenv(qsa.ENV, value)
+    assert qsa.fast(prefill, heads, dim) is fast
+
+
+@pytest.mark.parametrize("blocks, fast, tiled", [
+    (1, False, False), (1, True, False),
+    (8191, True, False), (8192, True, True), (8192, False, False),               # the fast scratch's threshold
+    (16384, False, False), (32768, False, False), (32768, True, True),
+    (32769, False, True), (32769, True, True), (65538, False, True),             # past the register width: always
+])
+def test_the_tiled_select_runs_from_8192_blocks_on_a_fast_scratch_and_past_the_registers_on_any(blocks, fast, tiled):
+    assert qsa.tiled(blocks, fast, att.SELECT_REGS) is tiled
+
+
+class _Launch:
+    """A Triton kernel stand-in: ``k[grid](*args, **kw)`` records (grid, kw)."""
+
+    def __init__(self, calls: list, name: str) -> None:
+        self.calls, self.name = calls, name
+
+    def __getitem__(self, grid):
+        return lambda *args, **kw: self.calls.append((self.name, grid, kw))
+
+
+@pytest.fixture
+def calls(monkeypatch):
+    seen: list = []
+    for name in ("_scores", "_select", "_select_tiles"):
+        monkeypatch.setattr(att, name, _Launch(seen, name))
+    monkeypatch.setattr(qsa, "scores", lambda *args: seen.append(("qsa_scores", args[4:], {})))
+    return seen
+
+
+def _scratch(rows: int, capacity: int, fast: bool) -> att.AttnScratch:
+    return att.AttnScratch(rows, 4, 64, capacity, "cpu", budget=2048, ratio=4, fast=fast)
+
+
+@pytest.mark.parametrize("context, fast, want", [
+    (4096, False, ["_scores", "_select"]),
+    (4096, True, ["qsa_scores", "_select"]),
+    (32764, True, ["qsa_scores", "_select"]),                 # 8,191 blocks
+    (32765, True, ["qsa_scores", "_select_tiles"]),           # 8,192 blocks: cdiv(32765, 4)
+    (32769, False, ["_scores", "_select"]),
+    (131072, False, ["_scores", "_select"]),                  # 32,768 blocks still fit the registers
+    (131076, False, ["_scores", "_select_tiles"]),
+    (131076, True, ["qsa_scores", "_select_tiles"]),
+])
+def test_rows_score_and_select_on_the_scratch_s_kernels(calls, context, fast, want):
+    sc = _scratch(256, 262144, fast)
+    iq = torch.zeros((256, 4, 128), dtype=torch.bfloat16)
+    pooled = torch.zeros((sc.nb, 128), dtype=torch.bfloat16)
+    pos = torch.zeros((1,), dtype=torch.int32)
+    att.qsa_rows(iq, pooled, pos, sc, 256, context=context)
+    assert [c[0] for c in calls] == want
+    blocks = -(-context // 4)
+    if fast:
+        assert calls[0][1] == (256, blocks, 4, 512)           # rows, blocks, ratio, top
+    else:
+        assert calls[0][1] == (256, -(-blocks // 64))         # _scores' grid: a row by 64-block tiles
+    if want[1] == "_select_tiles":
+        assert calls[1][2]["TB"] == 4096                      # a prompt's row block
+
+
+def test_a_window_s_row_view_keeps_the_scratch_s_kernels():
+    for fast in (False, True):
+        assert attn_multi._rows_from(_scratch(16, 65536, fast), 3).fast is fast
+
+
+def test_the_scratch_is_plain_unless_asked():
+    assert _scratch(8, 65536, False).fast is False
+    assert att.AttnScratch(8, 4, 64, 65536, "cpu").fast is False

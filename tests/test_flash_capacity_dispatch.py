@@ -38,7 +38,7 @@ def test_actual_attention_callsite_bounds_short_request_launches(monkeypatch, al
     weights = SimpleNamespace(cfg=cfg, inv_freq=SimpleNamespace(numel=lambda: 16))
     layer = SimpleNamespace(index=0, attn=SimpleNamespace(proj=None, q_scale=None, k_scale=None, iq_scale=None,
                                                          ik_scale=None, o=None))
-    scratch = SimpleNamespace(qsa=True, nch=(slots+511)//512, nb=(slots+3)//4, budget=2048, ratio=4,
+    scratch = SimpleNamespace(qsa=True, nch=(slots+511)//512, nb=(slots+3)//4, budget=2048, ratio=4, fast=False,
                               idw=2052, ids=None, nk=None, sparse=None, scores=None, po=None, pm=None, pl=None, out=tensor)
     buffers = SimpleNamespace(attn=scratch, mixed=tensor, xs_mixed=tensor, pa=tensor, q=tensor, iq=tensor,
                               gated=tensor, xs_gated=tensor, prefill=False)
@@ -111,8 +111,8 @@ def test_prompt_blocks_bound_their_launches_by_their_own_rows(monkeypatch, alloc
     layer = SimpleNamespace(index=0, attn=SimpleNamespace(proj=None, q_scale=None, k_scale=None, iq_scale=None,
                                                          ik_scale=None, o=None))
     scratch = SimpleNamespace(qsa=True, nch=(slots + 511) // 512, nb=(slots + 3) // 4, budget=2048, ratio=4,
-                              idw=2052, ids=None, nk=None, sparse=None, scores=None, po=None, pm=None, pl=None,
-                              out=tensor)
+                              fast=False, idw=2052, ids=None, nk=None, sparse=None, scores=None, po=None, pm=None,
+                              pl=None, out=tensor)
     buffers = SimpleNamespace(attn=scratch, mixed=tensor, xs_mixed=tensor, pa=tensor, q=tensor, iq=tensor,
                               gated=tensor, xs_gated=tensor, attn_o=tensor, prefill=True,
                               pos_blk=SimpleNamespace(fill_=lambda v: None))

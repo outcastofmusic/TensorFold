@@ -10,6 +10,7 @@ from tensorfold.cuda import moe as moe_mod
 from . import attention as attn_mod
 from . import gdn as gdn_mod
 from . import kvcache
+from . import qsa
 from .weights import Weights
 
 
@@ -54,8 +55,10 @@ class Buffers:
         self.pa = torch.empty((rows, attn_width), dtype=bf, device=dev)
         self.q = torch.empty((rows, c.heads, c.head_dim), dtype=bf, device=dev)
         self.iq = torch.empty((rows, c.index_heads, c.index_dim), dtype=bf, device=dev)
+        # prompt chunks score on qsa_scores.cu unless TF_FLASHNEXT_QSA=torch (the same bits and lists either way)
         self.attn = attn_mod.AttnScratch(min(rows, ATT_ROWS) if prefill else rows, c.heads, c.head_dim, capacity,
-                                         dev, budget=c.index_budget, ratio=c.index_ratio)
+                                         dev, budget=c.index_budget, ratio=c.index_ratio,
+                                         fast=qsa.fast(prefill, c.index_heads, c.index_dim))
         self.gated = torch.empty((rows, c.heads * c.head_dim), dtype=bf, device=dev)
         self.xs_gated = torch.empty((rows, c.heads * c.head_dim // 32), dtype=f32, device=dev)
         # the experts' prefill arithmetic for decode windows too (``moe_prefill``): their rows can share a pass's launch

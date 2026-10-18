@@ -125,3 +125,13 @@ from MiaAI-Lab's
 [engine prompt expert tile patch 0014](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/656879fd752749bbd11a6e1a065a326c00940911/patches/0014-engine-prompt-expert-tile.patch)
 (`fn_experts_tile.cu`), MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in
 `LICENSES/MiaAI-Lab-MIT.txt`. That kernel builds on the TensorFold contributors' `nvfp4_expert_kernel`.
+
+## Flash Next prompt indexer scores
+
+The row-tiled indexer kernel in `src/tensorfold/families/qwen4_exp/cuda/qsa_scores.cu` and the tiled-select threshold
+in `src/tensorfold/families/qwen4_exp/cuda/qsa.py` are ported from MiaAI-Lab's
+[kernels patch 0002](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/656879fd752749bbd11a6e1a065a326c00940911/patches/0002-kernels.patch)
+(`fn_qsa_scores.cu`) and
+[engine patch 0005](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/656879fd752749bbd11a6e1a065a326c00940911/patches/0005-engine.patch)
+(`qsa_tiles_from`), MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in
+`LICENSES/MiaAI-Lab-MIT.txt`. Both build on the TensorFold contributors' `attention._scores` and `_select_tiles`.

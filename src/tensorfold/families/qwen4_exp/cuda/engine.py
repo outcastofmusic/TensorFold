@@ -42,16 +42,18 @@ def lone_graphs() -> bool:
     return os.environ.get("TENSORFOLD_LONE_GRAPHS", "0").strip().lower() in ("1", "on", "true", "yes")
 
 
-def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True) -> None:
+def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True, qsa_cuda: bool = True) -> None:
     """Load each applicable extension after admission and before resident weights consume the pool."""
 
     from tensorfold.cuda import experts
     from tensorfold.cuda.kernels import gdn as shared_gdn
     from tensorfold.cuda.kernels import qmm
 
-    from . import gdn, gdn_io
+    from . import gdn, gdn_io, qsa
 
     loaders = [experts._ext, shared_gdn._ext, qmm._ext, gdn_io._ext]
+    if qsa_cuda:
+        loaders.append(qsa._ext)
     if solo:                                     # serial windows, including a concurrent decoder's lone graph slot
         loaders.append(gdn._ext)
     if nvfp4:
@@ -79,11 +81,13 @@ class FlashNextEngine:
         import torch
 
         from .copy_drafts import enabled as copy_enabled
+        from .qsa import mode as qsa_mode
 
         from .exl3_pack import admission, extra_files, is_exl3
 
         from tensorfold.families import quant_method, read_config
 
+        qsa_cuda = qsa_mode() == "cuda"      # TF_FLASHNEXT_QSA: an unknown value stops the start before any read
         exl3 = is_exl3(model_dir)
         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU: drop --tp "
@@ -160,7 +164,7 @@ class FlashNextEngine:
         if tp == 2:
             self._same_settings(torch, ids, vision)
         build_kernels(exl3=exl3, nvfp4=not exl3 and quant_method(read_config(model_dir)) == "modelopt",
-                      solo=streams == 1 or lone)
+                      solo=streams == 1 or lone, qsa_cuda=qsa_cuda)
         from concurrent.futures import wait
 
         from tensorfold.cuda.direct_read import wait_all
