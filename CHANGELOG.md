@@ -5,6 +5,14 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **Qwen3.8 Flash Next prompt chunks score sparse-attention blocks in a row-tiled CUDA kernel.** The Triton indexer
+  read every pooled block key once per row, so its cost grew 1.6 ms a 2,048-row chunk per 1k tokens of context: 50 ms
+  at 30k and an estimated 215 ms at 131k. `qsa_scores.cu` stages 64 blocks' keys and 32 rows' queries in shared
+  memory once and repeats the Triton kernel's fp32 instruction order, so each score is the same fp32 word. Rows of
+  8,192 blocks (32k keys) or more then select their blocks in tiles, with the same lists. `TF_FLASHNEXT_QSA=cuda`
+  (default) takes both, `torch` keeps the Triton kernels, and any other value stops the start. Decode windows keep
+  the Triton kernels. The kernel and the 8,192-block threshold are ported from MiaAI-Lab's Qwen3.8 Flash Next recipe,
+  patches 0002 and 0005 (MIT licence), which build on the TensorFold contributors' indexer kernels.
 - **Qwen3.8 Flash Next FP4-Local prompt chunks of 1,024+ rows run the routed experts in a shared-memory tile.** A
   CTA's four warps share an item's input rows through shared memory, and each decoded weight fragment serves up to
   four 16-row tiles on 64-pair items. The output bits equal the 16-pair kernel's, which decode and shorter chunks

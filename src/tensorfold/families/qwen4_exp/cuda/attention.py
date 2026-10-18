@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from . import qsa
 from .image_rows import rope_axis
 
 from .kvquant import dequant_group_4, dequant_group_8, h32
@@ -139,7 +140,7 @@ def _merge_row(PO, PM, PL, OUT, n, r, hk, H: tl.constexpr, HK: tl.constexpr, D: 
 
 class AttnScratch:
     def __init__(self, rows: int, heads: int, head_dim: int, capacity: int, device, *, budget: int = 2048,
-                 ratio: int = 4) -> None:
+                 ratio: int = 4, fast: bool = False) -> None:
         # a row reads at most budget + ratio - 1 keys (dense below the budget, its selected blocks and tail past it)
         self.nch = -(-min(capacity, budget + ratio - 1) // CHUNK)
         self.po = torch.zeros((rows, self.nch, heads, head_dim), dtype=torch.float32, device=device)
@@ -150,6 +151,7 @@ class AttnScratch:
         self.budget, self.ratio = budget, ratio
         self.idw = budget + ratio
         self.qsa = capacity > budget
+        self.fast = fast            # prompt chunks: qsa_scores.cu and the tiled select from qsa.TILES_FROM blocks
         self.nb = -(-capacity // ratio)
         self.ids = torch.zeros((rows, self.idw), dtype=torch.int32, device=device)
         self.nk = torch.zeros((rows,), dtype=torch.int32, device=device)
@@ -356,11 +358,11 @@ def _select_tiles(SC, POS0, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.cons
 
 
 def _launch_select(scratch: AttnScratch, pos0: torch.Tensor, rows: int, blocks: int) -> None:
-    """List each row's blocks from ``scratch.scores``: ``_select`` while ``blocks`` fit its registers, ``_select_tiles`` (the same lists) past them."""
+    """List each row's blocks from ``scratch.scores``: ``_select`` while ``blocks`` fit its registers, ``_select_tiles`` (the same lists) past them, or from ``qsa.TILES_FROM`` blocks on a fast scratch."""
 
     top = scratch.budget // scratch.ratio
     width = triton.next_power_of_2(blocks)
-    if width <= SELECT_REGS:
+    if not qsa.tiled(blocks, scratch.fast, SELECT_REGS):
         _select[(rows,)](scratch.scores, pos0, scratch.ids, scratch.nk, scratch.sparse, scratch.nb,
                          RATIO=scratch.ratio, TOP=top, IDW=scratch.idw, BLOCK=width, num_warps=16)
         return
@@ -399,6 +401,9 @@ def qsa_rows(iq: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, scratch
     ratio, top = scratch.ratio, scratch.budget // scratch.ratio
     bb = 64
     blocks = scratch.nb if context is None else min(scratch.nb, max(1, triton.cdiv(context, ratio)))
-    _scores[(rows, triton.cdiv(blocks, bb))](iq, pooled, pos0, scratch.scores, scratch.nb, HI=iq.shape[1],
-                                                 DI=di, RATIO=ratio, TOP=top, BB=bb, num_warps=4)
+    if scratch.fast:
+        qsa.scores(iq, pooled, pos0, scratch.scores, rows, blocks, ratio, top)
+    else:
+        _scores[(rows, triton.cdiv(blocks, bb))](iq, pooled, pos0, scratch.scores, scratch.nb, HI=iq.shape[1],
+                                                     DI=di, RATIO=ratio, TOP=top, BB=bb, num_warps=4)
     _launch_select(scratch, pos0, rows, blocks)

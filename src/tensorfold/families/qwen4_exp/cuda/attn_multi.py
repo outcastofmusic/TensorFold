@@ -174,4 +174,4 @@ def _rows_from(sc, a0: int) -> SimpleNamespace:
     """The scratch as seen by a launch whose row 0 is window row ``a0``."""
 
     return SimpleNamespace(ratio=sc.ratio, budget=sc.budget, nb=sc.nb, idw=sc.idw, scores=sc.scores[a0:],
-                           ids=sc.ids[a0:], nk=sc.nk[a0:], sparse=sc.sparse[a0:])
+                           ids=sc.ids[a0:], nk=sc.nk[a0:], sparse=sc.sparse[a0:], fast=sc.fast)
