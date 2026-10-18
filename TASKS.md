@@ -3,16 +3,12 @@
 The running list of TensorFold work on this box: what is done, in progress, to do or cancelled. `playbook.md` holds the
 guidance for bringing up a new model; this file holds the work. Dates are 2026.
 
-Standing rule: after every few merges into `fork/dev`, review what landed since the last review (bugs, poor engineering, over-complicated, dead or duplicated code, optimizations) without changing replies or speed, and record the reviewed range here. Last reviewed: 0.8.0 (`8c405e56`).
+Standing rule: after every few merges into `fork/dev`, review what landed since the last review (bugs, poor engineering, over-complicated, dead or duplicated code, optimizations) without changing replies or speed, and record the reviewed range here. Last reviewed: `7891345f` (review of `8c405e56..7891345f`, fixes merged 18 Oct). Next review starts at `7891345f`.
 
 ## In progress
 
 | Task | State |
 |---|---|
-| Follow-up 2 and d1 part of 4: LFM2.5 fast short prefill, prompt reuse, decode graphs; d1 one head matmul | Built on `perf/lfm2-prompts` (`d6319a1e`, `e8c805e2`, `a0b41220`, `b585b8fb`), CPU 4,803 passed. Not merged until `tf-runs/gpu-lfm2/run.sh` passes after bench2, then `PAIRS_ROWS` from its timing tool and a paired TrueScore |
-| Follow-up 4: Qwen persists only the longest state per chain; block reuse; scheduler liveness | Built on `perf/disk-states` (`d1c880fa`, `c5f31a9f`, `61f71117`), CPU 4,808 passed. Block names live on the snapshot (ids alone are unsafe: decoded rows differ from a cold prefill). Not merged until `tf-runs/gpu-disk/run.sh` passes after bench2. Deploying it changes the fingerprints, so states on disk start over once |
-| Follow-ups 1 and 3: Bolt decode CUDA graphs and a drafter-only Q8_0 head | Built on `perf/bolt-graphs` (`20201633`, `1b52dad4`), CPU 4,745 passed; expected serial 40-60 tok/s against 29. Not merged until its GPU run passes: `tf-runs/gpu-graphs/run.sh` after bench2 |
-| Code review since 0.8.0 (`8c405e56..7891345f`) | All fixes merged into `feat/integration` (`1bd20c09`): ops, GLM, Bolt, LFM2, Qwen and disk states; CPU 4,794 passed. Gateway branches fixed separately. Waiting for the GPU tests after bench2, then `fork/dev` and "Last reviewed" |
 | Qwen variants: Mia's Zig recipe on FP4-Local | Analysis done (`tf-runs/mia-qwen/ANALYSIS.md`): port patch 0014's shared-memory expert tile (`fn_experts_tile.cu`, same bits as our `nvfp4_expert_kernel`, +13-15% prefill on Zig), then 4,096-row prompt chunks for NVFP4 and n-gram read-ahead. Skip fp8 KV (under 3% capacity), fair fill and the repeat cache (we have both). Our FP4-Local prefill 1,857 tok/s at 8k against Mia's 2,583 (different tools, 1.4x). Next: A/B both engines with one tool on :31005, nsys on our 16k prefill, then port the tile |
 
 ## To do
@@ -44,6 +40,10 @@ Order (18 Oct): the pipeline code changes above, then the Qwen3.8 variants (Mia'
 
 | Task | Result |
 |---|---|
+| Code review since 0.8.0 (`8c405e56..7891345f`) | `docs/reviews/2026-10-17.md`. Fixes merged; GPU tests found two defects in them, both fixed on 18 Oct: the IQ2_XXS shared-memory ceiling cache (688bc309, fixed by `6f19c352`) and a stale GLM ring test (`a2dedd3d`) |
+| Bolt follow-ups: decode CUDA graphs and a drafter-only Q8_0 head | Merged (`e6bf4fb9`). Graphs add under 1% (serial 30.9 to 31.3 tok/s): decode was not launch-bound. The Q8_0 head lengthens accepted runs: drafted greedy code 36.5 to 45.1, chat 34.5 to 46.1, tools 49.1 to 60.4, long 37.2 to 46.4, prose 30.9 to 33.2 tok/s. Golden 94/96, drafted == serial 10/10 |
+| LFM2.5 follow-ups: tensor-core prompt kernel, prompt reuse, decode graphs; d1 one head matmul | Merged (`0d5afcab`). Prefill 1k 1,228 to 4,802 tok/s, 16k 1,792 to 3,982. `PAIRS_ROWS` 64 from the timing tool (`1985f992`). LFM2 24/24, d1 6/6. Paired TrueScore against the old build still to run |
+| Qwen disk-state follow-ups: longest state per chain, block reuse, scheduler liveness | Merged (`5ea1a0ef`). 336 GPU tests pass. Fingerprints change, so states on disk start over once |
 | Definitive playbook (18 Oct) | `playbook.md` rewritten as a 15-phase checklist with pass criteria and evidence, from four audits in `tf-runs/playbook-audit/` (upstream bring-ups, fork patches, per-model results, serving layer and other engines) |
 | Benchmark round 2 (18 Oct) | LFM2.5-24B TrueScore 91.7, planning 58.6 (443 min). Super VL TrueScore 94.1, planning 62.6. Stopped during GLM thinking-on planning to free the GPU; the remaining arms moved to Thinking-on TrueScore arms. `tf-runs/bench2/RESULTS.md` |
 | Empty-reply investigation | `~/empty-replies/empty-replies-findings.md` |
