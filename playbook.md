@@ -134,7 +134,25 @@ time. GLM now also keeps the last user message's start, inside the prefill pass 
 resumes 6,073 tokens on every question after the first (served check, 17 Oct). A served cache test must use a pattern the engine can resume (a regenerated turn, a growing
 conversation) before it can test eviction.
 
-## 8. Drafting
+## 8. Cold prefill speed
+
+Measure cold prefill at 4k, 32k and 131k tokens, one request, against the fastest engine that serves the same
+checkpoint. On FP4-Local, Mia's Zig recipe (18 Oct) prefilled 2,665, 2,430 and 2,197 tok/s. The MLX checkpoint ran
+2,300 to 2,500, and our EXL3 path 930 to 970. A gap of 2x or more points at the prompt kernels, since decode speed
+matched within 0.2 tok/s (67.9 against 67.8 on code). Investigate these on every new model, each behind a flag, and
+keep the golden checks and resumed equals fresh.
+
+| Idea | Where it showed up | What to measure |
+|---|---|---|
+| Decode each used expert's tiles once per prompt chunk | Qwen EXL3 decodes the routed experts' tiles again for every 16 rows. Mia's `TF_FLASHNEXT_PROMPT_EXPERT_TILE=2` targets the same cost | Prefill tok/s and bit-equal replies against the current kernel |
+| Decode experts into one reused buffer by broadcast | LFM2.5 decoded each used expert to fp32 through two `repeat_interleave`s, about 500 GB of traffic a chunk | Bytes moved a chunk, then tok/s |
+| A tensor-core grouped kernel for the prompt's experts | LFM2.5's fp32 prompt path (`perf/lfm2-prompts`, `TF_LFM2_PROMPT_KERNEL`) | bf16 rounding stays within the golden bounds |
+| Short prompt chunks on the decode kernel | LFM2.5's grouped FP8 kernel beats the prompt kernel under some row count (`PAIRS_ROWS`) | The crossover row count from the timing tool |
+| 4-bit activations in prefill | FP4-Local's card serves them; upstream `--precision checkpoint` prefilled 1.81x faster at a mean KL of 0.0077 nats a token | Replies change, so opt-in only, with a TrueScore pair |
+| Chunk size and fair fill | Mia's `TF_FLASHNEXT_FILL_FAIR=1` made mixed loads about 20% slower. Live replies decode at a tenth of their rate during a burst's prefill | Time to first token and decode rate under a mixed load |
+| KV precision written during prefill | Mia serves fp8 KV (17,888 bytes a token), we serve int8 | Prefill tok/s and the KV pool each allows |
+
+## 9. Drafting
 
 Measure acceptance per round and tokens per second on the served path, greedy and sampled, on at least 4 seeds. A
 change that keeps the tokens can still move acceptance. The GLM splice gave 83.4 against 76.7 acceptance on one seed
@@ -143,7 +161,7 @@ and 89.5 against 89.1 on another. Check both the drafted equals serial gate and 
 A new model's drafter (MTP head, DFlash, LiLiCorr) needs its target layers' taps (Bolt's LiLiCorr reads layers 1, 18,
 35, 51, 68 and 85) and must hold the prompt's context before its first round.
 
-## 9. Working on the shared GPU
+## 10. Working on the shared GPU
 
 Production serves from this box while experiments run.
 
@@ -163,7 +181,7 @@ Production serves from this box while experiments run.
 - Read `GATEWAY_API_KEY` from the environment. Never print it or write it to a file.
 - Stop a process by its PID. `pkill -f <pattern>` matched the shell that ran it and killed the command (exit 144).
 
-## 10. Measuring
+## 11. Measuring
 
 - Speed: `tools/bench_openai.py` with `--tokens 64 --reps 5 --temperatures 1.0,0`, code and chat cells, medians, both
   configs on the same image and box, alternated.
@@ -188,7 +206,7 @@ Production serves from this box while experiments run.
 - Production health: `GET :30002/health` gives `requests_running`, which is the reliable signal that a disconnect freed
   the GPU. Log lines matched the wrong request once.
 
-## 11. Upstream
+## 12. Upstream
 
 Upstream TensorFold became a Zig engine at 1.0.0 (7 Oct 2026). Read its CHANGELOG for each release and port by hand
 what fits. Ported or in progress from 1.0.9 to 1.0.12: background prefill, disk states, GLM tool-call repair, branch
