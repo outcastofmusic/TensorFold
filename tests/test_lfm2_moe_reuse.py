@@ -82,8 +82,8 @@ def test_a_resume_must_leave_a_token_to_prefill(weights):
 def app_engine(weights, entries: int = 8, budget: int = 1 << 30):
     """``Lfm2MoeEngine`` around a CPU engine: its constructor loads onto the GPU, its ``generate`` does not."""
 
+    from tensorfold.cuda.kept_states import Store
     from tensorfold.families.lfm2_moe.cuda.app import Lfm2MoeEngine
-    from tensorfold.families.nemotron_bolt.cuda.reuse import Store
 
     be = Lfm2MoeEngine.__new__(Lfm2MoeEngine)
     be.e, be.max_len, be.eos = engine(weights, prefill_rows=128), 1024, ()
