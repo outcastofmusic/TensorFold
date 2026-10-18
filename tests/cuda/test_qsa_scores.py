@@ -6,6 +6,7 @@ Shapes are the FP4-Local and EXL3 3.05bpw indexer's (4 heads of 128 dims, 4-key 
 
 import pytest
 import torch
+import triton
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
@@ -102,7 +103,8 @@ def test_the_tiled_select_lists_select_s_blocks_between_8192_blocks_and_the_regi
 
     rows = ATT_ROWS
     blocks = -(-end // RATIO)
-    assert qsa.tiled(blocks, True, att.SELECT_REGS) and not qsa.tiled(blocks, False, att.SELECT_REGS)
+    width = triton.next_power_of_2(blocks)
+    assert qsa.tiled(blocks, width, True, att.SELECT_REGS) and not qsa.tiled(blocks, width, False, att.SELECT_REGS)
     g = torch.Generator(device=DEV).manual_seed(end)
     base = torch.randn((rows, -(-CAP // RATIO)), generator=g, device=DEV)
     if pattern == "tied":
