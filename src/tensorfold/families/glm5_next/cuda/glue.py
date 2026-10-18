@@ -8,8 +8,19 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorfold.env_flags import flag
+
 # fixed K split of the mixing dots (a function of the shape only; changing it changes bits for every row alike)
 HC_BLOCKS = 16
+HC_SPLIT_ENV = "TF_GLM_HC_SPLIT"
+HC_GROUP = 8                  # mixing rows a program of _hc_partial_split: the 24 in three programs
+
+
+def hc_split() -> bool:
+    """TF_GLM_HC_SPLIT (unset: on): hc_pre's mixing dots on ``_hc_partial_split``, the old bytes. The engine reads it
+    once at startup into ``Weights.meta``; a value outside env_flags' set raises."""
+
+    return flag(HC_SPLIT_ENV, True)
 
 
 # -- embedding ----------------------------------------------------------------------------------------------
@@ -105,6 +116,39 @@ def _hc_partial(X, FN, PART, WIDE: tl.constexpr, NB: tl.constexpr, SUB: tl.const
 
 
 @triton.jit
+def _hc_partial_split(X, FN, PART, WIDE: tl.constexpr, NB: tl.constexpr, SUB: tl.constexpr, MG: tl.constexpr):
+    """``_hc_partial``'s bytes from three programs a block, MG mixing rows each, all KB // SUB steps' loads at once.
+
+    Both lay the K axis of a tile out as 4 values a thread and 32 threads, with the warps across rows, so each SUB
+    step's sum keeps its tree (an FMA chain of 4, then lane butterflies 16 to 1). The step sums join acc in order,
+    each picked out by a sum with zeros, which is exact; acc starts at +0.0 and is never -0.0, so a -0.0 step sum made
+    +0.0 adds the same. Program 0 of a block also takes the sum of squares with ``_hc_partial``'s own loop."""
+
+    r = tl.program_id(0)
+    b = tl.program_id(1)
+    g = tl.program_id(2)
+    KB: tl.constexpr = WIDE // NB
+    T: tl.constexpr = KB // SUB
+    m = g * MG + tl.arange(0, MG)
+    k = tl.arange(0, SUB)
+    t = tl.arange(0, T)
+    kk = b * KB + t[:, None, None] * SUB + k[None, None, :]
+    x = tl.load(X + r * WIDE + kk).to(tl.float32)
+    w = tl.load(FN + m[None, :, None] * WIDE + kk).to(tl.float32)
+    s = tl.sum(w * x, axis=2)
+    acc = tl.zeros((MG,), dtype=tl.float32)
+    for j in tl.static_range(T):
+        acc = acc + tl.sum(tl.where(t[:, None] == j, s, 0.0), axis=0)
+    tl.store(PART + (r * NB + b) * 32 + m, acc)
+    if g == 0:
+        ss = tl.zeros((SUB,), dtype=tl.float32)
+        for i in range(T):
+            xi = tl.load(X + r * WIDE + b * KB + i * SUB + k).to(tl.float32)
+            ss += xi * xi
+        tl.store(PART + (r * NB + b) * 32 + 24, tl.sum(ss, axis=0))
+
+
+@triton.jit
 def _hc_finish(X, PART, BASE, SCALE, NW, OUT, XS, POST, COMB, eps_norm, hc_eps,
                D: tl.constexpr, S: tl.constexpr, NB: tl.constexpr, ITERS: tl.constexpr, BLOCK: tl.constexpr):
     """Sum blocks in order, compute the collapsed row and its RMSNorm, and retain POST and COMB for hc_post."""
@@ -159,15 +203,28 @@ def _hc_finish(X, PART, BASE, SCALE, NW, OUT, XS, POST, COMB, eps_norm, hc_eps,
     tl.store(XS + r * (D // 64) + tl.arange(0, BLOCK // 64), g)
 
 
+def splits(fn: torch.Tensor) -> bool:
+    """Whether _hc_partial_split takes this mixing matrix: fp32 [24, K] with K in blocks of HC_BLOCKS x 128, the
+    layout whose thread tiles match _hc_partial's (a 2-byte FN would hold 8 values a thread there)."""
+
+    return fn.dtype == torch.float32 and fn.shape[0] == 24 and fn.shape[1] % (HC_BLOCKS * 128) == 0
+
+
 def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
            out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor,
-           eps: float, hc_eps: float, iters: int) -> None:
-    """BF16 or packed-TP1 FP32 streams -> unchanged BF16 normed rows + xs, post and comb."""
+           eps: float, hc_eps: float, iters: int, split: bool = False) -> None:
+    """BF16 or packed-TP1 FP32 streams -> unchanged BF16 normed rows + xs, post and comb; ``split``
+    (TF_GLM_HC_SPLIT) takes the mixing dots on _hc_partial_split, the same bytes."""
 
     rows, wide = x.shape
     d = norm_w.shape[0]
     s = wide // d
-    _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
+    if split and splits(fn):
+        # GB10, one decode row: _hc_partial's 16 programs took 12.3 µs a call, 1.1 ms a token over 90 calls
+        _hc_partial_split[(rows, HC_BLOCKS, 24 // HC_GROUP)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128,
+                                                            MG=HC_GROUP, num_warps=4)
+    else:
+        _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
     _hc_finish[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s, NB=HC_BLOCKS,
                         ITERS=iters, BLOCK=d, num_warps=8)
 

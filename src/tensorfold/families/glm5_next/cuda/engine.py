@@ -26,12 +26,13 @@ DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
 
 def kernel_switches() -> dict[str, bool]:
     """The decode kernels' switches, read once at startup into ``Weights.meta`` (``forward.Buffers`` takes them):
-    TF_GLM_PLAIN_NARROW (``packed.plain_narrow``), on when unset. Either way a reply keeps its bytes; a value outside
-    env_flags' set raises."""
+    TF_GLM_PLAIN_NARROW (``packed.plain_narrow``) and TF_GLM_HC_SPLIT (``glue.hc_split``), both on when unset. Either
+    way a reply keeps its bytes; a value outside env_flags' set raises."""
 
+    from .glue import hc_split
     from .packed import plain_narrow
 
-    return {"plain_narrow": plain_narrow()}
+    return {"plain_narrow": plain_narrow(), "hc_split": hc_split()}
 
 
 def _token_id(model_dir: Path, text: str) -> int:

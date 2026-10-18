@@ -143,13 +143,13 @@ def test_layer_routes_both_updates(monkeypatch):
     seen=[]
     def post(*args, **kw): seen.append(kw['fp32_residual'])
     monkeypatch.setattr(glue, 'hc_post', post)
-    monkeypatch.setattr(glue, 'hc_pre', lambda *a: None)
+    monkeypatch.setattr(glue, 'hc_pre', lambda *a, **kw: None)
     monkeypatch.setattr(forward, 'kda_block', lambda *a: torch.empty(1,1,128))
     monkeypatch.setattr(forward, 'mlp_block', lambda *a: torch.empty(1,1,128))
     h=NS(fn=None,base=None,scale=None)
     layer=NS(attn_hc=h,ffn_hc=h,in_norm=None,post_norm=None,kind='kda',mlp=object())
     b=NS(x=torch.empty(1,512),normed=torch.empty(1,128),xs=torch.empty(1,2),post=torch.empty(1,4),
-         comb=torch.empty(1,16),hcpart=torch.empty(1,16,32),fp32_residual=True)
+         comb=torch.empty(1,16),hcpart=torch.empty(1,16,32),fp32_residual=True,hc_split=True)
     forward.layer_forward(layer, NS(cfg=NS(eps=1e-5,hc_eps=1e-6,hc_iters=20)), None,b,1)
     assert seen == [True,True]
 

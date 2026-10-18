@@ -1,4 +1,5 @@
-"""TF_GLM_PLAIN_NARROW: the switch, which calls each kernel takes, and the thread layouts that keep the old bytes. CPU only: the kernels are spies that record their launches, and the layout checks compile the
+"""TF_GLM_PLAIN_NARROW and TF_GLM_HC_SPLIT: the switches, which calls each kernel takes, and the thread layouts that
+keep the old bytes. CPU only: the kernels are spies that record their launches, and the layout checks compile the
 Triton kernels for sm_121 without a GPU (tests/cuda/test_glm_decode_shapes.py compares the bytes on the GPU)."""
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
 pytestmark = pytest.mark.torch
 
-from tensorfold.families.glm5_next.cuda import engine, forward, packed, prefill
+from tensorfold.families.glm5_next.cuda import engine, forward, glue, packed, prefill
 
 
 class Spy:
@@ -28,7 +29,7 @@ class Spy:
 
 
 # -- the switches -------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("env,read", [("TF_GLM_PLAIN_NARROW", packed.plain_narrow)])
+@pytest.mark.parametrize("env,read", [("TF_GLM_PLAIN_NARROW", packed.plain_narrow), ("TF_GLM_HC_SPLIT", glue.hc_split)])
 def test_each_switch_is_on_unless_set_off_and_a_typo_raises(monkeypatch, env, read):
     monkeypatch.delenv(env, raising=False)
     assert read() is True
@@ -40,11 +41,12 @@ def test_each_switch_is_on_unless_set_off_and_a_typo_raises(monkeypatch, env, re
         read()
 
 
-def test_the_engine_reads_the_switch_into_the_weights_meta(monkeypatch):
+def test_the_engine_reads_both_switches_into_the_weights_meta(monkeypatch):
     monkeypatch.setenv("TF_GLM_PLAIN_NARROW", "0")
-    assert engine.kernel_switches() == {"plain_narrow": False}
-    monkeypatch.delenv("TF_GLM_PLAIN_NARROW")
-    assert engine.kernel_switches() == {"plain_narrow": True}
+    monkeypatch.delenv("TF_GLM_HC_SPLIT", raising=False)
+    assert engine.kernel_switches() == {"plain_narrow": False, "hc_split": True}
+    monkeypatch.setenv("TF_GLM_HC_SPLIT", "no")
+    assert engine.kernel_switches() == {"plain_narrow": False, "hc_split": False}
 
 
 def _weights(meta):
@@ -55,13 +57,14 @@ def _weights(meta):
     return NS(cfg=c, device="cpu", world=1, meta={"packed_exl3": True, **meta}, layers=[], head=head, mtp=None)
 
 
-@pytest.mark.parametrize("meta,narrow", [({}, True), ({"plain_narrow": False}, False), ({"plain_narrow": True}, True)])
-def test_buffers_take_the_switch_from_the_meta_and_default_on(monkeypatch, meta, narrow):
+@pytest.mark.parametrize("meta,narrow,split", [({}, True, True), ({"plain_narrow": False, "hc_split": True}, False, True),
+                                               ({"plain_narrow": True, "hc_split": False}, True, False)])
+def test_buffers_take_the_switches_from_the_meta_and_default_on(monkeypatch, meta, narrow, split):
     monkeypatch.setattr(packed, "projections", lambda w: [w.head])
     monkeypatch.setattr(forward.latent, "ENABLED", False)
     for prefill_rows in (False, True):
         b = forward.Buffers(_weights(meta), 4, capacity=16, prefill=prefill_rows)
-        assert b.projection_scratch.narrow is narrow
+        assert b.projection_scratch.narrow is narrow and b.hc_split is split
 
 
 # -- plain projections ---------------------------------------------------------------------------------------------
@@ -121,6 +124,41 @@ class _Cudaish(torch.Tensor):
         return torch.device("cuda")
 
 
+# -- hyper-connections ---------------------------------------------------------------------------------------------
+def _hc(rows, fn_dtype=torch.float32, wide=16384, d=4096):
+    x = torch.empty((rows, wide))
+    fn = torch.empty((24, wide), dtype=fn_dtype)
+    one = torch.empty(1)
+    return (x, fn, one, one, torch.empty(d), torch.empty((rows, d), dtype=torch.bfloat16), torch.empty((rows, d // 64)),
+            torch.empty((rows, 4)), torch.empty((rows, 16)), torch.empty((rows, glue.HC_BLOCKS, 32)), 1e-5, 1e-6, 20)
+
+
+@pytest.mark.parametrize("rows", [1, 6, 2048])
+@pytest.mark.parametrize("wide,d", [(16384, 4096), (2048, 512)])
+@pytest.mark.parametrize("split", [True, False])
+def test_hc_pre_takes_the_split_partials_with_the_switch_on(monkeypatch, rows, wide, d, split):
+    old, new, finish = Spy(), Spy(), Spy()
+    monkeypatch.setattr(glue, "_hc_partial", old)
+    monkeypatch.setattr(glue, "_hc_partial_split", new)
+    monkeypatch.setattr(glue, "_hc_finish", finish)
+    glue.hc_pre(*_hc(rows, wide=wide, d=d), split=split)
+    assert len(finish.calls) == 1 and finish.calls[0][0] == (rows,)
+    if split:
+        assert not old.calls and new.calls[0][0] == (rows, glue.HC_BLOCKS, 3)
+        assert new.calls[0][1]["MG"] == 8 and new.calls[0][1]["SUB"] == 128 and new.calls[0][1]["num_warps"] == 4
+    else:
+        assert not new.calls and old.calls[0][0] == (rows, glue.HC_BLOCKS)
+
+
+def test_a_two_byte_mixing_matrix_stays_on_the_old_partials(monkeypatch):
+    old, new = Spy(), Spy()
+    monkeypatch.setattr(glue, "_hc_partial", old)
+    monkeypatch.setattr(glue, "_hc_partial_split", new)
+    monkeypatch.setattr(glue, "_hc_finish", Spy())
+    glue.hc_pre(*_hc(1, fn_dtype=torch.bfloat16), split=True)
+    assert len(old.calls) == 1 and not new.calls
+
+
 # -- the thread layouts behind the bytes ----------------------------------------------------------------------------
 def _compile(fn, signature, constexprs, num_warps):
     """TTGIR and PTX for sm_121 (GB10), with the 16-byte alignment the launches specialize on."""
@@ -153,3 +191,22 @@ def test_the_narrow_kernel_lays_k_out_as_the_old_one_does(w_dtype, k, u):
     assert "sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1]" in old
     assert "sizePerThread = [1, 1, 8], threadsPerWarp = [1, 2, 16], warpsPerCTA = [1, 1, 1]" in new
     assert {8, 4, 2, 1} <= _butterflies(ptx)
+
+
+@pytest.mark.parametrize("x_dtype", ["fp32", "bf16"])
+@pytest.mark.parametrize("wide", [16384, 2048])
+def test_the_split_partials_lay_k_out_as_the_old_ones_do(x_dtype, wide):
+    """A SUB step as 4 values a thread and 32 threads with the warps across rows in both, and the sum of squares in
+    the old kernel's one-value-a-thread layout with the same butterflies (16 to 1 in a warp, then 2 and 1 across)."""
+
+    sig = {"X": "*" + x_dtype, "FN": "*fp32", "PART": "*fp32", "WIDE": "constexpr", "NB": "constexpr",
+           "SUB": "constexpr"}
+    old, old_ptx = _compile(glue._hc_partial, sig, {"WIDE": wide, "NB": 16, "SUB": 128}, 4)
+    new, new_ptx = _compile(glue._hc_partial_split, {**sig, "MG": "constexpr"},
+                            {"WIDE": wide, "NB": 16, "SUB": 128, "MG": 8}, 4)
+    one = "sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4]"
+    assert "sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1]" in old and one in old
+    assert "sizePerThread = [1, 1, 4], threadsPerWarp = [1, 1, 32], warpsPerCTA = [1, 4, 1]" in new and one in new
+    tail = re.findall(r"shfl\.sync\.bfly\.b32\s+%r\d+, %r\d+, (\d+),", old_ptx)[-7:]
+    assert tail == re.findall(r"shfl\.sync\.bfly\.b32\s+%r\d+, %r\d+, (\d+),", new_ptx)[-7:] == \
+        ["16", "8", "4", "2", "1", "2", "1"]
