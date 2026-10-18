@@ -30,10 +30,6 @@ SERVED = {
     "bolt": ("Nemotron-3.5-Bolt-74B-A9B-24GB", "tensorfold.families.nemotron_bolt.cuda.weights"),
     "lfm2": ("LFM2.5-24B-A2B-FP8", "tensorfold.families.lfm2_moe.config"),
 }
-GLM_SKIPS_GENERATION = pytest.mark.xfail(strict=True, reason=(
-    "mismatch: glm5_next.cuda.weights.Config.read takes eos_token_id from config.json only and never reads "
-    "generation_config.json; today's GLM checkpoint lists the same 3 ids in both, so serving is unaffected"))
-
 
 def folder_of(name: str) -> Path:
     folder = MODELS / SERVED[name][0]
@@ -84,7 +80,7 @@ def chat_end_ids(folder: Path) -> list[int]:
 
 
 def cases():
-    return [pytest.param(name, marks=GLM_SKIPS_GENERATION) if name == "glm" else name for name in sorted(SERVED)]
+    return sorted(SERVED)
 
 
 @pytest.mark.parametrize("name", sorted(SERVED))
