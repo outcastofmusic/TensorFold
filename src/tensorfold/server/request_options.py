@@ -181,19 +181,33 @@ class RequestOptions:
         """(opener, lead, tail) of this template's tool calls, read once from a rendered call."""
 
         from tensorfold.engine.call_gate import call_format
-        from tensorfold.server.text import _CALLS, render_prompt_ids
+        from tensorfold.server.text import _CALLS
 
         if not hasattr(self, "_form"):
-            probe = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "call_0", "type": "function", "function": {"name": "tfprobe_fn", "arguments": {}}}]}]
-            with self.tokenizer_lock:
-                try:
-                    text = self.tokenizer.decode(render_prompt_ids(self.tokenizer, probe, add_generation_prompt=False))
-                except Exception:  # noqa: BLE001 - a template that renders no calls: the opener alone
-                    text = ""
-            self._form = call_format(text, "tfprobe_fn", [o for o, _ in _CALLS]) or next(
+            self._form = call_format(self._call_probe(), "tfprobe_fn", [o for o, _ in _CALLS]) or next(
                 ((o, None, None) for o, _ in _CALLS if self._token_id(o) >= 0), None)      # no names: format unknown
         return self._form
+
+    def _call_opener(self) -> str | None:
+        """The opener of this template's own calls, which streamed text hides at once; None when it renders none."""
+
+        from tensorfold.server.text import call_opener
+
+        return call_opener(self._call_probe())
+
+    def _call_probe(self) -> str:
+        """A call to ``tfprobe_fn`` as this template renders it, "" when it renders none (read once)."""
+
+        from tensorfold.server.text import CALL_PROBE, render_prompt_ids
+
+        if not hasattr(self, "_probe_text"):
+            with self.tokenizer_lock:
+                try:
+                    self._probe_text = self.tokenizer.decode(
+                        render_prompt_ids(self.tokenizer, CALL_PROBE, add_generation_prompt=False))
+                except Exception:  # noqa: BLE001 - a template that renders no calls: the opener alone
+                    self._probe_text = ""
+        return self._probe_text
 
     def _text(self, token: int) -> str:
         with self.tokenizer_lock:

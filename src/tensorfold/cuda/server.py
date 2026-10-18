@@ -32,7 +32,8 @@ from tensorfold.cuda.chat_template import ChatTemplate
 from tensorfold.cuda.prompt_ids import PromptIds
 from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, close_call, hide_tool_calls, parse_tool_calls
 from tensorfold.cuda.turns import Turns, Yield
-from tensorfold.server.text import THINK_MARKERS, is_title_request, reasoning_count, split_thinking
+from tensorfold.server.text import (CALL_PROBE, THINK_MARKERS, call_opener, is_title_request, reasoning_count,
+                                    split_thinking)
 from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
 
 
@@ -106,6 +107,7 @@ class App:
         self.model_dir = Path(model_dir)
         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         self.template = ChatTemplate(model_dir)
+        self._call_probe()                           # rendered once here, so a request still renders once
         self.loop_close = loop_close(self.tok)       # tokenized once here, so a request still encodes once
         self.default_thinking = default_thinking
         self.reasoning_effort, self.thinking_budget = reasoning_effort, int(thinking_budget)   # the Mac's defaults
@@ -532,6 +534,7 @@ class App:
         # calls stream as argument deltas while written (as on the Mac); one-call requests keep the end parser
         calls_stream = ToolCallStreamer(tools) if tools and not policy.single else None
         answer_raw = [""]
+        own_opener = call_opener(self._call_probe()) if tools else None    # the template's calls hide at once
 
         def visible(finished: bool) -> tuple[str, str]:
             raw = stream.final() if finished else stream.text
@@ -546,7 +549,7 @@ class App:
             answer_raw[0] = answer
             if tools:
                 answer = (policy.content(answer, finished=finished) if policy.single
-                          else hide_tool_calls(answer, finished=finished))
+                          else hide_tool_calls(answer, finished=finished, opener=own_opener))
             return reasoning, answer
 
         serving: list[Any] = [None]
@@ -776,18 +779,23 @@ class App:
                           decode=lambda ids: self.tok.decode(ids, skip_special_tokens=False),
                           encode=lambda text: self.tok.encode(text, add_special_tokens=False).ids)
 
+    def _call_probe(self) -> str:
+        """A call to ``tfprobe_fn`` as this template renders it, "" when it renders none (read once)."""
+
+        if not hasattr(self, "_probe_text"):
+            try:
+                self._probe_text = self.template.render(CALL_PROBE, tools=None, enable_thinking=False)
+            except Exception:  # noqa: BLE001 - a template that renders no calls: the opener alone
+                self._probe_text = ""
+        return self._probe_text
+
     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:
         """The gate a required tool call needs, from this template's call markup and the rendered prompt."""
 
         if not hasattr(self, "_form"):
-            probe = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "call_0", "type": "function", "function": {"name": "tfprobe_fn", "arguments": {}}}]}]
-            try:
-                text = self.template.render(probe, tools=None, enable_thinking=False)
-            except Exception:  # noqa: BLE001 - a template that renders no calls: the opener alone
-                text = ""
             openers = [o for o in ("<tool_call>", "<|tool_call>") if self.tok.token_to_id(o) is not None]
-            self._form = call_format(text, "tfprobe_fn", openers) or ((openers[0], None, None) if openers else None)
+            self._form = (call_format(self._call_probe(), "tfprobe_fn", openers)
+                          or ((openers[0], None, None) if openers else None))
         if self._form is None:
             raise RequestError('tool_choice "required" or a named function needs a chat template that marks tool calls '
                                '(<tool_call> or <|tool_call>), and this one does not: send "auto"')
