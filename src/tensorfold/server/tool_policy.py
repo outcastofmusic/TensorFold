@@ -2,15 +2,14 @@ import re
 from typing import Any
 
 from tensorfold.server.errors import RequestError
-from tensorfold.server.pythonic_calls import CALL_CLOSE, CALL_OPEN
+from tensorfold.server.text import _CALLS, _LEADS
 
-# Envelopes whose opener is not an XML-like ``<name:tool_call>`` tag, as (opener, closer, payload leads): LFM2's
-# Pythonic list, Gemma 4's ``call:NAME{..}`` (the 26B writes a bare ``:NAME{..}``) and DeepSeek-V4's DSML invokes.
-# With leads, the opener hides only when its payload (after whitespace) starts with one: another family's reply
-# may name the opener in prose. LFM2's payload can be a bare call, which no lead tells apart from prose.
-_FIXED = ((CALL_OPEN, CALL_CLOSE, ()),
-          ("<|tool_call>", "<tool_call|>", ("call:", ":")),
-          ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>", ("<｜DSML｜invoke",)))
+# Envelopes whose opener is not an XML-like ``<name:tool_call>`` tag, as (opener, closer, payload leads), from the
+# streaming hider's tables in text.py: Gemma 4's ``call:NAME{..}`` (the 26B writes a bare ``:NAME{..}``), DeepSeek-V4's
+# DSML invokes and LFM2's Pythonic list. ``<tool_call>`` hides by the tag rule in ``feed``. With leads, the opener
+# hides only when its payload (after whitespace) starts with one: another family's reply may name the opener in prose.
+# LFM2's payload can be a bare call, which no lead tells apart from prose.
+_FIXED = tuple((opener, closer, _LEADS.get(opener, ())) for opener, closer in _CALLS if opener != "<tool_call>")
 
 
 class _ToolTextFilter:
