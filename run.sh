@@ -355,10 +355,12 @@ status() {
 }
 
 command -v docker >/dev/null || die "docker is not installed"
-# one start at a time: two direct runs would both stop_all, then load two models side by side
+# one start at a time: two direct runs would both stop_all, then load two models side by side. A run that hands the
+# load to the swap endpoint (ask_swap) takes no lock: the endpoint's own run.sh child takes it, and would otherwise wait
+# behind this process for the whole swap
 case "${1:-}" in
     qwen-flash-next|glm-5.3-flash|qwen-flash-next-fp4|nemotron-bolt|lfm2-24b|nemotron-3.5-super)
-        mkdir -p "$STATE"; exec 9>"$STATE/run.lock"; flock 9 ;;
+        if [ -n "${TF_SWAP_CHILD:-}" ] || ! swapping; then mkdir -p "$STATE"; exec 9>"$STATE/run.lock"; flock 9; fi ;;
 esac
 case "${1:-}" in
     "")              swap qwen-flash-next ;;

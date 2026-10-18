@@ -274,3 +274,46 @@ def test_a_first_load_has_nothing_to_persist(swap, tmp_path):
     finally:
         backend.shutdown()
     assert log.read_text().splitlines() == ["run glm-5.3-flash"]
+
+
+class _SwapEndpoint(BaseHTTPRequestHandler):
+    def do_POST(self):  # noqa: N802 - http.server's name
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def test_a_direct_start_under_the_swap_endpoint_takes_no_lock(tmp_path):
+    """A direct `run.sh <target>` hands the load to the swap endpoint, whose run.sh child takes run.lock: the direct run
+    must not hold that lock while it waits, or the child waits behind it for the whole swap."""
+
+    import fcntl
+    import os
+    import subprocess
+    import sys
+
+    state = tmp_path / "state" / "tensorfold-run"
+    state.mkdir(parents=True)
+    fake_swap = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "swap.py"])
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "docker").write_text("#!/bin/sh\nexit 0\n")
+    (bin_dir / "docker").chmod(0o755)
+    endpoint = _serve(_SwapEndpoint)
+    try:
+        (state / "swap.pid").write_text(str(fake_swap.pid))
+        with open(state / "run.lock", "w") as held:      # the endpoint's child, mid-load
+            fcntl.flock(held, fcntl.LOCK_EX)
+            env = dict(os.environ, XDG_STATE_HOME=str(tmp_path / "state"), PORT=str(endpoint.server_address[1]),
+                       PATH=f"{bin_dir}:{os.environ['PATH']}")
+            env.pop("TF_SWAP_CHILD", None)
+            done = subprocess.run(["bash", str(ROOT / "run.sh"), "qwen-flash-next"], env=env, capture_output=True,
+                                  text=True, timeout=20)
+        assert done.returncode == 0, done.stderr
+        assert "asking the swap endpoint" in done.stdout
+    finally:
+        fake_swap.kill()
+        endpoint.shutdown()
