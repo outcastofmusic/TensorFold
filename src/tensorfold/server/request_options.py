@@ -189,11 +189,14 @@ class RequestOptions:
         return self._form
 
     def _call_opener(self) -> str | None:
-        """The opener of this template's own calls, which streamed text hides at once; None when it renders none."""
+        """The opener of this template's own calls, which streamed text hides at once; None when it renders none (read
+        once)."""
 
         from tensorfold.server.text import call_opener
 
-        return call_opener(self._call_probe())
+        if not hasattr(self, "_opener"):
+            self._opener = call_opener(self._call_probe())
+        return self._opener
 
     def _call_probe(self) -> str:
         """A call to ``tfprobe_fn`` as this template renders it, "" when it renders none (read once)."""

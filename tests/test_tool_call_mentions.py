@@ -167,3 +167,31 @@ def test_the_cuda_server_streams_a_qwen_reply_that_names_other_openers(tmp_path,
     names = "".join(d["function"].get("name", "") for c in chunks for d in c["delta"].get("tool_calls", []))
     assert content == MentionEngine.PROSE and names == "get_weather"
     assert chunks[-1]["finish_reason"] == "tool_calls"
+
+
+def test_the_cuda_server_reads_its_opener_once_and_only_for_requests_that_hide_with_it(tmp_path, monkeypatch):
+    from tensorfold.cuda import server
+    from tests.test_cuda_admission import http_server, post
+    from tests.test_cuda_tool_choice import TOOLS, app_for
+
+    reads = []
+    monkeypatch.setattr(server, "call_opener", lambda rendered: reads.append(rendered) or QWEN)
+    body = {"messages": [{"role": "user", "content": "Weather?"}], "tools": TOOLS, "stream": True}
+    with http_server(app_for(tmp_path, MentionEngine())) as port:
+        assert post(port, {**body, "parallel_tool_calls": False}, True)[0] == 200
+        assert reads == []                                 # a one-call request filters with ToolCallPolicy
+        for _ in range(2):
+            assert post(port, body, True)[0] == 200
+    assert len(reads) == 1
+
+
+def test_the_mac_server_reads_its_opener_once(monkeypatch):
+    from tensorfold.server import text
+    from tensorfold.server.request_options import RequestOptions
+
+    reads = []
+    monkeypatch.setattr(text, "call_opener", lambda rendered: reads.append(rendered) or GEMMA)
+    options = object.__new__(RequestOptions)
+    options._probe_text = "<|turn>model\n<|tool_call>call:tfprobe_fn{}<tool_call|>"
+    assert [options._call_opener() for _ in range(3)] == [GEMMA] * 3
+    assert reads == [options._probe_text]
