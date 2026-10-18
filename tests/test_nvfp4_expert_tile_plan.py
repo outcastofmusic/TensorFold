@@ -63,7 +63,7 @@ def test_a_layer_reads_the_flag_when_it_loads(monkeypatch):
         nvfp4_moe.MoE4(None, None)                                 # a typo fails the load
 
 
-@pytest.mark.parametrize("value, mode", [(None, "qmmf"), ("", "qmmf"), ("qmmf", "qmmf"), ("prompt", "prompt"),
+@pytest.mark.parametrize("value, mode", [(None, "prompt"), ("", "prompt"), ("qmmf", "qmmf"), ("prompt", "prompt"),
                                          (" prompt ", "prompt")])
 def test_the_shared_decode_flag_reads_qmmf_or_prompt(monkeypatch, value, mode):
     if value is None:

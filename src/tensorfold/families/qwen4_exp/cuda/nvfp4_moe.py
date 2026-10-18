@@ -31,15 +31,16 @@ SHARED_DECODE_MODES = ("qmmf", "prompt")
 
 
 def shared_decode() -> str:
-    """TF_FP4_SHARED_DECODE: the kernel of a decode window's MXFP8 shared expert (unset: qmmf).
+    """TF_FP4_SHARED_DECODE: the kernel of a decode window's MXFP8 shared expert (unset: prompt).
 
     Decode windows keep bf16 slots (``moe_prefill``), which once sent their shared expert to the prompt GEMM. ``qmmf``
     runs it on the lane matmul like every other decode linear; ``prompt`` keeps the prompt GEMM's bits. Prompt rows
-    take the prompt GEMM either way."""
+    take the prompt GEMM either way. ``prompt`` is the default: on FP4-Local (GB10, 18 Oct) its 16-row tile gave
+    1.059x decode with the old replies' bytes, against 1.064x for ``qmmf``, whose replies differ."""
 
     value = os.environ.get(SHARED_DECODE_ENV, "").strip()
     if not value:
-        return "qmmf"
+        return "prompt"
     if value not in SHARED_DECODE_MODES:
         raise ValueError(f"{SHARED_DECODE_ENV}: qmmf (the lane matmul) or prompt (the prompt GEMM), not {value!r}")
     return value
