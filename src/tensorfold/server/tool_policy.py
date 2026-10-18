@@ -4,8 +4,13 @@ from typing import Any
 from tensorfold.server.errors import RequestError
 from tensorfold.server.pythonic_calls import CALL_CLOSE, CALL_OPEN
 
-# envelopes whose opener is not an XML-like ``<name:tool_call>`` tag: LFM2's Pythonic list
-_FIXED = ((CALL_OPEN, CALL_CLOSE),)
+# Envelopes whose opener is not an XML-like ``<name:tool_call>`` tag, as (opener, closer, payload leads): LFM2's
+# Pythonic list, Gemma 4's ``call:NAME{..}`` (the 26B writes a bare ``:NAME{..}``) and DeepSeek-V4's DSML invokes.
+# With leads, the opener hides only when its payload (after whitespace) starts with one: another family's reply
+# may name the opener in prose. LFM2's payload can be a bare call, which no lead tells apart from prose.
+_FIXED = ((CALL_OPEN, CALL_CLOSE, ()),
+          ("<|tool_call>", "<tool_call|>", ("call:", ":")),
+          ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>", ("<｜DSML｜invoke",)))
 
 
 class _ToolTextFilter:
@@ -14,6 +19,8 @@ class _ToolTextFilter:
     def __init__(self):
         self.pending = ""
         self.hidden = None              # the closer the hidden envelope ends at
+        self.opened = None              # (closer, leads) of an opener whose payload has not shown a lead yet
+        self.held: list[str] = []       # that opener and the whitespace after it, shown if no lead follows
 
     def feed(self, text: str) -> str:
         self.pending += text
@@ -28,6 +35,20 @@ class _ToolTextFilter:
                 self.pending = self.pending[end + len(close):]
                 self.hidden = None
                 continue
+            if self.opened:
+                closer, leads = self.opened
+                payload = self.pending.lstrip()
+                self.held.append(self.pending[:len(self.pending) - len(payload)])
+                self.pending = payload
+                if any(lead.startswith(payload) for lead in leads):   # whitespace or a partial lead: wait for more
+                    break
+                self.opened = None
+                if payload.startswith(leads):
+                    self.hidden = closer
+                else:                                                  # prose that names the opener
+                    out.extend(self.held)
+                self.held = []
+                continue
             start = self.pending.find("<")
             if start < 0:
                 out.append(self.pending)
@@ -35,12 +56,16 @@ class _ToolTextFilter:
                 break
             out.append(self.pending[:start])
             self.pending = self.pending[start:]
-            envelope = next(((o, c) for o, c in _FIXED if o.startswith(self.pending[:len(o)])), None)
+            envelope = next((e for e in _FIXED if e[0].startswith(self.pending[:len(e[0])])), None)
             if envelope is not None:
-                opener, closer = envelope
+                opener, closer, leads = envelope
                 if len(self.pending) < len(opener):            # a partial opener: wait for the rest
                     break
-                self.pending, self.hidden = self.pending[len(opener):], closer
+                self.pending = self.pending[len(opener):]
+                if leads:
+                    self.opened, self.held = (closer.lower(), leads), [opener]
+                else:
+                    self.hidden = closer.lower()
                 continue
             end = self.pending.find(">")
             if end < 0:
@@ -63,8 +88,8 @@ class _ToolTextFilter:
         return "".join(out)
 
     def finish(self) -> str:
-        tail = "" if self.hidden else self.pending
-        self.pending = ""
+        tail = "" if self.hidden or self.opened else self.pending
+        self.pending, self.opened, self.held = "", None, []
         return tail
 
 

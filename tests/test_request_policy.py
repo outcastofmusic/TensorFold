@@ -1,5 +1,6 @@
 import copy
 import json
+from itertools import pairwise
 
 import pytest
 
@@ -239,3 +240,119 @@ def test_single_call_hides_lfm2_s_pythonic_envelope():
     streamed = ToolCallPolicy({"parallel_tool_calls": False})
     shown = "".join(streamed.delta(ch) for ch in f"Sure. {LFM2_CALL} Done.") + streamed.flush()
     assert shown == "Sure.  Done."
+
+
+# Gemma 4's and DeepSeek-V4's envelopes, as upstream's server goldens script them (tools/gemma_tool, tools/dsml_tool)
+LOOKUP = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {
+    "query": {"type": "string"}, "limit": {"type": "integer"}}}}}]
+GEMMA_CALL = '<|tool_call>call:lookup{query:<|"|>hi, there<|"|>,limit:2}<tool_call|>'
+GEMMA_BARE_CALL = '<|tool_call>:lookup{query:<|"|>bare<|"|>,limit:5}<tool_call|>'      # the 26B's form (4447ac30)
+DSML_CALL = ('<｜DSML｜tool_calls>\n<｜DSML｜invoke name="lookup">\n'
+             '<｜DSML｜parameter name="query" string="true">fast</｜DSML｜parameter>\n'
+             '<｜DSML｜parameter name="limit" string="false">4</｜DSML｜parameter>\n'
+             '</｜DSML｜invoke>\n</｜DSML｜tool_calls>')
+DSML_SECOND = DSML_CALL.replace("fast", "slow").replace(">4<", ">7<")
+GEMMA_SECOND = GEMMA_CALL.replace("hi, there", "again").replace("limit:2", "limit:3")
+QWEN_LOOKUP = '<tool_call>\n<function=lookup>\n<parameter=query>\nParis\n</parameter>\n</function>\n</tool_call>'
+
+
+class RawProseApp(PolicyApp):
+    """An app that streams its reply's raw text, markup included, cut at ``splits``, as a token decoder would."""
+
+    def __init__(self, *, content, splits=None):
+        super().__init__(content=content)
+        self.splits = list(range(1, len(content))) if splits is None else splits
+
+    def chat(self, messages, *, on_delta=None, **kwargs):
+        reply = super().chat(messages, **kwargs)
+        if on_delta is not None:
+            cuts = [0, *self.splits, len(self.content)]
+            for start, end in pairwise(cuts):
+                on_delta(self.content[start:end])
+        return reply
+
+
+def reply_of(app, *, stream, parallel):
+    status, body = request(app, {"messages": [{"role": "user", "content": "Look it up"}], "tools": LOOKUP,
+                                 "stream": stream, "parallel_tool_calls": parallel})
+    assert status == 200
+    if not stream:
+        message = json.loads(body)["choices"][0]["message"]
+        return message["content"] or "", [(c["function"]["name"], json.loads(c["function"]["arguments"]))
+                                          for c in message.get("tool_calls") or []]
+    content = "".join(json.loads(line[5:])["choices"][0]["delta"].get("content", "")
+                      for line in body.splitlines() if line.startswith("data:") and line != "data: [DONE]")
+    calls = [(c["name"], json.loads(c["arguments"])) for _, c in sorted(stream_calls(body).items())]
+    return content, calls
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("first, second, arguments", [
+    (GEMMA_CALL, GEMMA_SECOND, {"query": "hi, there", "limit": 2}),
+    (GEMMA_BARE_CALL, GEMMA_SECOND, {"query": "bare", "limit": 5}),
+    (DSML_CALL, DSML_SECOND, {"query": "fast", "limit": 4}),
+])
+def test_single_call_returns_gemma_s_and_dsml_s_first_call_and_hides_the_rest(stream, first, second, arguments):
+    app = RawProseApp(content=f"Sure. {first}{second} Done.")
+    content, calls = reply_of(app, stream=stream, parallel=False)
+    assert calls == [("lookup", arguments)]
+    assert content == ("Sure.  Done." if stream else "")         # a message with calls has null content
+
+
+@pytest.mark.parametrize("first, second", [(GEMMA_CALL, GEMMA_SECOND), (DSML_CALL, DSML_SECOND)])
+def test_parallel_calls_still_return_every_gemma_and_dsml_call(first, second):
+    content, calls = reply_of(RawProseApp(content=f"{first}{second}"), stream=False, parallel=True)
+    assert content == "" and len(calls) == 2
+
+
+@pytest.mark.parametrize("envelope", [GEMMA_CALL, GEMMA_BARE_CALL, DSML_CALL])
+def test_single_call_hides_an_envelope_split_at_every_boundary(envelope):
+    from tensorfold.server.tool_policy import ToolCallPolicy
+
+    text = f"Sure. {envelope}{envelope} Done."
+    for cut in range(len(text) + 1):
+        policy = ToolCallPolicy({"parallel_tool_calls": False})
+        shown = policy.delta(text[:cut]) + policy.delta(text[cut:]) + policy.flush()
+        assert shown == "Sure.  Done.", cut
+    policy = ToolCallPolicy({"parallel_tool_calls": False})
+    assert "".join(policy.delta(ch) for ch in text) + policy.flush() == "Sure.  Done."
+    for cut in range(text.index(">") + 1, len("Sure. ") + len(envelope)):   # a reply that ends inside the envelope
+        assert ToolCallPolicy({"parallel_tool_calls": False}).content(text[:cut]) == "Sure. ", cut
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("mention", [
+    "Gemma opens a call with <|tool_call> in its replies. ",
+    "DeepSeek writes <｜DSML｜tool_calls> first. ",
+    "Gemma's <|tool_call>\n and DeepSeek's <｜DSML｜tool_calls> differ. ",
+])
+def test_another_family_s_opener_in_prose_neither_hides_text_nor_takes_the_call(stream, mention):
+    from tensorfold.server.tool_policy import ToolCallPolicy
+    from tensorfold.server.tools import parse_tool_calls_from_content
+
+    content, calls = reply_of(RawProseApp(content=mention + QWEN_LOOKUP), stream=stream, parallel=False)
+    assert calls == [("lookup", {"query": "Paris"})]
+    assert content == (mention if stream else "")
+    reply = ToolCallPolicy({"parallel_tool_calls": False}).finish(
+        {"content": mention + QWEN_LOOKUP}, LOOKUP, parse_tool_calls_from_content)
+    assert reply["content"] == mention.strip()
+    content, calls = reply_of(RawProseApp(content=mention + "That is all."), stream=stream, parallel=False)
+    assert calls == [] and content == mention + "That is all."
+
+
+def test_a_gemma_reply_that_names_the_dsml_opener_keeps_its_call():
+    mention = "Not <｜DSML｜tool_calls> here. "
+    content, calls = reply_of(RawProseApp(content=mention + GEMMA_CALL + GEMMA_SECOND), stream=True, parallel=False)
+    assert calls == [("lookup", {"query": "hi, there", "limit": 2})] and content == mention
+
+
+def test_an_opener_followed_by_whitespace_holds_a_bounded_tail():
+    from tensorfold.server.tool_policy import ToolCallPolicy
+
+    policy = ToolCallPolicy({"parallel_tool_calls": False})
+    assert policy.delta("a <|tool_call>") == "a "
+    for _ in range(20_000):
+        assert policy.delta(" ") == ""
+        assert len(policy._text.pending) == 0
+    assert policy.delta("then prose") == "<|tool_call>" + " " * 20_000 + "then prose"
+    assert policy.flush() == ""
