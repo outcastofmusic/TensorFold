@@ -144,6 +144,16 @@ def test_grouped_bolt_shapes(n, k, rows):
             check(out[sel], x[sel], wq[e])
 
 
+def test_a_smaller_k_does_not_lower_a_larger_ks_shared_memory():
+    """The decode kernel's shared-memory opt-in is per kernel: K 2560, then K 1024, then K 2560 again all launch."""
+
+    g = torch.Generator().manual_seed(5)
+    for k in (2560, 1024, 2560):
+        packed = random_packed((64,), k, seed=k)
+        x = torch.randn((1, k), generator=g).to(torch.bfloat16)
+        check(iq2xxs.iq2xxs_linear(x.to(DEV), torch.from_numpy(packed).to(DEV)).cpu(), x, bf16(dequant(packed)))
+
+
 def test_decode_and_prefill_agree():
     """A 512-row call (decode kernel) and a 513-row call (prefill kernel) both sit within bf16 rounding of float64."""
 

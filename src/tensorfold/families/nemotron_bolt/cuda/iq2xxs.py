@@ -56,7 +56,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_bolt_iq2xxs_v19", sources=[str(here / "iq2xxs.cpp"), str(here / "iq2xxs.cu")],
+    return load(name="tensorfold_bolt_iq2xxs_v20", sources=[str(here / "iq2xxs.cpp"), str(here / "iq2xxs.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
