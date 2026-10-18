@@ -5,6 +5,10 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **Nemotron 3.5 Bolt accepts `response_format` and guided requests.** Its `nemotron_h_omni` config keeps
+  `vocab_size` under `llm_config`, and the grammar read only `text_config` and the top level, so every structured
+  request got a 400. The grammar now reads `text_config`, `llm_config`, then the top level, and skips a value that
+  is a bool, not positive, or past 2^31 - 1. Ports upstream TensorFold 80559ad2 and 022344e9 (#951, #953).
 - **Qwen3.8 Flash Next FP4-Local decodes 1.059x faster with the same replies.** Decode rows of the shared expert ran
   the prompt GEMM on 128x128 blocks, 3.9 ms a serial token. They now take a 16x64 tile with six stages, whose bits
   equal the other tiles'. On 18 Oct 2026 at `--parallel 4 --kv-dtype int8`, decode ran 1.042-1.071x faster on code
