@@ -19,6 +19,8 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 
 | Task | Notes |
 |---|---|
+| Model split decision (planner vs executor) | After the GPU window. (1) Implementation suite (`cx-signal` + code + agentic, 44 x4, `run_ext.py`) and the long-context set on Qwen FP4-Local, Bolt with graphs and LFM2.5 with its prompt fixes. (2) Co-residence: does Qwen EXL3 + Clef + Bolt or LFM2.5 fit, and with how much KV room? A split only pays if the executor is clearly faster at equal quality and no swap sits between planner and executor |
+| Qwen FP4-Local vs EXL3 tie-breaker | Two more TrueScore repeats each (76x2 more, about 1.5 h each) to halve the CI on today's +2.3 [-1.1, +6.4]. Lead holds clear of zero: FP4-Local for planning and hard reasoning; near zero: EXL3 stays the default |
 | Follow-ups 1-4: approved 17 Oct | Each starts when its area's review fix is merged into `feat/integration` and branches from it (Bolt after `fix/review-bolt`, LFM2.5 and d1 after `fix/review-lfm2`, Qwen and GLM disk after `fix/review-qwen`), so no two agents edit the same files. Order: 1, 2, 3, 4 |
 | Follow-up 1: Bolt decode CUDA graphs | Deferred from the 17 Oct review. Bolt is launch-bound (~2,300 launches a window). Accept: graph replay bit-equal to eager on golden and drafted == serial, speed from `test_bolt_depth.py` |
 | Follow-up 2: LFM2.5 prompt reuse and fast short prefill | Short chunks on the FP8 decode kernel or a tensor-core grouped kernel (~1.5 s to <0.3 s), kept conv/KV states, decode CUDA graphs (53 toward 85 tok/s). bf16 rounding moves: accept within the golden bounds, resumed within tolerance of fresh, then a paired TrueScore |
