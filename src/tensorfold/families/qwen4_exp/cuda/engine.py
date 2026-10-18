@@ -55,8 +55,10 @@ def first_early() -> bool:
     return flag(FIRST_EARLY, True)
 
 
-def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True, qsa_cuda: bool = True) -> None:
-    """Load each applicable extension after admission and before resident weights consume the pool."""
+def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True, qsa_cuda: bool = True,
+                  indexer: tuple[int, int]) -> None:
+    """Load each applicable extension after admission and before resident weights consume the pool. ``indexer``: the
+    checkpoint's (index heads, index head dim); qsa_scores.cu builds only for a shape it covers (``qsa.fits``)."""
 
     from tensorfold.cuda import experts
     from tensorfold.cuda.kernels import gdn as shared_gdn
@@ -65,7 +67,7 @@ def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True,
     from . import gdn, gdn_io, qsa
 
     loaders = [experts._ext, shared_gdn._ext, qmm._ext, gdn_io._ext]
-    if qsa_cuda:
+    if qsa_cuda and qsa.fits(*indexer):
         loaders.append(qsa._ext)
     if solo:                                     # serial windows, including a concurrent decoder's lone graph slot
         loaders.append(gdn._ext)
@@ -181,8 +183,11 @@ class FlashNextEngine:
         self.max_len = self.capacity_plan["cache_slots"]
         if tp == 2:
             self._same_settings(torch, ids, vision)
-        build_kernels(exl3=exl3, nvfp4=not exl3 and quant_method(read_config(model_dir)) == "modelopt",
-                      solo=streams == 1 or lone, qsa_cuda=qsa_cuda)
+        from .weight_types import indexer_shape
+
+        raw = read_config(model_dir)
+        build_kernels(exl3=exl3, nvfp4=not exl3 and quant_method(raw) == "modelopt", solo=streams == 1 or lone,
+                      qsa_cuda=qsa_cuda, indexer=indexer_shape(raw.get("text_config") or raw))
         from concurrent.futures import wait
 
         from tensorfold.cuda.direct_read import wait_all

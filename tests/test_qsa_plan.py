@@ -62,7 +62,24 @@ def test_prompt_buffers_take_the_cuda_kernels_with_the_flag(monkeypatch, value, 
     (32769, False, True), (32769, True, True), (65538, False, True),             # past the register width: always
 ])
 def test_the_tiled_select_runs_from_8192_blocks_on_a_fast_scratch_and_past_the_registers_on_any(blocks, fast, tiled):
-    assert qsa.tiled(blocks, fast, att.SELECT_REGS) is tiled
+    assert qsa.tiled(blocks, att.triton.next_power_of_2(blocks), fast, att.SELECT_REGS) is tiled
+
+
+@pytest.mark.parametrize("qsa_cuda, indexer, built", [
+    (True, (4, 128), True), (False, (4, 128), False),
+    (True, (8, 128), False), (True, (4, 64), False),       # an indexer qsa_scores.cu does not cover keeps Triton
+])
+def test_the_qsa_extension_builds_only_under_the_flag_for_an_indexer_it_covers(monkeypatch, qsa_cuda, indexer, built):
+    from tensorfold.cuda import experts
+    from tensorfold.cuda.kernels import gdn as shared_gdn
+    from tensorfold.cuda.kernels import qmm
+    from tensorfold.families.qwen4_exp.cuda import engine, gdn, gdn_io
+
+    loaded = []
+    for module in (experts, shared_gdn, qmm, gdn, gdn_io, qsa):
+        monkeypatch.setattr(module, "_ext", lambda module=module: loaded.append(module))
+    engine.build_kernels(qsa_cuda=qsa_cuda, indexer=indexer)
+    assert (qsa in loaded) is built and len(loaded) == 5 + built
 
 
 class _Launch:

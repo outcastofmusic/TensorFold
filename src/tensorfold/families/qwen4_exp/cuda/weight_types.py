@@ -33,6 +33,12 @@ def stop_ids(configured: Any, generation: Path) -> tuple[int, ...]:
     return out
 
 
+def indexer_shape(text_config: dict[str, Any]) -> tuple[int, int]:
+    """The prompt indexer's (heads, head dim) from the text config (unset: 4 and 128, both shipped checkpoints')."""
+
+    return int(text_config.get("indexer_n_heads", 4)), int(text_config.get("indexer_head_dim", 128))
+
+
 @dataclass
 class Config:
     hidden: int
@@ -90,6 +96,7 @@ class Config:
         method = str(quant.get("quant_method") or "mlx").lower()
         groups = quant.get("config_groups") or {}
         group = int(((groups.get("group_0") or {}).get("weights") or {}).get("group_size", 16))
+        index_heads, index_dim = indexer_shape(t)
         return cls(
             hidden=int(t["hidden_size"]), layers=int(t["num_hidden_layers"]),
             layer_types=["linear" if k == "linear_attention" else "attention" for k in t["layer_types"]],
@@ -101,8 +108,8 @@ class Config:
             conv_kernel=int(t["linear_conv_kernel_dim"]), experts=int(t["num_experts"]),
             top_k=int(t["num_experts_per_tok"]), moe_width=int(t["moe_intermediate_size"]),
             shared_width=int(t["shared_expert_intermediate_size"]), streams=int(t.get("hc_count", 4)),
-            low=int(t.get("hc_lowrank", 320)), index_heads=int(t.get("indexer_n_heads", 4)),
-            index_dim=int(t.get("indexer_head_dim", 128)), index_budget=int(t.get("indexer_budget", 2048)),
+            low=int(t.get("hc_lowrank", 320)), index_heads=index_heads,
+            index_dim=index_dim, index_budget=int(t.get("indexer_budget", 2048)),
             index_ratio=int(t.get("indexer_compress_ratio", 4)),
             ple_layers=sorted({int(i) - 1 for i in t.get("ple_layer_ids") or []}),
             ple_dim=int(t.get("ple_embed_dim") or t["hidden_size"]),

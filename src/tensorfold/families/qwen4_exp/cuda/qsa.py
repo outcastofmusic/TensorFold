@@ -39,12 +39,11 @@ def fast(prefill: bool, index_heads: int, index_dim: int) -> bool:
     return prefill and mode() == "cuda" and fits(index_heads, index_dim)
 
 
-def tiled(blocks: int, fast: bool, regs: int) -> bool:
-    """``_select_tiles`` (rather than ``_select``) for rows of up to ``blocks`` blocks: past ``_select``'s ``regs``
-    register width always, and from TILES_FROM blocks on a ``fast`` (prompt, flag cuda) scratch. Both list the same
-    blocks."""
+def tiled(blocks: int, width: int, fast: bool, regs: int) -> bool:
+    """``_select_tiles`` (rather than ``_select``) for rows of up to ``blocks`` blocks: when ``_select``'s ``width``
+    (the next power of two from ``blocks``) passes its ``regs`` register width always, and from TILES_FROM blocks on a
+    ``fast`` (prompt, flag cuda) scratch. Both list the same blocks."""
 
-    width = 1 << max(0, blocks - 1).bit_length()
     return width > regs or (fast and blocks >= TILES_FROM)
 
 
