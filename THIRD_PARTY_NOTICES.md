@@ -63,7 +63,7 @@ Apache-2.0, without copying either implementation.
 
 GLM's CUDA engine implements transformers' `models/glm5_next/modular_glm5_next.py` math, Apache-2.0,
 without including that source. Its draft inputs and thinking-off rendering follow the public GLM recipe
-from Mia-AiLab without including recipe code.
+from MiaAI-Lab without including recipe code.
 
 GLM EXL3 (`families/glm5_next/cuda/exl3.py`, `exl3.cu`, `exl3_mm.py`), the shared EXL3 module
 (`src/tensorfold/cuda/exl3/`) and the EXL3 loaders of Qwen3.8-27B and Qwen3.8 Flash Next
