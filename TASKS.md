@@ -5,6 +5,8 @@ guidance for bringing up a new model; this file holds the work. Dates are 2026.
 
 Standing rule: after every few merges into `fork/dev`, review what landed since the last review (bugs, poor engineering, over-complicated, dead or duplicated code, optimizations) without changing replies or speed, and record the reviewed range here. Last reviewed: `7891345f` (review of `8c405e56..7891345f`, fixes merged 18 Oct). Next review starts at `7891345f`.
 
+Standing rule (18 Oct): keep every code change that gives a clear, measured win and passes the gates, however small. Small gains accumulate.
+
 ## In progress
 
 | Task | State |
