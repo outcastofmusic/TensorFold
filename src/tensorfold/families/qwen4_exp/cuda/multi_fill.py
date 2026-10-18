@@ -9,6 +9,7 @@ import torch
 from tensorfold.cuda.kernels.gdn import MARKS
 from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.streams import Stream
+from tensorfold.env_flags import flag
 
 from . import image_rows
 from .copy_drafts import CopyIndex
@@ -22,6 +23,14 @@ from .prompt_plan import pass_limit
 
 PASS_MIN = 512
 FILL_GUARD = 8
+FIRST_EARLY = "TF_FLASH_FIRST_EARLY"
+
+
+def first_early() -> bool:
+    """Whether a prompt's first token goes out before its first drafts are made (TF_FLASH_FIRST_EARLY=0: after them,
+    as before). The drafts and the copy index over the prompt depend only on the token, so the reply is the same."""
+
+    return flag(FIRST_EARLY, True)
 
 
 class PromptPasses:
@@ -197,8 +206,18 @@ class PromptPasses:
         return self.pbuf.cand_all[:world * count * width].view(world, count, width).clone()
 
     def _joined(self, pieces, heads, lasts, spent: float, candidates=None) -> list[Stream]:
-        """Prompts that ended sample their first token, draft and join the rounds; returns those already done."""
+        """Prompts that ended sample their first token, send it, draft and join the rounds; returns those already done.
 
+        ``spent`` is a piece's share of its pass as launched. A pass that ends a prompt waits here for its GPU work
+        (the first token's read-back would anyway), and that wait counts as prefill too, as the one-stream engine's
+        synchronized ``prefill_s`` does: without it the last pass's GPU time showed up as a gap before the first token.
+        """
+
+        if torch.cuda.is_available() and any(a + n == len(s.prompt) for s, a, n in pieces):
+            waited = time.perf_counter()
+            torch.cuda.synchronize()
+            spent += (time.perf_counter() - waited) / len(pieces)
+        early = first_early()
         joined, head = [], 0
         for (s, a, n), last in zip(pieces, lasts):
             s.prefill_s += spent
@@ -232,31 +251,49 @@ class PromptPasses:
                 _, first = self._spliced(s, [], [first], [0], first)
             head += 1
             s.context = list(s.prompt)
-            s.copies = CopyIndex(list(s.prompt) + [first]) if mtp and getattr(self, "copy", False) and s.constraint is None else None
             s.drafts = []
             if getattr(self, "count_drafters", False) and s.drafters is None:
                 s.drafters = {}
-            if mtp and s.count > 1:
-                room = min(self.depth, s.count - 1)
-                copied = s.copies.chain(room) if s.copies is not None and not s.forced else []
-                if s.forced:
-                    absorb(e, last, [first])
-                    s.drafts, s.drafter = self._force(s, room), "fix"
-                elif copied:                             # the MTP cache absorbs the prompt's last row either way
-                    absorb(e, last, [first])
-                    s.drafts, s.drafter = copied, "copy"
-                elif getattr(self, "spec", None) is not None:      # untimed: the prompt's pass shared this round
-                    s.drafts, probs, steps = draft_cut(e, last, [first], st.pos + 1, room, s.sampling, self.spec)
-                    self.traces[s.sid] = (probs, steps, 0.0, False)
-                else:
-                    s.drafts = draft(e, last, [first], st.pos + 1, room, s.sampling, self.confidence)
             s.started = time.perf_counter()
             self.streams[s.sid] = s
-            if s.error is not None:                      # its gate failed on the first token: it ends with that error
-                s.done = True                            # now, as a round's failed gate does, not after one more round
-            else:
-                s.take([first], self._ends(s))
+            if early:                                    # the client has it while the first drafts are made
+                self._take_first(s, first)
+            # every rank drafts, a stream that ended at its first token too: two ranks' MTP steps stay in step
+            self._first_drafts(s, e, mtp, last, first)
+            if not early:
+                self._take_first(s, first)
             if s.done:
                 joined.append(s)
         self._joined_ranks()
         return joined
+
+    def _take_first(self, s: Stream, first: int) -> None:
+        """Emit a joined stream's first token; a gate that failed on it ends the stream with that error instead, now,
+        as a round's failed gate does, not after one more round."""
+
+        if s.error is not None:
+            s.done = True
+        else:
+            s.take([first], self._ends(s))
+
+    def _first_drafts(self, s: Stream, e, mtp: bool, last: torch.Tensor, first: int) -> None:
+        """A joined stream's copy index over its prompt and first token, and its first round's drafts."""
+
+        copies = mtp and getattr(self, "copy", False) and s.constraint is None
+        s.copies = CopyIndex(list(s.prompt) + [first]) if copies else None
+        if not mtp or s.count <= 1:
+            return
+        st = s.st
+        room = min(self.depth, s.count - 1)
+        copied = s.copies.chain(room) if s.copies is not None and not s.forced else []
+        if s.forced:
+            absorb(e, last, [first])
+            s.drafts, s.drafter = self._force(s, room), "fix"
+        elif copied:                                     # the MTP cache absorbs the prompt's last row either way
+            absorb(e, last, [first])
+            s.drafts, s.drafter = copied, "copy"
+        elif getattr(self, "spec", None) is not None:    # untimed: the prompt's pass shared this round
+            s.drafts, probs, steps = draft_cut(e, last, [first], st.pos + 1, room, s.sampling, self.spec)
+            self.traces[s.sid] = (probs, steps, 0.0, False)
+        else:
+            s.drafts = draft(e, last, [first], st.pos + 1, room, s.sampling, self.confidence)
