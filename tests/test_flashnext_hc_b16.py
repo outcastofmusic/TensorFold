@@ -163,6 +163,17 @@ def test_up_to_128_rows_or_one_slice_the_down_projection_keeps_its_launches(kern
     assert [name for name, _, _ in kernels] == (["_b16mm", "_reduce"] if sk is None else ["_b16mm"])
 
 
+@pytest.mark.parametrize("n, k, sk", [(128, 2048, None), (64, 2048, None), (68, 512, 8)])
+def test_at_one_block_a_slice_the_down_projection_keeps_its_launches(kernels, n, k, sk):
+    """The tiny test checkpoint's down projections: SK 32 over K 2,048 leaves one 64-wide block a slice, where
+    ``_b16mm_ks``'s slice add folds into the tensor-core dot and changes bits (``bf16.inner_k_fits``)."""
+
+    x = torch.zeros((512, k), dtype=torch.bfloat16)
+    bf16.matmul(x, bf16.B16(torch.zeros((n, k), dtype=torch.bfloat16), n, k), f32=True, inner_k=True, sk=sk)
+    assert [name for name, _, _ in kernels] == ["_b16mm", "_reduce"]
+    assert kernels[0][2]["K"] // kernels[0][2]["SK"] == bf16.BK
+
+
 @pytest.fixture
 def up_mix_launches(monkeypatch):
     launched: list = []

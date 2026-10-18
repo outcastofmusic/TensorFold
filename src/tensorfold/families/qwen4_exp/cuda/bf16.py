@@ -124,6 +124,18 @@ if HAS_TRITON:
 
 
 INNER_K_ROWS = 129          # from here ``matmul`` tiles 128 rows, and ``inner_k`` sums the K slices in one launch
+INNER_K_BLOCKS = 2          # fewest BK blocks a slice for ``_b16mm_ks``: see ``inner_k_fits``
+
+
+def inner_k_fits(m: int, k: int, sk: int, bk: int = BK) -> bool:
+    """Whether ``_b16mm_ks`` writes ``_b16mm`` + ``_reduce``'s bytes for an [m, k] x at sk slices.
+
+    At one BK block a slice, Triton 3.7 drops the one-trip loop and folds ``total + dot(x, w, 0)`` into
+    ``dot(x, w, total)``: the tensor cores then add each slice into the running total in k16 steps, and the bits
+    differ (the tiny test checkpoint's [64 or 128, 2048] down projection, SK 32). From two blocks the slice stays a
+    loop whose result the add takes, which the fold cannot match (FP4-Local's [324, 10240] has five)."""
+
+    return sk > 1 and m >= INNER_K_ROWS and k // sk // bk >= INNER_K_BLOCKS
 
 
 def matmul(x: torch.Tensor, b: B16, *, out: torch.Tensor | None = None, f32: bool = False,
@@ -131,7 +143,7 @@ def matmul(x: torch.Tensor, b: B16, *, out: torch.Tensor | None = None, f32: boo
            block_n: int = BN, bk: int = BK, inner_k: bool = False) -> torch.Tensor:
     """x [M, K] bf16 @ b.T -> [M, N] bf16 (or fp32 sums), K slices summed in slice order.
 
-    ``inner_k``: with M >= INNER_K_ROWS and a split K, each program sums its tile's slices itself (``_b16mm_ks``),
+    ``inner_k``: on the shapes ``inner_k_fits`` accepts, each program sums its tile's slices itself (``_b16mm_ks``),
     the same bits without the [SK, M, N] fp32 partials and the ``_reduce`` launch."""
 
     if not HAS_TRITON:
@@ -148,7 +160,7 @@ def matmul(x: torch.Tensor, b: B16, *, out: torch.Tensor | None = None, f32: boo
         raise ValueError(f"b16 matmul: out {tuple(out.shape)} {out.dtype} must be a contiguous ({m}, {b.n}), "
                          f"dtype matching f32={f32}")
     bm = 128 if m > 128 else 16
-    if inner_k and sk > 1 and m >= INNER_K_ROWS:
+    if inner_k and inner_k_fits(m, k, sk, bk):
         _b16mm_ks[(triton.cdiv(m, bm), -(-b.n // block_n))](
             x, b.weight, out, m, x.stride(0), N=b.n, K=k, SK=sk, BM=bm, BLOCK_N=block_n, BK=bk, F32=f32,
             num_warps=num_warps, num_stages=num_stages)

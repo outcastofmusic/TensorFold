@@ -4,7 +4,7 @@ Each fusion against the kernels it replaces, on every HC shape FP4-Local's promp
 low rank 320; the down projection with the inject rows, 324, and without, 320) at chunk rows 1, 128, 129, 2,047,
 2,048 and 4,096: the down projection with its K slices summed in each program (``bf16._b16mm_ks``), the up projection
 with the mix (``hc_b16.up_mix``), the write-back with the norm (``hc_check.fuser``), and ``forward.hc_block`` whole.
-Then a prompt and 48 greedy tokens, serial and drafted, with the switch off and on: on the tiny ModelOpt checkpoint
+The first three also run at the tiny checkpoint's shapes (hidden 512, low rank 64) at its chunk rows 188 and 512. Then a prompt and 48 greedy tokens, serial and drafted, with the switch off and on: on the tiny ModelOpt checkpoint
 in FP4-Local's layout, and on FP4-Local itself when TF_FP4_LOCAL names its directory."""
 
 from __future__ import annotations
@@ -38,38 +38,58 @@ def _rand(shape, g, scale=1.0, dtype=torch.bfloat16):
     return (torch.randn(shape, generator=g, device=DEV) * scale).to(dtype)
 
 
+def _down_bytes(n: int, k: int, rows: int, f32: bool, sk=None):
+    g = torch.Generator(device=DEV).manual_seed(rows * 7 + n + k)
+    b = bf16.B16(_rand((n, k), g, 0.02), n, k)
+    x = _rand((rows, k), g)
+    x[rows // 2] = 0.0                                   # a zero row: every slice -0.0 or 0.0
+    x[rows - 1, : k // 2] = -x[rows - 1, k // 2:]
+    return bf16.matmul(x, b, f32=f32, sk=sk), bf16.matmul(x, b, f32=f32, sk=sk, inner_k=True)
+
+
 @pytest.mark.parametrize("n", [LOW + S, LOW])
 @pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("f32", [True, False])
 def test_the_down_projection_sums_its_slices_in_each_program_with_the_same_bytes(n, rows, f32):
-    g = torch.Generator(device=DEV).manual_seed(rows * 7 + n)
-    b = bf16.B16(_rand((n, S * D), g, 0.02), n, S * D)
-    x = _rand((rows, S * D), g)
-    x[rows // 2] = 0.0                                   # a zero row: every slice -0.0 or 0.0
-    x[rows - 1, : S * D // 2] = -x[rows - 1, S * D // 2:]
-    old = bf16.matmul(x, b, f32=f32)
-    new = bf16.matmul(x, b, f32=f32, inner_k=True)
-    assert bf16.split_k(n, S * D) == 32
+    assert bf16.split_k(n, S * D) == 32 and bf16.inner_k_fits(bf16.INNER_K_ROWS, S * D, 32)    # 5 blocks a slice
+    old, new = _down_bytes(n, S * D, rows, f32)
     assert _same(old, new), (n, rows, f32)
 
 
+# The tiny checkpoint (hidden 512, 4 streams, low rank 64): its down projections [64 or 128, 2,048] split K 32 ways
+# at one 64-wide block a slice, where ``_b16mm_ks`` would fold each slice's add into the tensor-core dot. ``matmul``
+# keeps the old launches there (``bf16.inner_k_fits``); from two blocks a slice it fuses, with the same bytes.
+TINY_D, TINY_LOW = 512, 64
+
+
+@pytest.mark.parametrize("n, k, sk, fused", [
+    (TINY_LOW, S * TINY_D, None, False), (2 * TINY_LOW, S * TINY_D, None, False),     # the tiny checkpoint: SK 32
+    (2 * TINY_LOW, S * TINY_D, 16, True), (TINY_LOW, 2 * S * TINY_D, 32, True), (TINY_LOW + S, 3 * S * TINY_D, 32, True)])
+@pytest.mark.parametrize("rows", [188, 512, 700])
+@pytest.mark.parametrize("f32", [True, False])
+def test_the_down_projection_keeps_the_old_bytes_at_one_block_a_slice_and_fuses_from_two(n, k, sk, fused, rows, f32):
+    assert bf16.inner_k_fits(rows, k, sk or bf16.split_k(n, k)) is fused
+    old, new = _down_bytes(n, k, rows, f32, sk)
+    assert _same(old, new), (n, k, sk, rows, f32)
+
+
+@pytest.mark.parametrize("d, low, rows", [(D, LOW, r) for r in ROWS] + [(TINY_D, TINY_LOW, r) for r in (188, 512)])
 @pytest.mark.parametrize("bm", [64, 128])
-@pytest.mark.parametrize("rows", ROWS)
-def test_the_up_projection_and_the_mix_in_one_kernel_write_the_old_bytes(rows, bm):
-    g = torch.Generator(device=DEV).manual_seed(rows * 11 + bm)
-    up = bf16.B16(_rand((S * D, LOW), g, 0.05), S * D, LOW)
-    act, normed = _rand((rows, LOW), g), _rand((rows, S * D), g)
+def test_the_up_projection_and_the_mix_in_one_kernel_write_the_old_bytes(d, low, rows, bm):
+    g = torch.Generator(device=DEV).manual_seed(rows * 11 + bm + d)
+    up = bf16.B16(_rand((S * d, low), g, 0.05), S * d, low)
+    act, normed = _rand((rows, low), g), _rand((rows, S * d), g)
     normed[0, :64] = -0.0
     old_up = bf16.matmul(act, up)
-    old = torch.empty((rows, D), dtype=torch.bfloat16, device=DEV)
-    glue.hc_mix(old_up, normed, old, torch.empty((rows, D // 32), device=DEV), S)
+    old = torch.empty((rows, d), dtype=torch.bfloat16, device=DEV)
+    glue.hc_mix(old_up, normed, old, torch.empty((rows, d // 32), device=DEV), S)
     new = torch.full_like(old, float("nan"))
     hc_b16.up_mix(act, up, normed, new, S, bm=bm)
-    assert _same(old, new), (rows, bm)
+    assert _same(old, new), (d, rows, bm)
     if rows > 1:                                         # a row's bytes do not depend on its chunk
-        one = torch.empty((1, D), dtype=torch.bfloat16, device=DEV)
+        one = torch.empty((1, d), dtype=torch.bfloat16, device=DEV)
         hc_b16.up_mix(act[rows - 1:].contiguous(), up, normed[rows - 1:].contiguous(), one, S, bm=bm)
-        assert _same(one, new[rows - 1:]), rows
+        assert _same(one, new[rows - 1:]), (d, rows)
 
 
 def _fuser():
@@ -80,24 +100,24 @@ def _fuser():
 
 
 @pytest.mark.parametrize("mode", [0, 1, 2])
-@pytest.mark.parametrize("rows", ROWS)
-def test_the_write_back_and_norm_in_one_kernel_write_the_old_bytes(rows, mode):
+@pytest.mark.parametrize("d, rows", [(D, r) for r in ROWS] + [(TINY_D, r) for r in (188, 512)])
+def test_the_write_back_and_norm_in_one_kernel_write_the_old_bytes(d, rows, mode):
     fused = _fuser()
-    g = torch.Generator(device=DEV).manual_seed(rows * 13 + mode)
-    h, scale = _rand((rows, S * D), g), _rand((S * D,), g, dtype=torch.float32)
-    inject, branch = _rand((rows, S), g), _rand((rows, D), g)
-    y, wts = _rand((rows, SLOTS, D), g), _rand((rows, SLOTS), g, dtype=torch.float32)
+    g = torch.Generator(device=DEV).manual_seed(rows * 13 + mode + d)
+    h, scale = _rand((rows, S * d), g), _rand((S * d,), g, dtype=torch.float32)
+    inject, branch = _rand((rows, S), g), _rand((rows, d), g)
+    y, wts = _rand((rows, SLOTS, d), g), _rand((rows, SLOTS), g, dtype=torch.float32)
 
     def buffers():
-        return (h.clone(), torch.empty((rows, D // 256, S), device=DEV), torch.empty_like(h),
-                torch.empty((rows, S * D // 32), device=DEV))
+        return (h.clone(), torch.empty((rows, d // 256, S), device=DEV), torch.empty_like(h),
+                torch.empty((rows, S * d // 32), device=DEV))
 
     old, new = buffers(), buffers()
     glue.hc_writeback(old[0], old[0], old[1], S, mode, branch=branch, inject=inject, y=y, wts=wts)
     glue.hc_normed(old[0], old[1], scale, old[2], old[3], S, 1e-6)
     fused(new[0], new[1], scale, new[2], new[3], S, 1e-6, mode, branch=branch, inject=inject, y=y, wts=wts)
     for i, (a, b) in enumerate(zip(old, new)):
-        assert _same(a, b), (rows, mode, i)
+        assert _same(a, b), (d, rows, mode, i)
 
 
 def _hc(g, inject: bool, fuse: bool):
@@ -189,19 +209,20 @@ def tiny(tmp_path_factory) -> Path:
     return path
 
 
-def test_the_tiny_checkpoint_replies_the_same_with_the_switch_off_or_on(tiny, monkeypatch):
+def test_the_tiny_checkpoint_replies_the_same_with_the_switch_off_or_on(tiny):
+    """One load with the switch flipped off, on, off: two loads of the tiny ModelOpt checkpoint already differ with the
+    switch off (18 Oct, a separate bug in TASKS.md), so comparing loads would test that, not the fusions."""
+
     from tensorfold.families.qwen4_exp.cuda.weights import load
 
     prompt = torch.randint(1, 256, (700,), generator=torch.Generator().manual_seed(3)).tolist()
-    got = {}
-    for value in ("0", "1"):                             # the flag as the loader reads it
-        monkeypatch.setenv(hc_b16.FUSE_ENV, value)
-        w = load(tiny, mtp=True, draft_vocab=None)
-        assert all(hc.fuse is (value == "1") for hc in _hcs(w) + [w.mixer])
-        got[value] = _reply(w, prompt, 512, 1024)          # chunks of 512 and 188 rows
-        del w
-        torch.cuda.empty_cache()
-    _equal(got["0"], got["1"])
+    w = load(tiny, mtp=True, draft_vocab=None, hc_fuse=True)
+    got = []
+    for on in (False, True, False):
+        _set_fuse(w, on)
+        got.append(_reply(w, prompt, 512, 1024))          # chunks of 512 and 188 rows
+    _equal(got[0], got[2])
+    _equal(got[0], got[1])
 
 
 FP4_LOCAL = os.environ.get("TF_FP4_LOCAL")
