@@ -14,7 +14,6 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 | Follow-ups 1 and 3: Bolt decode CUDA graphs and a drafter-only Q8_0 head | Built on `perf/bolt-graphs` (`20201633`, `1b52dad4`), CPU 4,745 passed; expected serial 40-60 tok/s against 29. Not merged until its GPU run passes: `tf-runs/gpu-graphs/run.sh` after bench2 |
 | Code review since 0.8.0 (`8c405e56..7891345f`) | All fixes merged into `feat/integration` (`1bd20c09`): ops, GLM, Bolt, LFM2, Qwen and disk states; CPU 4,794 passed. Gateway branches fixed separately. Waiting for the GPU tests after bench2, then `fork/dev` and "Last reviewed" |
 | Qwen variants: Mia's Zig recipe on FP4-Local | Analysis done (`tf-runs/mia-qwen/ANALYSIS.md`): port patch 0014's shared-memory expert tile (`fn_experts_tile.cu`, same bits as our `nvfp4_expert_kernel`, +13-15% prefill on Zig), then 4,096-row prompt chunks for NVFP4 and n-gram read-ahead. Skip fp8 KV (under 3% capacity), fair fill and the repeat cache (we have both). Our FP4-Local prefill 1,857 tok/s at 8k against Mia's 2,583 (different tools, 1.4x). Next: A/B both engines with one tool on :31005, nsys on our 16k prefill, then port the tile |
-| Definitive playbook audit | Four read-only audits running (upstream bring-ups, our patches and reviews, per-model results, serving layer and external engines' practice). Then rewrite `playbook.md` with a step-by-step checklist |
 
 ## To do
 
@@ -26,6 +25,7 @@ Order (18 Oct): the pipeline code changes above, then the Qwen3.8 variants (Mia'
 | Bolt's dropped closing braces | 35 of 160 Bolt planning replies end `...}]` + fence without the object's `}` and score 0 (other models 0 of 160). Replay with `return_token_ids` to tell the model from the detokenizer |
 | Tool-call markup with parallel_tool_calls false | Gemma 4's `<|tool_call>` and DeepSeek-V4's DSML envelopes still stream as content; `server/tool_policy.py`'s `_FIXED` table can take them |
 | Next review: shared prompt-state store | LFM2.5's reuse imports Bolt's `Store`/`keep_points` from `nemotron_bolt/cuda/reuse.py`; move them to a shared module (e.g. `tensorfold/cuda/kept_states.py`) once both branches are merged |
+| Playbook gaps (checks we do not run yet) | From `playbook.md` rows marked (gap): tokenizer round-trip and HF id diff on adversarial text; single-BOS test; one shared golden-logit gate with a stated tolerance per family; streamed markup-leak test per family; `test_prompt_parity.py` entries for Bolt, LFM2 and FP4-Local; RoPE/YaRN check against HF at 32k and 128k; warn on `generation_config.json` keys the CLI drops (LFM2.5's repetition_penalty); logprobs on tool or thinking requests; Bolt goldens into the repo; recipes for Bolt and FP4-Local |
 | Thinking-on TrueScore arms | TrueScore with thinking on per model Also the rest of round 2, stopped 18 Oct for the GPU window: GLM planning with thinking on (52 requests answered, rerun), Bolt planning with thinking on, and the long-context pilot on FP4-Local |
 | Nemotron 3.5 Super VL (120B-A12B) as a swap candidate | Upstream 1.0.12 serves it on one or two GB10s from NVIDIA's NVFP4. Native 1.0.12 smoke passes. TrueScore 94.1 (highest so far), planning 62.6 (round 2, 18 Oct). Then a native target in `run.sh`/`swap.py` (`serve_native`) |
 | Model split decision (planner vs executor) | After the GPU window. (1) Implementation suite (`cx-signal` + code + agentic, 44 x4, `run_ext.py`) and the long-context set on Qwen FP4-Local, Bolt with graphs and LFM2.5 with its prompt fixes. (2) Co-residence: does Qwen EXL3 + Clef + Bolt or LFM2.5 fit, and with how much KV room? A split only pays if the executor is clearly faster at equal quality and no swap sits between planner and executor |
@@ -44,6 +44,7 @@ Order (18 Oct): the pipeline code changes above, then the Qwen3.8 variants (Mia'
 
 | Task | Result |
 |---|---|
+| Definitive playbook (18 Oct) | `playbook.md` rewritten as a 15-phase checklist with pass criteria and evidence, from four audits in `tf-runs/playbook-audit/` (upstream bring-ups, fork patches, per-model results, serving layer and other engines) |
 | Benchmark round 2 (18 Oct) | LFM2.5-24B TrueScore 91.7, planning 58.6 (443 min). Super VL TrueScore 94.1, planning 62.6. Stopped during GLM thinking-on planning to free the GPU; the remaining arms moved to Thinking-on TrueScore arms. `tf-runs/bench2/RESULTS.md` |
 | Empty-reply investigation | `~/empty-replies/empty-replies-findings.md` |
 | Release 0.8.0 | Background prefill, disk states for GLM, GLM stop fix and the upstream fixes, 16 Oct |

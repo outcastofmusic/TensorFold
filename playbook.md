@@ -291,7 +291,7 @@ the equality gate and the speed.
 ### 2.5 Prompt reuse
 
 Check where the engine keeps states before testing how it evicts them. GLM kept states at the prompt's end and the
-system block's end only, so a history shared by several requests, each with a different user message, never resumed.
+system block's end only, so a history sent five times, each with a different user message, never resumed.
 Measure a multi-turn session's prefill time per turn before and after each mechanism.
 
 | Mechanism | Measured |
