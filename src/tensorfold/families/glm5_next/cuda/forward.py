@@ -192,7 +192,9 @@ class Buffers:
         self.tap_at: dict[int, list[int]] = {}
         self.experts = c.experts
         self.top_k = c.top_k
-        self.projection_scratch = (packed.ProjectionScratch(list(packed.projections(w)), rows, dev, prefill)
+        # TF_GLM_PLAIN_NARROW, read once by the engine at startup (absent: on): same bytes
+        self.projection_scratch = (packed.ProjectionScratch(list(packed.projections(w)), rows, dev, prefill,
+                                                           narrow=bool(w.meta.get("plain_narrow", True)))
                                    if w.meta.get("packed_exl3") else None)
         if self.projection_scratch is not None:
             self.projection_scratch.heads = {id(p) for p in packed.leaves(w.head)}

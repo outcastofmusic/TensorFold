@@ -24,6 +24,16 @@ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays de
 DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
 
 
+def kernel_switches() -> dict[str, bool]:
+    """The decode kernels' switches, read once at startup into ``Weights.meta`` (``forward.Buffers`` takes them):
+    TF_GLM_PLAIN_NARROW (``packed.plain_narrow``), on when unset. Either way a reply keeps its bytes; a value outside
+    env_flags' set raises."""
+
+    from .packed import plain_narrow
+
+    return {"plain_narrow": plain_narrow()}
+
+
 def _token_id(model_dir: Path, text: str) -> int:
     """An added token's id from the checkpoint's tokenizer, or -1 when it has none."""
 
@@ -289,7 +299,8 @@ class GlmEngine:
         w.comm = self.comm
         if not self.load_mtp and w.mtp is not None:
             raise RuntimeError("loader violated load_mtp=False: refusing dormant MTP allocation/work")
-        w.meta = {**getattr(w, "meta", {}), "target_only": self.target_only, "load_mtp": self.load_mtp}
+        w.meta = {**getattr(w, "meta", {}), "target_only": self.target_only, "load_mtp": self.load_mtp,
+                  **kernel_switches()}
         if self.comm is not None:
             self.comm.ready("loading")               # a peer stuck loading is named, not waited on in NCCL
             self.comm.barrier()
