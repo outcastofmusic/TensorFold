@@ -135,16 +135,18 @@ class Engine:
         branches = [f.encode(f.suffix(q)) for _, q in named]
         groups = [f.readout(q) for _, q in named]
         hidden = self._rows(trunk, branches, embeds)
-        answers = {name: answer(q, self._scores(row, group)) for (name, q), row, group in zip(named, hidden, groups)}
+        scores = self._scores(hidden, groups)
+        answers = {name: answer(q, row) for (name, q), row in zip(named, scores)}
         return answers, len(trunk) + sum(map(len, branches))
 
-    def _scores(self, row: torch.Tensor, group: list[list[int]]) -> list[float]:
-        """An option's best logit among its forms, read from the head's rows for this question's tokens alone."""
+    def _scores(self, hidden: torch.Tensor, groups: list[list[list[int]]]) -> list[list[float]]:
+        """Each question's options' best logits among their forms: one head matmul of every question's row [N, D]
+        over the head rows of all their tokens, read back to the host once."""
 
-        ids = sorted({t for forms in group for t in forms})
-        logits = self.model.logits(row[None], ids)[0].tolist()
+        ids = sorted({t for group in groups for forms in group for t in forms})
+        logits = self.model.logits(hidden, ids).tolist()
         where = {t: i for i, t in enumerate(ids)}
-        return [max(logits[where[t]] for t in forms) for forms in group]
+        return [[max(row[where[t]] for t in forms) for forms in group] for row, group in zip(logits, groups)]
 
     def _rows(self, trunk: list[int], branches: list[list[int]], embeds: torch.Tensor | None = None) -> torch.Tensor:
         """The final hidden state at each branch's last token, as many branches a forward as the budget holds."""

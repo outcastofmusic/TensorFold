@@ -107,6 +107,32 @@ def test_the_grouped_path_keeps_its_bits(weights):
     assert torch.equal(X.grouped(x, ids, ex), grouped_by_dequantize(x, ids, ex))
 
 
+@pytest.mark.parametrize("rows", [17, 64, 300])
+def test_the_tensor_core_kernel_equals_the_grouped_path(weights, rows):
+    """``dot`` at every tile height against the fp32 reference path: products exact, sums in another order."""
+
+    from tensorfold.families.lfm2_moe.cuda import experts as X
+
+    g = torch.Generator().manual_seed(rows)
+    for ex in (weights.blocks[2].moe.experts, weights.blocks[4].moe.experts):
+        x = torch.randn(rows, weights.config.hidden, generator=g).to(torch.bfloat16).cuda()
+        ids = torch.randint(0, ex.count, (rows, 2), generator=g).cuda()
+        want = X.grouped(x, ids, ex)
+        for bm in (16, 32, 64):
+            assert _close(X.dot(x, ids, ex, bm), want, 0.01), bm
+
+
+def test_the_prompt_kernels_give_one_reply(weights, monkeypatch):
+    """A 300-token prompt through each TF_LFM2_PROMPT_KERNEL: the same last-row logits within bf16 noise."""
+
+    ids = torch.randint(10, 500, (300,), generator=torch.Generator().manual_seed(1)).tolist()
+    out = {}
+    for kernel in ("fp32", "auto", "pairs", "dot"):
+        monkeypatch.setenv("TF_LFM2_PROMPT_KERNEL", kernel)
+        out[kernel] = _engine(weights).forward(ids, prompt=True)
+    assert all(_close(out[k], out["fp32"], 0.02) for k in out)
+
+
 def test_the_engine_computes_the_reference_on_its_own_picks(tiny, weights, monkeypatch):
     from tests.lfm2_moe_tiny import Picks, reference_logits
 
@@ -128,6 +154,37 @@ def test_chunks_and_decode_steps_continue_the_prompt(weights):
     steps = torch.cat([e.forward([t], prompt=False) for t in IDS[9:]])
     assert _close(parts, whole, 0.02) and _close(steps, whole[9:], 0.02)
     assert (steps.argmax(-1) == whole[9:].argmax(-1)).all()
+
+
+def test_a_resumed_prompt_continues_as_a_fresh_one(weights):
+    from tensorfold.families.lfm2_moe.cuda.engine import prefill
+
+    ids = torch.randint(10, 500, (300,), generator=torch.Generator().manual_seed(2)).tolist()
+    kept: dict[int, dict] = {}
+    e = _engine(weights)
+    prefill(e, ids[:200], None, keeps=[120], keep=lambda n, st: kept.setdefault(n, st))
+    a = prefill(e, ids, None, resume=kept[120])
+    resumed = e.forward([a], prompt=False)
+    b = prefill(e, ids, None)
+    assert a == b and _close(resumed, e.forward([b], prompt=False), 0.02)
+
+
+def test_graph_replay_gives_the_eager_step_s_bits(weights):
+    """Teacher-forced decode steps at moving positions, eager and replayed, and a sampled reply both ways."""
+
+    from tensorfold.families.lfm2_moe.cuda.engine import prefill, serial_decode
+
+    rows, replies = {}, {}
+    s = Sampling(5, temperature=50.0, top_k=50, top_p=1.0)
+    for graphs in (False, True):
+        e = _engine(weights)
+        e.graphs = graphs
+        e.forward(IDS[:5], prompt=True)
+        rows[graphs] = [e.forward([t], prompt=False) for t in IDS[5:]]
+        replies[graphs] = serial_decode(e, prefill(e, IDS, s), 24, s, stop_eos=False).tokens
+        assert (e.graph is not None) == graphs
+    assert all(torch.equal(a, b) for a, b in zip(rows[False], rows[True]))
+    assert replies[False] == replies[True]
 
 
 def test_keyed_sampling_repeats_a_seed_and_equals_the_host_rule(weights):
@@ -179,13 +236,18 @@ def _golden(name: str) -> dict:
     return json.loads(path.read_text())
 
 
-def _teacher_forced(e, g: dict) -> list[torch.Tensor]:
-    """The engine's logits [V] for the prompt's next token and after each of the reference's greedy tokens."""
+def _teacher_forced(e, g: dict, resume: dict | None = None) -> list[torch.Tensor]:
+    """The engine's logits [V] for the prompt's next token and after each of the reference's greedy tokens; from a
+    kept state's length when ``resume`` is given."""
 
     e.reset()
+    begin = 0
+    if resume is not None:
+        e.restore(resume)
+        begin = resume["pos"]
     e.set_sampling(None)
     ids = g["prompt_ids"]
-    for s in range(0, len(ids), e.prefill_rows):
+    for s in range(begin, len(ids), e.prefill_rows):
         logits = e.forward(ids[s:s + e.prefill_rows], prompt=True)
     rows = [logits[0]]
     for tok in g["greedy"][:-1]:
@@ -214,6 +276,42 @@ def test_logits_follow_the_fp32_reference_and_greedy_tokens_match(big, name):
     out = serial_decode(big.e, prefill(big.e, g["prompt_ids"], None), len(g["greedy"]), None, stop_eos=False).tokens
     sure = next((i for i, gap in enumerate(gaps) if gap < SURE_GAP), len(gaps))
     assert out[:sure] == g["greedy"][:sure], (out, g["greedy"], sure)
+
+
+@real
+def test_a_resumed_prompt_follows_the_reference_as_a_fresh_one(big):
+    """The long golden prompt resumed from a state kept 1,000 tokens in (inside its first chunk): teacher-forced logits
+    within the golden bounds, and within the same bounds of a fresh prefill's."""
+
+    from tensorfold.families.lfm2_moe.cuda.engine import prefill
+
+    g = _golden("long")
+    kept: dict[int, dict] = {}
+    prefill(big.e, g["prompt_ids"][:1500], None, keeps=[1000], keep=lambda n, st: kept.setdefault(n, st))
+    resumed = _teacher_forced(big.e, g, resume=kept[1000])
+    fresh = _teacher_forced(big.e, g)
+    errors = [float((row[t["ids"]] - torch.tensor(t["logits"])).abs().max()) for row, t in zip(resumed, g["step_top"])]
+    apart = [float((a[t["ids"]] - b[t["ids"]]).abs().max()) for a, b, t in zip(resumed, fresh, g["step_top"])]
+    median = sorted(errors)[len(errors) // 2]
+    print(f"resumed: top-20 logit error largest {max(errors):.3f}, median {median:.3f}; from fresh at most "
+          f"{max(apart):.3f}")
+    assert max(errors) <= GOLDEN_MAX and median <= GOLDEN_MEDIAN and max(apart) <= GOLDEN_MAX
+
+
+@real
+def test_generate_resumes_a_conversation(big):
+    """A second turn resumes from the first turn's prompt end and replies as a fresh prefill (draft: false) does."""
+
+    g = _golden("chat")
+    first = g["prompt_ids"] + g["greedy"]
+    out: list[int] = []
+    big.generate(first, 4, None, lambda new: out.extend(new) and False, stop_eos=False)
+    turn = first + out + g["prompt_ids"][-8:]
+    resumed: list[int] = []
+    fresh: list[int] = []
+    stats = big.generate(turn, 16, None, lambda new: resumed.extend(new) and False, stop_eos=False)
+    big.generate(turn, 16, None, lambda new: fresh.extend(new) and False, draft=False, stop_eos=False)
+    assert stats["cached"] == len(first) - 1 and resumed[:4] == fresh[:4]
 
 
 @real
@@ -262,8 +360,34 @@ def test_the_real_grouped_path_keeps_its_bits(big):
 
 
 @real
+def test_the_real_tensor_core_kernel_equals_the_grouped_path(big):
+    from tensorfold.families.lfm2_moe.cuda import experts as X
+
+    ex = big.w.blocks[2].moe.experts
+    g = torch.Generator().manual_seed(4)
+    for rows in (64, 512, 2048):
+        x = torch.randn(rows, big.w.config.hidden, generator=g).to(torch.bfloat16).cuda()
+        ids = torch.randint(0, ex.count, (rows, 4), generator=g).cuda()
+        assert _close(X.dot(x, ids, ex), X.grouped(x, ids, ex, big.e.decoded), 0.01), rows
+
+
+@real
+def test_real_graph_replay_gives_the_eager_step_s_bits(big):
+    """The chat golden teacher-forced, eager and replayed: every step's logits equal bit for bit."""
+
+    g = _golden("chat")
+    rows = {}
+    for graphs in (False, True):
+        big.e.graphs = graphs
+        rows[graphs] = _teacher_forced(big.e, g)
+    big.e.graphs = True
+    assert all(torch.equal(a, b) for a, b in zip(rows[False], rows[True]))
+
+
+@real
 def test_decode_speed(big):
-    """A 256-token greedy reply to the chat prompt; prints tok/s next to the 85 tok/s bytes bound."""
+    """A 256-token greedy reply to the chat prompt, eager and on the decode graph; prints tok/s next to the 85 tok/s
+    bytes bound."""
 
     from tokenizers import Tokenizer
 
@@ -273,10 +397,13 @@ def test_decode_speed(big):
     text = ChatTemplate(REAL).render([{"role": "user", "content": "Write a short story about a lighthouse."}],
                                      tools=None, enable_thinking=True)
     prompt = tok.encode(text, add_special_tokens=False).ids
-    big.generate(prompt, 16, None, None, stop_eos=False)                     # warm the kernels
-    torch.cuda.synchronize()
-    started = time.perf_counter()
-    stats = big.generate(prompt, 256, None, None, stop_eos=False)
-    wall = time.perf_counter() - started
-    print(f"decode {stats['decode_tps']} tok/s, prefill {stats['prefill_tps']} tok/s, {wall:.1f} s for 256 tokens")
-    assert stats["decode_tps"] >= DECODE_FLOOR
+    for graphs in (False, True):
+        big.e.graphs = graphs
+        big.generate(prompt, 16, None, None, stop_eos=False, draft=False)            # warm the kernels
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        stats = big.generate(prompt, 256, None, None, stop_eos=False, draft=False)
+        wall = time.perf_counter() - started
+        print(f"{'graph' if graphs else 'eager'}: decode {stats['decode_tps']} tok/s, prefill {stats['prefill_tps']} "
+              f"tok/s ({len(prompt)} tokens), {wall:.1f} s for 256 tokens")
+        assert stats["decode_tps"] >= DECODE_FLOOR

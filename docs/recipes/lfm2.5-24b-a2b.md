@@ -45,20 +45,29 @@ The FP8 export quantizes 7,342 matrices: attention, the dense FFN and 7,296 expe
 
 ## CUDA engine
 
-One stream: requests take turns, and every request prefills its whole prompt. There are no drafts and no kept
-prompt states.
+One stream: requests take turns, and there are no drafts. A prefill keeps the conversation's state at the second
+message's start, at the last assistant turn's start and at the prompt end less one token (`tensorfold.cuda.markers`):
+the conv states (240 KiB) and the attention rows so far (20 KiB a token). A request resumes from the longest kept
+prefix of its prompt and prefills only the rest. Up to `TF_LFM2_CACHE_ENTRIES` states (default 8) are kept in at
+most `TF_LFM2_CACHE_GIB` (default 4, capped by free memory); past either cap a conversation's earlier turn goes
+first, then the oldest state. A resumed prompt starts its chunks at the kept length, so its bf16 rows can round apart
+from a fresh prefill's, within the golden bounds below. `draft: false` prefills afresh and keeps nothing.
 
 | Part | Kernel |
 | --- | --- |
 | Attention q/k/v (stacked), out, dense FFN | `Fp8BlockLinear`, the lane matmul over the stored e4m3 bytes |
 | Conv in/out projections, tied head | `b16` (bf16) |
 | Routed experts, decode (up to 16 rows) | `cuda/experts.py`'s Triton kernels: a program a (row, pick) and 32 outputs, fp32 sums a 128-input block, times the block's scale |
-| Routed experts, prompt chunks | each used expert decoded to fp32 once a chunk, its rows multiplied in fp32 |
+| Routed experts, prompt chunks | the decode kernels up to 16 rows (`PAIRS_ROWS`), then `dot`: pairs sorted by expert into 16-, 32- or 64-row tiles on the device, each tile reading its expert's e4m3 bytes once as bf16 on `tl.dot`, fp32 sums a 128-input block, times the block's scale. `TF_LFM2_PROMPT_KERNEL=fp32` keeps the previous path (each used expert decoded to fp32, its rows multiplied in fp32) as the reference; `pairs` and `dot` force one path |
 | Norms | Qwen's row-invariant `add_rmsnorm` |
 | Attention | `prefill_attention` for prompts; Nemotron-H's 512-key chunked kernel for decode |
 | Sampling | Nemotron-H's keyed sampler: (seed, position, logits) decides a token |
 
 Activations round as transformers' bf16 forward does. The conv's state is the last two products B * x, bf16.
+
+A one-row decode step replays a CUDA graph captured on the first step. The step reads its position (RoPE, the KV row
+it writes, attention's length) from a device tensor and its token from a static buffer, so one graph serves every
+position, and a replay gives the eager step's bits. `TF_LFM2_GRAPHS=0` runs every step eagerly.
 
 ## Memory and speed
 
