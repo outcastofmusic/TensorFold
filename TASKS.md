@@ -19,7 +19,8 @@ Order (18 Oct): the pipeline code changes above, then the Qwen3.8 variants (Mia'
 
 | Task | Notes |
 |---|---|
-| 4,096-row NVFP4 prompt pieces (`perf/nvfp4-4k-chunks`) | Correct: replies identical in 4 boots, no test fails that the base passes. Speed unsettled: 131k 1.09x and 1.08x in two rounds, 4k 1.10x / 0.72x, 32k 0.85x / 1.03x, with two CPU suites running beside the A/B. Re-run `tf-runs/gpu-chunks/run.sh` in a quiet window (no CPU jobs) |
+| Upstream 1.1.0 ports | Triage `tf-runs/upstream-1.1.0/TRIAGE.md`. In progress: grammar vocab from llm_config (Bolt refuses structured output today), linear-time tool-call parse, GLM SwiGLU limit 0, Super VL native pin 1.0.12 to 1.1.0. Later: tool_choice required/named as a full grammar (LFM2.5 and d1 refuse today), Bolt on the native 1.1.0 binary (A/B), lone-stream decode at --parallel 4 against 1 |
+| 4,096-row NVFP4 prompt pieces, long prompts only | Four A/B rounds (18 Oct, last on an idle box): 131k faster in all four (1.09, 1.08, 1.03, 1.04x), 4k slower in three of four (0.72-0.97x), 32k mixed; replies identical. Next: take 4,096-row pieces only when the prompt left to fill is long (threshold from a sweep), then A/B again |
 | Tiny NVFP4 checkpoint: kept state inside a prompt piece | DeltaNet layer 1's `rec` and `conv` at a kept point inside a piece differ from a fresh prefill ending there, deterministically, on the base too and at both piece sizes (`tests/cuda/test_flashnext_nvfp4_pieces.py`, 18 Oct). FP4-Local passes. Find what differs about layer 1 of the tiny checkpoint |
 | Bolt's dropped closing braces | 35 of 160 Bolt planning replies end `...}]` + fence without the object's `}` and score 0 (other models 0 of 160). Replay with `return_token_ids` to tell the model from the detokenizer |
 | Tool-call markup with parallel_tool_calls false | Gemma 4's `<|tool_call>` and DeepSeek-V4's DSML envelopes still stream as content; `server/tool_policy.py`'s `_FIXED` table can take them |
