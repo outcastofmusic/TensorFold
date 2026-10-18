@@ -1,8 +1,9 @@
 """Cold prefill against any OpenAI server: chat prompts of fixed token lengths from the Python standard library,
 a unique first line each so no cached prefix resumes; TTFT and prompt tok/s per length.
 
-build (where tensorfold is installed): python3 tools/prefill_cold.py build MODEL_DIR PROMPTS.json
-run (any client):                      python3 tools/prefill_cold.py run URL MODEL PROMPTS.json OUT.json"""
+build (where tensorfold is installed): python3 tools/prefill_cold.py build MODEL_DIR PROMPTS.json [4096,16384,...]
+run (any client):                      python3 tools/prefill_cold.py run URL MODEL PROMPTS.json OUT.json
+The run summarizes the lengths the prompts file holds (LENGTHS unless the build named others)."""
 
 import json
 import statistics
@@ -25,7 +26,7 @@ def corpus() -> str:
     return "".join(f"# {p.relative_to(root)}\n{p.read_text(errors='ignore')}\n" for p in files)
 
 
-def build(model_dir: str, out: str) -> None:
+def build(model_dir: str, out: str, lengths: tuple[int, ...] = LENGTHS) -> None:
     from pathlib import Path
 
     from tokenizers import Tokenizer
@@ -43,7 +44,7 @@ def build(model_dir: str, out: str) -> None:
         return len(tok.encode(template.render(m, tools=None, enable_thinking=False), add_special_tokens=False).ids)
 
     items = []
-    for length in (1024,) + LENGTHS:
+    for length in (1024,) + tuple(lengths):
         for rep in range(1 if length == 1024 else REPS):
             nonce = f"{length}-{rep}" if length != 1024 else "warm"
             start = (rep * 1_000_003 + length * 7) % (len(text) - 20 * length)
@@ -89,7 +90,7 @@ def run(url: str, model: str, prompts: str, out: str) -> None:
         rows.append(r)
         print(json.dumps(r), flush=True)
     summary = []
-    for length in LENGTHS:
+    for length in sorted({it["length"] for it in items} - {1024}):
         rs = [r for r in rows if r["length"] == length]
         t = statistics.median(r["ttft_s"] for r in rs)
         n = statistics.median(r["prompt_tokens"] or 0 for r in rs)
@@ -101,6 +102,6 @@ def run(url: str, model: str, prompts: str, out: str) -> None:
 
 if __name__ == "__main__":
     if sys.argv[1] == "build":
-        build(sys.argv[2], sys.argv[3])
+        build(sys.argv[2], sys.argv[3], *([tuple(int(v) for v in sys.argv[4].split(","))] if len(sys.argv) > 4 else []))
     else:
         run(*sys.argv[2:6])
