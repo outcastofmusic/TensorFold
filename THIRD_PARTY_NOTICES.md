@@ -117,3 +117,11 @@ The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
 [Flash Next vision patch 0008](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/a3aa89835022c55ca8e55008c37785954834e04f/patches/0008-flash-next-vision.patch),
 MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
 The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.
+
+## Flash Next NVFP4 expert tile
+
+The shared-memory routed-expert kernel `nvfp4_expert_tile_kernel` in `src/tensorfold/cuda/nvfp4/experts.cu` is ported
+from MiaAI-Lab's
+[engine prompt expert tile patch 0014](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/656879fd752749bbd11a6e1a065a326c00940911/patches/0014-engine-prompt-expert-tile.patch)
+(`fn_experts_tile.cu`), MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in
+`LICENSES/MiaAI-Lab-MIT.txt`. That kernel builds on the TensorFold contributors' `nvfp4_expert_kernel`.

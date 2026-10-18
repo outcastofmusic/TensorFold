@@ -1,4 +1,9 @@
-"""Grouped NVFP4 experts on ``tensorfold.cuda.experts``' plan: a (row, slot) pair's bits never depend on the others."""
+"""Grouped NVFP4 experts on ``tensorfold.cuda.experts``' plan: a (row, slot) pair's bits never depend on the others.
+
+Two kernels compute the same bits: a warp per 16 pairs for decode and short prompts, and the shared-memory tile for
+prompt chunks of ``TILE_ROWS`` rows or more on 64-pair items. The tile is ported from MiaAI-Lab's Qwen3.8 Flash Next
+recipe, patch 0014 (MIT licence), built on the TensorFold contributors' kernels.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,9 @@ from tensorfold.cuda import experts as grouped
 COLS = 32                 # output columns a block
 WORDS = 144               # int32 a (32 columns, 32 inputs) block: 128 code words, then 16 of e4m3 scales
 PREFILL_TILE = 16         # this kernel's prompt item: 64 ran 1.53x slower on Flash Next's routed prompts
+TILE_ITEM = 64            # the shared-memory tile's prompt item (MiaAI-Lab's plan)
+TILE_ROWS = 1024          # prompt chunks of at least this many rows take the tile: fewer leave too few pairs an expert
+TILE_WARPS = 4            # column blocks a tile unit (one CTA)
 
 
 def _i32(v: torch.Tensor) -> torch.Tensor:
@@ -77,27 +85,39 @@ def make(gate: tuple, up: tuple, down: tuple, *, limit: float = 0.0) -> Experts4
     return Experts4(u, d, us, down[2].to(torch.float32).reshape(-1, 1).contiguous(), width, dims, float(limit))
 
 
+def units(rows: int, plan: grouped.Plan, nb: int, tile: bool = False) -> int:
+    """The most work units a call's plan can hold: an (item, column block) a warp, or with ``tile`` an (item, four
+    column blocks) a CTA."""
+
+    blocks = -(-nb // TILE_WARPS) if tile else nb
+    return grouped.max_items(rows * plan.slots, plan.experts, plan.tile) * blocks
+
+
 def _run(epi: int, x: torch.Tensor, slots: int, w: torch.Tensor, scale: torch.Tensor, kg: int, nb: int,
-         plan: grouped.Plan, out: torch.Tensor, n: int, limit: float, skip: int, rows: int) -> None:
+         plan: grouped.Plan, out: torch.Tensor, n: int, limit: float, skip: int, rows: int, tile: bool) -> None:
     from .linear import _ext
 
-    units = grouped.max_items(rows * plan.slots, plan.experts, plan.tile) * nb
-    _ext().experts(epi, x, x.stride(0), slots, w, scale, kg, nb, plan.items, plan.counts, plan.members, out, n,
-                   limit, skip, units)
+    run = _ext().experts_tile if tile else _ext().experts
+    run(epi, x, x.stride(0), slots, w, scale, kg, nb, plan.items, plan.counts, plan.members, out, n, limit, skip,
+        units(rows, plan, nb, tile))
 
 
-def gate_up(x: torch.Tensor, ex: Experts4, plan: grouped.Plan, out: torch.Tensor, rows: int, skip: int = -1) -> None:
-    """x [R, D] bf16 -> out [R * slots, NI] bf16, each routed pair's SwiGLU; pairs of expert ``skip`` untouched."""
+def gate_up(x: torch.Tensor, ex: Experts4, plan: grouped.Plan, out: torch.Tensor, rows: int, skip: int = -1, *,
+            tile: bool = False) -> None:
+    """x [R, D] bf16 -> out [R * slots, NI] bf16, each routed pair's SwiGLU; pairs of expert ``skip`` untouched.
+    ``tile``: the shared-memory kernel (same bits), for prompt plans of ``TILE_ITEM`` pairs an item."""
 
     _run(2, x, plan.slots, ex.up, ex.up_scale, ex.dims // 32, ex.width // COLS, plan, out, ex.width, ex.limit, skip,
-         rows)
+         rows, tile)
 
 
-def down(act: torch.Tensor, ex: Experts4, plan: grouped.Plan, out: torch.Tensor, rows: int, skip: int = -1) -> None:
-    """act [R * slots, NI] bf16 -> out [R * slots, D] in ``out``'s dtype; pairs of expert ``skip`` untouched."""
+def down(act: torch.Tensor, ex: Experts4, plan: grouped.Plan, out: torch.Tensor, rows: int, skip: int = -1, *,
+         tile: bool = False) -> None:
+    """act [R * slots, NI] bf16 -> out [R * slots, D] in ``out``'s dtype; pairs of expert ``skip`` untouched.
+    ``tile``: the shared-memory kernel (same bits), for prompt plans of ``TILE_ITEM`` pairs an item."""
 
     _run(0 if out.dtype == torch.float32 else 3, act, 0, ex.down, ex.down_scale, ex.width // 32, ex.dims // COLS,
-         plan, out, ex.dims, 0.0, skip, rows)
+         plan, out, ex.dims, 0.0, skip, rows, tile)
 
 
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
