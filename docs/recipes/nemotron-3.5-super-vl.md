@@ -39,8 +39,9 @@ release that `prepare.sh` fetches.
 
 ## Memory
 
-The weights take 73.2 GiB with the image tower. One stream's KV and Mamba state take 1.28 GiB at 131,072 tokens. The
-40 GiB left after load holds d1-3B (`D1=1`), whose estimate is 7.3 GiB. Clef stays off, because it guards Qwen's
+The weights take 74.2 GiB with the image tower, as the server logged at load on 2026-10-18
+(`tf-runs/bench2/super.server.log`, `--vision` on). One stream's KV and Mamba state take 1.28 GiB at 131,072 tokens.
+The 40 GiB left after load holds d1-3B (`D1=1`), whose estimate is 7.3 GiB. Clef stays off, because it guards Qwen's
 thinking.
 
 ## Precision
