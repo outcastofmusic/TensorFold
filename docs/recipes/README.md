@@ -13,6 +13,7 @@ Each family page describes its supported checkpoint, kernels and operating limit
 | DeepSeek-V4-Flash | [MLX on a 256 GB Mac, DSpark and MTP drafts](deepseek-v4-flash.md) |
 | Qwen3.6-35B-A3B | [MLX with MTP drafts, one-GPU CUDA](qwen3.6-moe.md) |
 | LFM2.5-24B-A2B | [one-GPU CUDA, block FP8](lfm2.5-24b-a2b.md) |
+| Nemotron 3.5 Super VL | [upstream's native server through `run.sh`](nemotron-3.5-super-vl.md) |
 
 ## Capability floor
 

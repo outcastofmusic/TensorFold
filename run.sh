@@ -7,6 +7,7 @@
 #   ./run.sh qwen-flash-next-fp4   Qwen3.8 Flash Next from NVIDIA's FP4-Local checkpoint (QAD NVFP4), Clef-Flash beside it
 #   ./run.sh nemotron-bolt     Nemotron 3.5 Bolt 74B-A9B (24 GB) with its LiLiCorr draft model
 #   ./run.sh lfm2-24b          Liquid's LFM2.5-24B-A2B (block FP8, 24.75 GB): tool routing and sub-agents
+#   ./run.sh nemotron-3.5-super    Nemotron 3.5 Super VL 120B-A12B (NVFP4, 75.1 GB) on upstream's native 1.0.12 server
 #                              With D1=1 each model target but GLM also starts d1-3B, Liquid AI's decision model, on :30003 once
 #                              the model answers (POST /v1/systemone and /v1/decisions; docs/d1-sidecar.md)
 #   ./run.sh swap              one endpoint on 127.0.0.1:30000 that loads whichever model a request names (swap.py)
@@ -23,7 +24,7 @@
 #   SWAP_DRAIN=600  SWAP_HOLD=0  SWAP_TIMEOUT=3600  SWAP_PERSIST=120   swap.py's waits, in seconds (its header says what each does)
 #   TF_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 #   EXTRA="..."                more `tensorfold serve` flags
-#   QWEN_MODEL, QWEN_FP4_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL, D1_MODEL   another checkpoint folder under $MODELS
+#   QWEN_MODEL, QWEN_FP4_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL, SUPER_MODEL, D1_MODEL   another checkpoint folder under $MODELS
 # Qwen, Qwen FP4, GLM:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused;  Qwen: STATES_ALL=0: each slot's shortest and longest state go to disk (1: every kept state)
 # Qwen:  CONTEXT=262144  PARALLEL=4  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)
@@ -32,6 +33,8 @@
 # Bolt:  CONTEXT=131072 (a stream's KV is 8 KiB a token)  THINK_BUDGET=8000 (0: none); no disk states, one stream
 # LFM2:  CONTEXT=131072 (KV 20 KiB a token)  THINK_BUDGET=8000 (0: none); one stream, no drafts, no disk states.
 #        LFM Open License v1.0: commercial use is licensed only under US$10M annual revenue
+# Super: CONTEXT=131072  THINK_BUDGET=8000 (0: none); --precision checkpoint, --vision, MTP drafts; no Clef, no disk states
+#        NATIVE=$MODELS/tensorfold-1.0.12-linux-aarch64: the native server's bin/ and lib/ (./prepare.sh nemotron-3.5-super)
 set -euo pipefail
 shopt -s inherit_errexit            # a failure inside $(image) stops the caller too
 
@@ -41,7 +44,7 @@ PORT="${PORT:-30000}"
 CLEF_PORT="${CLEF_PORT:-30001}"
 D1_PORT="${D1_PORT:-30003}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
-NAMES="tensorfold-serve clef-serve tensorfold-glm tensorfold-bolt tensorfold-lfm2 d1-serve tensorfold-build"
+NAMES="tensorfold-serve clef-serve tensorfold-glm tensorfold-bolt tensorfold-lfm2 tensorfold-super d1-serve tensorfold-build"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/tensorfold-run"
 
 die() { echo "run: $*" >&2; exit 1; }
@@ -51,11 +54,11 @@ avail_mib() { awk '/MemAvailable/{printf "%d", $2 / 1024}' /proc/meminfo; }
 
 uncache() {  # drop the served checkpoints' files from the page cache (they stay on disk)
     local f
-    for f in "$MODELS"/{Qwen3.8-Flash-Next-exl3-3.05bpw,Qwen3.8-Flash-Next-FP4-Local,clef-flash,glm53-flash-mosaic-12l,glm53-flash-sushi-experts-mosaic-dense,GLM-5.3-Flash-DFlash*,Nemotron-3.5-Bolt-74B-A9B-24GB*,LFM2.5-24B-A2B-FP8,d1-3B}/*.safetensors \
+    for f in "$MODELS"/{Qwen3.8-Flash-Next-exl3-3.05bpw,Qwen3.8-Flash-Next-FP4-Local,clef-flash,glm53-flash-mosaic-12l,glm53-flash-sushi-experts-mosaic-dense,GLM-5.3-Flash-DFlash*,Nemotron-3.5-Bolt-74B-A9B-24GB*,LFM2.5-24B-A2B-FP8,NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4,d1-3B}/*.safetensors \
              "$MODELS"/Qwen3.8-Flash-Next-FP4-Local/tensors/*.safetensors \
              "${QWEN_MODEL:-}"/*.safetensors "${QWEN_FP4_MODEL:-}"/*.safetensors "${CLEF_MODEL:-}"/*.safetensors \
              "${GLM_MODEL:-}"/*.safetensors "${BOLT_MODEL:-}"/*.safetensors "${LFM2_MODEL:-}"/*.safetensors \
-             "${D1_MODEL:-}"/*.safetensors; do
+             "${SUPER_MODEL:-}"/*.safetensors "${D1_MODEL:-}"/*.safetensors; do
         [ -f "$f" ] && dd if="$f" iflag=nocache count=0 status=none 2>/dev/null
     done
     return 0
@@ -107,6 +110,18 @@ serve() {  # container name, docker flags..., --, tensorfold serve arguments
     docker run -d --init --name "$name" --gpus all --ipc=host --network host \
         -v "$MODELS:$MODELS:ro" -v tensorfold-ext:/ext -e TORCH_EXTENSIONS_DIR=/ext -e TRITON_CACHE_DIR=/ext/triton -e HF_HUB_OFFLINE=1 "${flags[@]}" "$IMAGE" \
         tensorfold serve "$@" --no-update-check >/dev/null
+}
+
+serve_native() {  # container name, docker flags..., --, tensorfold-native serve arguments
+    local name=$1; shift
+    local flags=()
+    while [ "$1" != "--" ]; do flags+=("$1"); shift; done
+    shift
+    # upstream's binary from $NATIVE on the base image (any glibc >= 2.28 works); it finds libtfgrammar.so and
+    # libturbojpeg.so.0 in the lib/ beside its bin/, and reads libcuda.so.1 from the driver that --gpus mounts
+    docker run -d --init --name "$name" --gpus all --ipc=host --network host \
+        -v "$MODELS:$MODELS:ro" -v "$NATIVE:/opt/tensorfold:ro" -e HF_HUB_OFFLINE=1 "${flags[@]}" \
+        --entrypoint /opt/tensorfold/bin/tensorfold-native "$BASE" serve "$@" --no-update-check >/dev/null
 }
 
 wait_ready() {  # container name, port; returns 1 when the server exited while loading
@@ -262,6 +277,27 @@ lfm2() {
     d1
 }
 
+# Upstream TensorFold's native server, not this checkout's Python engine: TrueScore 94.1 and planning 62.6, thinking
+# off, ready in 44 s with 40 GiB available after load (2026-10-18). It runs the checkpoint's own FP8/NVFP4 math
+# (--precision checkpoint, the Blackwell default), whose replies differ from --precision full's (KL 0.0077 nats).
+# No Clef: it guards Qwen. d1 fits beside it: 7.3 GiB of the 40.
+super() {
+    local model="${SUPER_MODEL:-$MODELS/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4}"
+    NATIVE="${NATIVE:-$MODELS/tensorfold-1.0.12-linux-aarch64}"
+    [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh nemotron-3.5-super)"
+    [ -x "$NATIVE/bin/tensorfold-native" ] || die "no native server at $NATIVE/bin/tensorfold-native (run ./prepare.sh nemotron-3.5-super)"
+    [ -e "$NATIVE/lib/libturbojpeg.so.0" ] || echo "run: no $NATIVE/lib/libturbojpeg.so.0, so the server refuses JPEG images (PNG and WebP serve)" >&2
+    local budget=()
+    [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
+    [ "${D1:-0}" = 0 ] || IMAGE=$(image)          # only d1 runs this checkout's image
+    stop_all
+    serve_native tensorfold-super -- "$model" --host 127.0.0.1 --port "$PORT" --name nemotron-3.5-super \
+        --context "${CONTEXT:-131072}" --max-tokens "${CONTEXT:-131072}" --precision checkpoint --vision \
+        "${budget[@]}" ${EXTRA:-}
+    wait_ready tensorfold-super "$PORT" || failed tensorfold-super
+    d1
+}
+
 glm() {
     # The hybrid (Sushi's routed experts on Mosaic 12L's dense part) over Mosaic 12L: TrueScore 93.6 against 86.5,
     # paired difference +2.7 [-1.1, +7.3] over 76 scenarios, decode 5-7% slower (2026-10-13)
@@ -321,7 +357,7 @@ status() {
 command -v docker >/dev/null || die "docker is not installed"
 # one start at a time: two direct runs would both stop_all, then load two models side by side
 case "${1:-}" in
-    qwen-flash-next|glm-5.3-flash|qwen-flash-next-fp4|nemotron-bolt|lfm2-24b)
+    qwen-flash-next|glm-5.3-flash|qwen-flash-next-fp4|nemotron-bolt|lfm2-24b|nemotron-3.5-super)
         mkdir -p "$STATE"; exec 9>"$STATE/run.lock"; flock 9 ;;
 esac
 case "${1:-}" in
@@ -331,9 +367,10 @@ case "${1:-}" in
     qwen-flash-next-fp4) ask_swap "$1" || qwen_fp4 ;;
     nemotron-bolt)   ask_swap "$1" || bolt ;;
     lfm2-24b)        ask_swap "$1" || lfm2 ;;
+    nemotron-3.5-super) ask_swap "$1" || super ;;
     swap)            swap "${2:-}" ;;
     stop)            if swapping; then stop_swap; fi
                      stop_all ;;
     status)          status ;;
-    *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
