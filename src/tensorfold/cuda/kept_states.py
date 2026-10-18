@@ -5,8 +5,12 @@ A kept state is a family engine's copy of its state after a prompt position (``E
 family defines), with a drafter's context when the prefill fed one. A recurrent state exists only after the last row a
 pass committed, so a prefill takes states as it passes their positions (``keep_points``): the message starts
 ``tensorfold.cuda.markers`` finds, and the prompt end less one token, since a next turn sent back without its reasoning
-renders that last token differently. Only prompt rows are kept: decode and prefill bits differ, and each family's
-prompt kernels are chunk-invariant, so a resumed prompt ends in the state a fresh prefill reaches.
+renders that last token differently. Only prompt rows are kept, since decode and prefill bits differ.
+
+How close a resumed prompt ends to a fresh prefill depends on the family. Bolt's prompt kernels are chunk-invariant,
+so it resumes bit-exact. LFM2-MoE resumes within its tolerance: a resume can leave a short last chunk, and chunks of
+up to ``PAIRS_ROWS`` (64) rows run the experts on ``pairs`` where a fresh prefill's long chunk runs ``dot``, which
+rounds differently (tests/cuda/test_lfm2_moe.py checks resumed logits against the same bounds as fresh ones).
 """
 
 from __future__ import annotations
