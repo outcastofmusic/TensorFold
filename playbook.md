@@ -111,6 +111,7 @@ All four equalities compare token SHA-256 or `torch.equal` on rows and states.
 | 6.6 | Turn off FMA contraction where the reference sums products in sequence | `enable_fp_fusion=False` on that kernel (d79986c1) |
 | 6.7 | Size scratch and partial buffers for the rows actually launched | No NaN past a chunk edge. 128-row buffers under 2,048-row chunks gave "!!!!" past 2,051 tokens upstream |
 | 6.8 | Run any `.cu` or GPU-path change on the GPU before merging | The area's GPU test files pass. The CPU suite (4,794 passed) could not see 688bc309 |
+| 6.9 | Check a fused reduction at every shape it accepts, including one loop iteration | Byte equality holds at the smallest dispatch shape too. Triton 3.7.1 folded `total + dot(x, w, 0)` into `dot(x, w, total)` when a K slice held one block, so the in-program split-K sum changed bits on the tiny checkpoint (1 block a slice) and not on FP4-Local (5): guard `k // sk // bk >= 2` (edc00823, 18 Oct) |
 
 ### Phase 7. Memory
 
