@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from tensorfold import families, hub
-from tensorfold.cli import _drafter, _generation_config, _model_context, build_parser, main
+from tensorfold.cli import (_drafter, _dropped_sampling, _generation_config, _model_context, _warn_dropped_sampling,
+                            build_parser, main)
 
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
@@ -336,3 +337,36 @@ def test_null_sampling_fields_in_generation_config_keep_the_defaults(tmp_path):
     (tmp_path / "generation_config.json").write_text(json.dumps(
         {"do_sample": True, "temperature": None, "top_k": 20, "top_p": 0.95, "min_p": None}))
     assert _generation_config(tmp_path) == {"temperature": 1.0, "top_k": 20, "top_p": 0.95}
+
+
+LFM2_GENERATION = {"bos_token_id": 124894, "eos_token_id": [124900], "do_sample": True, "temperature": 0.1,
+                   "top_k": 50, "repetition_penalty": 1.05}     # LiquidAI/LFM2.5-24B-A2B-FP8's, trimmed
+
+
+def test_startup_names_the_sampling_keys_generation_config_sets_and_the_server_drops(tmp_path, capsys):
+    (tmp_path / "generation_config.json").write_text(json.dumps(LFM2_GENERATION))
+    assert _generation_config(tmp_path) == {"temperature": 0.1, "top_k": 50}       # sampling itself is unchanged
+    assert _dropped_sampling(tmp_path) == {"repetition_penalty": 1.05}
+    _warn_dropped_sampling(tmp_path)
+    assert "warning: generation_config.json sets repetition_penalty 1.05; this server does not apply it" in \
+        capsys.readouterr().err
+
+
+@pytest.mark.parametrize("generation", [
+    {"temperature": 1.0, "top_k": 20, "top_p": 0.95},                                  # Flash Next's
+    {"repetition_penalty": 1.0, "presence_penalty": 0, "frequency_penalty": 0.0, "typical_p": None},
+    None,
+])
+def test_neutral_or_absent_dropped_keys_give_no_warning(tmp_path, capsys, generation):
+    if generation is not None:
+        (tmp_path / "generation_config.json").write_text(json.dumps(generation))
+    assert _dropped_sampling(tmp_path) == {}
+    _warn_dropped_sampling(tmp_path)
+    assert capsys.readouterr().err == ""
+
+
+def test_every_dropped_key_is_named(tmp_path):
+    (tmp_path / "generation_config.json").write_text(json.dumps(
+        {"repetition_penalty": 1.1, "presence_penalty": 0.5, "no_repeat_ngram_size": 3, "temperature": 0.7}))
+    assert _dropped_sampling(tmp_path) == {"repetition_penalty": 1.1, "presence_penalty": 0.5,
+                                           "no_repeat_ngram_size": 3}

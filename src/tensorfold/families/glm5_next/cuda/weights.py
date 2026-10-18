@@ -105,6 +105,12 @@ class Config:
             raise ValueError(f"expert_quant format {stacked.get('format')!r}: stacked routed experts are read as exl3")
         eos = t.get("eos_token_id", raw.get("eos_token_id"))
         eos = tuple(int(e) for e in eos) if isinstance(eos, list) else (int(eos),)
+        gen = Path(model_dir) / "generation_config.json"
+        if gen.is_file():                    # an end id listed only there must still end the reply
+            extra = json.loads(gen.read_text()).get("eos_token_id")
+            for e in extra if isinstance(extra, list) else [extra]:
+                if isinstance(e, int) and e not in eos:
+                    eos += (e,)
         n = int(t["num_hidden_layers"])
         kinds = ["kda" if k == "linear_attention" else "dsa" for k in t["layer_types"]]
         dense = int(t.get("first_k_dense_replace", 3))

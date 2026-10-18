@@ -185,6 +185,27 @@ def _generation_config(model_dir: Path) -> dict[str, Any]:
     return sampling
 
 
+# generation_config.json's sampling keys no TensorFold sampler reads, with the value that leaves sampling unchanged
+UNREAD_SAMPLING = {"repetition_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0,
+                   "encoder_repetition_penalty": 1.0, "no_repeat_ngram_size": 0, "typical_p": 1.0,
+                   "epsilon_cutoff": 0.0, "eta_cutoff": 0.0}
+
+
+def _dropped_sampling(model_dir: Path) -> dict[str, Any]:
+    """generation_config.json's sampling settings the server does not apply (LFM2.5-24B's repetition_penalty 1.05)."""
+
+    path = Path(model_dir) / "generation_config.json"
+    config = json.loads(path.read_text()) if path.exists() else {}
+    return {k: config[k] for k, neutral in UNREAD_SAMPLING.items() if config.get(k) not in (None, neutral)}
+
+
+def _warn_dropped_sampling(model_dir: Path) -> None:
+    dropped = _dropped_sampling(model_dir)
+    if dropped:
+        print(f"[tensorfold] warning: generation_config.json sets {', '.join(f'{k} {v}' for k, v in dropped.items())}; "
+              f"this server does not apply {'it' if len(dropped) == 1 else 'them'}", file=sys.stderr, flush=True)
+
+
 def _model_context(model_dir: Path) -> int:
     from tensorfold.families import read_config
 
@@ -310,6 +331,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     from tensorfold.cuda.server import App, serve
 
     sampling = _generation_config(model_dir)
+    _warn_dropped_sampling(model_dir)
     for key, value in (("temperature", args.temperature), ("top_p", args.top_p), ("top_k", args.top_k),
                        ("min_p", args.min_p)):
         if value is not None:
@@ -489,6 +511,7 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
                                        prefill_pass=max(1, int(args.prefill_pass)),
                                        pass_cache=int(float(args.pass_cache_gib) * 1024**3))
     sampling = _generation_config(model_dir)
+    _warn_dropped_sampling(model_dir)
     for key, value in (("temperature", args.temperature), ("top_p", args.top_p), ("top_k", args.top_k),
                        ("min_p", args.min_p)):
         if value is not None:
