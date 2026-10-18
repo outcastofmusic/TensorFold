@@ -1,15 +1,15 @@
 # Nemotron 3.5 Super VL
 
-`run.sh` serves NVIDIA's Nemotron 3.5 Super VL 120B-A12B (`nemotron_h_omni`) with upstream TensorFold's native 1.0.12
+`run.sh` serves NVIDIA's Nemotron 3.5 Super VL 120B-A12B (`nemotron_h_omni`) with upstream TensorFold's native 1.1.0
 server, which `run.sh` runs in place of this checkout's Python engine. It is an opt-in swap target. The default stays
-`qwen-flash-next`. Upstream's [recipe](https://github.com/ashhart/TensorFold/blob/6ee828c2/docs/recipes/nemotron-3.5-super-vl.md)
+`qwen-flash-next`. Upstream's [recipe](https://github.com/ashhart/TensorFold/blob/v1.1.0/docs/recipes/nemotron-3.5-super-vl.md)
 describes the engine, its exactness and its speed.
 
 ## Run
 
 ```bash
 ./prepare.sh nemotron-3.5-super   # nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 at 82d93699 (75.1 GB), and the
-                                  # 1.0.12 linux-aarch64 archive, sha256-pinned, into ~/models/tensorfold-1.0.12-linux-aarch64
+                                  # 1.1.0 linux-aarch64 archive, sha256-pinned, into ~/models/tensorfold-1.1.0-linux-aarch64
 ./run.sh nemotron-3.5-super       # served as nemotron-3.5-super on 127.0.0.1:30000, or through ./run.sh swap
 ```
 
@@ -21,9 +21,18 @@ tensorfold-native serve ~/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 --
 ```
 
 MTP drafts are on, the server's default. `CONTEXT`, `THINK_BUDGET` (0: none) and `EXTRA` change the flags as for the
-other targets. The release archive has no `libturbojpeg.so.0`, so the server refuses JPEG images and serves PNG and
-WebP. A `lib/` holding libjpeg-turbo 3.1.4.1's library, such as a local build's `zig-out/native`, fixes that through
-`NATIVE=`.
+other targets. Every flag above exists in both 1.0.12 and 1.1.0 (`zig/src/server/cli.zig`).
+
+1.1.0 makes `--mtp-drafts N` and `--mtp-confidence C` reach CUDA Nemotron streams (#997). `N` caps the MTP depth at
+up to 31 for Super, and 0 turns drafting off. `C`, from 0 to 1, replaces the cost-based cutoff with a cumulative
+confidence threshold. `run.sh` passes neither, so the server's cost-based depth applies. `EXTRA` can pass them for an
+A/B.
+
+1.1.0 also answers `response_format` (JSON schema) and `tool_choice: "required"` through `lib/libtfgrammar.so`, which
+1.0.12 refused (#951). The release archive has neither `libturbojpeg.so.0` nor `libwebpdecoder`. The server therefore
+refuses JPEG and WebP images and serves PNG. A `lib/` holding libjpeg-turbo 3.1.4.1's `libturbojpeg.so.0`, such as a
+local build's `zig-out/native`, lets JPEG serve through `NATIVE=`. WebP needs libwebp 1.6.0's `libwebpdecoder` there
+too.
 
 ## Numbers
 
@@ -35,7 +44,7 @@ WebP. A `lib/` holding libjpeg-turbo 3.1.4.1's library, such as a local build's 
 | Available after load at 131,072 tokens | 40 to 41 GiB of 121.7 | 2026-10-18 |
 
 The binary in these runs was a local build of upstream `6ee828c2`, which changes no engine code from the 1.0.12
-release that `prepare.sh` fetches.
+release. `tf-runs/gpu-super110/run.sh` repeats the speed, memory and greedy-reply checks on 1.1.0 against that build.
 
 ## Memory
 

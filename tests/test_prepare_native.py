@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.0.12"
+VERSION = re.search(r"^NATIVE=\((\S+) [0-9a-f]{64}\)$", (ROOT / "prepare.sh").read_text(), flags=re.MULTILINE).group(1)
 FOLDER = f"tensorfold-{VERSION}-linux-aarch64"
 
 
