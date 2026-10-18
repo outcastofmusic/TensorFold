@@ -5,6 +5,13 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **Qwen3.8 Flash Next FP4-Local prefills idle prompts in 4,096-row pieces when memory allows.** At one GPU on the
+  GB10, the engine widens idle pieces from 2,048 rows when the admitted window leaves room. That room is the wider
+  buffers plus the fp32 K-slice partials of the bf16 linears: 2.50 GiB of workspace with MTP drafts, 2.04 GiB
+  without. Each expert then gets 80 routed rows a weight read instead of 40, and pieces beside live replies stay at
+  2,048 rows or fewer. The checkpoint must keep NVFP4 experts and MXFP8 for every other quantized linear. A row's
+  bits do not depend on its piece, so replies and kept states stay the same. `TENSORFOLD_PREFILL_ROWS=2048` keeps
+  the old width.
 - **Qwen3.8 Flash Next FP4-Local prompt chunks run the bf16 hyper-connections in fewer kernels, with the same bytes.**
   In a 32,768-token prefill on 18 Oct 2026, the 98 HC read-outs of a 2,048-row chunk took 102 ms for the down projection
   and its split-K reduce, 72 ms for the up projection and the stream mix, and 105 ms for the write-back and the norm.
