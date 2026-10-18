@@ -1,7 +1,7 @@
 import pytest
 
 from tensorfold.cuda.markers import GRID_ENV, MIN_GAP, grid_env
-from tensorfold.env_flags import flag
+from tensorfold.env_flags import choice, flag
 
 
 @pytest.mark.parametrize("value", ["1", "on", "TRUE", " yes "])
@@ -56,3 +56,20 @@ def test_an_unset_flag_takes_its_default(monkeypatch):
     assert flag("TENSORFOLD_X", default=True)
     monkeypatch.setenv("TENSORFOLD_X", "off")
     assert not flag("TENSORFOLD_X", default=True)
+
+
+@pytest.mark.parametrize("value, ignore_case, got", [(None, False, "b"), ("", False, "b"), (" a ", False, "a"),
+                                                     ("c", False, "c"), (" A ", True, "a"), ("C", True, "c")])
+def test_a_choice_reads_one_of_its_values_or_the_default(monkeypatch, value, ignore_case, got):
+    if value is None:
+        monkeypatch.delenv("TENSORFOLD_X", raising=False)
+    else:
+        monkeypatch.setenv("TENSORFOLD_X", value)
+    assert choice("TENSORFOLD_X", ("a", "b", "c"), "b", ignore_case=ignore_case) == got
+
+
+@pytest.mark.parametrize("value, ignore_case", [("A", False), ("d", False), ("d", True), ("a,b", True)])
+def test_a_choice_outside_its_values_raises_naming_the_flag_and_values(monkeypatch, value, ignore_case):
+    monkeypatch.setenv("TENSORFOLD_X", value)
+    with pytest.raises(ValueError, match="TENSORFOLD_X: one of a, b, c"):
+        choice("TENSORFOLD_X", ("a", "b", "c"), "b", ignore_case=ignore_case)
