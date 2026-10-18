@@ -13,18 +13,20 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 | Follow-up 4: Qwen persists only the longest state per chain; block reuse; scheduler liveness | Built on `perf/disk-states` (`d1c880fa`, `c5f31a9f`, `61f71117`), CPU 4,808 passed. Block names live on the snapshot (ids alone are unsafe: decoded rows differ from a cold prefill). Not merged until `tf-runs/gpu-disk/run.sh` passes after bench2. Deploying it changes the fingerprints, so states on disk start over once |
 | Follow-ups 1 and 3: Bolt decode CUDA graphs and a drafter-only Q8_0 head | Built on `perf/bolt-graphs` (`20201633`, `1b52dad4`), CPU 4,745 passed; expected serial 40-60 tok/s against 29. Not merged until its GPU run passes: `tf-runs/gpu-graphs/run.sh` after bench2 |
 | Code review since 0.8.0 (`8c405e56..7891345f`) | All fixes merged into `feat/integration` (`1bd20c09`): ops, GLM, Bolt, LFM2, Qwen and disk states; CPU 4,794 passed. Gateway branches fixed separately. Waiting for the GPU tests after bench2, then `fork/dev` and "Last reviewed" |
-| Benchmark round 2 (`tf-runs/bench2.sh`) | LFM2.5-24B and Super VL TrueScore + planning; GLM and Bolt planning with thinking on; long-context pilot on FP4-Local. Then production restarts on the new `fork/dev` |
+| Qwen variants: Mia's Zig recipe on FP4-Local | Same checkpoint as ours on the Zig engine with patches 0011-0015. Decode equal (67.9 against 67.8 tok/s, code, one stream); Mia's cold prefill 2,665 tok/s at 4k, ours not measured on FP4 (EXL3 930-970). (1) Read the patches and prompt-tile kernel: `tf-runs/mia-qwen/ANALYSIS.md`, running. (2) A/B Mia's container and ours on :31005: prefill at 4k/32k/131k, decode at 1 and 5 streams. (3) If prefill is 2x or better, port the prompt-tile kernel to Python behind a flag; try fp8 KV and `--parallel 5`. Stay on Python: Clef, d1, disk states and swap persist live there |
 
 ## To do
 
+Order (18 Oct): the pipeline code changes above, then the Qwen3.8 variants (Mia's recipe, the FP4-Local vs EXL3 tie-breaker), then the rest.
+
 | Task | Notes |
 |---|---|
+| Qwen FP4-Local vs EXL3 tie-breaker | Two more TrueScore repeats each (76x2 more, about 1.5 h each) to halve the CI on today's +2.3 [-1.1, +6.4]. Lead holds clear of zero: FP4-Local for planning and hard reasoning; near zero: EXL3 stays the default |
 | Tool-call markup with parallel_tool_calls false | Gemma 4's `<|tool_call>` and DeepSeek-V4's DSML envelopes still stream as content; `server/tool_policy.py`'s `_FIXED` table can take them |
 | Next review: shared prompt-state store | LFM2.5's reuse imports Bolt's `Store`/`keep_points` from `nemotron_bolt/cuda/reuse.py`; move them to a shared module (e.g. `tensorfold/cuda/kept_states.py`) once both branches are merged |
-| Thinking-on TrueScore arms | TrueScore with thinking on per model (planning with thinking on for GLM and Bolt runs in benchmark round 2) |
-| Nemotron 3.5 Super VL (120B-A12B) as a swap candidate | Upstream 1.0.12 serves it on one or two GB10s from NVIDIA's NVFP4. Staged: checkpoint downloaded, native 1.0.12 built, smoke passes; benchmarking in round 2. Then a native target in `run.sh`/`swap.py` (`serve_native`) |
+| Thinking-on TrueScore arms | TrueScore with thinking on per model Also the rest of round 2, stopped 18 Oct for the GPU window: GLM planning with thinking on (52 requests answered, rerun), Bolt planning with thinking on, and the long-context pilot on FP4-Local |
+| Nemotron 3.5 Super VL (120B-A12B) as a swap candidate | Upstream 1.0.12 serves it on one or two GB10s from NVIDIA's NVFP4. Native 1.0.12 smoke passes. TrueScore 94.1 (highest so far), planning 62.6 (round 2, 18 Oct). Then a native target in `run.sh`/`swap.py` (`serve_native`) |
 | Model split decision (planner vs executor) | After the GPU window. (1) Implementation suite (`cx-signal` + code + agentic, 44 x4, `run_ext.py`) and the long-context set on Qwen FP4-Local, Bolt with graphs and LFM2.5 with its prompt fixes. (2) Co-residence: does Qwen EXL3 + Clef + Bolt or LFM2.5 fit, and with how much KV room? A split only pays if the executor is clearly faster at equal quality and no swap sits between planner and executor |
-| Qwen FP4-Local vs EXL3 tie-breaker | Two more TrueScore repeats each (76x2 more, about 1.5 h each) to halve the CI on today's +2.3 [-1.1, +6.4]. Lead holds clear of zero: FP4-Local for planning and hard reasoning; near zero: EXL3 stays the default |
 | Deploy the gateway empty-reply retry | Reviewed and fixed: `feat/empty-retry` `19d4145` (hold opt-in at 0, retry keeps the last body sent, shadow mode, headers flushed at once), go test -race passes. Deploy in shadow first: `"reseed": {"qwen3.8-flash-next": {"retries": 1, "mode": "shadow"}}`, then act. Merge into `~/mini-llm-gateway`, Ctrl-C and `just serve` in its tmux pane. Waiting for your go |
 | Evaluate the gateway's shadow checks: real-model run | Case set built (`feat/check-eval`, rebased with fixes `19ee308`, `e1e1f8d`: localhost-only upstream, stops on a swap, recorded traffic gitignored, `~/workspace/gateway-check-eval`): 158 labelled cases, runner, fake-engine run done. Provisional: side_requests and arg_loop act; empty_retry (fire only on finish stop), retry (only with Retry-After) and repeated_call (exempt command and wait tools) tweak; tool_repair and reasoning_loop stay shadow. Run the real-model commands in CHECK-EVAL.md when a model is up, then label results and decide |
 | Run the long-context set | Built in `spark-bench-ext` (`lc_ext.py`, `run_lc.py`): 72 measurement scenarios (recall with near-duplicate distractors, aggregation over 2-4 facts, superseded values in long tool transcripts) at 16k/64k/128k, 468 unit tests pass. Pilot the 27-scenario dev set (`--scenario-ids lc`) on one model first, then `lcm` x3: about 4.5 h for Qwen and 10.5 h for GLM without prefix reuse. GLM's 98,304 window leaves 8,400 tokens at 128k |
@@ -40,6 +42,7 @@ Standing rule: after every few merges into `fork/dev`, review what landed since 
 
 | Task | Result |
 |---|---|
+| Benchmark round 2 (18 Oct) | LFM2.5-24B TrueScore 91.7, planning 58.6 (443 min). Super VL TrueScore 94.1, planning 62.6. Stopped during GLM thinking-on planning to free the GPU; the remaining arms moved to Thinking-on TrueScore arms. `tf-runs/bench2/RESULTS.md` |
 | Empty-reply investigation | `~/empty-replies/empty-replies-findings.md` |
 | Release 0.8.0 | Background prefill, disk states for GLM, GLM stop fix and the upstream fixes, 16 Oct |
 | GLM splice of gate cuts into the live stream | Merged into `fork/dev`, `8c405e56` |
