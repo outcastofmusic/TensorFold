@@ -19,6 +19,9 @@ from tensorfold.cuda.exl3.linear import Exl3Linear
 MOE_WINDOW = 1024
 # experiment: a prompt chunk's trellis projections decode W once into the shared prompt GEMM (cuda/exl3/prefill.py)
 DENSE_PROMPT = os.environ.get('TF_GLM_DENSE_PROMPT', '0') == '1'
+# TF_GLM_PACKED_COPIES=1: every projection stages its rows in the scratch and copies its output back, and decode
+# computes the group sums packed projections never read (forward.group_sums): the old path, kept as the byte reference
+COPIES = os.environ.get('TF_GLM_PACKED_COPIES', '0') == '1'
 
 
 @dataclass
@@ -69,8 +72,9 @@ def leaves(q):
 class ProjectionScratch:
     """Fixed capacity, no lazy allocations in CUDA matmul; shared sequentially.
 
-    Component output is contiguous for the native C++ ABI. Copying to composed
-    output slices happens AFTER its output rotation/rounding, never before.
+    Holds the rows of a layout a kernel cannot read or write in place (``matmul``):
+    the EXL3 kernels take contiguous rows only. Copying to composed output slices
+    happens AFTER its output rotation/rounding, never before.
     """
     def __init__(self, projections, rows, device, prefill=False):
         if rows < 1:
@@ -109,6 +113,33 @@ def _plain_cuda(q,x,out):
     return plain_matmul(q.weight,x,out)
 
 
+def _overlap(a, b):
+    """Whether two tensors' elements share any byte."""
+    def span(t):
+        end = sum((size-1)*stride for size,stride in zip(t.shape,t.stride()))+1 if t.numel() else 0
+        return t.data_ptr(), t.data_ptr()+end*t.element_size()
+    (a0,a1),(b0,b1) = span(a),span(b)
+    return a0<b1 and b0<a1
+
+
+def _reads_in_place(q, x):
+    """Whether q's kernel reads the rows x where they lie; else they are staged in the scratch."""
+    if isinstance(q,Exl3Linear):          # rot_in: contiguous rows, 16-byte aligned
+        return x.is_contiguous() and x.data_ptr()%16==0
+    if isinstance(q,Affine6):             # other dtypes convert into the bf16 scratch straight from x
+        return x.dtype!=torch.bfloat16 or (x.stride(1)==1 and (x.shape[0]<=1 or x.stride(0)%2==0) and x.data_ptr()%4==0)
+    return x.stride(1)==1                 # plain: any row stride
+
+
+def _writes_in_place(q, y):
+    """Whether q's kernel writes the rows y where they lie; else it writes the scratch and y takes a copy."""
+    if isinstance(q,Exl3Linear):          # contiguous rows (a composed output's column slice is one only at one row)
+        return y.is_contiguous() and y.data_ptr()%16==0
+    if isinstance(q,Affine6):             # other dtypes convert from its fp32 scratch straight into y
+        return y.dtype not in (torch.bfloat16,torch.float32) or y.is_contiguous()
+    return True                           # plain: any row stride; matmul checked the unit column stride
+
+
 def matmul(q, x, out, scratch):
     m = x.shape[0]
     if m > scratch.rows:
@@ -128,11 +159,14 @@ def matmul(q, x, out, scratch):
         from tensorfold.cuda.exl3.prefill import matmul as prompt_matmul
         prompt_matmul(q,x,dst,scratch.prompt)
         return out
+    # a layout the kernel takes is read and written where it lies; an output that overlaps the input stages both, so no
+    # kernel reads rows it has written
+    copies=COPIES or _overlap(x,dst)
     for start in range(0,m,scratch.chunk):
         r=min(scratch.chunk,m-start)
-        xi=scratch.inputs[x.dtype][:r*q.k].view(r,q.k)
-        xi.copy_(x[start:start+r])
-        yi=scratch.outputs[out.dtype][:r*q.n].view(r,q.n)
+        xr,yr=x[start:start+r],dst[start:start+r]
+        xi=xr if not copies and _reads_in_place(q,xr) else scratch.inputs[x.dtype][:r*q.k].view(r,q.k).copy_(xr)
+        yi=yr if not copies and _writes_in_place(q,yr) else scratch.outputs[out.dtype][:r*q.n].view(r,q.n)
         if isinstance(q,Exl3Linear):
             q(xi,out=yi,xh=scratch.xh[:r*q.k].view(r,q.k),z=scratch.z)
         elif isinstance(q,Affine6):
@@ -155,7 +189,8 @@ def matmul(q, x, out, scratch):
                 _plain_cuda(q,xi,yi)
         else:
             raise TypeError(f'unsupported packed adapter projection {type(q)}')
-        dst[start:start+r].copy_(yi)
+        if yi is not yr:
+            yr.copy_(yi)
     return out
 
 

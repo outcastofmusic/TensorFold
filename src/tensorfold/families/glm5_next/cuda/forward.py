@@ -309,10 +309,22 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
     return out.view(b.world, R, d)
 
 
+PACKED = (packed.PlainLinear, packed.ComposedLinear, packed.Exl3Linear, packed.Affine6)
+
+
+def group_sums(q, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor | None:
+    """x's group sums for ``mm`` of ``q``; None for a packed projection, which never reads them (unless
+    TF_GLM_PACKED_COPIES=1, the reference that still computes them)."""
+
+    if isinstance(q, PACKED) and not packed.COPIES:
+        return None
+    return qmm.group_sums(x, out)
+
+
 def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tensor, f32: bool = False) -> torch.Tensor:
     """A projection: 4-bit ones of a prompt chunk on the shared prefill matmul, the rest on ``qmm.matmul``."""
 
-    if isinstance(q, (packed.PlainLinear, packed.ComposedLinear, packed.Exl3Linear, packed.Affine6)):
+    if isinstance(q, PACKED):
         with prof.timed("mm: packed"):
             return packed.matmul(q, x, out, b.projection_scratch)
     if b.prefill and isinstance(q, qmm.Q4):
@@ -334,8 +346,8 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cuts: Se
     fa = p[:, k.fa_off:k.fa_off + 128]
     ga = p[:, k.ga_off:k.ga_off + 128]
     pre = b.prefill
-    mm(b, fa, k.fb, None if pre else qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
-    mm(b, ga, k.gb, None if pre else qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
+    mm(b, fa, k.fb, None if pre else group_sums(k.fb, fa, b.xs_fa[:R]), b.ka[:R])
+    mm(b, ga, k.gb, None if pre else group_sums(k.gb, ga, b.xs_ga[:R]), b.kg[:R])
     cur = st.cur[li]
     if not cuts:
         out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
@@ -357,7 +369,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cuts: Se
     if pre:                              # a prompt chunk keeps every row: the layer commits now
         st.cur[li] = 1 - cur
         _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
-    return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R)
+    return out_proj(w, b, out, k.o, None if pre else group_sums(k.o, out, b.kxs[:R]), R)
 
 
 def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
@@ -401,7 +413,7 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
                                               pk.shape[0] - 2, pos_dev)
         sparse.sparse_attention(b.q[:R], kc, vc, tokens, counts, o, c.qk_dim ** -0.5)
     o = o.view(R, HL * c.v_dim)
-    return out_proj(w, b, o, a.o, None if b.prefill else qmm.group_sums(o, b.xs_ao[:R]), R)
+    return out_proj(w, b, o, a.o, None if b.prefill else group_sums(a.o, o, b.xs_ao[:R]), R)
 
 
 def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s: latent.LatentScratch, *,
@@ -458,7 +470,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
             latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
     with prof.timed("dsa: expand"):
         o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
-    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
+    return out_proj(w, b, o, a.o, group_sums(a.o, o, b.xs_ao[:R]), R)
 
 
 def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:

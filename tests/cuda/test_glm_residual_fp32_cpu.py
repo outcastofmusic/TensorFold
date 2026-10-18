@@ -213,7 +213,7 @@ def test_mtp_plain_residual_stays_bf16_not_mhc(monkeypatch):
     def forbidden(*a,**kw): raise AssertionError('MTP must not use mHC post')
     monkeypatch.setattr(glue,'hc_post',forbidden)
     monkeypatch.setattr(mtp,'mm',mm)
-    monkeypatch.setattr(mtp.qmm,'group_sums',lambda x,out: out)
+    monkeypatch.setattr(forward.qmm,'group_sums',lambda x,out: out)
     monkeypatch.setattr(mtp,'dsa_block',lambda *a: g)
     monkeypatch.setattr(mtp,'moe_block',lambda *a: g)
     mtp.mtp_compute(w,NS(mtp_kc=None,mtp_vc=None,mtp_pos_dev=None,index=None),b,1)
