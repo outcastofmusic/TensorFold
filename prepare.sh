@@ -12,7 +12,7 @@
 #   ./prepare.sh lfm2-24b         Liquid's LFM2.5-24B-A2B in block FP8 (24.75 GB; LFM Open License v1.0: commercial
 #                                 use only under US$10M annual revenue)
 #   ./prepare.sh nemotron-3.5-super   Nemotron 3.5 Super VL 120B-A12B NVFP4 (75.1 GB) and upstream TensorFold's native
-#                                 1.0.12 server for linux-aarch64 (9.8 MB), which serves it in place of this checkout
+#                                 1.1.0 server for linux-aarch64 (21.9 MB), which serves it in place of this checkout
 #
 # Needs Docker with the NVIDIA runtime. Downloads run inside the serving image, so the host needs no Python packages.
 # A gated or rate-limited download reads HF_TOKEN from the environment. Reruns resume and skip what is complete.
@@ -48,7 +48,7 @@ D1=(LiquidAI/d1-3B 051bcc464b01b9f92942b364d9586b0ef5912432 d1-3B)
 LFM2=(LiquidAI/LFM2.5-24B-A2B-FP8 f54bf39547fd5b7955abb9fe8d1b151e31fbbddb LFM2.5-24B-A2B-FP8)
 SUPER=(nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 82d93699acd3be9e4617c53360fe5b3f5dbeb1b3 NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)
 # upstream's release archive (version, sha256): its bin/ and lib/ are what run.sh's NATIVE points at
-NATIVE=(1.0.12 437eb0ca6fa102ffcbee8ffe3ad8053b7e45d227e80b6981b7973869f396a612)
+NATIVE=(1.1.0 8f18033fca9df0c56c19afb2f11b55175151ff886c2603b01c0390bf48773e59)
 
 die() { echo "prepare: $*" >&2; exit 1; }
 
@@ -93,8 +93,8 @@ lfm2() {
     fetch "${LFM2[@]}"
 }
 
-# The archive has no libturbojpeg, so the server refuses JPEG images until lib/ holds libjpeg-turbo 3.1.4.1's
-# libturbojpeg.so.0; PNG and WebP serve without it
+# The archive has no libturbojpeg or libwebpdecoder, so the server refuses JPEG images until lib/ holds libjpeg-turbo
+# 3.1.4.1's libturbojpeg.so.0, and WebP images until it holds libwebp 1.6.0's libwebpdecoder; PNG serves without either
 super() {
     fetch "${SUPER[@]}"
     local v=${NATIVE[0]} dir
