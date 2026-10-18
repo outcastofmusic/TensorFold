@@ -55,6 +55,14 @@ def _engine(weights, max_len: int = 1024):
     return Engine(weights, max_len=max_len)
 
 
+def test_only_the_fp32_prompt_path_holds_a_decode_buffer(weights, monkeypatch):
+    monkeypatch.delenv("TF_LFM2_PROMPT_KERNEL", raising=False)
+    assert _engine(weights).decoded is None                      # auto: pairs and dot decode in their kernels
+    monkeypatch.setenv("TF_LFM2_PROMPT_KERNEL", "fp32")
+    assert _engine(weights).decoded.numel() == max(b.moe.experts.w13[0].numel() for b in weights.blocks
+                                                  if b.moe is not None)
+
+
 def _close(got, want, rel: float) -> bool:
     return float((got.float().cpu() - want.float().cpu()).abs().max()) <= rel * float(want.abs().max())
 
