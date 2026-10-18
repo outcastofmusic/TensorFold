@@ -224,6 +224,7 @@ void by_tile(int tile, const at::Tensor& x, const at::Tensor& w, const at::Tenso
         case 3: launch<MODE, 64, 128, 1, 4, 4, F32>(x, w, bs, scale, out, N, npad); break;
         case 4: launch<MODE, 128, 128, 2, 2, 2, F32>(x, w, bs, scale, out, N, npad); break;
         case 5: launch<MODE, 64, 128, 1, 2, 2, F32>(x, w, bs, scale, out, N, npad); break;
+        case 6: launch<MODE, 16, 64, 1, 4, 6, F32>(x, w, bs, scale, out, N, npad); break;
         default: launch<MODE, 128, 128, 2, 4, 3, F32>(x, w, bs, scale, out, N, npad); break;
     }
 }
@@ -231,7 +232,8 @@ void by_tile(int tile, const at::Tensor& x, const at::Tensor& w, const at::Tenso
 }  // namespace
 
 // ``tile`` (0: 128x128 on 8 warps; 1: 128x256 on 8; 2: 128x128 on 4; 3: 64x128 on 4; 4: 128x128 on 4, two stages;
-// 5: 64x128 on 2, two stages) never changes a row's bits.
+// 5: 64x128 on 2, two stages; 6: 16x64 on 4, six stages, for a few rows) never changes a row's bits: each output
+// keeps its one mma chain over K, and only the rows and columns a block holds change.
 void prompt16_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor& bs, double scale, at::Tensor& out,
                    int64_t mode, int64_t N, int64_t npad, int64_t tile, bool f32) {
     const int n = static_cast<int>(N), np = static_cast<int>(npad), t = static_cast<int>(tile);

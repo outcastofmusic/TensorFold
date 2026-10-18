@@ -144,7 +144,7 @@ def _bf16_prompts(lin, x, ref):
         parts = [lin.prefill(x[a:b].contiguous()) for a, b in ((0, 1), (1, 130), (130, x.shape[0]))]
         assert torch.equal(torch.cat(parts), got)
         first = linear.PROMPT_TILE
-        for tile in range(6):
+        for tile in range(7):
             linear.PROMPT_TILE = tile
             try:
                 assert torch.equal(lin.prefill(x), got), tile

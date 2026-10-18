@@ -1,5 +1,6 @@
 """The NVFP4 expert tile's CPU side: TF_FLASHNEXT_PROMPT_EXPERT_TILE's values, which faces of which calls take the tile,
-and the 64-pair plan it runs on (items, tails, the scratch that holds them, the units a launch covers)."""
+and the 64-pair plan it runs on (items, tails, the scratch that holds them, the units a launch covers); and
+TF_FP4_SHARED_DECODE's values."""
 
 from __future__ import annotations
 
@@ -59,6 +60,33 @@ def test_a_layer_reads_the_flag_when_it_loads(monkeypatch):
     assert layer.prompt_tile == 1                                  # a later change does not reach a loaded layer
     monkeypatch.setenv(nvfp4_moe.TILE_ENV, "yes")
     with pytest.raises(ValueError, match=nvfp4_moe.TILE_ENV):
+        nvfp4_moe.MoE4(None, None)                                 # a typo fails the load
+
+
+@pytest.mark.parametrize("value, mode", [(None, "prompt"), ("", "prompt"), ("qmmf", "qmmf"), ("prompt", "prompt"),
+                                         (" prompt ", "prompt")])
+def test_the_shared_decode_flag_reads_qmmf_or_prompt(monkeypatch, value, mode):
+    if value is None:
+        monkeypatch.delenv(nvfp4_moe.SHARED_DECODE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(nvfp4_moe.SHARED_DECODE_ENV, value)
+    assert nvfp4_moe.shared_decode() == mode
+
+
+@pytest.mark.parametrize("value", ["QMMF", "Prompt", "0", "1", "lane", "qmmf,prompt"])
+def test_the_shared_decode_flag_rejects_any_other_value(monkeypatch, value):
+    monkeypatch.setenv(nvfp4_moe.SHARED_DECODE_ENV, value)
+    with pytest.raises(ValueError, match=nvfp4_moe.SHARED_DECODE_ENV):
+        nvfp4_moe.shared_decode()
+
+
+def test_a_layer_reads_the_shared_decode_flag_when_it_loads(monkeypatch):
+    monkeypatch.setenv(nvfp4_moe.SHARED_DECODE_ENV, "prompt")
+    layer = nvfp4_moe.MoE4(None, None)
+    monkeypatch.setenv(nvfp4_moe.SHARED_DECODE_ENV, "qmmf")
+    assert layer.shared_decode == "prompt"                         # a later change does not reach a loaded layer
+    monkeypatch.setenv(nvfp4_moe.SHARED_DECODE_ENV, "lane")
+    with pytest.raises(ValueError, match=nvfp4_moe.SHARED_DECODE_ENV):
         nvfp4_moe.MoE4(None, None)                                 # a typo fails the load
 
 

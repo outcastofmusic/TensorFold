@@ -28,11 +28,12 @@ def _prompt_ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_nvfp4_prompt_v1", sources=[str(here / "prompt.cpp"), str(here / "prompt.cu")],
+    return load(name="tensorfold_nvfp4_prompt_v2", sources=[str(here / "prompt.cpp"), str(here / "prompt.cu")],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3"], verbose=False)
 
 
 PROMPT_TILE = 4             # ``prompt.cu``'s tile (128x128 on four 64x64 warps, two blocks an SM): never changes bits
+FEW_TILE, FEW_ROWS = 6, 16  # up to 16 rows: 16x64 blocks, six stages (a decode window's bf16 slots); the same bits
 
 
 def _prompt(mode: int, w: torch.Tensor, bs: torch.Tensor | None, scale: float, n: int, npad: int, x: torch.Tensor,
@@ -43,7 +44,8 @@ def _prompt(mode: int, w: torch.Tensor, bs: torch.Tensor | None, scale: float, n
         x = x.to(torch.bfloat16).contiguous()
     fits = out is not None and out.is_contiguous() and out.dtype == torch.bfloat16 and out.shape == (x.shape[0], n)
     y = out if fits else torch.empty((x.shape[0], n), dtype=torch.bfloat16, device=x.device)
-    _prompt_ext().prompt16(x, w, bs, float(scale), y, mode, n, npad, PROMPT_TILE, False)
+    tile = FEW_TILE if x.shape[0] <= FEW_ROWS else PROMPT_TILE
+    _prompt_ext().prompt16(x, w, bs, float(scale), y, mode, n, npad, tile, False)
     if out is not None and y is not out:
         out.copy_(y)
     return y

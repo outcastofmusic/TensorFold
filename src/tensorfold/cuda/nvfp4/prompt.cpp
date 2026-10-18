@@ -12,7 +12,7 @@ void prompt16(const at::Tensor& x, const at::Tensor& w, const c10::optional<at::
                 "x: (M, K) bf16 with contiguous rows");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && (x.size(0) == 1 || x.stride(0) % 8 == 0),
                 "x rows must start on 16-byte boundaries");
-    TORCH_CHECK(mode >= 0 && mode <= 2 && tile >= 0 && tile <= 5, "mode 0-2, tile 0-5");
+    TORCH_CHECK(mode >= 0 && mode <= 2 && tile >= 0 && tile <= 6, "mode 0-2, tile 0-6");
     const int64_t m = x.size(0), k = x.size(1);
     TORCH_CHECK(k % 64 == 0 && npad % 128 == 0 && n <= npad, "K in groups of 64, n padded to 128");
     TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.numel() * w.element_size() == npad * k / (mode == 0 ? 2 : 1),
