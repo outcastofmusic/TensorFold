@@ -11,7 +11,7 @@ Standing rule (18 Oct): keep every code change that gives a clear, measured win 
 
 | Task | State |
 |---|---|
-| Qwen variants: close the prefill gap to Mia | nsys side by side (18 Oct, `tf-runs/profile-mia/`): steady 2,048-row chunk 1,059 ms ours against 948 Mia at 32k (+11.7%), all GPU kernel time in the hyper-connection path; host idle 0.2%. In progress (`perf/fp4-hc-fusions`): HC down split-K fused (+71 ms a chunk), HC up+mix fused (+33 ms), HC write-back+norm gate extended to bf16 HC (+13 ms), all bit-identical, from Mia patch 0008: expected 32k 1,891 to about 2,125 tok/s. Next: gate/up expert tile 5,369 against Mia's 4,690 us with identical code (+33 ms, cause unknown: plan order, X layout or flags); shared expert on a second stream (about 22 ms). Both bit-identical. We lead on the MXFP8 prompt kernel (-32 ms) and copies (-32 ms) |
+| Qwen variants: close the prefill gap to Mia | HC fusions merged (ef6834b4, 18 Oct): FP4-Local cold prefill 12k 2,228 tok/s (Mia 2,145), 32k 2,076 (Mia 2,159), bytes and served replies identical. Remaining at 32k: gate/up expert tile 5,369 against Mia's 4,690 us with identical code (about 33 ms a chunk, cause unknown: plan order, X layout or compile flags); shared expert on a second stream (about 22 ms). Both bit-identical. 131k not re-profiled |
 
 ## To do
 
