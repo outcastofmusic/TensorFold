@@ -10,11 +10,10 @@ from typing import Any
 from tensorfold.server import pythonic_calls
 from tensorfold.server.stopping import StopPolicy
 from tensorfold.server.text import hide_tool_calls  # noqa: F401  (the CUDA server's, with the Mac's four formats)
-from tensorfold.server.tools import parse_glm_tool_call_block, tool_spec_name
+from tensorfold.server.tools import parse_glm_tool_call_block, tool_call_blocks, tool_spec_name
 from tensorfold.tool_parameters import closed_json, decode_parameter, parameter_schemas
 
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
 _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
 _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
 
@@ -97,12 +96,12 @@ def _parse_tagged(text: str, tools: list[dict[str, Any]],
     calls: list[dict[str, Any]] = []
     residue: list[str] = []
     cursor = 0
-    for match in _TOOL_CALL_BLOCK_RE.finditer(text):
-        residue.append(text[cursor:match.start()])
-        cursor = match.end()
+    for start, end, body in tool_call_blocks(text):
+        residue.append(text[cursor:start])
+        cursor = end
         if max_calls is not None and len(calls) >= max_calls:
             continue
-        block = match.group(1).strip()
+        block = body.strip()
         name, args = None, {}
         try:
             payload = json.loads(block)
@@ -129,7 +128,7 @@ def _parse_tagged(text: str, tools: list[dict[str, Any]],
                     name, args = glm
         if not name or str(name).lower() not in known:
             if max_calls is None:
-                residue.append(match.group(0))
+                residue.append(text[start:end])
             continue
         if max_calls is not None:
             try:

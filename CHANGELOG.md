@@ -5,6 +5,11 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **A reply full of unclosed tool-call openers parses in milliseconds.** The lazy envelope regexes searched the rest
+  of the reply again from every opener without a closer, holding the GIL: 2,000 unclosed openers in 1 MB took 7.5-10 s
+  in each of the four formats (`<tool_call>`, `<NAME:tool_call>`, Gemma's `<|tool_call>` and DSML). A forward scan
+  now finds each closer once, under 5 ms on the same replies, and returns the same calls and text on 30,000 random
+  replies. Ports upstream TensorFold e6cd4d94 (#913), which fixed the namespaced form.
 - **Nemotron 3.5 Bolt accepts `response_format` and guided requests.** Its `nemotron_h_omni` config keeps
   `vocab_size` under `llm_config`, and the grammar read only `text_config` and the top level, so every structured
   request got a 400. The grammar now reads `text_config`, `llm_config`, then the top level, and skips a value that
