@@ -167,7 +167,7 @@ All four equalities compare token SHA-256 or `torch.equal` on rows and states.
 | 10.4 | Measure cold prefill at 4k, 32k and 131k against the fastest engine on the same checkpoint | The gap is known. Work the ideas in Part 2.3 when it is 1.4x or more |
 | 10.5 | Measure drafting per text kind | tok/s and accept length on code, prose, chat, tools and long, greedy and sampled, 4+ seeds. Drafted beats serial on every kind, or depth adapts. Bolt at depth 7 ran prose at 22.4 against 29.0 serial. A zero acceptance rate is a bug even with exact tokens (upstream: a draft head read at group 64 for 32) |
 | 10.6 | Add copy drafts for code and edit traffic | Qwen EXL3: a 2,252-token prompt 36.5 to 89.0 tok/s (e773dbdb) |
-| 10.7 | Count a speed number only from a GPU A/B | Arms alternated on the same image and box, `tools/bench_openai.py --tokens 256 --reps 5 --temperatures 1.0,0`, token SHAs checked first. Two GB10s ran identical code 4-6% apart |
+| 10.7 | Count a speed number only from a GPU A/B | Arms alternated on the same image and box, `tools/bench_openai.py --tokens 256 --reps 5 --temperatures 1.0,0`, token SHAs checked first. Two GB10s ran identical code 4-6% apart. Run no CPU-heavy job beside it: on 18 Oct two full CPU test suites during a prefill A/B spread one config's 32k prompts over 17.8-24.6 s and flipped 4k between 1.10x and 0.72x |
 
 ### Phase 11. Serving wiring
 
