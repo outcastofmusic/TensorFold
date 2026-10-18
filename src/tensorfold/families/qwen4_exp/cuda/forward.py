@@ -17,7 +17,7 @@ from tensorfold.cuda.kernels.gdn import MARKS
 
 from . import attention as attn_mod
 from . import gdn as gdn_mod
-from . import attn_multi, bf16, gdn_io, gdn_multi, glue, nvfp4_moe, qmm
+from . import attn_multi, bf16, gdn_io, gdn_multi, glue, hc_b16, nvfp4_moe, qmm
 from . import image_rows
 from .hc_check import fuser as _hc_fuser
 from .state import ATT_ROWS, CAND, Buffers, State, _MoECfg
@@ -52,40 +52,59 @@ def _embed(w: Weights, ids: torch.Tensor, copies: int, out: torch.Tensor) -> tor
 
 def hc_block(hc: HC, b: Buffers, R: int, eps: float, streams: int, low: int, mode: int, inject_prev,
              inject_out, h: torch.Tensor, branch=None, y=None, wts=None) -> None:
-    """Write the pending branch back into the streams h (in place), then the hyper-connection's read-out: b.mixed [R, D] (+ group sums), and its inject gates into ``inject_out``."""
+    """Write the pending branch back into the streams h (in place), then the hyper-connection's read-out: b.mixed [R, D] (+ group sums), and its inject gates into ``inject_out``.
 
-    if b.prefill and R > FUSED_ROWS and isinstance(hc.down, qmm.Q4):
+    A bf16 HC with ``hc.fuse`` (TF_FLASHNEXT_HC_FUSE) takes its prompt fusions here. Its read-out feeds the layer's
+    DeltaNet or attention projection and its experts, and none of their bf16, FP8 or NVFP4 kernels reads b.xs_mixed.
+    ``finish`` keeps the separate kernels and the sums, which the MTP draft head's 4-bit matmul reads."""
+
+    prompt = b.prefill and R > FUSED_ROWS
+    inject = inject_out[:R] if hc.inject else None
+    if prompt and (isinstance(hc.down, qmm.Q4) or hc.fuse):
         fused = _hc_fuser(h.device)
         if fused is not None:
             fused(h[:R], b.pss[:R], hc.scale, b.normed[:R], b.xs_normed[:R], streams, eps, mode,
                   branch=branch, inject=inject_prev, y=y, wts=wts)
-            _readout_plain(hc, b, h, R, eps, streams, low, inject_out[:R] if hc.inject else None, normed=True)
+            if hc.fuse:
+                _readout_b16(hc, b, h, R, eps, streams, low, inject, normed=True, fuse=True)
+            else:
+                _readout_plain(hc, b, h, R, eps, streams, low, inject, normed=True)
             return
     glue.hc_writeback(h[:R], h[:R], b.pss[:R], streams, mode, branch=branch, inject=inject_prev, y=y, wts=wts)
-    _readout(hc, b, h, R, eps, streams, low, inject_out[:R] if hc.inject else None)
+    _readout(hc, b, h, R, eps, streams, low, inject, fuse=prompt and hc.fuse)
 
 
 FUSED_ROWS = 16      # decode windows: the read-out in 3 kernels; wider windows (prefill) in 5, the same bits
 
 
-def _readout(hc: HC, b: Buffers, h: torch.Tensor, R: int, eps: float, streams: int, low: int, inject) -> None:
-    """normed streams -> down -> SiLU / inject -> up -> mix: b.mixed [R, D] and its group sums."""
+def _readout(hc: HC, b: Buffers, h: torch.Tensor, R: int, eps: float, streams: int, low: int, inject,
+             fuse: bool = False) -> None:
+    """normed streams -> down -> SiLU / inject -> up -> mix: b.mixed [R, D] and its group sums (``fuse``: see
+    ``_readout_b16``)."""
 
     if getattr(hc.down, "kernel", "qmm") == "b16":     # an NVFP4 checkpoint: the same steps, bf16 kernels
-        _readout_b16(hc, b, h, R, eps, streams, low, inject)
+        _readout_b16(hc, b, h, R, eps, streams, low, inject, fuse=fuse)
     elif R <= FUSED_ROWS and not b.prefill and isinstance(hc.down, qmm.Q4):
         _readout_fused(hc, b, h, R, eps, streams, low, inject)
     else:
         _readout_plain(hc, b, h, R, eps, streams, low, inject)
 
 
-def _readout_b16(hc: HC, b: Buffers, h: torch.Tensor, R: int, eps: float, streams: int, low: int, inject) -> None:
-    """The read-out on the bf16 kernels: norm, down, activation and inject gates, up, the mix; same bits per row."""
+def _readout_b16(hc: HC, b: Buffers, h: torch.Tensor, R: int, eps: float, streams: int, low: int, inject,
+                 normed: bool = False, fuse: bool = False) -> None:
+    """The read-out on the bf16 kernels: norm, down, activation and inject gates, up, the mix; same bits per row.
 
-    glue.hc_normed(h[:R], b.pss[:R], hc.scale, b.normed[:R], b.xs_normed[:R], streams, eps)
+    ``fuse``: the down projection sums its K slices in each program, and the up projection and the mix run as one
+    kernel that leaves b.up and b.xs_mixed unwritten (``hc_b16``); b.mixed keeps its bytes."""
+
+    if not normed:
+        glue.hc_normed(h[:R], b.pss[:R], hc.scale, b.normed[:R], b.xs_normed[:R], streams, eps)
     got = bf16.matmul(b.normed[:R], hc.down.b, out=torch.empty((R, hc.down.n), dtype=torch.float32,
-                                                               device=h.device), f32=True)
+                                                               device=h.device), f32=True, inner_k=fuse)
     glue.hc_act(got, b.act[:R], b.xs_act[:R], inject, streams, low)
+    if fuse:
+        hc_b16.up_mix(b.act[:R], hc.up.b, b.normed[:R], b.mixed[:R], streams)
+        return
     _mm(b.act[:R], hc.up, b.xs_act[:R], b.up[:R], b)
     glue.hc_mix(b.up[:R], b.normed[:R], b.mixed[:R], b.xs_mixed[:R], streams)
 

@@ -85,11 +85,66 @@ if HAS_TRITON:
             acc = acc + tl.load(PART + s * total + offs, mask=ok, other=0.0)
         tl.store(OUT + offs, acc if F32 else acc.to(tl.bfloat16), mask=ok)
 
+    @triton.jit
+    def _b16mm_ks(X, W, OUT, M, x_stride,
+                  N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
+                  BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr):
+        """``_b16mm`` over all SK slices of one tile, then ``_reduce``'s adds, with no fp32 partials in memory.
+
+        Slice s is ``_b16mm`` program ``pid_s = s``: the same K blocks in order from a zero accumulator, on the same
+        tile and warps, so each slice total is the same fp32 word. The totals are then summed as ``_reduce`` sums
+        them: total = p0 (taken as is, so a -0.0 stays -0.0), then total + p_s for s = 1 .. SK - 1.
+        Ported from MiaAI-Lab's Qwen3.8 Flash Next recipe, patch 0008 ``prompt_mm._b16mm_ks`` (MIT licence)."""
+
+        pid_n = tl.program_id(1)
+        rm = tl.program_id(0) * BM + tl.arange(0, BM)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rk = tl.arange(0, BK)
+        m_ok = rm < M
+        n_ok = rn < N
+        KS: tl.constexpr = K // SK
+        NB: tl.constexpr = KS // BK
+        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        for i in range(NB):                       # slice 0
+            k0 = i * BK
+            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+            w = tl.load(W + rn[:, None] * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
+            acc = tl.dot(x, tl.trans(w), acc)
+        total = acc
+        for s in range(1, SK):
+            acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+            for i in range(NB):
+                k0 = (s * NB + i) * BK
+                x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+                w = tl.load(W + rn[:, None] * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
+                acc = tl.dot(x, tl.trans(w), acc)
+            total = total + acc
+        out_mask = m_ok[:, None] & n_ok[None, :]
+        tl.store(OUT + rm[:, None] * N + rn[None, :], total if F32 else total.to(tl.bfloat16), mask=out_mask)
+
+
+INNER_K_ROWS = 129          # from here ``matmul`` tiles 128 rows, and ``inner_k`` sums the K slices in one launch
+INNER_K_BLOCKS = 2          # fewest BK blocks a slice for ``_b16mm_ks``: see ``inner_k_fits``
+
+
+def inner_k_fits(m: int, k: int, sk: int, bk: int = BK) -> bool:
+    """Whether ``_b16mm_ks`` writes ``_b16mm`` + ``_reduce``'s bytes for an [m, k] x at sk slices.
+
+    At one BK block a slice, Triton 3.7 drops the one-trip loop and folds ``total + dot(x, w, 0)`` into
+    ``dot(x, w, total)``: the tensor cores then add each slice into the running total in k16 steps, and the bits
+    differ (the tiny test checkpoint's [64 or 128, 2048] down projection, SK 32). From two blocks the slice stays a
+    loop whose result the add takes, which the fold cannot match (FP4-Local's [324, 10240] has five)."""
+
+    return sk > 1 and m >= INNER_K_ROWS and k // sk // bk >= INNER_K_BLOCKS
+
 
 def matmul(x: torch.Tensor, b: B16, *, out: torch.Tensor | None = None, f32: bool = False,
            sk: int | None = None, num_warps: int = 4, num_stages: int = 3,
-           block_n: int = BN, bk: int = BK) -> torch.Tensor:
-    """x [M, K] bf16 @ b.T -> [M, N] bf16 (or fp32 sums), K slices summed in slice order."""
+           block_n: int = BN, bk: int = BK, inner_k: bool = False) -> torch.Tensor:
+    """x [M, K] bf16 @ b.T -> [M, N] bf16 (or fp32 sums), K slices summed in slice order.
+
+    ``inner_k``: on the shapes ``inner_k_fits`` accepts, each program sums its tile's slices itself (``_b16mm_ks``),
+    the same bits without the [SK, M, N] fp32 partials and the ``_reduce`` launch."""
 
     if not HAS_TRITON:
         raise RuntimeError("the BF16 matmul needs Triton (the CUDA engine's environment)")
@@ -104,8 +159,13 @@ def matmul(x: torch.Tensor, b: B16, *, out: torch.Tensor | None = None, f32: boo
     elif out.shape != (m, b.n) or not out.is_contiguous() or (out.dtype == torch.float32) != f32:
         raise ValueError(f"b16 matmul: out {tuple(out.shape)} {out.dtype} must be a contiguous ({m}, {b.n}), "
                          f"dtype matching f32={f32}")
-    part = torch.empty((sk, m, b.n), dtype=torch.float32, device=x.device) if sk > 1 else out
     bm = 128 if m > 128 else 16
+    if inner_k and inner_k_fits(m, k, sk, bk):
+        _b16mm_ks[(triton.cdiv(m, bm), -(-b.n // block_n))](
+            x, b.weight, out, m, x.stride(0), N=b.n, K=k, SK=sk, BM=bm, BLOCK_N=block_n, BK=bk, F32=f32,
+            num_warps=num_warps, num_stages=num_stages)
+        return out
+    part = torch.empty((sk, m, b.n), dtype=torch.float32, device=x.device) if sk > 1 else out
     grid = (triton.cdiv(m, bm), -(-b.n // block_n), sk)
     _b16mm[grid](x, b.weight, out, part, m, x.stride(0), N=b.n, K=k, SK=sk, BM=bm,
                  BLOCK_N=block_n, BK=bk, F32=f32, num_warps=num_warps, num_stages=num_stages)

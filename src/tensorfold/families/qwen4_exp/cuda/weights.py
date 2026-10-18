@@ -31,11 +31,11 @@ def _plain(name: str, w: torch.Tensor) -> torch.Tensor:
 
 def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: tuple[int, int] | None = None,
          draft_vocab: int | str | None = None, ple_on_ssd: bool = False, table_reads: list | None = None,
-         prompt_tile: int | None = None, shared_decode: str | None = None) -> Weights:
+         prompt_tile: int | None = None, shared_decode: str | None = None, hc_fuse: bool | None = None) -> Weights:
     """Load rank ``tp``'s shares; ``draft_vocab`` selects default/file ids or ids below N, None scores all ids.
 
-    ``prompt_tile`` and ``shared_decode`` set every NVFP4 layer's expert kernels (``nvfp4_moe``); None reads their
-    flags here, before any weight."""
+    ``prompt_tile`` and ``shared_decode`` set every NVFP4 layer's expert kernels (``nvfp4_moe``), ``hc_fuse`` every
+    bf16 hyper-connection's prompt fusions (``hc_b16``); None reads their flags here, before any weight."""
 
     import time
     from dataclasses import replace
@@ -45,10 +45,11 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     model_dir = Path(model_dir)
     if exl3.is_exl3(model_dir):                       # an EXL3 pack: its own loader, the same dataclasses
         return exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab, table_reads=table_reads)
-    from . import nvfp4_moe
+    from . import hc_b16, nvfp4_moe
 
     prompt_tile = nvfp4_moe.tile_mode() if prompt_tile is None else prompt_tile
     shared_decode = nvfp4_moe.shared_decode() if shared_decode is None else shared_decode
+    hc_fuse = hc_b16.fuse() if hc_fuse is None else hc_fuse
     full = Config.read(model_dir)
     rank, world = tp if tp is not None else (0, 1)
     cfg = full if world == 1 else replace(full, heads=full.heads // world, kv_heads=full.kv_heads // world,
@@ -150,7 +151,8 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         parts = [b16(name + ".input_mix_weight_down")]
         if inject:
             parts.append(b16(name + ".block_inject_weight"))
-        return HC(stack_b16(parts), b16(name + ".input_mix_weight_up"), cscale(name + ".hc_norm.weight"), inject)
+        return HC(stack_b16(parts), b16(name + ".input_mix_weight_up"), cscale(name + ".hc_norm.weight"), inject,
+                  fuse=hc_fuse)
 
     def gdn_nvfp4(name: str) -> GDNW:
         """A rank's DeltaNet rows, conv and head vectors from bf16 or MXFP8 checkpoint linears."""
