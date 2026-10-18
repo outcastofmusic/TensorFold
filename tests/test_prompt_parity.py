@@ -1,7 +1,7 @@
 """The Mac and CUDA servers render the same prompt ids for the same request from each checkpoint's own chat template
-and tokenizer (Qwen3.8-27B, Flash Next, GLM-5.3 and Nemotron): thinking on and off, every effort or none, a server
-default effort or none, tools and a tool-call history. Checkpoints come from the environment or the Hugging Face
-cache; a missing one is skipped."""
+and tokenizer (Qwen3.8-27B, Flash Next, GLM-5.3, Nemotron, and the served FP4-Local, Bolt and LFM2.5 checkpoints):
+thinking on and off, every effort or none, a server default effort or none, tools and a tool-call history. Checkpoints
+come from the environment, the Hugging Face cache or a folder under $MODELS; a missing one is skipped."""
 
 import json
 import os
@@ -19,11 +19,16 @@ from tensorfold.cuda import server
 from tensorfold.server.request_options import RequestOptions, thinking_fields
 from tensorfold.server.text import render_prompt_ids, template_late_system
 
-CHECKPOINTS = {                       # name: (environment variable, Hugging Face repo)
-    "qwen27": ("TENSORFOLD_MLX_MODEL", "TensorFold/Qwen3.8-27B-MLX-4bit"),
-    "flashnext": ("TF_FLASHNEXT_MODEL", "TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP"),
-    "glm": ("TF_GLM5_MODEL", "TensorFold/GLM-5.3-Flash-MLX-4bit-MTP"),
-    "nemotron": ("TF_NEMOTRON_MODEL", "TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit"),
+MODELS = Path(os.environ.get("MODELS", str(Path.home() / "models")))
+CHECKPOINTS = {                       # name: (environment variable, Hugging Face repo, folder under $MODELS)
+    "qwen27": ("TENSORFOLD_MLX_MODEL", "TensorFold/Qwen3.8-27B-MLX-4bit", None),
+    "flashnext": ("TF_FLASHNEXT_MODEL", "TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP", None),
+    "glm": ("TF_GLM5_MODEL", "TensorFold/GLM-5.3-Flash-MLX-4bit-MTP", None),
+    "nemotron": ("TF_NEMOTRON_MODEL", "TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit", None),
+    # the served checkpoints run.sh starts as qwen_fp4, bolt and lfm2 (prepare.sh's repos)
+    "flashnext-fp4": ("TF_FLASHNEXT_FP4_MODEL", "nvidia/Qwen3.8-Flash-Next-FP4-Local", "Qwen3.8-Flash-Next-FP4-Local"),
+    "bolt": ("TF_BOLT_MODEL", "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB", "Nemotron-3.5-Bolt-74B-A9B-24GB"),
+    "lfm2": ("TF_LFM2_MODEL", "LiquidAI/LFM2.5-24B-A2B-FP8", "LFM2.5-24B-A2B-FP8"),
 }
 WEATHER = [{"type": "function", "function": {"name": "get_weather", "description": "Current weather",
                                              "parameters": {"type": "object", "required": ["city"],
@@ -51,11 +56,21 @@ REQUESTS = [{}, {"reasoning_effort": "none"}, {"reasoning_effort": "minimal"}, {
             {"chat_template_kwargs": {"enable_thinking": False}},
             {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}},
             {"chat_template_kwargs": {"thinking": False}}, {"chat_template_kwargs": {"thinking": {"type": "enabled"}}}]
+# LFM2.5's template opens <think> whatever the switch. With thinking off the Mac path (render_prompt_ids) closes it
+# with </think>, while the CUDA Lfm2MoeApp turns thinking back on (always_thinking) and leaves it open
+THINKING_OFF = [{"reasoning_effort": "none"}, {"chat_template_kwargs": {"enable_thinking": False}},
+                {"chat_template_kwargs": {"thinking": False}}]
+LFM2_THINKING_OFF = pytest.mark.xfail(strict=True, reason=(
+    "mismatch: LFM2.5 with thinking off renders <think></think> (124902) on the Mac path and <think> alone on CUDA"))
+
+
+def requests_for(name):
+    return [r for r in REQUESTS if not (name == "lfm2" and r in THINKING_OFF)]
 
 
 def _folder(name):
-    variable, repo = CHECKPOINTS[name]
-    found = os.environ.get(variable) or hub.cached(repo)
+    variable, repo, local = CHECKPOINTS[name]
+    found = os.environ.get(variable) or hub.cached(repo) or (MODELS / local if local else None)
     folder = Path(found) if found else None
     if folder is None or not (folder / "tokenizer.json").is_file():
         pytest.skip(f"needs the {name} tokenizer and chat template ({variable} or {repo})")
@@ -115,6 +130,9 @@ def cuda_app(name, folder, thinking, effort):
     if name == "glm":
         from tensorfold.families.glm5_next.cuda.app import GlmApp, ThinkingOffTemplate
         cls = GlmApp
+    if name == "lfm2":                 # lfm2_moe's CUDA_APP: thinking always on
+        from tensorfold.families.lfm2_moe.cuda.app import Lfm2MoeApp
+        cls = Lfm2MoeApp
     app = cls.__new__(cls)
     app.engine, app.served, app.model_dir = None, "parity", folder
     app.tok = Tokenizer.from_file(str(folder / "tokenizer.json"))
@@ -134,7 +152,7 @@ def test_the_mac_and_cuda_render_the_same_prompt(name, default_effort):
     folder = _folder(name)
     mac, cuda = Mac(name, folder, True, default_effort), cuda_app(name, folder, True, default_effort)
     for label, (messages, tools) in CONVERSATIONS.items():
-        for request in REQUESTS:
+        for request in requests_for(name):
             body = {"messages": messages, **({"tools": tools} if tools else {}), **request}
             mac_ids = mac.prompt(body, messages, tools)
             cuda_ids = cuda._prepare(body, True).prompt
@@ -173,7 +191,7 @@ def test_tokenize_gives_the_chat_route_s_prompt_on_both_servers(name):
     mac, cuda = Mac(name, folder, True, None), cuda_app(name, folder, True, None)
     mac.tokenizer_lock, mac.context_window = threading.Lock(), 0
     for label, (messages, tools) in CONVERSATIONS.items():
-        for request in REQUESTS:
+        for request in requests_for(name):
             body = {"messages": messages, **({"tools": tools} if tools else {}), **request}
             want = cuda._prepare(body, True).prompt
             assert cuda.tokenize(body)["tokens"] == want == token_routes.tokenize(mac, body)["tokens"], (label, request)
@@ -188,3 +206,13 @@ def test_tokenize_gives_the_chat_route_s_prompt_on_both_servers(name):
         assert cuda.detokenize({"tokens": mine["tokens"]}) == token_routes.detokenize(mac, {"tokens": mine["tokens"]})
     assert cuda.detokenize({"tokens": cuda.tokenize({"prompt": text, "add_special_tokens": False})["tokens"]}) == {
         "prompt": text}
+
+
+@LFM2_THINKING_OFF
+@pytest.mark.parametrize("request_fields", THINKING_OFF)
+def test_lfm2_with_thinking_off_renders_the_same_on_both_servers(request_fields):
+    folder = _folder("lfm2")
+    mac, cuda = Mac("lfm2", folder, True, None), cuda_app("lfm2", folder, True, None)
+    messages, _ = CONVERSATIONS["plain"]
+    body = {"messages": messages, **request_fields}
+    assert mac.prompt(body, messages, None) == cuda._prepare(body, True).prompt
