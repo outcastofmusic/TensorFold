@@ -357,6 +357,36 @@ and the model on :30002, with Clef on :30001 and d1 on :30003.
 - Replay failing requests with `return_token_ids: true` to see the raw ids before any parser. The server refuses
   logprobs on tool or thinking requests, which blocked the empty-reply diagnosis **(gap)**.
 
+### 2.10 Where to look for speed
+
+Profile one decode step and one prompt chunk with nsys (`-t cuda-sw --cuda-graph-trace=node` on this image), set each
+kernel's time against its byte bound, then sweep these patterns. Each found at least one win between 17 and 19 Oct.
+
+| Pattern | How to spot it | Seen | Bits |
+|---|---|---|---|
+| Too few programs at small row counts | grid against 48 SMs at 1 row | FP4 shared expert (51a7daa1), GLM `_plain` | identical: split N, keep each output's K loop |
+| Occupancy capped by registers or shared memory | `ptxas -v`, blocks a SM x bytes in flight a warp | EXL3 experts, 3 to 4 blocks a SM | identical if the sum order holds |
+| Dependent loads before the first weight read | the kernel prologue's index, id, pointer chain | EXL3 experts, 4 chained reads | identical |
+| Weights decoded again for every row tile | bytes read a chunk against weight bytes | expert tile (Mia 0014), +11-13% prefill | identical |
+| Too few rows per weight read | achieved bandwidth already near peak | 4,096-row pieces, long prompts only | identical if chunk-invariant |
+| Wrong kernel from a dispatch condition | kernel names per phase against intent | FP4 decode on the prompt kernel through a dtype test | usually identical |
+| A fusion gated off | grep `isinstance` and flag gates | HC write-back + norm limited to Q4 | identical |
+| Split-K partials plus a separate reduce | `_reduce`-style kernels after a matmul | HC down projection, +71 ms a chunk | identical in order; see row 6.9 |
+| An intermediate written then read | producer and consumer pairs | HC up + mix | identical |
+| Copies and layout conversions | memcpy and copy nodes a step | GLM, 1,067 memcpy nodes a token | identical |
+| Work nobody reads | trace outputs to readers | GLM's dead `group_sums` | identical |
+| Cost growing with context | per-chunk time against position | indexer +1.6 ms a chunk per 1k tokens | depends |
+| Independent work in series | chains with no data dependency | shared expert beside routed experts (Mia) | identical if combined in order |
+| Host syncs inside a round | `.item()`, `.tolist()`, blocking H2D, stream syncs a round | d1 head, MTP draft chain (1.8-4.7 ms idle a round) | identical for greedy |
+| Launch overhead | launches a step x 0.7 us | PDL, 0.4-0.9% | identical |
+| Allocator churn | `cudaMalloc` or `empty_cache` mid-request | 0.4-0.8 s slow windows after cache growth | identical |
+| A one-stream engine | concurrent requests queue | GLM, Bolt, LFM2.5 | identical when concurrent equals solo |
+
+Before trusting a gap, rule out the measurement: a log figure that leaves out work (the done line's prefill missed the last
+pass), contention (two CPU suites spread 32k prompts over 17.8-24.6 s), a cold page cache for mapped tables, and clock or
+thermal throttling (log SM clocks during long runs). Under several streams, also check L2 thrashing: per-stream decode
+falling faster than bandwidth predicts.
+
 ### 2.9 Upstream
 
 Upstream TensorFold became a Zig engine at 1.0.0 (7 Oct 2026) and froze Python at 0.6.6. Read its CHANGELOG each
