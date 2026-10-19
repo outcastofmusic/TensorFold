@@ -10,6 +10,11 @@ A one-row decode step replays a CUDA graph (``TF_LFM2_GRAPHS=0`` runs it eagerly
 device ``meta`` (RoPE, the KV row it writes, attention's length) and its token from a static buffer, so one capture
 serves every position and the replay launches the eager step's kernels with its shapes, giving its bits.
 
+``TF_LFM2_DECODE_FUSE`` (default on; ``0`` restores the torch chains) runs a decode call's conv and MoE combine as
+one kernel each (``fused.py``, the chains' bits), computes RoPE's angles and the KV rows once a call instead of once
+an attention layer, and drops two launches a MoE layer that change no value: route's int32 copy of the ids and its
+multiply by a scaling of 1.0. A one-row step launched about 2,040 kernels and launches about 1,020 with it.
+
 Every tensor operation here also runs on the CPU, with fp32 matmuls and attention in place of the kernels, so the
 tests drive this same code against the fp32 reference.
 """
@@ -23,7 +28,9 @@ from dataclasses import dataclass
 
 import torch
 
-from . import DECODE_ROWS, PAIRS_ROWS, PREFILL_ROWS
+from tensorfold.env_flags import flag
+
+from . import DECODE_ROWS, PAIRS_ROWS, PREFILL_ROWS, fused
 from . import experts as X
 from .weights import Attention, Block, Conv, Weights
 
@@ -70,6 +77,8 @@ class Engine:
         # the expert kernels of prompt chunks (experts.path): TF_LFM2_PROMPT_KERNEL=fp32 keeps the reference path
         self.prompt_kernel = os.environ.get("TF_LFM2_PROMPT_KERNEL", "auto").strip() or "auto"
         X.path(self.prompt_kernel, 1, 0, 0)            # refuses an unknown value at startup
+        self.fuse = flag("TF_LFM2_DECODE_FUSE", True) and self.cuda      # read once: a graph keeps what it captured
+        self.call_rope: tuple[torch.Tensor, ...] | None = None           # a fused call's (cos, sin, rows' positions)
         self.slot = {layer: j for j, layer in enumerate(c.attention_layers)}
         self.slot.update({layer: j for j, layer in enumerate(c.conv_layers)})
         na, nc = len(c.attention_layers), len(c.conv_layers)
@@ -147,6 +156,8 @@ class Engine:
 
     def _conv(self, cv: Conv, x: torch.Tensor, j: int, prompt: bool) -> torch.Tensor:
         rows, d = x.shape
+        if self.fuse and not prompt and not self.parts and fused.conv_fits(rows, self.conv_state[j], cv.taps):
+            return cv.out_proj(fused.conv_step(cv.in_proj(x, prompt), self.conv_state[j], cv.taps), prompt)
         b, gate, v = cv.in_proj(x, prompt).split(d, dim=-1)
         seq = torch.cat([self.conv_state[j], b * v])                    # B * x in bf16, as transformers rounds it
         taps = cv.taps.shape[1]
@@ -163,11 +174,18 @@ class Engine:
         rows = x.shape[0]
         qd, kd = c.heads * c.head_dim, c.kv_heads * c.head_dim
         qkv = a.qkv(x, prompt)
-        cos, sin = self._rope(rows)
+        if self.fuse and not prompt:                # every attention layer of a call reads the same positions
+            if self.call_rope is None:
+                self.call_rope = (*self._rope(rows), (self.meta[:1] + self.offsets[:rows]).long())
+            cos, sin, at = self.call_rope
+        else:
+            cos, sin = self._rope(rows)
+            at = None
         q = head_norm_rope(qkv[:, :qd].view(rows, c.heads, c.head_dim), a.q_norm, cos, sin, c.eps)
         k = head_norm_rope(qkv[:, qd:qd + kd].view(rows, c.kv_heads, c.head_dim), a.k_norm, cos, sin, c.eps)
         kc, vc = self.k_cache[j], self.v_cache[j]
-        at = (self.meta[:1] + self.offsets[:rows]).long()
+        if at is None:
+            at = (self.meta[:1] + self.offsets[:rows]).long()
         kc.index_copy_(0, at, k)
         vc.index_copy_(0, at, qkv[:, qd + kd:].view(rows, c.kv_heads, c.head_dim))
         scale = c.head_dim ** -0.5
@@ -188,7 +206,7 @@ class Engine:
     def _ffn(self, b: Block, x: torch.Tensor, prompt: bool) -> torch.Tensor:
         if b.moe is not None:
             return X.moe(x, b.moe, self.c.top_k, self.c.scaling, few=DECODE_ROWS, work=self.decoded,
-                         kernel=self.prompt_kernel, pairs_rows=PAIRS_ROWS)
+                         kernel=self.prompt_kernel, pairs_rows=PAIRS_ROWS, fuse=self.fuse and not prompt)
         g, u = b.w13(x, prompt).chunk(2, dim=-1)
         act = (torch.nn.functional.silu(g.float()).to(torch.bfloat16).float() * u.float()).to(torch.bfloat16)
         return b.w2(act, prompt)
@@ -197,6 +215,7 @@ class Engine:
         """Every layer over the rows ``ids`` at positions pos..: the final-normed rows [R, D] bf16."""
 
         c, w = self.c, self.w
+        self.call_rope = None
         h = w.embed[ids.long()]
         delta = None
         for i, b in enumerate(w.blocks):
