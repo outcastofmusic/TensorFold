@@ -91,6 +91,29 @@ def test_grouped_kernels_launches_take_the_list_the_grouping_wrote(monkeypatch, 
         assert fake.calls[i][1][22] == tile // 16                 # row tiles a block: the list's member group
 
 
+@pytest.mark.parametrize("rows", [1, 5, 6, 16])
+def test_flash_next_gate_up_back_on_grouped_kernel_takes_the_list_and_down_on_decode_kernel_does_not(monkeypatch,
+                                                                                                    rows):
+    """DECODE_TILES keeps Flash Next gate/up (2,560 -> 640) of 6 to 16 rows on grouped_kernel while down runs on
+    decode_kernel, so the grouping lists 16-row member groups for gate/up alone."""
+
+    fake = FakeExt()
+    monkeypatch.setattr(experts, "_ext", lambda: fake)
+    switches.use(switches.Switches(expert_decode=True, pdl=True, expert_items=True))
+    ex = _layer(D=2560, I=640)
+    s = experts.Scratch(ex, 32, 4, device="cpu")
+    experts.routed(torch.zeros((rows, ex.dims), dtype=torch.bfloat16), torch.zeros((rows, 4), dtype=torch.int32),
+                   None, ex, s, None, rows)
+    gate_up, down = fake.calls[2][1], fake.calls[4][1]
+    assert down[-2] is True and fake.kwargs[4] == {}
+    if rows <= 5:
+        assert gate_up[-2] is True and all(kw == {} for kw in fake.kwargs)
+        return
+    assert gate_up[-2] is False and fake.kwargs[2]["items"] is fake.kwargs[0]["items"]
+    assert fake.kwargs[0]["tile"] == 16
+    assert fake.kwargs[0]["items"].numel() == experts.item_bound(rows * 4, min(rows * 4, ex.count), 16)
+
+
 def test_without_grouping_no_list_is_read(monkeypatch):
     fake, _, _ = _route(monkeypatch, 64, False, True, group=False)
     assert [n for n, _ in fake.calls][0] == "rot_in"

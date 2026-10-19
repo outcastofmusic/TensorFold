@@ -3,7 +3,7 @@ one load, so a served A/B's difference can be split by switch.
 
 Switches: TF_EXL3_EXPERT_ITEMS ("items"), TF_FLASHNEXT_STACK_DIRECT ("stack"), TF_FLASHNEXT_F16_INNER_K ("inner_k"),
 TF_FLASHNEXT_MOE_DIRECT ("moe"), and TF_FLASHNEXT_HC_FUSE on the pack's fp16 hyper-connections ("hc"). The other
-EXL3 switches keep their defaults. Per setting: a fresh prefill of a ``--prompt``-token prompt in 2,048-row chunks
+switches (TF_EXL3_EXPERT_DECODE, TF_EXL3_PDL, TF_FLASHNEXT_F16_NARROW) keep their environment's setting. Per setting: a fresh prefill of a ``--prompt``-token prompt in 2,048-row chunks
 (median of ``--reps`` after one untimed), and the forward of decode windows of 1, 4 and 7 rows from CUDA graphs
 (serial and MTP verify) and 17 and 28 rows eager (four streams' windows past decode_kernel's 16), each the median of
 ``--reps`` after one untimed (``decode.time_windows``). The settings run off, each alone, all, off again; a setting's
@@ -15,6 +15,7 @@ last-row prompt logits are compared with the first off run's bytes. Prints one J
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import time
 
@@ -27,7 +28,7 @@ NAMES = ("items", "stack", "inner_k", "moe", "hc")
 
 
 def _set(w, on: set[str]) -> None:
-    switches.use(switches.Switches(expert_items="items" in on))
+    switches.use(dataclasses.replace(switches.read(), expert_items="items" in on))
     exl3_mm.use(exl3_mm.Switches(stack_direct="stack" in on, inner_k="inner_k" in on, moe_direct="moe" in on))
     hcs = [w.mixer] + [hc for layer in w.layers for hc in (layer.attn_hc, layer.mlp_hc)]
     if w.mtp is not None:
@@ -78,7 +79,7 @@ def main() -> None:
     a = p.parse_args()
     from tensorfold.families.qwen4_exp.cuda.weights import load
 
-    w = load(a.model, mtp=True, draft_vocab=None, f16_narrow=True, hc_fuse=True)
+    w = load(a.model, mtp=True, draft_vocab=None, f16_narrow=exl3_mm.f16_narrow(), hc_fuse=True)
     prompt = torch.randint(10, 150_000, (a.prompt,), generator=torch.Generator().manual_seed(9)).tolist()
     settings = [("off", set())] + [(n, {n}) for n in NAMES] + [("all", set(NAMES)), ("off again", set())]
     rows, first = [], None

@@ -1,16 +1,17 @@
-"""Replies on the real checkpoints with the sweep's switches off, on, off on one load (two loads of some checkpoints
-already differ, so comparing loads would test that): TF_EXL3_EXPERT_ITEMS, and on Flash Next also
-TF_FLASHNEXT_STACK_DIRECT, TF_FLASHNEXT_F16_INNER_K, TF_FLASHNEXT_MOE_DIRECT and TF_FLASHNEXT_HC_FUSE on the pack's
-fp16 hyper-connections (the loader's flag, flipped here on every HC of the load).
+"""Flash Next EXL3 replies with the sweep's switches off, on, off on one load (two loads of some checkpoints already
+differ, so comparing loads would test that): TF_EXL3_EXPERT_ITEMS, TF_FLASHNEXT_STACK_DIRECT, TF_FLASHNEXT_F16_INNER_K,
+TF_FLASHNEXT_MOE_DIRECT and TF_FLASHNEXT_HC_FUSE on the pack's fp16 hyper-connections (the loader's flag, flipped here
+on every HC of the load).
 
 - Flash Next EXL3 3.05 bpw: a 4,700-token prompt in 2,048-row chunks (two whole chunks and a partial one, which the
   prompt switches all touch), its last logits, 64 serial tokens and 64 drafted tokens (MTP at the default depth,
   confidence 0 so every verify window is full) from CUDA graphs, greedy and seeded; drafted equal serial in every
   setting, and every setting equal to the first. Then four streams decoded together (windows of 4 to 16 rows, past
-  decode_kernel's 16 once the drafts fill) equal each alone, in every setting.
-- GLM-5.3 (the sushi-experts pack): eager replies serial and drafted, greedy and seeded.
+  decode_kernel's 16 once the drafts fill) equal each alone, in every setting. Gate/up of windows of 6 to 16 rows
+  stay on grouped_kernel (experts.DECODE_TILES), so they take the item list too.
 
-Needs the checkpoints under $MODELS (about 60 GiB free for Flash Next, 100 GiB for GLM-5.3)."""
+GLM-5.3's replies with the item list are in test_glm_exl3_sweep2_replies.py, which runs in its own pytest process.
+Needs the Flash Next pack under $MODELS (about 60 GiB free)."""
 
 from __future__ import annotations
 
@@ -30,8 +31,6 @@ from tensorfold.families.qwen4_exp.cuda import exl3_mm  # noqa: E402
 
 MODELS = Path(os.environ.get("MODELS", "/home/agis/models"))
 FN_PACK = MODELS / "Qwen3.8-Flash-Next-exl3-3.05bpw"
-GLM = MODELS / "glm53-flash-sushi-experts-mosaic-dense"
-GLM_DRAFTER = MODELS / "GLM-5.3-Flash-DFlash2-TR3-v3"
 SAMPLINGS = [None, Sampling(1234, 1.0, 20, 0.95)]
 ORDER = (False, True, False)                    # off twice: a difference is the switches', not noise
 
@@ -56,8 +55,6 @@ def _free():
 def _set(w, on: bool) -> None:
     switches.use(switches.Switches(expert_items=on))
     exl3_mm.use(exl3_mm.Switches(stack_direct=on, inner_k=on, moe_direct=on))
-    if w is None:
-        return
     hcs = [w.mixer] + [hc for layer in w.layers for hc in (layer.attn_hc, layer.mlp_hc)]
     if w.mtp is not None:
         hcs += [w.mtp.mixer, w.mtp.layer.attn_hc, w.mtp.layer.mlp_hc]
@@ -168,45 +165,3 @@ def test_flash_next_four_streams_equal_each_alone_with_the_switches_off_on_off(f
         del dec
         _free()
     assert got_all[0] == got_all[1] == got_all[2]
-
-
-# ------------------------------------------------------------------------------------------------- GLM-5.3
-
-
-@pytest.fixture(scope="module")
-def glm():
-    if not (GLM / "config.json").exists() or not (GLM_DRAFTER / "config.json").exists():
-        pytest.skip("the GLM-5.3 pack or its drafter is not here")
-    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
-
-    engine = GlmEngine(GLM, rank=0, master="", port=0, world=1, drafter=GLM_DRAFTER, context=8192, eager=True,
-                       calibrate=False)
-    yield engine
-    del engine
-    _free()
-
-
-def _glm_reply(engine, prompt, sampling, draft, tokens=48):
-    out: list[int] = []
-    engine.cache.clear()
-    engine.live = []
-    engine.request.policy = None
-    engine.request.stop_eos = False
-    stats = engine.generate(list(prompt), tokens, sampling, lambda new: out.extend(new), draft=draft)
-    assert len(out) == tokens
-    if draft:
-        assert stats["rounds"] >= 1, stats
-    return out
-
-
-@pytest.mark.parametrize("sampling", SAMPLINGS, ids=["greedy", "seeded"])
-def test_glm_replies_keep_their_bytes_with_the_item_list_off_on_off(glm, sampling):
-    prompt = _prompt(2600, 11, 150_000)
-    got = []
-    for on in ORDER:
-        _set(None, on)
-        got.append((_glm_reply(glm, prompt, sampling, False), _glm_reply(glm, prompt, sampling, True)))
-    for setting, (serial, drafted) in zip(ORDER, got):
-        assert drafted == serial, setting
-    assert got[0] == got[2]
-    assert got[0] == got[1]
