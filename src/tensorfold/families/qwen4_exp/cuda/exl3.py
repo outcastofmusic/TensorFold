@@ -13,6 +13,7 @@ from tensorfold.cuda.exl3 import experts as x3experts
 from tensorfold.cuda.exl3 import format as fmt
 
 from .exl3_mm import Scratch, f16, stack, x3
+from .exl3_mm import f16_narrow as narrow_flag
 from .exl3_pack import _DT, EXTRA_FILES, NgramTable, Pack, is_exl3
 
 AHEAD_RUN = 128 << 20     # bytes of experts one read-ahead read brings in: eight in flight, each through a pinned block
@@ -143,7 +144,9 @@ def requant_rows(head, ids: torch.Tensor, device) -> tuple[torch.Tensor, torch.T
 
 
 def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: tuple[int, int] | None = None,
-         draft_vocab: int | str | None = None, table_reads: list | None = None):
+         draft_vocab: int | str | None = None, table_reads: list | None = None, f16_narrow: bool | None = None):
+    """``f16_narrow`` sets the fp16 matrices' decode tiles (``exl3_mm.f16_narrow``); None reads the flag here."""
+
     from .qmm import make_q4
     from tensorfold.cuda.direct_read import in_background
 
@@ -151,10 +154,11 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
 
     if tp is not None and tp[1] > 1:
         raise ValueError("EXL3 packs of Flash Next run on one GPU; two ranks read the MLX checkpoint")
+    f16_narrow = narrow_flag() if f16_narrow is None else f16_narrow
     model_dir = Path(model_dir)
     cfg = Config.read(model_dir)
     pk = Pack(model_dir)
-    sc = Scratch(cfg.top_k + 1)
+    sc = Scratch(cfg.top_k + 1, f16_narrow)
     T = "model.language_model."
     t0 = time.time()
     offset = centred_offset(pk, [f"{T}layers.{i}.attn_hyper_connection.hc_norm.weight" for i in range(cfg.layers)])

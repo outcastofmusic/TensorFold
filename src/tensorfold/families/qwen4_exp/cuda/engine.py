@@ -96,6 +96,7 @@ class FlashNextEngine:
         import torch
 
         from .copy_drafts import enabled as copy_enabled
+        from .exl3_mm import f16_narrow
         from .hc_b16 import fuse as hc_fuse
         from .nvfp4_moe import shared_decode, tile_mode
         from .qsa import mode as qsa_mode
@@ -110,6 +111,7 @@ class FlashNextEngine:
         # TF_FLASHNEXT_PROMPT_EXPERT_TILE and TF_FP4_SHARED_DECODE: every NVFP4 layer's expert kernels
         self.prompt_tile, self.shared_decode = tile_mode(), shared_decode()
         self.hc_fuse = hc_fuse()                         # TF_FLASHNEXT_HC_FUSE: every bf16 HC's prompt fusions
+        self.f16_narrow = f16_narrow()                   # TF_FLASHNEXT_F16_NARROW: an EXL3 pack's fp16 decode tiles
         exl3 = is_exl3(model_dir)
         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU: drop --tp "
@@ -199,7 +201,7 @@ class FlashNextEngine:
             w = load(model_dir, mtp=self.depth > 0, tp=(rank, 2) if tp == 2 else None,
                      draft_vocab=draft_vocab if self.depth > 0 else None, ple_on_ssd=ple_on_ssd,
                      table_reads=reads if prefetch and not ple_on_ssd else None, prompt_tile=self.prompt_tile,
-                     shared_decode=self.shared_decode, hc_fuse=self.hc_fuse)
+                     shared_decode=self.shared_decode, hc_fuse=self.hc_fuse, f16_narrow=self.f16_narrow)
         except BaseException:
             wait(reads)                               # a failed load leaves no table read behind it
             raise

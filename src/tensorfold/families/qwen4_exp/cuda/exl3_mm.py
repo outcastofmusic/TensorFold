@@ -13,17 +13,28 @@ import triton.language as tl
 from tensorfold.cuda.exl3 import experts as x3experts
 from tensorfold.cuda.exl3 import prefill as x3prefill
 from tensorfold.cuda.exl3.linear import Exl3Linear
+from tensorfold.env_flags import flag
 
 from .exl3_pack import MOE_WINDOW
 
 ROWS = 128               # most rows one call of the EXL3 linear or a split fp16 matmul takes
+NARROW_ENV = "TF_FLASHNEXT_F16_NARROW"
+
+
+def f16_narrow() -> bool:
+    """TF_FLASHNEXT_F16_NARROW (unset: on): decode rows of the fp16 matrices on narrow tiles (``narrow_tile``), the
+    old bytes. The engine reads it once at startup and the loader stores it on the shared ``Scratch``; a value outside
+    env_flags' set raises."""
+
+    return flag(NARROW_ENV, True)
 
 
 class Scratch:
     """Buffers for every EXL3 and fp16 matrix of the model (calls run one after another on one stream)."""
 
-    def __init__(self, slots: int) -> None:
+    def __init__(self, slots: int, narrow: bool = True) -> None:
         self.slots = slots                 # routed experts a row, plus the shared expert
+        self.narrow = narrow               # TF_FLASHNEXT_F16_NARROW: every F16 matrix's decode tiles
         self.users: list[Any] = []
         self.xh = self.z = self.tmp = self.part = None
         self.moe: x3experts.Scratch | None = None
@@ -99,6 +110,26 @@ def _reduce(P, OUT, M, N, o_stride, SK: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(OUT + r * o_stride + c, acc.to(OUT.dtype.element_ty), mask=ok)
 
 
+# Narrow tiles take calls of one m tile (decode and verify windows); a prompt's windows keep BN 64 on four warps.
+NARROW_ROWS = 16
+WIDE_TILE = (64, 4, 3)        # (BN, warps, stages)
+
+
+def narrow_tile(m: int, n: int, sk: int, target: int = 96) -> tuple[int, int, int]:
+    """(BN, warps, stages) for an [m, K] call on an [n, K] fp16 matrix of ``sk`` K slices with the narrow switch on.
+
+    Every tile gives each warp 16 columns (BN / warps), as BN 64 on four warps does, so the MMA layout, the K slices
+    and each output's chain of m16n8k16 steps in K order stay the old ones and a row keeps its bytes. In the serial
+    decode profile (GB10, tf-runs/profile/RESULTS.md) BN 64 ran HC up (n 10,240) on 160 programs and HC down (n 324,
+    16 slices) on 96, on 48 SMs at 190-200 GB/s. BN 32 doubles the programs; BN 16 on one warp takes a matrix that would still run fewer than ``target``."""
+
+    if m > NARROW_ROWS:
+        return WIDE_TILE
+    if -(-n // 32) * sk >= target:
+        return 32, 2, 4
+    return 16, 1, 4
+
+
 def f16_split(n: int, k: int, target: int = 96) -> int:
     """K slices for an (n, k) fp16 matrix: a function of the shape only."""
 
@@ -136,9 +167,11 @@ class F16:
         m = x.shape[0]
         if x.stride(1) != 1 or x.shape[1] != self.k:
             raise ValueError(f"F16: x {tuple(x.shape)} does not match K={self.k}")
-        grid = (triton.cdiv(m, 16), triton.cdiv(self.n, 64), self.sk)
+        bn, warps, stages = narrow_tile(m, self.n, self.sk) if self.sc.narrow else WIDE_TILE
+        grid = (triton.cdiv(m, 16), triton.cdiv(self.n, bn), self.sk)
         _f16_mm[grid](x, self.w, out, m, self.n, x.stride(0), self.n if f32 else out.stride(0),
-                      K=self.k, KS=self.k // self.sk, BM=16, BN=64, BK=64, F32=f32, num_warps=4, num_stages=3)
+                      K=self.k, KS=self.k // self.sk, BM=16, BN=bn, BK=64, F32=f32, num_warps=warps,
+                      num_stages=stages)
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         if out.stride(-1) != 1:
