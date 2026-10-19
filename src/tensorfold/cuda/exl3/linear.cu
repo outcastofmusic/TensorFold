@@ -132,7 +132,10 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
     store4(xh, F16, (size_t)row * K + k, v);
 }
 
-template <int K2, int CB, int WK>
+// RT 16-row tiles a pass: RT = 2 (TF_EXL3_LINEAR_PAIR) decodes each k step's weights once for 32 rows, where RT = 1
+// reads and decodes every weight again for each 16 rows. A row's sums stay its own: the same mma chain over the same
+// K range a warp, warps added in order, then splits in order.
+template <int K2, int CB, int WK, int RT>
 __global__ void __launch_bounds__(WK * 32) linear_kernel(
     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
     const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype, long long ldy,
@@ -165,21 +168,30 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                 prefetch_l2(tiles + (size_t)(kt0 + s) * stride_k + w);
     tf_exl3_pdl::grid_wait();
 
-    for (int m0 = 0, pass = 0; m0 < M; m0 += 16, ++pass) {
-        const int R = min(16, M - m0);
+    for (int m0 = 0, pass = 0; m0 < M; m0 += 16 * RT, ++pass) {
+        const int RP = min(16 * RT, M - m0);                  // the pass's rows; tile u holds rows 16u.. of them
 
-        float acc[8][2][4];
+        float acc[RT][8][2][4];
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
+        for (int u = 0; u < RT; ++u)
 #pragma unroll
-            for (int h = 0; h < 2; ++h)
+            for (int i = 0; i < 8; ++i)
 #pragma unroll
-                for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+                for (int h = 0; h < 2; ++h)
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) acc[u][i][h][c] = 0.f;
 
-        // the walk's rows for the mma, clamped so rows past the pass read inside the buffer (their outputs are dropped)
-        const int r0 = m0 + (g < R ? g : R - 1), r1 = m0 + (g + 8 < R ? g + 8 : R - 1);
-        const half* x0 = xh + (size_t)r0 * K;
-        const half* x1 = xh + (size_t)r1 * K;
+        // the walk's rows for the mma, clamped so rows past a tile read inside the buffer (their outputs are dropped);
+        // a tile past the pass's rows reads nothing
+        const half* x0[RT];
+        const half* x1[RT];
+#pragma unroll
+        for (int u = 0; u < RT; ++u) {
+            const int R = RT == 1 ? RP : max(1, min(16, RP - 16 * u)), mt = RT == 1 ? m0 : min(m0 + 16 * u, M - 1);
+            const int r0 = mt + (g < R ? g : R - 1), r1 = mt + (g + 8 < R ? g + 8 : R - 1);
+            x0[u] = xh + (size_t)r0 * K;
+            x1[u] = xh + (size_t)r1 * K;
+        }
         const uint32_t* tile = tiles + (size_t)kt0 * stride_k;
         // up to 6 bits the next k step's words are loaded while this one is decoded; 7 and 8 bits load per tile
         constexpr bool PF = K2 <= 12;
@@ -189,11 +201,15 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
 #pragma unroll 1
         for (int i = 0; i < per_warp; ++i) {
             const int kt = kt0 + i;
-            uint32_t a[4];
-            a[0] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t));
-            a[1] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t));
-            a[2] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t + 8));
-            a[3] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t + 8));
+            uint32_t a[RT][4];
+#pragma unroll
+            for (int u = 0; u < RT; ++u)
+                if (u == 0 || 16 * u < RP) {
+                    a[u][0] = __ldg(reinterpret_cast<const uint32_t*>(x0[u] + kt * 16 + 2 * t));
+                    a[u][1] = __ldg(reinterpret_cast<const uint32_t*>(x1[u] + kt * 16 + 2 * t));
+                    a[u][2] = __ldg(reinterpret_cast<const uint32_t*>(x0[u] + kt * 16 + 2 * t + 8));
+                    a[u][3] = __ldg(reinterpret_cast<const uint32_t*>(x1[u] + kt * 16 + 2 * t + 8));
+                }
             if constexpr (PF) {
                 if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
             }
@@ -204,8 +220,12 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                 else ldg_lane_words<K2>(tile + (size_t)i * stride_k + j * TW, lane, w);
                 uint32_t b0[2], b1[2];
                 decode_lane<K2, CB>(w, lane, b0, b1);
-                mma16816(acc[j][0], a, b0);
-                mma16816(acc[j][1], a, b1);
+#pragma unroll
+                for (int u = 0; u < RT; ++u)
+                    if (u == 0 || 16 * u < RP) {
+                        mma16816(acc[u][j][0], a[u], b0);
+                        mma16816(acc[u][j][1], a[u], b1);
+                    }
             }
             if constexpr (PF) {
 #pragma unroll
@@ -213,45 +233,53 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
             }
         }
 
-        // the warps' sums, added in warp order, rows 0-7 of the pass and then rows 8-15
-        for (int rlo = 0; rlo < R; rlo += 8) {
-            const int rn = min(R - rlo, 8);
-            __syncthreads();                         // red is reused by every half and pass
-            if (g < RH) {
+        // each tile's warp sums, added in warp order, rows 0-7 of the tile and then rows 8-15
 #pragma unroll
-                for (int i = 0; i < 8; ++i)
-#pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        const int col = i * 16 + h * 8 + 2 * t;
-                        *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
-                            rlo ? make_float2(acc[i][h][2], acc[i][h][3]) : make_float2(acc[i][h][0], acc[i][h][1]);
-                    }
+        for (int u = 0; u < RT; ++u) {
+            const int R = RT == 1 ? RP : min(16, RP - 16 * u), mt = m0 + 16 * u;
+            if constexpr (RT > 1) {
+                if (R <= 0) break;
             }
-            __syncthreads();
-
-            if (SK == 1) {
-                for (int r = warp; r < rn; r += WK) {
-                    float v[4];
-                    const float4 u = *reinterpret_cast<const float4*>(red + r * 128 + 4 * lane);
-                    v[0] = u.x; v[1] = u.y; v[2] = u.z; v[3] = u.w;
+            for (int rlo = 0; rlo < R; rlo += 8) {
+                const int rn = min(R - rlo, 8);
+                __syncthreads();                         // red is reused by every half, tile and pass
+                if (g < RH) {
 #pragma unroll
-                    for (int w = 1; w < WK; ++w) {
-                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + 4 * lane);
-                        v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
-                    }
-                    finish(v, lane, svh, bias, col0 + 4 * lane);
-                    store4(y, y_dtype, (size_t)(m0 + rlo + r) * ldy + col0 + 4 * lane, v);
+                    for (int i = 0; i < 8; ++i)
+#pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            const int col = i * 16 + h * 8 + 2 * t;
+                            *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
+                                rlo ? make_float2(acc[u][i][h][2], acc[u][i][h][3])
+                                    : make_float2(acc[u][i][h][0], acc[u][i][h][1]);
+                        }
                 }
-            } else {
-                for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
-                    const int r = idx >> 5, c = 4 * (idx & 31);
-                    float4 s = *reinterpret_cast<const float4*>(red + r * 128 + c);
+                __syncthreads();
+
+                if (SK == 1) {
+                    for (int r = warp; r < rn; r += WK) {
+                        float v[4];
+                        const float4 q0 = *reinterpret_cast<const float4*>(red + r * 128 + 4 * lane);
+                        v[0] = q0.x; v[1] = q0.y; v[2] = q0.z; v[3] = q0.w;
 #pragma unroll
-                    for (int w = 1; w < WK; ++w) {
-                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + c);
-                        s.x += q.x; s.y += q.y; s.z += q.z; s.w += q.w;
+                        for (int w = 1; w < WK; ++w) {
+                            const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + 4 * lane);
+                            v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
+                        }
+                        finish(v, lane, svh, bias, col0 + 4 * lane);
+                        store4(y, y_dtype, (size_t)(mt + rlo + r) * ldy + col0 + 4 * lane, v);
                     }
-                    *reinterpret_cast<float4*>(Z + ((size_t)split * M + m0 + rlo + r) * N + col0 + c) = s;
+                } else {
+                    for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
+                        const int r = idx >> 5, c = 4 * (idx & 31);
+                        float4 s = *reinterpret_cast<const float4*>(red + r * 128 + c);
+#pragma unroll
+                        for (int w = 1; w < WK; ++w) {
+                            const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + c);
+                            s.x += q.x; s.y += q.y; s.z += q.z; s.w += q.w;
+                        }
+                        *reinterpret_cast<float4*>(Z + ((size_t)split * M + mt + rlo + r) * N + col0 + c) = s;
+                    }
                 }
             }
         }
@@ -262,7 +290,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
             __syncthreads();
             if (last) {
                 __threadfence();
-                for (int r = warp; r < R; r += WK) {
+                for (int r = warp; r < RP; r += WK) {
                     const size_t at = ((size_t)m0 + r) * N + col0 + 4 * lane;
                     float4 s = __ldcg(reinterpret_cast<const float4*>(Z + at));
                     for (int q = 1; q < SK; ++q) {
@@ -317,10 +345,11 @@ void exl3_rot_in_cuda(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xh
 void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb,
                       const at::Tensor& svh, const c10::optional<at::Tensor>& bias, at::Tensor& y,
                       const c10::optional<at::Tensor>& Z, at::Tensor& counters, int64_t K2, int64_t cb, int64_t SK,
-                      int64_t WK, bool pdl) {
+                      int64_t WK, bool pdl, int64_t RT) {
     const int M = (int)xh.size(0), K = (int)xh.size(1), N = (int)y.size(1);
     const long long ldy = M > 1 ? (long long)y.stride(0) : N;     // a row stride wider than N: columns of a wider y
     TORCH_CHECK(WK == 2 || WK == 4 || WK == 8, "WK must be 2, 4 or 8");
+    TORCH_CHECK(RT == 1 || RT == 2, "RT: 1 or 2 row tiles a pass");
     TORCH_CHECK((K / 16) % (SK * WK) == 0, "K / 16 must split evenly over SK * WK warps");
     dim3 grid((unsigned)(N / 128), (unsigned)SK);
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -328,10 +357,11 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
     float* zptr = Z ? Z->data_ptr<float>() : nullptr;
     TORCH_CHECK(SK == 1 || zptr, "Z is needed with more than one split");
     const bool early = tf_exl3_pdl::enabled(pdl);
+#define TF_KERNEL(K2_, CB_, RT_)                                                                                   \
+    (WK == 2 ? linear_kernel<K2_, CB_, 2, RT_> : WK == 4 ? linear_kernel<K2_, CB_, 4, RT_> : linear_kernel<K2_, CB_, 8, RT_>)
 #define TF_LAUNCH(K2_, CB_)                                                                                        \
     if (K2 == K2_ && cb == CB_) {                                                                               \
-        auto kernel = WK == 2 ? linear_kernel<K2_, CB_, 2>                                                      \
-                              : WK == 4 ? linear_kernel<K2_, CB_, 4> : linear_kernel<K2_, CB_, 8>;              \
+        auto kernel = RT == 2 ? TF_KERNEL(K2_, CB_, 2) : TF_KERNEL(K2_, CB_, 1);                                 \
         const int smem = (int)(WK * std::min(M, 8) * 128 * sizeof(float));                                \
         if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
         tf_exl3_pdl::launch(kernel, grid, dim3((unsigned)(WK * 32)), (size_t)smem, stream, early,              \
@@ -342,6 +372,7 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
     }
     TF_EXL3_ALL(TF_LAUNCH)
 #undef TF_LAUNCH
+#undef TF_KERNEL
     TORCH_CHECK(false, "unsupported EXL3 width/codebook: K2=", K2, " codebook=", cb);
 }
 

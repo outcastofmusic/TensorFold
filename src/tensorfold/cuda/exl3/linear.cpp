@@ -4,7 +4,7 @@
 void exl3_rot_in_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, bool);
 void exl3_linear_cuda(const at::Tensor&, const at::Tensor&, int64_t, int64_t, const at::Tensor&,
                       const c10::optional<at::Tensor>&, at::Tensor&, const c10::optional<at::Tensor>&, at::Tensor&,
-                      int64_t, int64_t, int64_t, int64_t, bool);
+                      int64_t, int64_t, int64_t, int64_t, bool, int64_t);
 void exl3_unpack_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
@@ -47,7 +47,7 @@ void rot_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor xh, bool pdl)
 // counters int32 [8 * N / 128], left zero.
 void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb, const at::Tensor& svh,
             const c10::optional<at::Tensor>& bias, at::Tensor y, const c10::optional<at::Tensor>& Z,
-            at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK, bool pdl) {
+            at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK, bool pdl, int64_t RT) {
     check(xh, at::kHalf, "xh");
     check_out(y, "y");
     check(svh, at::kHalf, "svh");
@@ -67,7 +67,8 @@ void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t
         TORCH_CHECK(Z->numel() >= SK * M * N, "Z too small");
     }
     c10::cuda::CUDAGuard guard(xh.device());
-    exl3_linear_cuda(xh, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK, pdl);
+    TORCH_CHECK(RT == 1 || RT == 2, "RT: 1 or 2 row tiles a pass");
+    exl3_linear_cuda(xh, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK, pdl, RT);
 }
 
 // W [K, N] fp16 = W_q, the trellis tiles decoded; tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb words.
@@ -80,12 +81,13 @@ void unpack(const at::Tensor& T, at::Tensor W, int64_t stride_k, int64_t stride_
     exl3_unpack_cuda(T, W, stride_k, stride_nb, K2, cb);
 }
 
-// pdl (TF_EXL3_PDL, pdl.cuh) defaults to off, so a direct call launches as before the switch.
+// pdl (TF_EXL3_PDL, pdl.cuh) defaults to off and RT (TF_EXL3_LINEAR_PAIR: 2, two 16-row tiles a pass) to 1, so a
+// direct call launches as before the switches.
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     namespace py = pybind11;
     m.def("rot_in", &rot_in, py::arg("x"), py::arg("suh"), py::arg("xh"), py::arg("pdl") = false);
     m.def("linear", &linear, py::arg("xh"), py::arg("T"), py::arg("stride_k"), py::arg("stride_nb"), py::arg("svh"),
           py::arg("bias"), py::arg("y"), py::arg("Z"), py::arg("counters"), py::arg("K2"), py::arg("cb"), py::arg("SK"),
-          py::arg("WK"), py::arg("pdl") = false);
+          py::arg("WK"), py::arg("pdl") = false, py::arg("RT") = 1);
     m.def("unpack", &unpack);
 }
