@@ -199,7 +199,7 @@ def _ptxas(kernels: list[str]) -> dict[str, tuple[int, int, bool]]:
 
     from torch.utils import cpp_extension
 
-    listed = ", const int*, const int*"                        # grouped_kernel's item list and its count
+    listed = ", const int*, const int*, Epi"                   # grouped_kernel's item list, its count, the epilogue
     src = "#include \"experts_grouped.cuh\"\nnamespace tf_exl3x {\n" + "".join(
         f"template __global__ void {k}(const half*, const half*, const int64_t*, const int64_t*, const int*, "
         "const int*, const int*, const int*, const int*, float*, int, int, int, int, int, int, uint32_t"
@@ -235,7 +235,7 @@ def test_decode_kernel_fits_more_blocks_an_sm_than_grouped_kernel_without_spilli
     (8 n tiles, 1 k step) holds 3 blocks of 4 warps an SM on GB10 (64K registers, 100 KB shared, 1 KB of it reserved a block); decode_kernel at
     at 4x2 holds 5, with less than half the shared memory."""
 
-    old = "grouped_kernel<2, 8, 4, 1, 2, 10, 1>"
+    old = "grouped_kernel<2, 8, 4, 1, 2, 10, 1, 0>"
     new = "decode_kernel<2, 4, 4, 2, 2, 10>"                         # 4x2, the table's tile from 2 rows
     got = _ptxas([old, new])
     (r_old, s_old, sp_old), (r_new, s_new, sp_new) = (next(v for k, v in got.items() if tag in k)

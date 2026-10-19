@@ -357,7 +357,7 @@ def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
 
     from tensorfold.cuda.exl3.experts import routed
 
-    from .exl3_mm import current
+    from .exl3_mm import current, moe_window
     from .exl3_pack import MOE_WINDOW
 
     buf = b.moe
@@ -368,8 +368,9 @@ def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
         return 2, y.view(R, buf.slots, -1), buf.wts[:R]
     # a window's bf16 slots go straight into buf.y (TF_FLASHNEXT_MOE_DIRECT), or come as fp32 and a copy rounds them
     direct = current().moe_direct and buf.y.dtype == torch.bfloat16
-    for r0 in range(0, R, MOE_WINDOW):
-        n = min(MOE_WINDOW, R - r0)
+    window = moe_window()                    # TF_FLASHNEXT_MOE_CHUNK: a 2,048-row chunk in one call
+    for r0 in range(0, R, window):
+        n = min(window, R - r0)
         into = buf.y[r0:r0 + n].view(n * buf.slots, -1) if direct else None
         y = routed(b.mixed[r0:r0 + n], buf.pick[r0:r0 + n], None, m.experts, w.x3.moe, None, n, y=into)
         if not direct:

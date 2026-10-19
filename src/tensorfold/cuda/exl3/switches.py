@@ -9,7 +9,16 @@ groups an expert, and a routed expert fills one of them. The programs and their 
 old launches, and any value outside env_flags' set raises. Served on Qwen EXL3 (GPU 19 Oct), EXPERT_DECODE and PDL
 were 0.99-1.00x on decode, so they stay off; the item list took cold prefill 1.41x.
 
-An engine reads both once at startup (``read``) and installs them (``use``). The kernels' Python callers consult
+Three prompt-window switches (unset: off, not yet measured on the GPU), each the same bytes as without it:
+TF_EXL3_GROUP_SCAN groups the picks with ``group_scan_kernel`` (a count, a scan and a stable scatter on 8 blocks),
+which writes ``group_kernel``'s ids, members and item list: on Flash Next's 1,024-row windows ``group_kernel`` held
+513 experts on 129 threads of one block and took 2.3 ms a window, 901 ms of an 8,192-token prefill's 6,887 (nsys,
+19 Oct). TF_EXL3_DOWN_FUSE runs the down epilogue inside the down projection's programs (no fp32 partials written and
+read again, no separate launch: 315 ms of the 6,887). TF_EXL3_GATEUP_FUSE has the last of an (item, n block)'s gate
+and up programs add their splits and run the gate/up epilogue (433 ms of the 6,887). Both fusions take the listed
+layout (TF_EXL3_EXPERT_ITEMS) at the prompt setting.
+
+An engine reads every switch once at startup (``read``) and installs them (``use``). The kernels' Python callers consult
 ``current()`` at each launch, so a CUDA graph keeps the setting it was captured with. A test flips a setting on one
 load by calling ``use`` and building a new engine.
 """
@@ -23,6 +32,9 @@ from tensorfold.env_flags import flag
 EXPERT_DECODE_ENV = "TF_EXL3_EXPERT_DECODE"
 PDL_ENV = "TF_EXL3_PDL"
 EXPERT_ITEMS_ENV = "TF_EXL3_EXPERT_ITEMS"
+GROUP_SCAN_ENV = "TF_EXL3_GROUP_SCAN"
+DOWN_FUSE_ENV = "TF_EXL3_DOWN_FUSE"
+GATEUP_FUSE_ENV = "TF_EXL3_GATEUP_FUSE"
 
 
 @dataclass(frozen=True)
@@ -30,6 +42,9 @@ class Switches:
     expert_decode: bool = False
     pdl: bool = False
     expert_items: bool = True
+    group_scan: bool = False
+    down_fuse: bool = False
+    gateup_fuse: bool = False
 
 
 _current = Switches()
@@ -39,7 +54,8 @@ def read() -> Switches:
     """Every switch from the environment; a typo raises before any weight is read."""
 
     return Switches(expert_decode=flag(EXPERT_DECODE_ENV, False), pdl=flag(PDL_ENV, False),
-                    expert_items=flag(EXPERT_ITEMS_ENV, True))
+                    expert_items=flag(EXPERT_ITEMS_ENV, True), group_scan=flag(GROUP_SCAN_ENV, False),
+                    down_fuse=flag(DOWN_FUSE_ENV, False), gateup_fuse=flag(GATEUP_FUSE_ENV, False))
 
 
 def use(switches: Switches) -> Switches:

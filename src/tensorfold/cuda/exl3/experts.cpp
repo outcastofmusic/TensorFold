@@ -1,13 +1,18 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <cmath>
+
 void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, int64_t, int64_t, bool, bool, const int*, const int*, int64_t);
+                        int64_t, int64_t, int64_t, int64_t, bool, bool, const int*, const int*, int64_t, int64_t,
+                        const void*, const void*, const void*, void*, int*, double, int64_t, bool);
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t);
 void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, bool, int*,
                       int*, int64_t);
+void exl3x_group_scan_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, bool,
+                           int*, int*, int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                        at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, bool);
 void exl3x_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -39,7 +44,10 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
              const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
              int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi,
              int64_t rt, int64_t window, bool decode, bool pdl, const c10::optional<at::Tensor>& items,
-             const c10::optional<at::Tensor>& icount) {
+             const c10::optional<at::Tensor>& icount, int64_t epi, const c10::optional<at::Tensor>& s0,
+             const c10::optional<at::Tensor>& s1, const c10::optional<at::Tensor>& s2,
+             const c10::optional<at::Tensor>& out, const c10::optional<at::Tensor>& arrivals, double limit,
+             int64_t act_mode) {
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
     check(TP0, at::kLong, "TP0");
@@ -58,10 +66,41 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
     TORCH_CHECK(!decode || (members.size(1) <= 16 && rt == 1), "decode: a window of at most 16 rows, one row tile");
     check_items(items, icount);
     TORCH_CHECK(!(decode && items), "the item list lays out grouped_kernel; decode_kernel takes none");
+    // the fused epilogues (TF_EXL3_GATEUP_FUSE 1, TF_EXL3_DOWN_FUSE 2) take the epilogue kernels' operands
+    const void *e0 = nullptr, *e1 = nullptr, *e2 = nullptr;
+    void* eout = nullptr;
+    int* earr = nullptr;
+    bool ebf16 = false;
+    if (epi != 0) {
+        TORCH_CHECK(epi == 1 || epi == 2, "epi: 0, 1 (gate/up) or 2 (down)");
+        TORCH_CHECK(items.has_value(), "a fused epilogue runs on the item list");
+        TORCH_CHECK(s0 && out, "a fused epilogue needs its scales and its output");
+        check(*s0, at::kHalf, "s0");
+        TORCH_CHECK(s0->size(-1) == N, "s0: [E, N]");
+        if (epi == 1) {
+            TORCH_CHECK(s1 && s2 && arrivals, "the gate/up epilogue needs svh_u, suh_d and its arrival counters");
+            check(*s1, at::kHalf, "s1");
+            check(*s2, at::kHalf, "s2");
+            check(*out, at::kHalf, "out");
+            check(*arrivals, at::kInt, "arrivals");
+            TORCH_CHECK(s1->size(-1) == N && s2->size(-1) == N, "s1, s2: [E, N]");
+            TORCH_CHECK(arrivals->numel() >= items->numel() * (N / (16 * nt)), "arrivals: one an item and n block");
+            TORCH_CHECK(act_mode == 0 || act_mode == 1, "act_mode: 0 or 1");
+            e1 = s1->data_ptr();
+            e2 = s2->data_ptr();
+            earr = arrivals->data_ptr<int>();
+        } else {
+            ebf16 = out->scalar_type() == at::kBFloat16;
+            check(*out, ebf16 ? at::kBFloat16 : at::kFloat, "out");
+        }
+        TORCH_CHECK(out->numel() >= P * N, "out too small");
+        e0 = s0->data_ptr();
+        eout = out->data_ptr();
+    }
     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
                        pf, lo, hi, rt, (int64_t(1) << window) - 1, decode, pdl,
                        items ? items->data_ptr<int>() : nullptr, icount ? icount->data_ptr<int>() : nullptr,
-                       items ? items->numel() : 0);
+                       items ? items->numel() : 0, epi, e0, e1, e2, eout, earr, limit, act_mode, ebf16);
 }
 
 void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb, int64_t window) {
@@ -79,7 +118,7 @@ void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb, int64_
 
 void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tensor members, int64_t R, int64_t slots,
            int64_t E, bool pdl, const c10::optional<at::Tensor>& items, const c10::optional<at::Tensor>& icount,
-           int64_t tile) {
+           int64_t tile, bool scan) {
     check(pick, at::kInt, "pick");
     check(uids, at::kInt, "uids");
     check(ucount, at::kInt, "ucount");
@@ -94,8 +133,10 @@ void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tenso
         TORCH_CHECK(items->numel() >= (R * slots + tile - 1) / tile + uids.numel(), "items too small");
     }
     c10::cuda::CUDAGuard guard(pick.device());
-    exl3x_group_cuda(pick, uids, ucount, members, R, slots, E, pdl, items ? items->data_ptr<int>() : nullptr,
-                     icount ? icount->data_ptr<int>() : nullptr, tile);
+    // ``scan``: group_scan_kernel (TF_EXL3_GROUP_SCAN), the same outputs
+    (scan ? exl3x_group_scan_cuda : exl3x_group_cuda)(pick, uids, ucount, members, R, slots, E, pdl,
+                                                      items ? items->data_ptr<int>() : nullptr,
+                                                      icount ? icount->data_ptr<int>() : nullptr, tile);
 }
 
 void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
@@ -162,7 +203,9 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
 
 // The trailing switches default to off, so a direct call (the GPU tests') launches as before them: ``decode`` takes
 // decode_kernel (TF_EXL3_EXPERT_DECODE), ``pdl`` programmatic dependent launch on GB10 (TF_EXL3_PDL, pdl.cuh), and
-// ``items`` with ``icount`` (group's list, TF_EXL3_EXPERT_ITEMS) grouped_kernel's listed layout.
+// ``items`` with ``icount`` (group's list, TF_EXL3_EXPERT_ITEMS) grouped_kernel's listed layout, ``scan`` group's
+// count-scan-scatter kernel (TF_EXL3_GROUP_SCAN), and ``epi`` with its operands a fused epilogue (TF_EXL3_GATEUP_FUSE,
+// TF_EXL3_DOWN_FUSE).
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     namespace py = pybind11;
     m.def("grouped", &grouped, py::arg("X0"), py::arg("X1"), py::arg("TP0"), py::arg("TP1"), py::arg("B0"),
@@ -170,11 +213,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("K"), py::arg("N"), py::arg("P"), py::arg("SK"), py::arg("slots"), py::arg("cb"), py::arg("nt"),
           py::arg("warps"), py::arg("pf"), py::arg("lo"), py::arg("hi"), py::arg("rt"), py::arg("window"),
           py::arg("decode") = false, py::arg("pdl") = false, py::arg("items") = py::none(),
-          py::arg("icount") = py::none());
+          py::arg("icount") = py::none(), py::arg("epi") = 0, py::arg("s0") = py::none(), py::arg("s1") = py::none(),
+          py::arg("s2") = py::none(), py::arg("out") = py::none(), py::arg("arrivals") = py::none(),
+          py::arg("limit") = INFINITY, py::arg("act_mode") = 1);
     m.def("dequant", &dequant);
     m.def("group", &group, py::arg("pick"), py::arg("uids"), py::arg("ucount"), py::arg("members"), py::arg("R"),
           py::arg("slots"), py::arg("E"), py::arg("pdl") = false, py::arg("items") = py::none(),
-          py::arg("icount") = py::none(), py::arg("tile") = 0);
+          py::arg("icount") = py::none(), py::arg("tile") = 0, py::arg("scan") = false);
     m.def("rot_in", &rot_in, py::arg("x"), py::arg("x_stride"), py::arg("pick"), py::arg("suh0"), py::arg("suh1"),
           py::arg("out0"), py::arg("out1"), py::arg("rows"), py::arg("K"), py::arg("slots"), py::arg("E"),
           py::arg("pdl") = false);

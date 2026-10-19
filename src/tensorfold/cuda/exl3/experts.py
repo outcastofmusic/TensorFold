@@ -38,6 +38,9 @@ DECODE_TILES: dict[tuple[int, int], tuple[tuple[int, tuple[int, int] | None], ..
     (2048, 4096): ((16, (4, 2)),),                             # GLM-5.3 down
 }
 DECODE_TILE = (4, 2)      # another shape: the setting that was at least grouped_kernel's speed (0.99x) everywhere
+SCAN_EXPERTS = 1024       # group_scan_kernel (TF_EXL3_GROUP_SCAN): an expert a thread of a 1,024-thread block
+SCAN_PICKS = 65535        # and ranks of 16 bits
+EPI_GATEUP, EPI_DOWN = 1, 2   # grouped_kernel's fused epilogues (TF_EXL3_GATEUP_FUSE, TF_EXL3_DOWN_FUSE)
 
 
 @lru_cache(maxsize=1)
@@ -46,7 +49,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v4", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v5", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -221,6 +224,8 @@ class Scratch:
         # grouped_kernel's listed layout (TF_EXL3_EXPERT_ITEMS): the member groups group_kernel lists, and their count
         self.items_buf = torch.zeros((item_bound(P, maxu, 16),), dtype=torch.int32, device=device)
         self.icount = torch.zeros((1,), dtype=torch.int32, device=device)
+        # the fused gate/up epilogue's arrivals, an (item, 128-column n block); each launch leaves them zero
+        self.arrivals = torch.zeros((self.items_buf.numel() * max(1, I // 128),), dtype=torch.int32, device=device)
         self.rows, self.slots, self.count_experts = rows, slots, ex.count
 
     def window(self, R: int):
@@ -282,7 +287,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
 
     ``prompt`` (default: more than PROMPT_ROWS rows) reads each expert once for 32 of its rows; the values are the same.
     With TF_EXL3_EXPERT_ITEMS (and ``group``) a prompt window's grouping lists the member groups grouped_kernel's
-    launches run.
+    launches run. On a prompt window TF_EXL3_GROUP_SCAN groups on group_scan_kernel, and on the listed layout
+    TF_EXL3_GATEUP_FUSE and TF_EXL3_DOWN_FUSE (without ``wts``) run the epilogues inside grouped_kernel's launches.
     ``y`` (without ``wts``): a contiguous bf16 [R * slots, D] that takes the slots rounded once, as a copy of the fp32
     slots into it would round them."""
 
@@ -301,20 +307,30 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     tile = listed_tile(gu, dn) if group and sw.expert_items and many else 0
     listed = {"items": s.items(R, tile), "icount": s.icount} if tile else {}
     if group:
-        ext.group(pick, ids, s.count, members, R, slots, E, pdl, **listed, **({"tile": tile} if tile else {}))
+        scan = {"scan": True} if sw.group_scan and many and scan_fits(E, P) else {}
+        ext.group(pick, ids, s.count, members, R, slots, E, pdl, **listed, **({"tile": tile} if tile else {}),
+                  **scan)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E, pdl)
     (nt, w, sk, pf, rt), dec = gu
+    fuse_gu = sw.gateup_fuse and bool(listed) and fusable(gu, ex.k2_gu)
+    fused = {"epi": EPI_GATEUP, "s0": ex.svh_g, "s1": ex.svh_u, "s2": ex.suh_d, "out": s.xd, "arrivals": s.arrivals,
+             "limit": float(limit), "act_mode": act_mode} if fuse_gu else {}
     ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
                 P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], rt, ex.window, dec, pdl,
-                **({} if dec else listed))
-    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode,
-                        pdl)
+                **({} if dec else listed), **fused)
+    if not fuse_gu:
+        ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit),
+                            act_mode, pdl)
     (nt, w, sk, pf, rt), dec = dn
+    into = s.y if y is None else y
+    fuse_dn = sw.down_fuse and bool(listed) and wts is None and sk == 1 and fusable(dn, ex.k2_d)
+    fused = {"epi": EPI_DOWN, "s0": ex.svh_d, "out": into} if fuse_dn else {}
     ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
                 D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], rt, ex.window, dec, pdl,
-                **({} if dec else listed))
+                **({} if dec else listed), **fused)
     if wts is None:
-        ext.down_epilogue(s.z, pick, ex.svh_d, s.y if y is None else y, R, P, D, sk, slots, E, pdl)
+        if not fuse_dn:
+            ext.down_epilogue(s.z, pick, ex.svh_d, into, R, P, D, sk, slots, E, pdl)
         return s.y[:P] if y is None else y
     if out is None:
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
@@ -324,6 +340,23 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
 
 
 Launch = tuple[tuple[int, int, int, int, int], bool]
+
+
+def scan_fits(experts: int, pairs: int) -> bool:
+    """Whether group_scan_kernel takes ``experts`` experts and ``pairs`` picks (else group_kernel groups them)."""
+
+    return experts <= SCAN_EXPERTS and pairs <= SCAN_PICKS
+
+
+def fusable(launch: Launch, k2: tuple[int, int]) -> bool:
+    """Whether a fused epilogue has an instance for ``launch`` at the rate codes ``k2`` (min, max): grouped_kernel
+    (not decode_kernel) at the prompt setting, rates up to 5 bits or 2.25 bits alone. The 2..16 instances spilled
+    registers (ptxas, sm_121), so a layer with experts above 5 bits keeps the epilogue kernels."""
+
+    (nt, w, _, pf, rt), dec = launch
+    lo, hi = k2
+    rates = (lo, hi) in ((8, 8), (RATE_WORDS + 18, RATE_WORDS + 18)) or (lo >= 2 and hi <= 10)
+    return not dec and (nt, w, pf, rt) == (8, 4, 1, 2) and rates
 
 
 def listed_tile(gu: Launch, dn: Launch) -> int:

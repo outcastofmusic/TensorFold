@@ -22,6 +22,8 @@ NARROW_ENV = "TF_FLASHNEXT_F16_NARROW"
 STACK_DIRECT_ENV = "TF_FLASHNEXT_STACK_DIRECT"
 INNER_K_ENV = "TF_FLASHNEXT_F16_INNER_K"
 MOE_DIRECT_ENV = "TF_FLASHNEXT_MOE_DIRECT"
+MOE_CHUNK_ENV = "TF_FLASHNEXT_MOE_CHUNK"
+MOE_CHUNK_WINDOW = 2048   # TF_FLASHNEXT_MOE_CHUNK: a prompt chunk's rows (exl3.PREFILL_ROWS) in one routed call
 
 
 @dataclass(frozen=True)
@@ -37,11 +39,18 @@ class Switches:
     wrote fp32 slices and summed them in a second launch, 128 rows a pair of launches.
     TF_FLASHNEXT_MOE_DIRECT: a prompt window's routed experts round their slots to bf16 straight into the MoE buffer
     (``experts.routed(y=...)``), where they wrote fp32 slots that a copy then rounded: 1,024 rows x 11 slots x 2,560
-    is 115 MB of fp32 written and read again a window and layer."""
+    is 115 MB of fp32 written and read again a window and layer.
+    TF_FLASHNEXT_MOE_CHUNK (unset: off, not yet measured on the GPU): a prompt chunk's routed experts in one call of
+    MOE_CHUNK_WINDOW rows, where two calls of MOE_WINDOW each read every expert's trellis. The 8,192-token profile
+    (19 Oct) read about 0.96 GB of expert trellis a window and layer and ran grouped_kernel at about 246 GB/s of DRAM
+    traffic. In one call an expert's member groups (about 44 rows, two groups of 32) run next to each other, so the
+    second group's weights can come from L2. Rows never depend on the window, so the bytes are the same. The routed
+    scratch doubles: 478 to 955 MB at Flash Next's shape."""
 
     stack_direct: bool = True
     inner_k: bool = False
     moe_direct: bool = True
+    moe_chunk: bool = False
 
 
 _current = Switches()
@@ -51,7 +60,7 @@ def read() -> Switches:
     """Every switch from the environment; a value outside env_flags' set raises before any weight is read."""
 
     return Switches(stack_direct=flag(STACK_DIRECT_ENV, True), inner_k=flag(INNER_K_ENV, False),
-                    moe_direct=flag(MOE_DIRECT_ENV, True))
+                    moe_direct=flag(MOE_DIRECT_ENV, True), moe_chunk=flag(MOE_CHUNK_ENV, False))
 
 
 def use(switches: Switches) -> Switches:
@@ -64,6 +73,12 @@ def use(switches: Switches) -> Switches:
 
 def current() -> Switches:
     return _current
+
+
+def moe_window() -> int:
+    """Most rows a prompt's routed-expert call takes: MOE_CHUNK_WINDOW with TF_FLASHNEXT_MOE_CHUNK, else MOE_WINDOW."""
+
+    return MOE_CHUNK_WINDOW if _current.moe_chunk else MOE_WINDOW
 
 
 def f16_narrow() -> bool:
@@ -88,7 +103,7 @@ class Scratch:
 
     def allocate(self, device, *, experts: x3experts.Exl3RoutedExperts, rows: int, ple_words: int, ple_heads: int,
                  ple_dim: int) -> None:
-        """Size the buffers for the model's matrices, routed windows of ``MOE_WINDOW`` rows and n-gram rows for ``rows``."""
+        """Size the buffers for the model's matrices, routed windows of ``moe_window()`` rows, n-gram rows for ``rows``."""
 
         xh = z = tmp = part = 1
         for u in self.users:
@@ -104,7 +119,7 @@ class Scratch:
         self.z = torch.empty((z,), dtype=torch.float32, device=device)
         self.tmp = torch.empty((tmp,), dtype=torch.bfloat16, device=device)
         self.part = torch.empty((part,), dtype=torch.float32, device=device)
-        self.moe = x3experts.Scratch(experts, MOE_WINDOW, self.slots, device=device)
+        self.moe = x3experts.Scratch(experts, moe_window(), self.slots, device=device)
         if ple_words:
             pin = torch.cuda.is_available()
             self.ple_host = torch.zeros((rows * ple_heads, ple_words), dtype=torch.int16, pin_memory=pin)
@@ -114,7 +129,8 @@ class Scratch:
     def nbytes(self) -> int:
         own = [self.xh, self.z, self.tmp, self.part, self.ple_dev, self.ple_emb]
         moe = [] if self.moe is None else [self.moe.xg, self.moe.xu, self.moe.xd, self.moe.z, self.moe.y,
-                                          self.moe.ids, self.moe.members_buf, self.moe.items_buf]
+                                          self.moe.ids, self.moe.members_buf, self.moe.items_buf,
+                                          self.moe.arrivals]
         return sum(t.numel() * t.element_size() for t in own + moe if t is not None) + self.prefill.nbytes()
 
 

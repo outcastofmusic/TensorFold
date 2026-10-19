@@ -7,6 +7,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include "epilogue.cuh"
 #include "pdl.cuh"
 
 namespace tf_exl3x {
@@ -223,6 +224,24 @@ __host__ __device__ constexpr bool k2_supported(int k2) {
     return (k2 >= 2 && k2 <= 16) || k2 == K2_QUARTER;
 }
 
+// What a program does with its sums. EPI_NONE writes them to Z for the epilogue kernels (experts.cu). The fused
+// epilogues run those kernels' arithmetic (epilogue.cuh) in grouped_kernel's listed layout at the prompt setting:
+// EPI_DOWN (one K split) takes each row's sums from shared memory and writes Y; EPI_GATEUP writes Z as before, and
+// the last of an (item, n block)'s mats x SK programs to arrive reads them back from L2 in split order and writes Xd.
+// An integer counter picks that program; the sums' order does not depend on which one it is.
+constexpr int EPI_NONE = 0, EPI_GATEUP = 1, EPI_DOWN = 2;
+
+struct Epi {
+    const half* s0 = nullptr;    // gate/up: svh_g [E, N]; down: svh_d [E, N]
+    const half* s1 = nullptr;    // gate/up: svh_u [E, N]
+    const half* s2 = nullptr;    // gate/up: suh_d [E, N]
+    void* out = nullptr;         // gate/up: Xd fp16 [P, N]; down: Y fp32 or bf16 [P, N]
+    int* arrivals = nullptr;     // gate/up: programs arrived a (item, n block), zero between launches
+    float limit = 0.f;
+    int act = 0;                 // gate/up: SwiGLU mode (gateup_epilogue_kernel's act_mode)
+    int bf16 = 0;                // down: Y is bf16
+};
+
 // Program (expert u, n block, split and member group): up to 16 * RT members times W_q over the split's K range; warps
 // added in order. A row's sums do not depend on NT, PF or RT, nor on its place among the members.
 //
@@ -231,13 +250,14 @@ __host__ __device__ constexpr bool k2_supported(int k2) {
 // leaves 31 of a typical routed expert's empty. Listed (TF_EXL3_EXPERT_ITEMS): grid (n blocks, matrices x splits,
 // items), one program a (place << 16 | member group) item group_kernel listed, so only filled groups launch, and an
 // item's n blocks run next to each other while its rows are still in L2. Each program computes the same sums.
-template <int CB, int NT, int W, int PF, int LO, int HI, int RT>
+template <int CB, int NT, int W, int PF, int LO, int HI, int RT, int EPI>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, uint32_t wmask,
-    const int* __restrict__ items, const int* __restrict__ icount) {
+    const int* __restrict__ items, const int* __restrict__ icount, const Epi epi) {
+    static_assert(EPI == EPI_NONE || NT * 16 == 128, "a fused epilogue takes one 128-wide Hadamard block a program");
     tf_exl3_pdl::grid_wait();
     int u, mtile, zz, nb;
     if (items != nullptr) {
@@ -355,9 +375,66 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             float sum = red[0][row][col];
 #pragma unroll
             for (int w = 1; w < W; ++w) sum += red[w][row][col];
-            Z[(((size_t)mat * SK + split) * P + rr) * N + nt0 * 16 + col] = sum;
+            if constexpr (EPI == EPI_DOWN)
+                red[0][row][col] = sum;                   // only this thread reads this place
+            else
+                Z[(((size_t)mat * SK + split) * P + rr) * N + nt0 * 16 + col] = sum;
         }
         __syncthreads();
+        if constexpr (EPI == EPI_DOWN) {
+            // down_epilogue_kernel's arithmetic on this row tile: one warp a row, a lane's 4 columns
+            const int n = nt0 * 16 + 4 * lane;
+            for (int row = warp; row < 16; row += W) {
+                const int p = rows_sh[16 * r + row];
+                if (p < 0) continue;
+                float v[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    float s = 0.f;
+                    s += red[0][row][4 * lane + j];           // SK = 1: the loop over splits from zero
+                    v[j] = s;
+                }
+                if (epi.bf16)
+                    down_tail(v, lane, epi.s0 + (size_t)e * N + n,
+                              reinterpret_cast<__nv_bfloat16*>(epi.out) + (size_t)p * N + n);
+                else
+                    down_tail(v, lane, epi.s0 + (size_t)e * N + n,
+                              reinterpret_cast<float*>(epi.out) + (size_t)p * N + n);
+            }
+            __syncthreads();
+        }
+    }
+    if constexpr (EPI == EPI_GATEUP) {
+        // the threadFenceReduction pattern: every program's Z is visible GPU-wide before its arrival counts
+        __shared__ bool last;
+        __threadfence();
+        __syncthreads();
+        int* arrivals = epi.arrivals + (size_t)blockIdx.z * gridDim.x + blockIdx.x;
+        if (threadIdx.x == 0) last = atomicAdd(arrivals, 1) == 2 * SK - 1;
+        __syncthreads();
+        if (!last) return;
+        __threadfence();
+        if (threadIdx.x == 0) *arrivals = 0;          // every program of this (item, n block) has counted
+        // gateup_epilogue_kernel's arithmetic on the group's rows: one warp a row, a lane's 4 columns
+        const int n = nt0 * 16 + 4 * lane;
+        for (int row = warp; row < 16 * RT; row += W) {
+            const int p = rows_sh[row];
+            if (p < 0) continue;
+            float gv[4], uv[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float sg = 0.f, su = 0.f;
+                for (int s = 0; s < SK; ++s) {
+                    sg += __ldcg(Z + ((size_t)(0 * SK + s) * P + p) * N + n + j);
+                    su += __ldcg(Z + ((size_t)(1 * SK + s) * P + p) * N + n + j);
+                }
+                gv[j] = sg;
+                uv[j] = su;
+            }
+            gateup_tail(gv, uv, lane, epi.s0 + (size_t)e * N + n, epi.s1 + (size_t)e * N + n,
+                        epi.s2 + (size_t)e * N + n, reinterpret_cast<half*>(epi.out) + (size_t)p * N + n, epi.limit,
+                        epi.act);
+        }
     }
 }
 
@@ -586,6 +663,8 @@ struct GroupedArgs {
     const int* items = nullptr;    // grouped_kernel's listed layout: group_kernel's items, their count, the list's size
     const int* icount = nullptr;
     int nitems = 0;
+    int epi = EPI_NONE;            // a fused epilogue (listed layout, prompt setting) and its arguments
+    Epi ep;
 };
 
 template <int CB>
@@ -597,14 +676,35 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     TORCH_CHECK(a.hi <= 16 || a.lo == a.hi, "a rate between ExLlamaV3's widths must be its layer's only rate");
     TORCH_CHECK(!a.items || (a.icount && a.nitems > 0 && a.nitems <= 65535), "listed: an item list of 1 to 65,535");
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
-    tf_exl3_pdl::launch(grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, TF_RT>, grid, dim3(W_ * 32), 0, stream, a.pdl, \
-                        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, \
-                        a.SK, a.maxm, a.slots, a.wmask, a.items, a.icount)
+    tf_exl3_pdl::launch(grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, TF_RT, EPI_NONE>, grid, dim3(W_ * 32), 0,      \
+                        stream, a.pdl, a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, \
+                        a.K, a.N, a.P, a.SK, a.maxm, a.slots, a.wmask, a.items, a.icount, Epi{})
 #define TF_RANGES(NT_, W_, PF_)                                                                                 \
     if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
     else if (a.lo == K2_QUARTER && a.hi == K2_QUARTER) TF_LAUNCH(NT_, W_, PF_, K2_QUARTER, K2_QUARTER);         \
     else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10);                                           \
     else TF_LAUNCH(NT_, W_, PF_, 2, 16);
+    if (a.epi != EPI_NONE) {
+        // the prompt setting alone: 8 n tiles (one Hadamard block), 4 warps, 1 tile in flight, 2 row tiles
+        TORCH_CHECK(a.items && a.rt == 2 && a.nt == 8 && a.warps == 4 && a.pf == 1,
+                    "a fused epilogue runs on the listed layout at the prompt setting");
+        TORCH_CHECK(a.epi == EPI_GATEUP ? a.mats == 2 : (a.epi == EPI_DOWN && a.mats == 1 && a.SK == 1),
+                    "fused epilogues: gate/up (2 matrices) or down (1 matrix, 1 split)");
+#define TF_EPI_LAUNCH(EPI_, LO_, HI_)                                                                           \
+    tf_exl3_pdl::launch(grouped_kernel<CB, 8, 4, 1, LO_, HI_, 2, EPI_>, grid, dim3(128), 0, stream, a.pdl,         \
+                        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, \
+                        a.SK, a.maxm, a.slots, a.wmask, a.items, a.icount, a.ep)
+#define TF_EPI_RANGES(EPI_)                                                                                     \
+    if (a.lo == 8 && a.hi == 8) TF_EPI_LAUNCH(EPI_, 8, 8);                                                      \
+    else if (a.lo == K2_QUARTER && a.hi == K2_QUARTER) TF_EPI_LAUNCH(EPI_, K2_QUARTER, K2_QUARTER);             \
+    else if (a.lo >= 2 && a.hi <= 10) TF_EPI_LAUNCH(EPI_, 2, 10);                                               \
+    else TORCH_CHECK(false, "fused epilogues take rates up to 5 bits or 2.25 bits (rates 2..16 spill registers)");
+        if (a.epi == EPI_GATEUP) { TF_EPI_RANGES(EPI_GATEUP) }
+        else { TF_EPI_RANGES(EPI_DOWN) }
+#undef TF_EPI_RANGES
+#undef TF_EPI_LAUNCH
+        return;
+    }
 #define TF_RT 1
     if (a.rt == 1 && a.nt == 8 && a.warps == 4 && a.pf == 1) { TF_RANGES(8, 4, 1) }
     else if (a.rt == 1 && a.nt == 8 && a.warps == 4 && a.pf == 2) { TF_RANGES(8, 4, 2) }

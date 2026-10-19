@@ -10,7 +10,9 @@
 
 namespace {
 
-constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
+using tf_exl3x::HAD_SCALE;
+using tf_exl3x::bf16r;
+using tf_exl3x::fwht128;
 
 // Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.
 // With ``items`` it also lists the work of grouped_kernel's listed layout: (place << 16 | row tile) for each tile of
@@ -118,17 +120,93 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
     }
 }
 
-// Walsh-Hadamard transform of 128 values, 4 a lane, fixed butterfly order (strides 1, 2 in registers, 4..64 across lanes).
-__device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
-    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
-    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
-#pragma unroll
-    for (int m = 1; m < 32; m <<= 1) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
-            v[j] = (lane & m) ? o - v[j] : v[j] + o;
+// group_kernel's outputs (the same uids, ucount, members, items and icount) by a count, a scan and a stable scatter
+// (TF_EXL3_GROUP_SCAN). group_kernel's threads each scan every pick once an expert they hold: on a 1,024-row window
+// of Flash Next (11,264 picks, 513 experts) 129 threads of one block ran 2.3 ms. Here every block counts all picks
+// (warps merge equal experts with match_any) and scans the counts to the places in id order; block b then owns
+// experts [b * per, (b + 1) * per): their ids, items and members. Members come out in pick order because the picks
+// go in rounds of 1,024 in order: a pick's rank is the expert's count before the round, plus its count in earlier
+// warps of the round, plus its lanes below in its warp. Expert e is thread e of each block, so E <= 1,024.
+constexpr int SCAN_THREADS = 1024;
+constexpr int SCAN_BLOCKS = 8;
+
+__global__ void __launch_bounds__(SCAN_THREADS) group_scan_kernel(const int* __restrict__ pick,
+                                                                   int* __restrict__ uids, int* __restrict__ ucount,
+                                                                   int* __restrict__ members, int R, int slots, int E,
+                                                                   int maxm, int* __restrict__ items,
+                                                                   int* __restrict__ icount, int tile) {
+    extern __shared__ int sh_scan[];
+    int* cnt = sh_scan;                                               // [E] picks an expert
+    int* place = sh_scan + E;                                         // [E] place, -1 if unused
+    unsigned short* at = reinterpret_cast<unsigned short*>(sh_scan + 2 * E);   // [32][E] a round's warp counts/offsets
+    __shared__ int used_tot[SCAN_THREADS / 32];
+    __shared__ int item_tot[SCAN_THREADS / 32];
+    __shared__ int totals[2];
+    tf_exl3_pdl::grid_wait();
+    tf_exl3_pdl::grid_launch();
+    const int n = R * slots, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const unsigned below = (1u << lane) - 1u;
+    if (tid < E) cnt[tid] = 0;
+    for (int i = tid; i < 32 * E; i += SCAN_THREADS) at[i] = 0;
+    __syncthreads();
+    for (int i0 = 0; i0 < n; i0 += SCAN_THREADS) {                   // every lane takes every round (match_any)
+        const int i = i0 + tid;
+        const int v = i < n ? pick[i] : -1;
+        const int key = v >= 0 && v < E ? v : -1;
+        const unsigned peers = __match_any_sync(0xffffffffu, key);
+        if (key >= 0 && (peers & below) == 0) atomicAdd(&cnt[key], __popc(peers));
+    }
+    __syncthreads();
+    const int e = tid;
+    const int c = e < E ? cnt[e] : 0;
+    const int mc = min(c, maxm);
+    const int pl = block_scan(c > 0, used_tot, &totals[0]);
+    const int it0 = block_scan(items != nullptr && c > 0 ? (mc + tile - 1) / tile : 0, item_tot, &totals[1]);
+    if (e < E) place[e] = c > 0 ? pl : -1;
+    const int per = (E + gridDim.x - 1) / gridDim.x, e0 = blockIdx.x * per, e1 = min(E, e0 + per);
+    const bool own = e >= e0 && e < e1;
+    if (own && c > 0) {
+        uids[pl] = e;
+        if (items != nullptr)
+            for (int t = 0; t * tile < mc; ++t) items[it0 + t] = (pl << 16) | t;
+    }
+    if (blockIdx.x == 0 && tid == 0) {
+        ucount[0] = totals[0];
+        if (items != nullptr) icount[0] = totals[1];
+    }
+    __syncthreads();
+    // the owned places' members past their count: -1
+    for (int f = tid; f < (e1 - e0) * maxm; f += SCAN_THREADS) {
+        const int q = e0 + f / maxm, j = f % maxm;
+        if (place[q] >= 0 && j >= min(cnt[q], maxm)) members[(size_t)place[q] * maxm + j] = -1;
+    }
+    // the owned experts' picks, rank by rank
+    int run = 0;                                                      // thread e: e's picks before this round
+    for (int i0 = 0; i0 < n; i0 += SCAN_THREADS) {
+        const int i = i0 + tid;
+        const int v = i < n ? pick[i] : -1;
+        const int key = v >= e0 && v < e1 ? v : -1;
+        const unsigned peers = __match_any_sync(0xffffffffu, key);
+        const bool leader = key >= 0 && (peers & below) == 0;
+        if (leader) at[warp * E + key] = (unsigned short)__popc(peers);
+        __syncthreads();
+        if (own) {                                                    // counts -> offsets, warps in order
+            int r = run;
+            for (int w = 0; w < 32; ++w) {
+                const int k = at[w * E + e];
+                if (k) at[w * E + e] = (unsigned short)r;             // a warp without e keeps its zero
+                r += k;
+            }
+            run = r;
         }
+        __syncthreads();
+        if (key >= 0) {
+            const int j = at[warp * E + key] + __popc(peers & below);
+            if (j < maxm) members[(size_t)place[key] * maxm + j] = (i / slots) * 32 + (i % slots);
+        }
+        __syncwarp();
+        if (leader) at[warp * E + key] = 0;                           // the next round's empty warps read zero
+        __syncthreads();
     }
 }
 
@@ -159,8 +237,6 @@ __global__ void rot_in_kernel(const TIN* __restrict__ x, int x_stride, const int
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
 
-__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
-
 // Program (member row, 128-block of the width): splits summed in order, rotated, * svh, SwiGLU (0: GLM's bf16 roundings, 1: fp32), then Xd = fp16((act * suh_d) @ H).
 __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                        const half* __restrict__ svh_g, const half* __restrict__ svh_u,
@@ -184,6 +260,8 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
         gv[j] = sg;
         uv[j] = su;
     }
+    // the arithmetic of tf_exl3x::gateup_tail (epilogue.cuh), kept inline: through the call this kernel's SASS
+    // schedules two independent shuffle/add pairs in another order (the same operations, so the same bits)
     fwht128(gv, lane);
     fwht128(uv, lane);
     float v[4];
@@ -208,9 +286,6 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
 
-__device__ __forceinline__ void put(float* o, float v) { *o = v; }
-__device__ __forceinline__ void put(__nv_bfloat16* o, float v) { *o = __float2bfloat16_rn(v); }
-
 // Program (member row, 128-block of the model width): Y = (splits summed in order) @ H * svh_d, fp32, or rounded to
 // bf16 once as a copy of the fp32 Y into a bf16 tensor rounds it (a prompt's MoE buffer, TF_FLASHNEXT_MOE_DIRECT).
 template <typename TO>
@@ -230,10 +305,7 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
         for (int k = 0; k < SK; ++k) s += Z[((size_t)k * P + p) * D + n + j];
         v[j] = s;
     }
-    fwht128(v, lane);
-    TO* o = y + (size_t)p * D + n;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) put(o + j, v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]));
+    tf_exl3x::down_tail(v, lane, svh_d + (size_t)e * D + n, y + (size_t)p * D + n);
 }
 
 // out[r][d] = sum over slots in order of wts[r][k] * y[r * slots + k][d] (fp32, fma chain from 0).
@@ -316,7 +388,8 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
                         int64_t hi, int64_t rt, int64_t wmask, bool decode, bool pdl, const int* items,
-                        const int* icount, int64_t nitems) {
+                        const int* icount, int64_t nitems, int64_t epi, const void* s0, const void* s1,
+                        const void* s2, void* out, int* arrivals, double limit, int64_t act, bool bf16) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
@@ -338,6 +411,16 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.items = items;
     a.icount = icount;
     a.nitems = (int)nitems;
+    a.epi = (int)epi;
+    a.ep.s0 = static_cast<const half*>(s0);
+    a.ep.s1 = static_cast<const half*>(s1);
+    a.ep.s2 = static_cast<const half*>(s2);
+    a.ep.out = out;
+    a.ep.arrivals = arrivals;
+    a.ep.limit = (float)limit;
+    a.ep.act = (int)act;
+    a.ep.bf16 = bf16;
+    TORCH_CHECK(!(decode && epi), "decode_kernel has no fused epilogue");
     auto stream = at::cuda::getCurrentCUDAStream();
     TORCH_CHECK(cb >= 0 && cb <= 2, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
     if (decode) {
@@ -380,6 +463,34 @@ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucou
             C10_CUDA_CHECK(cudaFuncSetAttribute(group_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)limit));
     }
     tf_exl3_pdl::launch(group_kernel, dim3(1), dim3(GROUP_THREADS), smem, at::cuda::getCurrentCUDAStream(),
+                        tf_exl3_pdl::enabled(pdl), static_cast<const int*>(pick.data_ptr<int>()), uids.data_ptr<int>(),
+                        ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R, (int)slots, (int)E,
+                        (int)members.size(1), items, icount, (int)tile);
+}
+
+// group_scan_kernel's dynamic shared memory: counts and places (int), and 32 warps' offsets (uint16) an expert.
+static size_t scan_smem(int64_t E) { return (size_t)E * (2 * sizeof(int) + 32 * sizeof(unsigned short)); }
+
+void exl3x_group_scan_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucount, at::Tensor& members,
+                           int64_t R, int64_t slots, int64_t E, bool pdl, int* items, int* icount, int64_t tile) {
+    TORCH_CHECK(E >= 1 && E <= SCAN_THREADS, "the scan grouping holds at most ", SCAN_THREADS, " experts");
+    TORCH_CHECK(R * slots < 65536, "the scan grouping ranks at most 65,535 picks");
+    TORCH_CHECK(slots <= 32, "at most 32 slots a row");
+    const size_t smem = scan_smem(E);
+    if (smem > 48 * 1024) {
+        // raise only, to the device's ceiling (playbook 6.5): a smaller size never lowers what a larger one set
+        cudaFuncAttributes attributes;
+        C10_CUDA_CHECK(cudaFuncGetAttributes(&attributes, group_scan_kernel));
+        const auto* device = at::cuda::getCurrentDeviceProperties();
+        const size_t limit = device->sharedMemPerBlockOptin - attributes.sharedSizeBytes;
+        TORCH_CHECK(smem <= limit, "EXL3 scan grouping needs ", smem, " dynamic shared-memory bytes; this GPU allows ",
+                    limit, " after the kernel's static storage");
+        if (smem > (size_t)attributes.maxDynamicSharedSizeBytes)
+            C10_CUDA_CHECK(cudaFuncSetAttribute(group_scan_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                (int)limit));
+    }
+    const unsigned blocks = (unsigned)std::min<int64_t>(SCAN_BLOCKS, E);
+    tf_exl3_pdl::launch(group_scan_kernel, dim3(blocks), dim3(SCAN_THREADS), smem, at::cuda::getCurrentCUDAStream(),
                         tf_exl3_pdl::enabled(pdl), static_cast<const int*>(pick.data_ptr<int>()), uids.data_ptr<int>(),
                         ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R, (int)slots, (int)E,
                         (int)members.size(1), items, icount, (int)tile);

@@ -171,7 +171,7 @@ def test_the_listed_layout_keeps_grouped_kernels_footprint():
     """Flash Next's instances (mul1, rates 2..10) at the decode setting (1 row tile) and the prompt one (2): no spill,
     and the prompt instance's 2 blocks an SM (GB10: 64K registers) and 33 KB of shared memory, as before."""
 
-    built = _ptxas(["grouped_kernel<2, 8, 4, 1, 2, 10, 1>", "grouped_kernel<2, 8, 4, 1, 2, 10, 2>"])
+    built = _ptxas(["grouped_kernel<2, 8, 4, 1, 2, 10, 1, 0>", "grouped_kernel<2, 8, 4, 1, 2, 10, 2, 0>"])
     got = {k: v for k, v in built.items() if "grouped_kernel" in k}
     assert len(got) == 2
     for name, (regs, smem, spills) in got.items():

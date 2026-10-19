@@ -29,7 +29,9 @@ def admission(geometry):
 
     from tensorfold.cuda.geometry import PREFILL_ROWS, exl3_indexed_scratch, with_fixed
 
-    return lambda text: with_fixed(geometry(text), exl3_indexed_scratch(text, MOE_WINDOW, PREFILL_ROWS))
+    from .exl3_mm import moe_window
+
+    return lambda text: with_fixed(geometry(text), exl3_indexed_scratch(text, moe_window(), PREFILL_ROWS))
 
 
 class Pack:

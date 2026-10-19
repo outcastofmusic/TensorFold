@@ -114,8 +114,10 @@ class FlashNextEngine:
         self.prompt_tile, self.shared_decode = tile_mode(), shared_decode()
         self.hc_fuse = hc_fuse()                         # TF_FLASHNEXT_HC_FUSE: every HC's prompt fusions
         self.f16_narrow = f16_narrow()                   # TF_FLASHNEXT_F16_NARROW: an EXL3 pack's fp16 decode tiles
-        exl3_switches.use(exl3_switches.read())        # TF_EXL3_EXPERT_DECODE, _PDL, _EXPERT_ITEMS: the EXL3 kernels
-        exl3_mm.use(exl3_mm.read())                    # TF_FLASHNEXT_STACK_DIRECT, _F16_INNER_K, _MOE_DIRECT
+        # TF_EXL3_EXPERT_DECODE, _PDL, _EXPERT_ITEMS, _GROUP_SCAN, _DOWN_FUSE, _GATEUP_FUSE: the EXL3 kernels
+        exl3_switches.use(exl3_switches.read())
+        # TF_FLASHNEXT_STACK_DIRECT, _F16_INNER_K, _MOE_DIRECT, _MOE_CHUNK (before admission: it sizes the scratch)
+        exl3_mm.use(exl3_mm.read())
         exl3 = is_exl3(model_dir)
         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU: drop --tp "
