@@ -79,7 +79,9 @@ def _launch(rows, slots=SLOTS, device="cuda"):
 
 
 def test_device_limit_allows_more_than_a_hardcoded_96_kib_when_available():
-    limit = torch.cuda.get_device_properties(0).shared_memory_per_block_optin - 128
+    # 1 KiB for the kernel's static storage: 256 B since fba05ef2's grouping changes (the guard refused by 112 B on
+    # GB10, 19 Oct); the check is that the device limit, not a hard-coded 96 KiB, bounds the launch
+    limit = torch.cuda.get_device_properties(0).shared_memory_per_block_optin - 1024
     rows = limit // (SLOTS * 4)
     if rows * SLOTS * 4 <= 96 * 1024:
         pytest.skip("this device has no grouping launch between 96 KiB and its opt-in limit")
