@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 
 from . import format as fmt
+from . import switches
 
 CODEBOOK_IDS = {"3inst": 0, "mcg": 1, "mul1": 2}
 
@@ -18,7 +19,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_linear_v3", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
+    return load(name="tensorfold_exl3_linear_v4", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                 verbose=False)
 
@@ -179,9 +180,10 @@ class Exl3Linear:
             z = torch.empty((sk * m * self.n,), dtype=torch.float32, device=x.device)
         sk_stride, nb_stride = self.strides
         ext = _ext()
-        ext.rot_in(x, self.suh, xh)
+        pdl = switches.current().pdl              # TF_EXL3_PDL
+        ext.rot_in(x, self.suh, xh, pdl)
         ext.linear(xh, self.words, sk_stride, nb_stride, self.svh, self.bias, out, z if sk > 1 else None,
-                   self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk)
+                   self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk, pdl)
         return out
 
     def unpack(self, out: torch.Tensor | None = None) -> torch.Tensor:

@@ -181,6 +181,9 @@ class GlmEngine:
                  calibrate: bool = True) -> None:
         """Defaults preserve TP2. Target-only skips all draft work; eager never captures or calibrates."""
 
+        from tensorfold.cuda.exl3 import switches as exl3_switches
+
+        exl3_switches.use(exl3_switches.read())        # TF_EXL3_EXPERT_DECODE and TF_EXL3_PDL, before any read
         from .split import require_full_checkpoint, validate_world
         if comm is not None:
             world = getattr(comm, "world", world)        # a test communicator names its own rank count

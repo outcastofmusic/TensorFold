@@ -21,6 +21,8 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
                                                               int R, int slots, int E, int maxm) {
     extern __shared__ int sh_pick[];
     __shared__ int warp_tot[GROUP_THREADS / 32];
+    tf_exl3_pdl::grid_wait();
+    tf_exl3_pdl::grid_launch();
     const int n = R * slots;
     for (int i = threadIdx.x; i < n; i += GROUP_THREADS) sh_pick[i] = pick[i];
     __syncthreads();
@@ -96,6 +98,8 @@ __global__ void rot_in_kernel(const TIN* __restrict__ x, int x_stride, const int
                               half* __restrict__ out1, int K, int slots, int E) {
     const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
     const int row = p / slots;
+    tf_exl3_pdl::grid_wait();
+    tf_exl3_pdl::grid_launch();
     const int e = pick[p];
     if (e < 0 || e >= E) return;
     const int lane = threadIdx.x;
@@ -118,6 +122,8 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
                                        const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N, int SK,
                                        int E, float limit, int act_mode) {
     const int p = blockIdx.x, blk = blockIdx.y;
+    tf_exl3_pdl::grid_wait();
+    tf_exl3_pdl::grid_launch();
     const int e = pick[p];
     if (e < 0 || e >= E) return;
     const int lane = threadIdx.x;
@@ -162,6 +168,7 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
                                      const half* __restrict__ svh_d, float* __restrict__ y, int P, int D, int SK,
                                      int E) {
     const int p = blockIdx.x, blk = blockIdx.y;
+    tf_exl3_pdl::grid_wait();
     const int e = pick[p];
     if (e < 0 || e >= E) return;
     const int lane = threadIdx.x;
@@ -184,6 +191,7 @@ __global__ void combine_kernel(const float* __restrict__ y, const float* __restr
                                int D, int slots) {
     const int r = blockIdx.x;
     const int d = blockIdx.y * blockDim.x + threadIdx.x;
+    tf_exl3_pdl::grid_wait();
     if (d >= D) return;
     float acc = 0.f;
     for (int k = 0; k < slots; ++k) acc = fmaf(wts[r * slots + k], y[((size_t)r * slots + k) * D + d], acc);
@@ -200,6 +208,7 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
     const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int n = blk * 128 + 4 * lane;
     const int p = r * slots + k;
+    tf_exl3_pdl::grid_wait();
     const int e = pick[p];
     float o[4];
     if (e >= 0 && e < E) {
@@ -244,6 +253,9 @@ namespace tf_exl3x {
 extern template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<1>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<2>(const GroupedArgs&, cudaStream_t);
+extern template void decode_launch<0>(const GroupedArgs&, cudaStream_t);
+extern template void decode_launch<1>(const GroupedArgs&, cudaStream_t);
+extern template void decode_launch<2>(const GroupedArgs&, cudaStream_t);
 extern template void dequant_launch<0>(const uint32_t*, half*, int, int, int, uint32_t, cudaStream_t);
 extern template void dequant_launch<1>(const uint32_t*, half*, int, int, int, uint32_t, cudaStream_t);
 extern template void dequant_launch<2>(const uint32_t*, half*, int, int, int, uint32_t, cudaStream_t);
@@ -253,7 +265,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
                         const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
-                        int64_t hi, int64_t rt, int64_t wmask) {
+                        int64_t hi, int64_t rt, int64_t wmask, bool decode, bool pdl) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
@@ -271,11 +283,18 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
     a.rt = (int)rt;
     a.wmask = (uint32_t)wmask;
+    a.pdl = tf_exl3_pdl::enabled(pdl);
     auto stream = at::cuda::getCurrentCUDAStream();
-    if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
-    else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
-    else if (cb == 2) tf_exl3x::grouped_launch<2>(a, stream);
-    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    TORCH_CHECK(cb >= 0 && cb <= 2, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    if (decode) {
+        if (cb == 0) tf_exl3x::decode_launch<0>(a, stream);
+        else if (cb == 1) tf_exl3x::decode_launch<1>(a, stream);
+        else tf_exl3x::decode_launch<2>(a, stream);
+    } else {
+        if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
+        else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
+        else tf_exl3x::grouped_launch<2>(a, stream);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -291,7 +310,7 @@ void exl3x_dequant_cuda(const at::Tensor& T, at::Tensor& out, int64_t K, int64_t
 }
 
 void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucount, at::Tensor& members, int64_t R,
-                      int64_t slots, int64_t E) {
+                      int64_t slots, int64_t E, bool pdl) {
     TORCH_CHECK(E <= GROUP_THREADS * GROUP_PER_THREAD, "too many experts for the grouping kernel");
     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
     const size_t smem = (size_t)R * slots * sizeof(int);
@@ -306,69 +325,71 @@ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucou
         if (smem > (size_t)attributes.maxDynamicSharedSizeBytes)
             C10_CUDA_CHECK(cudaFuncSetAttribute(group_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)limit));
     }
-    group_kernel<<<1, GROUP_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
-        pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R,
-        (int)slots, (int)E, (int)members.size(1));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    tf_exl3_pdl::launch(group_kernel, dim3(1), dim3(GROUP_THREADS), smem, at::cuda::getCurrentCUDAStream(),
+                        tf_exl3_pdl::enabled(pdl), static_cast<const int*>(pick.data_ptr<int>()), uids.data_ptr<int>(),
+                        ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R, (int)slots, (int)E,
+                        (int)members.size(1));
 }
 
 void exl3x_rot_in_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
                        const at::Tensor& suh1, at::Tensor& out0, at::Tensor& out1, int64_t rows, int64_t K,
-                       int64_t slots, int64_t E) {
+                       int64_t slots, int64_t E, bool pdl) {
     dim3 grid((unsigned)(rows * slots), (unsigned)(K / 128), 2);
     auto stream = at::cuda::getCurrentCUDAStream();
+    const bool early = tf_exl3_pdl::enabled(pdl);
     auto s0 = reinterpret_cast<const half*>(suh0.data_ptr());
     auto s1 = reinterpret_cast<const half*>(suh1.data_ptr());
     auto o0 = reinterpret_cast<half*>(out0.data_ptr());
     auto o1 = reinterpret_cast<half*>(out1.data_ptr());
+    const int* pk = pick.data_ptr<int>();
     if (x.scalar_type() == at::kBFloat16)
-        rot_in_kernel<__nv_bfloat16><<<grid, 32, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
-                                                              (int)x_stride, pick.data_ptr<int>(), s0, s1, o0, o1,
-                                                              (int)K, (int)slots, (int)E);
+        tf_exl3_pdl::launch(rot_in_kernel<__nv_bfloat16>, grid, dim3(32), 0, stream, early,
+                            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride, pk, s0, s1, o0, o1,
+                            (int)K, (int)slots, (int)E);
     else
-        rot_in_kernel<half><<<grid, 32, 0, stream>>>(reinterpret_cast<const half*>(x.data_ptr()), (int)x_stride,
-                                                     pick.data_ptr<int>(), s0, s1, o0, o1, (int)K, (int)slots,
-                                                     (int)E);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        tf_exl3_pdl::launch(rot_in_kernel<half>, grid, dim3(32), 0, stream, early,
+                            reinterpret_cast<const half*>(x.data_ptr()), (int)x_stride, pk, s0, s1, o0, o1, (int)K,
+                            (int)slots, (int)E);
 }
 
 void exl3x_gateup_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_g,
                                 const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor& xd, int64_t rows,
                                 int64_t P, int64_t N, int64_t SK, int64_t slots, int64_t E, double limit,
-                                int64_t act_mode) {
+                                int64_t act_mode, bool pdl) {
     dim3 grid((unsigned)(rows * slots), (unsigned)(N / 128));
-    gateup_epilogue_kernel<<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
-        Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_g.data_ptr()),
-        reinterpret_cast<const half*>(svh_u.data_ptr()), reinterpret_cast<const half*>(suh_d.data_ptr()),
-        reinterpret_cast<half*>(xd.data_ptr()), (int)P, (int)N, (int)SK, (int)E, (float)limit, (int)act_mode);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    tf_exl3_pdl::launch(gateup_epilogue_kernel, grid, dim3(32), 0, at::cuda::getCurrentCUDAStream(),
+                        tf_exl3_pdl::enabled(pdl), static_cast<const float*>(Z.data_ptr<float>()),
+                        static_cast<const int*>(pick.data_ptr<int>()), reinterpret_cast<const half*>(svh_g.data_ptr()),
+                        reinterpret_cast<const half*>(svh_u.data_ptr()), reinterpret_cast<const half*>(suh_d.data_ptr()),
+                        reinterpret_cast<half*>(xd.data_ptr()), (int)P, (int)N, (int)SK, (int)E, (float)limit,
+                        (int)act_mode);
 }
 
 void exl3x_down_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, at::Tensor& y,
-                              int64_t rows, int64_t P, int64_t D, int64_t SK, int64_t slots, int64_t E) {
+                              int64_t rows, int64_t P, int64_t D, int64_t SK, int64_t slots, int64_t E, bool pdl) {
     dim3 grid((unsigned)(rows * slots), (unsigned)(D / 128));
-    down_epilogue_kernel<<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
-        Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_d.data_ptr()),
-        y.data_ptr<float>(), (int)P, (int)D, (int)SK, (int)E);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    tf_exl3_pdl::launch(down_epilogue_kernel, grid, dim3(32), 0, at::cuda::getCurrentCUDAStream(),
+                        tf_exl3_pdl::enabled(pdl), static_cast<const float*>(Z.data_ptr<float>()),
+                        static_cast<const int*>(pick.data_ptr<int>()), reinterpret_cast<const half*>(svh_d.data_ptr()),
+                        y.data_ptr<float>(), (int)P, (int)D, (int)SK, (int)E);
 }
 
 void exl3x_combine_cuda(const at::Tensor& y, const at::Tensor& wts, at::Tensor& out, int64_t rows, int64_t D,
-                        int64_t slots) {
+                        int64_t slots, bool pdl) {
     dim3 grid((unsigned)rows, (unsigned)((D + 255) / 256));
-    combine_kernel<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(y.data_ptr<float>(), wts.data_ptr<float>(),
-                                                                        out.data_ptr<float>(), (int)D, (int)slots);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    tf_exl3_pdl::launch(combine_kernel, grid, dim3(256), 0, at::cuda::getCurrentCUDAStream(),
+                        tf_exl3_pdl::enabled(pdl), static_cast<const float*>(y.data_ptr<float>()),
+                        static_cast<const float*>(wts.data_ptr<float>()), out.data_ptr<float>(), (int)D, (int)slots);
 }
 
 void exl3x_down_combine_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, at::Tensor& y,
                              const at::Tensor& wts, at::Tensor& out, int64_t rows, int64_t P, int64_t D, int64_t SK,
-                             int64_t slots, int64_t E) {
+                             int64_t slots, int64_t E, bool pdl) {
     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
     dim3 grid((unsigned)rows, (unsigned)(D / 128));
-    down_combine_kernel<<<grid, (unsigned)(32 * slots), 0, at::cuda::getCurrentCUDAStream()>>>(
-        Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_d.data_ptr()),
-        y.data_ptr<float>(), wts.data_ptr<float>(), out.data_ptr<float>(), (int)P, (int)D, (int)SK, (int)E,
-        (int)slots);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    tf_exl3_pdl::launch(down_combine_kernel, grid, dim3((unsigned)(32 * slots)), 0, at::cuda::getCurrentCUDAStream(),
+                        tf_exl3_pdl::enabled(pdl), static_cast<const float*>(Z.data_ptr<float>()),
+                        static_cast<const int*>(pick.data_ptr<int>()), reinterpret_cast<const half*>(svh_d.data_ptr()),
+                        y.data_ptr<float>(), static_cast<const float*>(wts.data_ptr<float>()), out.data_ptr<float>(),
+                        (int)P, (int)D, (int)SK, (int)E, (int)slots);
 }
