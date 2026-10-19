@@ -281,7 +281,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
 
     ``prompt`` (default: more than PROMPT_ROWS rows) reads each expert once for 32 of its rows; the values are the same.
-    With TF_EXL3_EXPERT_ITEMS (and ``group``) the grouping lists the member groups grouped_kernel's launches run.
+    With TF_EXL3_EXPERT_ITEMS (and ``group``) a prompt window's grouping lists the member groups grouped_kernel's
+    launches run.
     ``y`` (without ``wts``): a contiguous bf16 [R * slots, D] that takes the slots rounded once, as a copy of the fp32
     slots into it would round them."""
 
@@ -296,7 +297,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     pdl = sw.pdl
     many = R > PROMPT_ROWS if prompt is None else bool(prompt)
     gu, dn = plan(s.cfg_gu, s.cfg_d, I, D, R, many, sw.expert_decode)
-    tile = listed_tile(gu, dn) if group and sw.expert_items else 0
+    # prompt windows only: on decode windows the list cost about 1% decode (GPU 19 Oct, tf-runs/gpu-exl3s2 alone/)
+    tile = listed_tile(gu, dn) if group and sw.expert_items and many else 0
     listed = {"items": s.items(R, tile), "icount": s.icount} if tile else {}
     if group:
         ext.group(pick, ids, s.count, members, R, slots, E, pdl, **listed, **({"tile": tile} if tile else {}))

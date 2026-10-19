@@ -74,9 +74,8 @@ def test_grouped_kernels_launches_take_the_list_the_grouping_wrote(monkeypatch, 
     fake, s, ex = _route(monkeypatch, rows, decode, items)
     names = [n for n, _ in fake.calls]
     assert names == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
-    on_decode = decode and rows <= experts.DECODE_ROWS
-    tile = 16 * experts.PROMPT_TILES if rows > experts.PROMPT_ROWS else 16
-    listed = items and not on_decode
+    tile = 16 * experts.PROMPT_TILES
+    listed = items and rows > experts.PROMPT_ROWS                 # prompt windows only
     group_kw = fake.kwargs[0]
     if not listed:
         assert all(kw == {} for kw in fake.kwargs)                # the launches of before the switch
@@ -91,27 +90,19 @@ def test_grouped_kernels_launches_take_the_list_the_grouping_wrote(monkeypatch, 
         assert fake.calls[i][1][22] == tile // 16                 # row tiles a block: the list's member group
 
 
-@pytest.mark.parametrize("rows", [1, 5, 6, 16])
-def test_flash_next_gate_up_back_on_grouped_kernel_takes_the_list_and_down_on_decode_kernel_does_not(monkeypatch,
-                                                                                                    rows):
-    """DECODE_TILES keeps Flash Next gate/up (2,560 -> 640) of 6 to 16 rows on grouped_kernel while down runs on
-    decode_kernel, so the grouping lists 16-row member groups for gate/up alone."""
+@pytest.mark.parametrize("rows", [1, 5, 6, 16, 28, 64])
+def test_decode_windows_read_no_list(monkeypatch, rows):
+    """A decode window (at most PROMPT_ROWS rows) keeps the launches of before the switch: on GPU the list cost Qwen
+    EXL3 about 1% decode at MTP verify windows (19 Oct), while prompt chunks gained 1.34x."""
 
     fake = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: fake)
     switches.use(switches.Switches(expert_decode=True, pdl=True, expert_items=True))
     ex = _layer(D=2560, I=640)
-    s = experts.Scratch(ex, 32, 4, device="cpu")
+    s = experts.Scratch(ex, 64, 4, device="cpu")
     experts.routed(torch.zeros((rows, ex.dims), dtype=torch.bfloat16), torch.zeros((rows, 4), dtype=torch.int32),
                    None, ex, s, None, rows)
-    gate_up, down = fake.calls[2][1], fake.calls[4][1]
-    assert down[-2] is True and fake.kwargs[4] == {}
-    if rows <= 5:
-        assert gate_up[-2] is True and all(kw == {} for kw in fake.kwargs)
-        return
-    assert gate_up[-2] is False and fake.kwargs[2]["items"] is fake.kwargs[0]["items"]
-    assert fake.kwargs[0]["tile"] == 16
-    assert fake.kwargs[0]["items"].numel() == experts.item_bound(rows * 4, min(rows * 4, ex.count), 16)
+    assert all(kw == {} for kw in fake.kwargs)
 
 
 def test_without_grouping_no_list_is_read(monkeypatch):
