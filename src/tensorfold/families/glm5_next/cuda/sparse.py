@@ -6,10 +6,21 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorfold.env_flags import flag
+
 from tensorfold.cuda.geometry import MLA_SELECT_ROWS as SELECT_ROWS   # a prompt chunk's rows scored at once
 
 POOL = 4
 TOPK_POOLS = 512
+TOKEN_LIST_ENV = "TF_GLM_TOKEN_LIST"
+
+
+def token_list() -> bool:
+    """TF_GLM_TOKEN_LIST (unset: on): ``select_tokens`` builds each row's token list and count in one kernel
+    (``_token_list``) instead of about 13 torch ops, the same integers. The engine reads it once at startup into
+    ``Weights.meta``; a value outside env_flags' set raises."""
+
+    return flag(TOKEN_LIST_ENV, True)
 BR = 16
 
 
@@ -177,9 +188,45 @@ def pool_bucket(pos: int, R: int, np_max: int) -> int:
     return min(np_max, max(1024, 1 << (visible - 1).bit_length()))
 
 
+@triton.jit
+def _token_list(POOLS, POS, TOK, CNT, WIDTH, K: tl.constexpr, POOL: tl.constexpr, BLOCK: tl.constexpr,
+                TAIL: tl.constexpr):
+    """Program r: row r's K pools' tokens ascending, then its incomplete pool's visible tokens (-1 past them), and
+    its count (0 while the row is within the K pools); integers only, as ``select_tokens``' torch ops build them."""
+
+    r = tl.program_id(0).to(tl.int64)
+    q = tl.load(POS).to(tl.int64) + r
+    npool = (q + 1) // POOL
+    for c in tl.static_range(0, K * POOL, BLOCK):
+        i = c + tl.arange(0, BLOCK)
+        p = tl.load(POOLS + r * K + i // POOL)
+        tl.store(TOK + r * WIDTH + i, (p * POOL + i % POOL).to(tl.int32))
+    j = tl.arange(0, TAIL)
+    real = j < POOL - 1
+    tail = npool * POOL + j
+    ok = real & (tail <= q)
+    tl.store(TOK + r * WIDTH + K * POOL + j, tl.where(ok, tail, -1).to(tl.int32), mask=real)
+    tl.store(CNT + r, tl.where(npool > K, K * POOL + tl.sum(ok.to(tl.int32), 0), 0).to(tl.int32))
+
+
+def token_rows(pools: torch.Tensor, pos_dev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``select_tokens``' tokens and counts from rows' TOPK_POOLS pools [R, K] (int64) in one launch."""
+
+    R, K = pools.shape
+    width = K * POOL + POOL - 1
+    tokens = torch.empty((R, width), dtype=torch.int32, device=pools.device)
+    counts = torch.empty((R,), dtype=torch.int32, device=pools.device)
+    _token_list[(R,)](pools.contiguous(), pos_dev, tokens, counts, width, K=K, POOL=POOL, BLOCK=512,
+                      TAIL=triton.next_power_of_2(POOL - 1), num_warps=4)
+    return tokens, counts
+
+
 def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int | None, R: int, np_max: int,
-                  pos_dev: torch.Tensor, *, bucket: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Each row's attended tokens [R, 2051] ascending (-1 padded) and their count past the dense limit; ``bucket`` fixes the pool count for graphs."""
+                  pos_dev: torch.Tensor, *, bucket: int | None = None,
+                  fused: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """Each row's attended tokens [R, 2051] ascending (-1 padded) and their count past the dense limit; ``bucket`` fixes the pool count for graphs.
+
+    ``fused`` (TF_GLM_TOKEN_LIST): the list and counts from ``token_rows``' one kernel, the same integers."""
 
     if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
         raise ValueError("select_tokens: index queries must be contiguous rows, weights unit-stride columns")
@@ -202,7 +249,14 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
         blocks.append(top_pools(scores[:n], TOPK_POOLS, at))                           # ascending pool index
     del scores
     pools = blocks[0] if len(blocks) == 1 else torch.cat(blocks)
-    dev = qi.device
+    return token_rows(pools, pos_dev) if fused else token_rows_ops(pools, pos_dev)
+
+
+def token_rows_ops(pools: torch.Tensor, pos_dev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``token_rows`` in torch ops, the reference (TF_GLM_TOKEN_LIST=0)."""
+
+    R = pools.shape[0]
+    dev = pools.device
     width = TOPK_POOLS * POOL + POOL - 1
     # all rows at once: the 512 pools' tokens ascending, then the incomplete last pool's visible tokens; rows within the dense limit count 0
     q = pos_dev.to(torch.int64) + torch.arange(R, device=dev)

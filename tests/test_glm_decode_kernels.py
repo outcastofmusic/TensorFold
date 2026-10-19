@@ -44,9 +44,11 @@ def test_each_switch_is_on_unless_set_off_and_a_typo_raises(monkeypatch, env, re
 def test_the_engine_reads_both_switches_into_the_weights_meta(monkeypatch):
     monkeypatch.setenv("TF_GLM_PLAIN_NARROW", "0")
     monkeypatch.delenv("TF_GLM_HC_SPLIT", raising=False)
-    assert engine.kernel_switches() == {"plain_narrow": False, "hc_split": True}
+    assert {k: v for k, v in engine.kernel_switches().items() if k in ("plain_narrow", "hc_split")} == \
+        {"plain_narrow": False, "hc_split": True}
     monkeypatch.setenv("TF_GLM_HC_SPLIT", "no")
-    assert engine.kernel_switches() == {"plain_narrow": False, "hc_split": False}
+    assert {k: v for k, v in engine.kernel_switches().items() if k in ("plain_narrow", "hc_split")} == \
+        {"plain_narrow": False, "hc_split": False}
 
 
 def _weights(meta):
