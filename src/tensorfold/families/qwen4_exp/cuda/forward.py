@@ -56,7 +56,9 @@ def hc_block(hc: HC, b: Buffers, R: int, eps: float, streams: int, low: int, mod
 
     A bf16 HC with ``hc.fuse`` (TF_FLASHNEXT_HC_FUSE) takes its prompt fusions here. Its read-out feeds the layer's
     DeltaNet or attention projection and its experts, and none of their bf16, FP8 or NVFP4 kernels reads b.xs_mixed.
-    ``finish`` keeps the separate kernels and the sums, which the MTP draft head's 4-bit matmul reads."""
+    ``finish`` keeps the separate kernels and the sums, which the MTP draft head's 4-bit matmul reads. An EXL3 pack's
+    fp16 HC with ``hc.fuse`` takes the first fusion alone, the write-back and the norm in one kernel, which leaves
+    the same bytes in h, b.pss, b.normed and b.xs_normed whatever the matrices."""
 
     prompt = b.prefill and R > FUSED_ROWS
     inject = inject_out[:R] if hc.inject else None
@@ -65,7 +67,7 @@ def hc_block(hc: HC, b: Buffers, R: int, eps: float, streams: int, low: int, mod
         if fused is not None:
             fused(h[:R], b.pss[:R], hc.scale, b.normed[:R], b.xs_normed[:R], streams, eps, mode,
                   branch=branch, inject=inject_prev, y=y, wts=wts)
-            if hc.fuse:
+            if hc.fuse and getattr(hc.down, "kernel", "qmm") == "b16":
                 _readout_b16(hc, b, h, R, eps, streams, low, inject, normed=True, fuse=True)
             else:
                 _readout_plain(hc, b, h, R, eps, streams, low, inject, normed=True)
@@ -355,6 +357,7 @@ def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
 
     from tensorfold.cuda.exl3.experts import routed
 
+    from .exl3_mm import current
     from .exl3_pack import MOE_WINDOW
 
     buf = b.moe
@@ -363,10 +366,14 @@ def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
     if not b.prefill and R <= MOE_WINDOW:
         y = routed(b.mixed[:R], buf.pick[:R], None, m.experts, w.x3.moe, None, R)
         return 2, y.view(R, buf.slots, -1), buf.wts[:R]
+    # a window's bf16 slots go straight into buf.y (TF_FLASHNEXT_MOE_DIRECT), or come as fp32 and a copy rounds them
+    direct = current().moe_direct and buf.y.dtype == torch.bfloat16
     for r0 in range(0, R, MOE_WINDOW):
         n = min(MOE_WINDOW, R - r0)
-        y = routed(b.mixed[r0:r0 + n], buf.pick[r0:r0 + n], None, m.experts, w.x3.moe, None, n)
-        buf.y[r0:r0 + n].copy_(y.view(n, buf.slots, -1))
+        into = buf.y[r0:r0 + n].view(n * buf.slots, -1) if direct else None
+        y = routed(b.mixed[r0:r0 + n], buf.pick[r0:r0 + n], None, m.experts, w.x3.moe, None, n, y=into)
+        if not direct:
+            buf.y[r0:r0 + n].copy_(y.view(n, buf.slots, -1))
     return 2, buf.y[:R], buf.wts[:R]
 
 

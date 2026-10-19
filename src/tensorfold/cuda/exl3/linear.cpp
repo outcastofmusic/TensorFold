@@ -1,10 +1,10 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 
-void exl3_rot_in_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&);
+void exl3_rot_in_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, bool);
 void exl3_linear_cuda(const at::Tensor&, const at::Tensor&, int64_t, int64_t, const at::Tensor&,
                       const c10::optional<at::Tensor>&, at::Tensor&, const c10::optional<at::Tensor>&, at::Tensor&,
-                      int64_t, int64_t, int64_t, int64_t);
+                      int64_t, int64_t, int64_t, int64_t, bool);
 void exl3_unpack_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
@@ -20,23 +20,36 @@ static void check_io(const at::Tensor& x, const char* name) {
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, name, ": must be 16-byte aligned");
 }
 
-// xh [M, K] fp16 = fp16(((x * suh) @ H) / sqrt(128)); x [M, K] fp16, bf16 or fp32.
-void rot_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor xh) {
+// The output may be a column range of a wider matrix (a stack's part writing its columns in place): rows of unit
+// column stride, any row stride of at least N that keeps every row 16-byte aligned.
+static void check_out(const at::Tensor& y, const char* name) {
+    const auto t = y.scalar_type();
+    TORCH_CHECK(y.is_cuda() && y.dim() == 2 && (t == at::kHalf || t == at::kBFloat16 || t == at::kFloat),
+                name, ": expected a 2-d fp16, bf16 or fp32 CUDA tensor");
+    TORCH_CHECK(y.is_contiguous() || (y.stride(1) == 1 && y.stride(0) >= y.size(1) &&
+                                      y.stride(0) * y.element_size() % 16 == 0),
+                name, ": rows must be contiguous, at a row stride of at least N and a multiple of 16 bytes");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0, name, ": must be 16-byte aligned");
+}
+
+// xh [M, K] fp16 = fp16(((x * suh) @ H) / sqrt(128)); x [M, K] fp16, bf16 or fp32. pdl: TF_EXL3_PDL (pdl.cuh).
+void rot_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor xh, bool pdl) {
     check_io(x, "x");
     check(suh, at::kHalf, "suh");
     check(xh, at::kHalf, "xh");
     TORCH_CHECK(x.size(1) % 128 == 0 && suh.numel() == x.size(1) && xh.sizes() == x.sizes(),
                 "x and xh must be [M, K], K a multiple of 128, suh [K]");
     c10::cuda::CUDAGuard guard(x.device());
-    exl3_rot_in_cuda(x, suh, xh);
+    exl3_rot_in_cuda(x, suh, xh, pdl);
 }
 
-// y [M, N] = (xh @ W_q) @ H * svh + bias; Z [SK, M, N] fp32 when SK > 1; counters int32 [8 * N / 128], left zero.
+// y [M, N] = (xh @ W_q) @ H * svh + bias, y's rows at their own stride (check_out); Z [SK, M, N] fp32 when SK > 1;
+// counters int32 [8 * N / 128], left zero.
 void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb, const at::Tensor& svh,
             const c10::optional<at::Tensor>& bias, at::Tensor y, const c10::optional<at::Tensor>& Z,
-            at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK) {
+            at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK, bool pdl) {
     check(xh, at::kHalf, "xh");
-    check_io(y, "y");
+    check_out(y, "y");
     check(svh, at::kHalf, "svh");
     check(T, at::kInt, "T");
     check(counters, at::kInt, "counters");
@@ -54,7 +67,7 @@ void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t
         TORCH_CHECK(Z->numel() >= SK * M * N, "Z too small");
     }
     c10::cuda::CUDAGuard guard(xh.device());
-    exl3_linear_cuda(xh, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK);
+    exl3_linear_cuda(xh, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK, pdl);
 }
 
 // W [K, N] fp16 = W_q, the trellis tiles decoded; tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb words.
@@ -67,8 +80,12 @@ void unpack(const at::Tensor& T, at::Tensor W, int64_t stride_k, int64_t stride_
     exl3_unpack_cuda(T, W, stride_k, stride_nb, K2, cb);
 }
 
+// pdl (TF_EXL3_PDL, pdl.cuh) defaults to off, so a direct call launches as before the switch.
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("rot_in", &rot_in);
-    m.def("linear", &linear);
+    namespace py = pybind11;
+    m.def("rot_in", &rot_in, py::arg("x"), py::arg("suh"), py::arg("xh"), py::arg("pdl") = false);
+    m.def("linear", &linear, py::arg("xh"), py::arg("T"), py::arg("stride_k"), py::arg("stride_nb"), py::arg("svh"),
+          py::arg("bias"), py::arg("y"), py::arg("Z"), py::arg("counters"), py::arg("K2"), py::arg("cb"), py::arg("SK"),
+          py::arg("WK"), py::arg("pdl") = false);
     m.def("unpack", &unpack);
 }

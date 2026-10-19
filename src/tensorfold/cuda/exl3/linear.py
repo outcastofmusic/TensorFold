@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 
 from . import format as fmt
+from . import switches
 
 CODEBOOK_IDS = {"3inst": 0, "mcg": 1, "mul1": 2}
 
@@ -18,7 +19,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_linear_v3", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
+    return load(name="tensorfold_exl3_linear_v5", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                 verbose=False)
 
@@ -164,7 +165,9 @@ class Exl3Linear:
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None, out_dtype: torch.dtype | None = None,
                  xh: torch.Tensor | None = None, z: torch.Tensor | None = None) -> torch.Tensor:
-        """y [M, N] = x [M, K] @ W + bias for M = 1..128; scratch ``xh`` fp16 [M, K] and ``z`` fp32 (SK > 1) allocated when not given."""
+        """y [M, N] = x [M, K] @ W + bias for M = 1..128; scratch ``xh`` fp16 [M, K] and ``z`` fp32 (SK > 1) allocated when not given.
+
+        ``out`` may be N columns of a wider matrix (unit column stride, rows 16-byte aligned): the rows go there."""
 
         if x.dim() != 2 or x.shape[1] != self.k or not 1 <= x.shape[0] <= 128:
             raise ValueError(f"x must be [1..128, {self.k}], got {tuple(x.shape)}")
@@ -179,9 +182,10 @@ class Exl3Linear:
             z = torch.empty((sk * m * self.n,), dtype=torch.float32, device=x.device)
         sk_stride, nb_stride = self.strides
         ext = _ext()
-        ext.rot_in(x, self.suh, xh)
+        pdl = switches.current().pdl              # TF_EXL3_PDL
+        ext.rot_in(x, self.suh, xh, pdl)
         ext.linear(xh, self.words, sk_stride, nb_stride, self.svh, self.bias, out, z if sk > 1 else None,
-                   self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk)
+                   self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk, pdl)
         return out
 
     def unpack(self, out: torch.Tensor | None = None) -> torch.Tensor:

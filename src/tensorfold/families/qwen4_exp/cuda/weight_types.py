@@ -146,7 +146,8 @@ class HC:
     inject: bool
     prefill_down: Q4 | None = None      # the same matrices packed for the shared prefill matmul
     prefill_up: Q4 | None = None
-    fuse: bool = False                  # a bf16 HC's prompt fusions (``hc_b16``, TF_FLASHNEXT_HC_FUSE)
+    fuse: bool = False                  # prompt fusions (``hc_b16``, TF_FLASHNEXT_HC_FUSE): all three on a bf16 HC,
+    #                                     the write-back with the norm on an EXL3 pack's fp16 HC
 
 
 @dataclass

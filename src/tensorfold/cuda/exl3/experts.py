@@ -10,6 +10,8 @@ from typing import Sequence
 
 import torch
 
+from . import switches
+
 CB_3INST, CB_MCG, CB_MUL1 = 0, 1, 2
 ACT_BF16, ACT_F32 = 0, 1          # SwiGLU with the GLM family's bf16 roundings / in fp32
 # Rate codes with a kernel instance. Half-bits a value: 1..8 bits (2, 4, .. 16) and every half-integer rate
@@ -22,6 +24,20 @@ GLM_GATEUP = (8, 4, 4, 1)
 GLM_DOWN = (8, 4, 1, 1)
 PROMPT_ROWS = 64          # a window of more rows than this is a prompt's: its experts each serve many rows
 PROMPT_TILES = 2          # row tiles (16 rows each) that share one read of an expert's weights in such a window
+DECODE_ROWS = 16          # a window of at most this many rows fits one row tile: decode_kernel (TF_EXL3_EXPERT_DECODE)
+# decode_kernel's (n tiles a block, k steps in flight a warp) by projection shape (K, N) and window rows: entries
+# (most rows, tile), the first whose rows cover the window; None keeps grouped_kernel. Every tile writes the same bytes.
+# GB10 sweep (tools/exl3_expert_sweep.py, tf-runs/gpu-exl3dec/RESULTS.md, 2026-10-19), against grouped_kernel:
+# Flash Next gate/up 4x4 1.09x at 1 row, 4x2 1.01-1.10x at 2-5 rows and 0.99-1.00x from 6; Flash Next down 4x4
+# 1.06-1.09x at 1-4 rows and 0.98-1.00x from 5, where 4x2 is 1.00-1.04x; GLM-5.3 4x2 1.07-1.23x at every row count,
+# 4x4 0.93-1.07x. 2x4 and 2x8 never won.
+DECODE_TILES: dict[tuple[int, int], tuple[tuple[int, tuple[int, int] | None], ...]] = {
+    (2560, 640): ((1, (4, 4)), (5, (4, 2)), (16, None)),       # Flash Next gate/up
+    (640, 2560): ((4, (4, 4)), (16, (4, 2))),                  # Flash Next down
+    (4096, 2048): ((16, (4, 2)),),                             # GLM-5.3 gate/up
+    (2048, 4096): ((16, (4, 2)),),                             # GLM-5.3 down
+}
+DECODE_TILE = (4, 2)      # another shape: the setting that was at least grouped_kernel's speed (0.99x) everywhere
 
 
 @lru_cache(maxsize=1)
@@ -30,7 +46,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v2", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v4", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -202,6 +218,9 @@ class Scratch:
         self.ids = torch.zeros((maxu,), dtype=torch.int32, device=device)
         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
         self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
+        # grouped_kernel's listed layout (TF_EXL3_EXPERT_ITEMS): the member groups group_kernel lists, and their count
+        self.items_buf = torch.zeros((item_bound(P, maxu, 16),), dtype=torch.int32, device=device)
+        self.icount = torch.zeros((1,), dtype=torch.int32, device=device)
         self.rows, self.slots, self.count_experts = rows, slots, ex.count
 
     def window(self, R: int):
@@ -209,6 +228,18 @@ class Scratch:
 
         maxu = min(R * self.slots, self.count_experts)
         return self.ids[:maxu], self.members_buf[:maxu * R].view(maxu, R)
+
+    def items(self, R: int, tile: int) -> torch.Tensor:
+        """The item list sized for R rows in member groups of ``tile`` rows: its length is the listed grid's depth."""
+
+        return self.items_buf[:item_bound(R * self.slots, min(R * self.slots, self.count_experts), tile)]
+
+
+def item_bound(pairs: int, places: int, tile: int) -> int:
+    """Most items group_kernel lists for ``pairs`` picks over ``places`` experts in groups of ``tile``: an expert
+    with c members lists ceil(c / tile) <= c / tile + 1, so the list holds at most ceil(pairs / tile) + places."""
+
+    return -(-pairs // tile) + places
 
 
 def prompt_config(cfg: tuple[int, int, int, int]) -> tuple[int, int, int, int, int]:
@@ -220,12 +251,40 @@ def prompt_config(cfg: tuple[int, int, int, int]) -> tuple[int, int, int, int, i
     return (nt, w, sk, pf, PROMPT_TILES) if (nt, w, pf) == (8, 4, 1) else (nt, w, sk, pf, 1)
 
 
+def decode_tile(K: int, N: int, R: int) -> tuple[int, int] | None:
+    """(n tiles, k steps in flight) of decode_kernel for an R-row window of a K -> N projection, or None for
+    grouped_kernel (DECODE_TILES, else DECODE_TILE)."""
+
+    for most, tile in DECODE_TILES.get((K, N), ((DECODE_ROWS, DECODE_TILE),)):
+        if R <= most:
+            return tile
+    return None
+
+
+def decode_config(cfg: tuple[int, int, int, int], K: int, N: int, R: int) -> tuple[int, int, int, int] | None:
+    """``cfg`` for decode_kernel: the same warps and K splits, so every sum is ``cfg``'s, with decode_tile's n tiles
+    and k steps in flight; None when the table keeps grouped_kernel or the n tiles do not divide N.
+
+    GB10, Flash Next 3.05 bpw: grouped_kernel's 4-warp blocks ran 3 an SM (168 registers, 32.8 KB of shared memory)
+    with one k step in flight a warp; decode_kernel's run 4 (4x4: 128 registers) or 5 (4x2: 96) an SM."""
+
+    _, w, sk, _ = cfg
+    tile = decode_tile(K, N, R) if R <= DECODE_ROWS else None
+    if tile is None or w != 4 or N % (16 * tile[0]):
+        return None
+    return tile[0], w, sk, tile[1]
+
+
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True, prompt: bool | None = None) -> torch.Tensor:
+           group: bool = True, prompt: bool | None = None, y: torch.Tensor | None = None) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
 
-    ``prompt`` (default: more than PROMPT_ROWS rows) reads each expert once for 32 of its rows; the values are the same."""
+    ``prompt`` (default: more than PROMPT_ROWS rows) reads each expert once for 32 of its rows; the values are the same.
+    With TF_EXL3_EXPERT_ITEMS (and ``group``) a prompt window's grouping lists the member groups grouped_kernel's
+    launches run.
+    ``y`` (without ``wts``): a contiguous bf16 [R * slots, D] that takes the slots rounded once, as a copy of the fp32
+    slots into it would round them."""
 
     ext = _ext()
     D, I, E = ex.dims, ex.width, ex.count
@@ -234,25 +293,60 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     if R > s.rows:
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
-    if group:
-        ext.group(pick, ids, s.count, members, R, slots, E)
-    ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
+    sw = switches.current()
+    pdl = sw.pdl
     many = R > PROMPT_ROWS if prompt is None else bool(prompt)
-    nt, w, sk, pf, rt = prompt_config(s.cfg_gu) if many else (*s.cfg_gu, 1)
+    gu, dn = plan(s.cfg_gu, s.cfg_d, I, D, R, many, sw.expert_decode)
+    # prompt windows only: on decode windows the list cost about 1% decode (GPU 19 Oct, tf-runs/gpu-exl3s2 alone/)
+    tile = listed_tile(gu, dn) if group and sw.expert_items and many else 0
+    listed = {"items": s.items(R, tile), "icount": s.icount} if tile else {}
+    if group:
+        ext.group(pick, ids, s.count, members, R, slots, E, pdl, **listed, **({"tile": tile} if tile else {}))
+    ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E, pdl)
+    (nt, w, sk, pf, rt), dec = gu
     ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], rt, ex.window)
-    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode)
-    nt, w, sk, pf, rt = prompt_config(s.cfg_d) if many else (*s.cfg_d, 1)
+                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], rt, ex.window, dec, pdl,
+                **({} if dec else listed))
+    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode,
+                        pdl)
+    (nt, w, sk, pf, rt), dec = dn
     ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
-                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], rt, ex.window)
+                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], rt, ex.window, dec, pdl,
+                **({} if dec else listed))
     if wts is None:
-        ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
-        return s.y[:P]
+        ext.down_epilogue(s.z, pick, ex.svh_d, s.y if y is None else y, R, P, D, sk, slots, E, pdl)
+        return s.y[:P] if y is None else y
     if out is None:
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two)
-    ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E)
+    ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E, pdl)
     return out
+
+
+Launch = tuple[tuple[int, int, int, int, int], bool]
+
+
+def listed_tile(gu: Launch, dn: Launch) -> int:
+    """The member group's rows (16 a row tile) the item list takes for ``plan``'s two launches: 0 when both run on
+    decode_kernel, which takes no list, or when their grouped_kernel launches group members differently."""
+
+    tiles = {16 * cfg[4] for cfg, dec in (gu, dn) if not dec}
+    return tiles.pop() if len(tiles) == 1 else 0
+
+
+def plan(cfg_gu, cfg_d, I: int, D: int, R: int, many: bool, decode: bool) -> tuple[Launch, Launch]:
+    """((nt, warps, splits, pf, row tiles), decode_kernel?) for gate/up (K D -> N I) and down (K I -> N D).
+
+    A prompt window takes prompt_config; a window of at most DECODE_ROWS rows with ``decode`` (TF_EXL3_EXPERT_DECODE)
+    takes decode_kernel at decode_config's tile; the rest keep grouped_kernel at their cfg."""
+
+    def one(cfg, K, N):
+        if many:
+            return prompt_config(cfg), False
+        dc = decode_config(cfg, K, N, R) if decode else None
+        return ((*dc, 1), True) if dc else ((*cfg, 1), False)
+
+    return one(cfg_gu, D, I), one(cfg_d, I, D)
 
 
 def dequant(trellis: torch.Tensor, codebook: int | str, window: int = 16) -> torch.Tensor:

@@ -8,6 +8,7 @@
 #include <algorithm>
 
 #include "decode.cuh"
+#include "pdl.cuh"
 
 using namespace tf_exl3;
 
@@ -109,9 +110,15 @@ __device__ __forceinline__ void step_lane_words(const uint32_t (&raw)[step_regs<
     }
 }
 
+__device__ __forceinline__ void prefetch_l2(const void* p) {
+    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(p));
+}
+
 __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x, int x_dtype,
                                                      const half* __restrict__ suh, half* __restrict__ xh, int K) {
     const int blk = blockIdx.x * 4 + (threadIdx.x >> 5), row = blockIdx.y, lane = threadIdx.x & 31;
+    tf_exl3_pdl::grid_wait();
+    tf_exl3_pdl::grid_launch();                     // the linear after it may load its first weights meanwhile
     if (blk * 128 >= K) return;
     const int k = blk * 128 + 4 * lane;
     float v[4], s[4];
@@ -128,7 +135,7 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
 template <int K2, int CB, int WK>
 __global__ void __launch_bounds__(WK * 32) linear_kernel(
     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
-    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
+    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype, long long ldy,
     float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
     constexpr int TW = tile_words<K2>();
     constexpr int LW = lane_words<K2>();
@@ -149,6 +156,14 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
         lane_start<K2>(lane, word, offset);
         prev = word != lane / (8 / K2);
     }
+    // the warp's first two k steps into L2 before the wait (the weights are written once, at load); a register
+    // load here would stay live through the passes and spill
+#pragma unroll
+    for (int s = 0; s < 2; ++s)
+        if (s < per_warp)
+            for (int w = 32 * lane; w < 8 * TW; w += 32 * 32)
+                prefetch_l2(tiles + (size_t)(kt0 + s) * stride_k + w);
+    tf_exl3_pdl::grid_wait();
 
     for (int m0 = 0, pass = 0; m0 < M; m0 += 16, ++pass) {
         const int R = min(16, M - m0);
@@ -225,7 +240,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                         v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
                     }
                     finish(v, lane, svh, bias, col0 + 4 * lane);
-                    store4(y, y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
+                    store4(y, y_dtype, (size_t)(m0 + rlo + r) * ldy + col0 + 4 * lane, v);
                 }
             } else {
                 for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
@@ -256,7 +271,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                     }
                     float v[4] = {s.x, s.y, s.z, s.w};
                     finish(v, lane, svh, bias, col0 + 4 * lane);
-                    store4(y, y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
+                    store4(y, y_dtype, (size_t)(m0 + r) * ldy + col0 + 4 * lane, v);
                 }
                 if (threadIdx.x == 0) counters[pass * NB + nb] = 0;   // every program of the block has arrived
             }
@@ -291,20 +306,20 @@ int dtype_of(const at::Tensor& t) {
 #define TF_EXL3_WIDTHS(X, CB) X(2, CB) X(4, CB) X(6, CB) X(8, CB) X(10, CB) X(12, CB) X(14, CB) X(16, CB)
 #define TF_EXL3_ALL(X) TF_EXL3_WIDTHS(X, 0) TF_EXL3_WIDTHS(X, 1) TF_EXL3_WIDTHS(X, 2) X(3, 2) X(5, 2) X(7, 2)
 
-void exl3_rot_in_cuda(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xh) {
+void exl3_rot_in_cuda(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xh, bool pdl) {
     const int M = (int)x.size(0), K = (int)x.size(1);
     dim3 grid((unsigned)((K / 128 + 3) / 4), (unsigned)M);
-    rot_in_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
-        x.data_ptr(), dtype_of(x), reinterpret_cast<const half*>(suh.data_ptr()),
-        reinterpret_cast<half*>(xh.data_ptr()), K);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    tf_exl3_pdl::launch(rot_in_kernel, grid, dim3(128), 0, at::cuda::getCurrentCUDAStream(),
+                        tf_exl3_pdl::enabled(pdl), static_cast<const void*>(x.data_ptr()), dtype_of(x),
+                        reinterpret_cast<const half*>(suh.data_ptr()), reinterpret_cast<half*>(xh.data_ptr()), K);
 }
 
 void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb,
                       const at::Tensor& svh, const c10::optional<at::Tensor>& bias, at::Tensor& y,
                       const c10::optional<at::Tensor>& Z, at::Tensor& counters, int64_t K2, int64_t cb, int64_t SK,
-                      int64_t WK) {
+                      int64_t WK, bool pdl) {
     const int M = (int)xh.size(0), K = (int)xh.size(1), N = (int)y.size(1);
+    const long long ldy = M > 1 ? (long long)y.stride(0) : N;     // a row stride wider than N: columns of a wider y
     TORCH_CHECK(WK == 2 || WK == 4 || WK == 8, "WK must be 2, 4 or 8");
     TORCH_CHECK((K / 16) % (SK * WK) == 0, "K / 16 must split evenly over SK * WK warps");
     dim3 grid((unsigned)(N / 128), (unsigned)SK);
@@ -312,17 +327,17 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
     const half* bptr = bias ? reinterpret_cast<const half*>(bias->data_ptr()) : nullptr;
     float* zptr = Z ? Z->data_ptr<float>() : nullptr;
     TORCH_CHECK(SK == 1 || zptr, "Z is needed with more than one split");
+    const bool early = tf_exl3_pdl::enabled(pdl);
 #define TF_LAUNCH(K2_, CB_)                                                                                        \
     if (K2 == K2_ && cb == CB_) {                                                                               \
         auto kernel = WK == 2 ? linear_kernel<K2_, CB_, 2>                                                      \
                               : WK == 4 ? linear_kernel<K2_, CB_, 4> : linear_kernel<K2_, CB_, 8>;              \
         const int smem = (int)(WK * std::min(M, 8) * 128 * sizeof(float));                                \
         if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
-        kernel<<<grid, (unsigned)(WK * 32), smem, stream>>>(                                              \
+        tf_exl3_pdl::launch(kernel, grid, dim3((unsigned)(WK * 32)), (size_t)smem, stream, early,              \
             reinterpret_cast<const half*>(xh.data_ptr()), reinterpret_cast<const uint32_t*>(T.data_ptr()),      \
-            stride_k, stride_nb, reinterpret_cast<const half*>(svh.data_ptr()), bptr, y.data_ptr(), dtype_of(y),\
-            zptr, counters.data_ptr<int>(), M, K, N, (int)SK);                                                  \
-        C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                         \
+            (long long)stride_k, (long long)stride_nb, reinterpret_cast<const half*>(svh.data_ptr()), bptr,     \
+            y.data_ptr(), dtype_of(y), ldy, zptr, counters.data_ptr<int>(), M, K, N, (int)SK);                  \
         return;                                                                                                 \
     }
     TF_EXL3_ALL(TF_LAUNCH)
