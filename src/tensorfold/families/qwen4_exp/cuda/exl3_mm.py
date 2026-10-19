@@ -26,7 +26,7 @@ MOE_DIRECT_ENV = "TF_FLASHNEXT_MOE_DIRECT"
 
 @dataclass(frozen=True)
 class Switches:
-    """The pack's matmul switches, both unset: on. The engine reads them once at startup (``read``) and installs them
+    """The pack's matmul switches (unset: stack and moe on, inner_k off; GPU 19 Oct, inner_k 0.994x prefill). The engine reads them once at startup (``read``) and installs them
     (``use``); the matmuls consult ``current()`` at each call, so a CUDA graph keeps the setting it was captured with.
 
     TF_FLASHNEXT_STACK_DIRECT: a stack's parts write their columns of its output in place at every row count. Rows
@@ -40,7 +40,7 @@ class Switches:
     is 115 MB of fp32 written and read again a window and layer."""
 
     stack_direct: bool = True
-    inner_k: bool = True
+    inner_k: bool = False
     moe_direct: bool = True
 
 
@@ -50,7 +50,7 @@ _current = Switches()
 def read() -> Switches:
     """Every switch from the environment; a value outside env_flags' set raises before any weight is read."""
 
-    return Switches(stack_direct=flag(STACK_DIRECT_ENV, True), inner_k=flag(INNER_K_ENV, True),
+    return Switches(stack_direct=flag(STACK_DIRECT_ENV, True), inner_k=flag(INNER_K_ENV, False),
                     moe_direct=flag(MOE_DIRECT_ENV, True))
 
 
@@ -67,11 +67,11 @@ def current() -> Switches:
 
 
 def f16_narrow() -> bool:
-    """TF_FLASHNEXT_F16_NARROW (unset: on): decode rows of the fp16 matrices on narrow tiles (``narrow_tile``), the
+    """TF_FLASHNEXT_F16_NARROW (unset: off; served 1.00x on 19 Oct): decode rows of the fp16 matrices on narrow tiles (``narrow_tile``), the
     old bytes. The engine reads it once at startup and the loader stores it on the shared ``Scratch``; a value outside
     env_flags' set raises."""
 
-    return flag(NARROW_ENV, True)
+    return flag(NARROW_ENV, False)
 
 
 class Scratch:

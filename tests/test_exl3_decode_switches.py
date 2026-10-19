@@ -31,16 +31,16 @@ def restore():
 
 
 @pytest.mark.parametrize("env", ENVS)
-@pytest.mark.parametrize("value, on", [(None, True), ("", True), ("1", True), ("on", True), ("0", False),
+@pytest.mark.parametrize("value, on", [(None, False), ("", False), ("1", True), ("on", True), ("0", False),
                                        ("off", False), ("false", False), (" NO ", False)])
-def test_each_flag_is_on_unless_turned_off(monkeypatch, env, value, on):
+def test_each_flag_is_off_unless_turned_on(monkeypatch, env, value, on):
     for e in ENVS:
         monkeypatch.delenv(e, raising=False)
     if value is not None:
         monkeypatch.setenv(env, value)
     got = switches.read()
     assert (got.expert_decode if env == switches.EXPERT_DECODE_ENV else got.pdl) is on
-    assert (got.pdl if env == switches.EXPERT_DECODE_ENV else got.expert_decode) is True
+    assert (got.pdl if env == switches.EXPERT_DECODE_ENV else got.expert_decode) is False   # off: 0.99-1.00x served
 
 
 @pytest.mark.parametrize("env", ENVS)

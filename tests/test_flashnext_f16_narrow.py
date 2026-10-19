@@ -20,9 +20,9 @@ ENV = exl3_mm.NARROW_ENV
 SHAPES = [(324, 10240), (10240, 320), (320, 10240), (96, 2560), (10240, 2560), (2560, 2560)]
 
 
-@pytest.mark.parametrize("value, on", [(None, True), ("", True), ("1", True), ("on", True), ("0", False),
+@pytest.mark.parametrize("value, on", [(None, False), ("", False), ("1", True), ("on", True), ("0", False),
                                        ("off", False), ("false", False), (" NO ", False)])
-def test_the_flag_is_on_unless_turned_off(monkeypatch, value, on):
+def test_the_flag_is_off_unless_turned_on(monkeypatch, value, on):
     if value is None:
         monkeypatch.delenv(ENV, raising=False)
     else:

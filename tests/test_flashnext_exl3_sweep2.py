@@ -21,6 +21,7 @@ from tests.test_flashnext_f16_narrow import SHAPES, Spy, _chain  # noqa: E402
 
 ENVS = (exl3_mm.STACK_DIRECT_ENV, exl3_mm.INNER_K_ENV, exl3_mm.MOE_DIRECT_ENV)
 FIELDS = dict(zip(ENVS, ("stack_direct", "inner_k", "moe_direct")))
+DEFAULTS = dict(zip(ENVS, (True, False, True)))      # inner_k off: 0.994x prefill served (19 Oct)
 
 
 @pytest.fixture(autouse=True)
@@ -34,14 +35,14 @@ def restore():
 @pytest.mark.parametrize("env", ENVS)
 @pytest.mark.parametrize("value, on", [(None, True), ("", True), ("1", True), ("on", True), ("0", False),
                                        ("off", False), ("false", False), (" NO ", False)])
-def test_each_flag_is_on_unless_turned_off(monkeypatch, env, value, on):
+def test_each_flag_takes_its_default_unless_set(monkeypatch, env, value, on):
     for e in ENVS:
         monkeypatch.delenv(e, raising=False)
     if value is not None:
         monkeypatch.setenv(env, value)
     got = exl3_mm.read()
-    assert getattr(got, FIELDS[env]) is on
-    assert all(getattr(got, f) for e, f in FIELDS.items() if e != env)
+    assert getattr(got, FIELDS[env]) is (DEFAULTS[env] if value in (None, "") else on)
+    assert all(getattr(got, f) is DEFAULTS[e] for e, f in FIELDS.items() if e != env)
 
 
 @pytest.mark.parametrize("env", ENVS)
@@ -63,7 +64,7 @@ def test_the_engine_installs_what_it_reads(monkeypatch, tmp_path):
     exl3_mm.use(exl3_mm.Switches())
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
-    assert exl3_mm.current() == exl3_mm.Switches(stack_direct=False, inner_k=True, moe_direct=False)
+    assert exl3_mm.current() == exl3_mm.Switches(stack_direct=False, inner_k=False, moe_direct=False)
 
 
 # -- a stack's parts write their columns in place ------------------------------------------------------------------
