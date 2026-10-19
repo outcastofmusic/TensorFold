@@ -69,6 +69,12 @@ A one-row decode step replays a CUDA graph captured on the first step. The step 
 it writes, attention's length) from a device tensor and its token from a static buffer, so one graph serves every
 position, and a replay gives the eager step's bits. `TF_LFM2_GRAPHS=0` runs every step eagerly.
 
+A decode call runs the gated conv after its in_proj and the MoE combine as one Triton kernel each (`cuda/fused.py`),
+computes RoPE's angles and the KV rows once a call, and skips route's int32 id copy and its multiply by a scaling of
+1.0. Counted on the CPU dispatch (2026-10-19), a one-row step drops from about 2,040 launches to about 1,020. The
+kernels round where torch's kernels round and launch with Triton's fma contraction off, so the bits stay the same.
+`TF_LFM2_DECODE_FUSE=0` restores the torch chains; the GPU byte comparison has not run yet.
+
 ## Memory and speed
 
 | Per stream | |

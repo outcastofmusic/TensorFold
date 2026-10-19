@@ -34,13 +34,15 @@ DOT_BN = 64         # outputs a ``dot`` program: within one 128-row scale block
 KERNELS = ("auto", "pairs", "dot", "fp32")       # TF_LFM2_PROMPT_KERNEL's values
 
 
-def route(x: torch.Tensor, moe: Moe, top_k: int, scaling: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """x [R, D] bf16 -> (expert ids [R, k] int64, fp32 weights [R, k]): picks by sigmoid + bias, weights by sigmoid."""
+def route(x: torch.Tensor, moe: Moe, top_k: int, scaling: float | None) -> tuple[torch.Tensor, torch.Tensor]:
+    """x [R, D] bf16 -> (expert ids [R, k] int64, fp32 weights [R, k]): picks by sigmoid + bias, weights by sigmoid.
+    A ``scaling`` of None skips the multiply, which a scaling of 1.0 makes without changing a value."""
 
     gates = torch.sigmoid(x.float() @ moe.router.t())
     picks = torch.topk(gates + moe.bias, top_k, dim=-1).indices
     chosen = gates.gather(1, picks)
-    return picks, chosen / (chosen.sum(-1, keepdim=True) + 1e-6) * scaling
+    weights = chosen / (chosen.sum(-1, keepdim=True) + 1e-6)
+    return picks, weights if scaling is None else weights * scaling
 
 
 @triton.jit
@@ -140,14 +142,15 @@ def dense(w: torch.Tensor, s: torch.Tensor | None, out: torch.Tensor | None = No
     return out
 
 
-def pairs(x: torch.Tensor, ids: torch.Tensor, ex: Experts) -> torch.Tensor:
-    """x [R, D] bf16, ids [R, k] -> each (row, pick)'s expert output [R * k, D] bf16, on the Triton kernels."""
+def pairs(x: torch.Tensor, ids: torch.Tensor, ex: Experts, fuse: bool = False) -> torch.Tensor:
+    """x [R, D] bf16, ids [R, k] -> each (row, pick)'s expert output [R * k, D] bf16, on the Triton kernels.
+    ``fuse`` hands the kernels route's int64 ids as they are, without an int32 copy."""
 
     rows, top_k = ids.shape
     d, width = x.shape[1], ex.width
     if d % BK or width % BK:
         raise ValueError(f"experts of width {width} over {d} inputs are not whole {BK}-input blocks")
-    flat = ids.reshape(-1).to(torch.int32).contiguous()
+    flat = ids.reshape(-1).contiguous() if fuse else ids.reshape(-1).to(torch.int32).contiguous()
     act = torch.empty((rows * top_k, width), dtype=torch.bfloat16, device=x.device)
     out = torch.empty((rows * top_k, d), dtype=torch.bfloat16, device=x.device)
     fp8 = ex.fp8
@@ -347,11 +350,17 @@ def path(kernel: str, rows: int, few: int, pairs_rows: int) -> str:
 
 
 def moe(x: torch.Tensor, m: Moe, top_k: int, scaling: float, *, few: int, work: torch.Tensor | None = None,
-        kernel: str = "auto", pairs_rows: int = 0) -> torch.Tensor:
-    """The MoE block's output [R, D] bf16 on ``path``'s kernels (on the CPU always ``grouped``, in ``work``)."""
+        kernel: str = "auto", pairs_rows: int = 0, fuse: bool = False) -> torch.Tensor:
+    """The MoE block's output [R, D] bf16 on ``path``'s kernels (on the CPU always ``grouped``, in ``work``).
+    ``fuse`` (TF_LFM2_DECODE_FUSE, CUDA) takes the ``pairs`` path's decode rows with ``fused.combine``: same bits,
+    one launch for combine's 3k + 1."""
 
-    ids, weights = route(x, m, top_k, scaling)
+    ids, weights = route(x, m, top_k, None if fuse and scaling == 1.0 else scaling)
     way = path(kernel, x.shape[0], few, pairs_rows) if x.is_cuda else "grouped"
+    if way == "pairs" and fuse:
+        from . import fused
+
+        return fused.combine(pairs(x, ids, m.experts, fuse=True), weights)
     if way == "pairs":
         return combine(pairs(x, ids, m.experts), weights)
     if way == "dot":

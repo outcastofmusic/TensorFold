@@ -54,11 +54,15 @@ def stream(base: str, model: str, item: dict, tokens: int, temperature: float, s
             if chunk.get("usage"):
                 usage = chunk["usage"]
             for choice in chunk.get("choices", []):
-                piece = choice.get("text") or (choice.get("delta") or {}).get("content") or ""
-                if piece:
+                delta = choice.get("delta") or {}
+                piece = choice.get("text") or delta.get("content") or ""
+                # a model that always thinks (LFM2.5) can spend the whole budget in reasoning: time every token
+                thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                if piece or thought:
                     now = time.perf_counter()
                     first = first if first is not None else now
                     last = now
+                if piece:
                     text.append(piece)
     n = int(usage["completion_tokens"]) if usage else None
     return {"ttft_s": first - start, "decode_s": last - first, "tokens": n,
