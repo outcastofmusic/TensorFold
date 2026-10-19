@@ -18,6 +18,10 @@ read again, no separate launch: 315 ms of the 6,887). TF_EXL3_GATEUP_FUSE has th
 and up programs add their splits and run the gate/up epilogue (433 ms of the 6,887). Both fusions take the listed
 layout (TF_EXL3_EXPERT_ITEMS) at the prompt setting.
 
+TF_EXL3_GROUP_SCAN_DECODE (unset: off) groups decode windows (up to PROMPT_ROWS rows: verify windows, four streams'
+rounds) on ``group_scan_kernel`` too, which TF_EXL3_GROUP_SCAN takes on prompt windows only. ``group_kernel`` costs
+0.22 us a pick: 18 us a layer at 7 rows (0.87 ms of a 51.6 ms drafted round, tf-runs/profile exl3-mtp) and about
+68 us at four streams' 28 rows. The same integers either way.
 TF_EXL3_LINEAR_PAIR (unset: off) runs the EXL3 linear's windows of more than 16 rows in passes of 32 rows, decoding
 each k step's weights once for both 16-row tiles, where each 16-row pass read and decoded every weight again. Each
 row keeps its mma chain, warp order and split order, so its bytes.
@@ -39,6 +43,7 @@ EXPERT_ITEMS_ENV = "TF_EXL3_EXPERT_ITEMS"
 GROUP_SCAN_ENV = "TF_EXL3_GROUP_SCAN"
 DOWN_FUSE_ENV = "TF_EXL3_DOWN_FUSE"
 GATEUP_FUSE_ENV = "TF_EXL3_GATEUP_FUSE"
+GROUP_SCAN_DECODE_ENV = "TF_EXL3_GROUP_SCAN_DECODE"
 LINEAR_PAIR_ENV = "TF_EXL3_LINEAR_PAIR"
 
 
@@ -50,6 +55,7 @@ class Switches:
     group_scan: bool = False
     down_fuse: bool = False
     gateup_fuse: bool = False
+    group_scan_decode: bool = False
     linear_pair: bool = False
 
 
@@ -62,6 +68,7 @@ def read() -> Switches:
     return Switches(expert_decode=flag(EXPERT_DECODE_ENV, False), pdl=flag(PDL_ENV, False),
                     expert_items=flag(EXPERT_ITEMS_ENV, True), group_scan=flag(GROUP_SCAN_ENV, True),
                     down_fuse=flag(DOWN_FUSE_ENV, True), gateup_fuse=flag(GATEUP_FUSE_ENV, True),
+                    group_scan_decode=flag(GROUP_SCAN_DECODE_ENV, False),
                     linear_pair=flag(LINEAR_PAIR_ENV, False))
 
 

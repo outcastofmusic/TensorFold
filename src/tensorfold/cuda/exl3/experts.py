@@ -307,7 +307,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     tile = listed_tile(gu, dn) if group and sw.expert_items and many else 0
     listed = {"items": s.items(R, tile), "icount": s.icount} if tile else {}
     if group:
-        scan = {"scan": True} if sw.group_scan and many and scan_fits(E, P) else {}
+        # TF_EXL3_GROUP_SCAN on prompt windows, TF_EXL3_GROUP_SCAN_DECODE on decode windows
+        scan = {"scan": True} if (sw.group_scan if many else sw.group_scan_decode) and scan_fits(E, P) else {}
         ext.group(pick, ids, s.count, members, R, slots, E, pdl, **listed, **({"tile": tile} if tile else {}),
                   **scan)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E, pdl)
