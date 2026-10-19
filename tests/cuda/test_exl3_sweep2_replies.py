@@ -156,7 +156,7 @@ def test_flash_next_four_streams_equal_each_alone_with_the_switches_off_on_off(f
         outs = []
         for prompt, sampling in zip(prompts, samplings):
             got: list[int] = []
-            dec.admit(Stream(prompt, 48, sampling, emit=lambda new, got=got: got.extend(new)))
+            dec.admit(Stream(prompt, 48, sampling, stop_eos=False, emit=lambda new, got=got: got.extend(new)))
             outs.append(got)
         while dec.live():
             dec.finish(dec.round())
