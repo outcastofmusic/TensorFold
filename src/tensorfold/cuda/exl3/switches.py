@@ -9,7 +9,7 @@ groups an expert, and a routed expert fills one of them. The programs and their 
 old launches, and any value outside env_flags' set raises. Served on Qwen EXL3 (GPU 19 Oct), EXPERT_DECODE and PDL
 were 0.99-1.00x on decode, so they stay off; the item list took cold prefill 1.41x.
 
-Three prompt-window switches (unset: off, not yet measured on the GPU), each the same bytes as without it:
+Three prompt-window switches (unset: on; served 8k prefill alone 1.142x, 1.041x, 1.036x, 19 Oct), each the same bytes as without it:
 TF_EXL3_GROUP_SCAN groups the picks with ``group_scan_kernel`` (a count, a scan and a stable scatter on 8 blocks),
 which writes ``group_kernel``'s ids, members and item list: on Flash Next's 1,024-row windows ``group_kernel`` held
 513 experts on 129 threads of one block and took 2.3 ms a window, 901 ms of an 8,192-token prefill's 6,887 (nsys,
@@ -54,8 +54,8 @@ def read() -> Switches:
     """Every switch from the environment; a typo raises before any weight is read."""
 
     return Switches(expert_decode=flag(EXPERT_DECODE_ENV, False), pdl=flag(PDL_ENV, False),
-                    expert_items=flag(EXPERT_ITEMS_ENV, True), group_scan=flag(GROUP_SCAN_ENV, False),
-                    down_fuse=flag(DOWN_FUSE_ENV, False), gateup_fuse=flag(GATEUP_FUSE_ENV, False))
+                    expert_items=flag(EXPERT_ITEMS_ENV, True), group_scan=flag(GROUP_SCAN_ENV, True),
+                    down_fuse=flag(DOWN_FUSE_ENV, True), gateup_fuse=flag(GATEUP_FUSE_ENV, True))
 
 
 def use(switches: Switches) -> Switches:

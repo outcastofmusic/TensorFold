@@ -64,7 +64,7 @@ def test_the_engine_installs_what_it_reads(monkeypatch, tmp_path):
     exl3_mm.use(exl3_mm.Switches())
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
-    assert exl3_mm.current() == exl3_mm.Switches(stack_direct=False, inner_k=False, moe_direct=False)
+    assert exl3_mm.current() == exl3_mm.Switches(stack_direct=False, inner_k=False, moe_direct=False, moe_chunk=True)
 
 
 # -- a stack's parts write their columns in place ------------------------------------------------------------------

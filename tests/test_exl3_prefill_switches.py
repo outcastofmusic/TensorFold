@@ -39,16 +39,16 @@ def restore():
 
 # -- the flags ------------------------------------------------------------------------------------------------------
 @pytest.mark.parametrize("env", list(EXL3_ENVS))
-@pytest.mark.parametrize("value, on", [(None, False), ("", False), ("1", True), ("on", True), ("yes", True),
+@pytest.mark.parametrize("value, on", [(None, True), ("", True), ("1", True), ("on", True), ("yes", True),
                                        ("0", False), ("off", False), (" NO ", False)])
-def test_each_exl3_flag_is_off_unless_turned_on(monkeypatch, env, value, on):
+def test_each_exl3_flag_is_on_unless_turned_off(monkeypatch, env, value, on):
     for e in ALL_EXL3_ENVS:
         monkeypatch.delenv(e, raising=False)
     if value is not None:
         monkeypatch.setenv(env, value)
     got = switches.read()
     assert getattr(got, EXL3_ENVS[env]) is on
-    assert all(getattr(got, f) is False for e, f in EXL3_ENVS.items() if e != env)
+    assert all(getattr(got, f) is True for e, f in EXL3_ENVS.items() if e != env)     # on since 19 Oct's GPU A/B
     assert (got.expert_decode, got.pdl, got.expert_items) == (False, False, True)     # the others keep defaults
 
 
@@ -65,7 +65,7 @@ def test_an_exl3_flag_typo_stops_both_engines_before_any_read(monkeypatch, tmp_p
         GlmEngine(tmp_path / "missing", rank=0, master="", port=0, world=1)
 
 
-@pytest.mark.parametrize("value, on", [(None, False), ("1", True), ("off", False)])
+@pytest.mark.parametrize("value, on", [(None, True), ("1", True), ("off", False)])
 def test_the_chunk_window_flag(monkeypatch, value, on):
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
 

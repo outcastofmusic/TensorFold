@@ -66,7 +66,7 @@ def test_an_engine_installs_what_it_reads(monkeypatch, tmp_path):
     switches.use(switches.Switches())
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
-    assert switches.current() == switches.Switches(expert_decode=False, pdl=True)
+    assert switches.current() == switches.Switches(expert_decode=False, pdl=True, group_scan=True, down_fuse=True, gateup_fuse=True)
 
 
 def test_use_returns_the_previous_setting():

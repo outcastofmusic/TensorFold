@@ -40,7 +40,7 @@ class Switches:
     TF_FLASHNEXT_MOE_DIRECT: a prompt window's routed experts round their slots to bf16 straight into the MoE buffer
     (``experts.routed(y=...)``), where they wrote fp32 slots that a copy then rounded: 1,024 rows x 11 slots x 2,560
     is 115 MB of fp32 written and read again a window and layer.
-    TF_FLASHNEXT_MOE_CHUNK (unset: off, not yet measured on the GPU): a prompt chunk's routed experts in one call of
+    TF_FLASHNEXT_MOE_CHUNK (unset: on; served 8k prefill 1.085x alone, 19 Oct): a prompt chunk's routed experts in one call of
     MOE_CHUNK_WINDOW rows, where two calls of MOE_WINDOW each read every expert's trellis. The 8,192-token profile
     (19 Oct) read about 0.96 GB of expert trellis a window and layer and ran grouped_kernel at about 246 GB/s of DRAM
     traffic. In one call an expert's member groups (about 44 rows, two groups of 32) run next to each other, so the
@@ -60,7 +60,7 @@ def read() -> Switches:
     """Every switch from the environment; a value outside env_flags' set raises before any weight is read."""
 
     return Switches(stack_direct=flag(STACK_DIRECT_ENV, True), inner_k=flag(INNER_K_ENV, False),
-                    moe_direct=flag(MOE_DIRECT_ENV, True), moe_chunk=flag(MOE_CHUNK_ENV, False))
+                    moe_direct=flag(MOE_DIRECT_ENV, True), moe_chunk=flag(MOE_CHUNK_ENV, True))
 
 
 def use(switches: Switches) -> Switches:
