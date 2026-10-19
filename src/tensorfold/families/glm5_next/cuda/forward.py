@@ -118,6 +118,8 @@ class Buffers:
         self.post = torch.empty((rows, S), dtype=f32, device=dev)
         self.comb = torch.empty((rows, S * S), dtype=f32, device=dev)
         self.hcpart = torch.empty((rows, glue.HC_BLOCKS, 32), dtype=f32, device=dev)
+        # TF_GLM_HC_SPLIT, read once by the engine at startup (absent: on): same bytes
+        self.hc_split = bool(w.meta.get("hc_split", True))
         # KDA
         self.ka = torch.empty((rows, LL * 128), dtype=bf, device=dev)
         self.kg = torch.empty((rows, LL * 128), dtype=bf, device=dev)
@@ -192,7 +194,9 @@ class Buffers:
         self.tap_at: dict[int, list[int]] = {}
         self.experts = c.experts
         self.top_k = c.top_k
-        self.projection_scratch = (packed.ProjectionScratch(list(packed.projections(w)), rows, dev, prefill)
+        # TF_GLM_PLAIN_NARROW, read once by the engine at startup (absent: on): same bytes
+        self.projection_scratch = (packed.ProjectionScratch(list(packed.projections(w)), rows, dev, prefill,
+                                                           narrow=bool(w.meta.get("plain_narrow", True)))
                                    if w.meta.get("packed_exl3") else None)
         if self.projection_scratch is not None:
             self.projection_scratch.heads = {id(p) for p in packed.leaves(w.head)}
@@ -536,7 +540,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
     x = b.x[:R]
     h = layer.attn_hc
     glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
-                b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
+                b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, split=b.hc_split)
     if layer.kind == "kda":
         with prof.timed("kda"):
             g = kda_block(layer, w, st, b, R, cuts)
@@ -549,7 +553,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
         glue.hc_post(x, x, g, b.post[:R], b.comb[:R], fp32_residual=b.fp32_residual)
         h = layer.ffn_hc
         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
-                    b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
+                    b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, split=b.hc_split)
     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
         g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
     glue.hc_post(x, x, g, b.post[:R], b.comb[:R], fp32_residual=b.fp32_residual)

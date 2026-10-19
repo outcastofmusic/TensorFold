@@ -12,6 +12,7 @@ import re
 import torch
 from tensorfold.cuda.affine6.affine6 import Affine6
 from tensorfold.cuda.exl3.linear import Exl3Linear
+from tensorfold.env_flags import flag
 
 # Rows of a prompt chunk whose routed experts run as one window: an expert's weights are read once per 32 of its rows
 # in a window, so wider windows read fewer bytes. GB10, Mosaic 12L, 20.5k-token prompt, 2026-10-11: 128 rows 247 tok/s,
@@ -22,6 +23,13 @@ DENSE_PROMPT = os.environ.get('TF_GLM_DENSE_PROMPT', '0') == '1'
 # TF_GLM_PACKED_COPIES=1: every projection stages its rows in the scratch and copies its output back, and decode
 # computes the group sums packed projections never read (forward.group_sums): the old path, kept as the byte reference
 COPIES = os.environ.get('TF_GLM_PACKED_COPIES', '0') == '1'
+PLAIN_NARROW_ENV = 'TF_GLM_PLAIN_NARROW'
+
+
+def plain_narrow() -> bool:
+    """TF_GLM_PLAIN_NARROW (unset: on): decode rows of fp16 projections on ``prefill._plain_narrow``, the old bytes.
+    The engine reads it once at startup into ``Weights.meta``; a value outside env_flags' set raises."""
+    return flag(PLAIN_NARROW_ENV, True)
 
 
 @dataclass
@@ -76,11 +84,12 @@ class ProjectionScratch:
     the EXL3 kernels take contiguous rows only. Copying to composed output slices
     happens AFTER its output rotation/rounding, never before.
     """
-    def __init__(self, projections, rows, device, prefill=False):
+    def __init__(self, projections, rows, device, prefill=False, narrow=True):
         if rows < 1:
             raise ValueError('scratch rows must be positive')
         mats = [p for q in projections for p in leaves(q)]
         self.rows, self.chunk = rows, min(rows, 128)
+        self.narrow = narrow                              # TF_GLM_PLAIN_NARROW: plain projections' decode kernel
         self.k = max((q.k for q in mats), default=1)
         self.n = max((q.n for q in mats), default=1)
         self.xh = torch.empty(self.chunk*self.k,dtype=torch.float16,device=device)
@@ -107,10 +116,10 @@ class ProjectionScratch:
                    [self.xh,self.z,self.xs,*self.inputs.values(),*self.outputs.values()])
 
 
-def _plain_cuda(q,x,out):
+def _plain_cuda(q,x,out,narrow):
     # Import is lazy: CPU contracts never compile or load CUDA extensions.
     from .prefill import plain_matmul
-    return plain_matmul(q.weight,x,out)
+    return plain_matmul(q.weight,x,out,narrow)
 
 
 def _overlap(a, b):
@@ -186,7 +195,7 @@ def matmul(q, x, out, scratch):
                 # Real CPU plain contract, NOT a packed/CUDA arithmetic oracle.
                 yi.copy_(xi.float() @ q.weight.float().T)
             else:
-                _plain_cuda(q,xi,yi)
+                _plain_cuda(q,xi,yi,scratch.narrow)
         else:
             raise TypeError(f'unsupported packed adapter projection {type(q)}')
         if yi is not yr:
