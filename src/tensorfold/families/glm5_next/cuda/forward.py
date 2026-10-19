@@ -21,6 +21,26 @@ from .prefill import routed_micro_windows
 from tensorfold.cuda.exl3 import experts as generic_exl3
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
+from tensorfold.env_flags import flag
+
+MOE_IN_PLACE_ENV = "TF_GLM_MOE_IN_PLACE"
+SHARED_STREAM_ENV = "TF_GLM_SHARED_STREAM"
+
+
+def moe_in_place() -> bool:
+    """TF_GLM_MOE_IN_PLACE (unset: on): a packed MoE layer's routed kernels and shared expert write their slots of
+    ``Buffers.ey`` themselves, without the copies of the routed scratch and of ``sy`` into it. Same bytes.
+    The engine reads it once at startup into ``Weights.meta``; a value outside env_flags' set raises."""
+
+    return flag(MOE_IN_PLACE_ENV, True)
+
+
+def shared_stream() -> bool:
+    """TF_GLM_SHARED_STREAM (unset: off): a packed MoE layer's shared expert runs on a second stream beside the routed
+    experts, joined before the combine. Same kernels on the same buffers, so the same bytes. The engine reads it once
+    at startup into ``Weights.meta``; a value outside env_flags' set raises."""
+
+    return flag(SHARED_STREAM_ENV, False)
 
 # Expert skipping (changes replies; a measurement tool). TF_GLM_SKIP_SHARE=0.05: a routed pick under 5% of its row's routed
 # weight is not read. TF_GLM_SKIP_LAYERS=A:B: only layers A <= index < B. TF_GLM_SKIP_RENORM=0: the kept picks keep their weights.
@@ -120,9 +140,15 @@ class Buffers:
         self.hcpart = torch.empty((rows, glue.HC_BLOCKS, 32), dtype=f32, device=dev)
         # TF_GLM_HC_SPLIT, read once by the engine at startup (absent: on): same bytes
         self.hc_split = bool(w.meta.get("hc_split", True))
+        # TF_GLM_TOKEN_LIST, read once by the engine at startup (absent: on): the same token lists
+        self.token_list = bool(w.meta.get("token_list", True))
         # KDA
         self.ka = torch.empty((rows, LL * 128), dtype=bf, device=dev)
         self.kg = torch.empty((rows, LL * 128), dtype=bf, device=dev)
+        # TF_GLM_KDA_WIDE (absent: off): decode windows' chains on the three-kernel path, with their own q and read-out
+        self.kda_tmp = ((torch.empty((rows, LL, kda_mod.DK), dtype=f32, device=dev),
+                         torch.empty((rows, LL, kda_mod.DV), dtype=bf, device=dev))
+                        if w.meta.get("kda_wide", False) and not prefill else None)
         self.xs_fa = torch.empty((rows, 2), dtype=f32, device=dev)
         self.xs_ga = torch.empty((rows, 2), dtype=f32, device=dev)
         self.kxs = torch.empty((rows, LL * 128 // 64), dtype=f32, device=dev)
@@ -156,6 +182,7 @@ class Buffers:
         self.ey = None if exl3 else torch.empty((rows, slots, D), dtype=bf if prefill else f32, device=dev)
         self.plan = None if exl3 else grouped.Plan(rows, slots, c.experts + 1, dev, prefill=prefill)
         self.exl3 = None
+        self.moe_in_place, self.side = False, None
         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
             sl = c.shared_width // w.world
             if w.meta.get("packed_exl3"):
@@ -163,7 +190,15 @@ class Buffers:
                 ex = next((l.moe.experts for l in w.layers if l.moe is not None),
                           w.mtp.layer.moe.experts if w.mtp is not None else None)
                 self.exl3 = generic_exl3.Scratch(ex, min(rows, packed.MOE_WINDOW), slots, device=dev) if ex is not None else None
-                self.ey = torch.empty((rows, slots, D), dtype=f32, device=dev)
+                # TF_GLM_MOE_IN_PLACE (absent: on): the routed kernels write ey's rows themselves. Zeros: a skipped
+                # pick's slot (TF_GLM_SKIP_*) keeps a finite value, which its weight 0 cancels as the copied one did
+                self.moe_in_place = bool(w.meta.get("moe_in_place", True)) and self.exl3 is not None
+                self.ey = torch.zeros((rows, slots, D), dtype=f32, device=dev)
+                # TF_GLM_SHARED_STREAM (absent: off): the shared expert's stream beside the routed experts. Decode
+                # windows only: a prompt chunk's projections grow the prompt GEMM's workspace, and a block allocated on
+                # the second stream and freed on the first could be handed out again while still read
+                if w.meta.get("shared_stream", False) and not prefill and torch.device(dev).type == "cuda":
+                    self.side = torch.cuda.Stream(device=dev)
             else:
                 shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
                 self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
@@ -353,10 +388,13 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cuts: Se
     mm(b, fa, k.fb, None if pre else group_sums(k.fb, fa, b.xs_fa[:R]), b.ka[:R])
     mm(b, ga, k.gb, None if pre else group_sums(k.gb, ga, b.xs_ga[:R]), b.kg[:R])
     cur = st.cur[li]
+    # TF_GLM_KDA_WIDE: a decode window's chain on the three-kernel path, with the buffers' own q and read-out rows
+    tmp = getattr(b, "kda_tmp", None)
+    wide = {} if tmp is None else {"wide": True, "tmp": tmp}
     if not cuts:
         out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
                             k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
-                            st.rec[1 - cur, li])
+                            st.rec[1 - cur, li], **wide)
     else:
         # the chain runs piece by piece, each from the last cut's state and conv window: every piece's rows are those
         # of the whole chunk, and each cut keeps the state a prefill ending at its row leaves
@@ -414,7 +452,7 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
     if sparse_rows:
         mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
         tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
-                                              pk.shape[0] - 2, pos_dev)
+                                              pk.shape[0] - 2, pos_dev, fused=b.token_list)
         sparse.sparse_attention(b.q[:R], kc, vc, tokens, counts, o, c.qk_dim ** -0.5)
     o = o.view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, None if b.prefill else group_sums(a.o, o, b.xs_ao[:R]), R)
@@ -469,7 +507,8 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
         with prof.timed("dsa: select tokens"):
             mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
             tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
-                                                  pk.shape[0] - 2, pos_dev, bucket=sparse_np)
+                                                  pk.shape[0] - 2, pos_dev, bucket=sparse_np,
+                                                  fused=b.token_list)
         with prof.timed("dsa: sparse attention"):
             latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
     with prof.timed("dsa: expand"):
@@ -511,17 +550,31 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         # a row whose every pick is skipped keeps zero weights instead of dividing by their zero sum
         kept = wts.sum(1, keepdim=True).clamp_min(torch.finfo(wts.dtype).tiny)
         wts.mul_(torch.where(t[64] > 0, total / kept, torch.ones_like(total)))
+    if m.shared is not None and b.side is not None:
+        # TF_GLM_SHARED_STREAM: the shared expert reads normed beside the routed experts; neither writes what the
+        # other reads (the routed kernels skip the shared slot, the shared expert has the projection scratch)
+        main = torch.cuda.current_stream()
+        b.side.wait_stream(main)
+        with torch.cuda.stream(b.side):
+            sy = _shared_expert(m.shared, w, b, R, b.ey[:R, c.top_k] if b.moe_in_place else b.sy[:R])
+        routed_micro_windows(b.normed[:R], b.pick[:R], m.experts, b.exl3, b.ey[:R], R, c.limit,
+                             in_place=b.moe_in_place)
+        main.wait_stream(b.side)
+        if not b.moe_in_place:          # after the routed copy, which also fills the shared slot
+            b.ey[:R, c.top_k].copy_(sy)
+        glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+        return gather(w, b, R)
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         if w.meta.get("packed_exl3"):
-            routed_micro_windows(b.normed[:R], b.pick[:R], m.experts, b.exl3, b.ey[:R], R, c.limit)
+            routed_micro_windows(b.normed[:R], b.pick[:R], m.experts, b.exl3, b.ey[:R], R, c.limit,
+                                 in_place=b.moe_in_place)
         else:
             exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
-        s = m.shared
-        mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
-        glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
-        mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
-        b.ey[:R, c.top_k].copy_(b.sy[:R])
+        if b.moe_in_place:              # TF_GLM_MOE_IN_PLACE: straight into the shared slot
+            _shared_expert(m.shared, w, b, R, b.ey[:R, c.top_k])
+        else:
+            b.ey[:R, c.top_k].copy_(_shared_expert(m.shared, w, b, R, b.sy[:R]))
         glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
         return gather(w, b, R)
     with prof.timed("moe: gate/up"):
@@ -532,6 +585,14 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
     with prof.timed("moe: all-gather"):
         return gather(w, b, R)
+
+
+def _shared_expert(s, w: Weights, b: Buffers, R: int, out: torch.Tensor) -> torch.Tensor:
+    """The shared expert of R normed rows into ``out`` (fp32 [R, D], any row stride): BF16 or packed matmuls."""
+
+    mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
+    glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], w.cfg.limit)
+    return mm(b, b.sact[:R], s.down, b.sxs[:R], out, f32=True)
 
 
 def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,

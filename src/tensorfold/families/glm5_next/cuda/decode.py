@@ -568,11 +568,14 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
     sp = splice
     out, head = list(lead) if lead else [pending], pending
     stages = dict(forward=0.0, sample=0.0, commit=0.0)
+    early = bool(getattr(w, "meta", {}).get("early_launch", False))      # TF_GLM_EARLY_LAUNCH (engine.early_launch)
+    ahead = None                                          # the next step's logits, launched before the host's callback
     _sync(w)
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
-        logits = e.forward(e.verify_window([head]))
+        logits = ahead if ahead is not None else e.forward(e.verify_window([head]))
+        ahead = None
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         if sp is not None and sp.forced:
@@ -593,6 +596,10 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
         stages["commit"] += t3 - t2
         out.extend(new)
         head = tok
+        if early and len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+            # the next step needs only head and the commit; a stop below leaves its rows uncommitted, as a verify
+            # window leaves its refused drafts
+            ahead = e.forward(e.verify_window([head]))
         if new and _fed(w, on_tokens, new):
             break
     _sync(w)
@@ -697,12 +704,22 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
     sp = splice
     out, head = list(lead) if lead else [pending], pending
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
-    rounds = drafted = accepted = 0
     depths: list[int] = []
     keeps: list[int] = []
+    early = bool(getattr(w, "meta", {}).get("early_launch", False)) and sp is None    # TF_GLM_EARLY_LAUNCH (engine.early_launch)
     _sync(w)
     start = time.perf_counter()
     depth = min(policy.next(0, 0), count - len(out))
+    try:
+        return _dflash_rounds(e, drafter, w, st, b, dflash2, policy, sp, out, head, depth, count, sampling, stop_eos,
+                              on_tokens, early, stages, depths, keeps, start)
+    finally:
+        drafter.ahead = None                       # a block pass launched for a round that never came
+
+
+def _dflash_rounds(e, drafter, w, st, b, dflash2, policy, sp, out, head, depth, count, sampling, stop_eos, on_tokens,
+                   early, stages, depths, keeps, start) -> DecodeResult:
+    rounds = drafted = accepted = 0
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
         forced = sp.drafts(count - len(out)) if sp is not None else None
@@ -739,6 +756,9 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         e.follow(new)
         out.extend(new)
         head = follows[-1]
+        if early and len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+            # the next round's block pass needs only head and the taps just added
+            drafter.launch_ahead(head, policy.most)
         stop = _fed(w, on_tokens, new[:max(0, count - (len(out) - len(new)))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
         stages["forward"] += t2 - t1

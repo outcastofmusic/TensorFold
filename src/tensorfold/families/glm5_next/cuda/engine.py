@@ -24,15 +24,32 @@ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays de
 DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
 
 
+def early_launch() -> bool:
+    """TF_GLM_EARLY_LAUNCH (unset: off): the serial loop launches the next step's forward, and the DFlash2 loop the
+    next round's block pass, before the host calls ``on_tokens``; the same tokens. Read once at startup into
+    ``Weights.meta``; a value outside env_flags' set raises."""
+
+    from tensorfold.env_flags import flag
+
+    return flag("TF_GLM_EARLY_LAUNCH", False)
+
+
 def kernel_switches() -> dict[str, bool]:
     """The decode kernels' switches, read once at startup into ``Weights.meta`` (``forward.Buffers`` takes them):
-    TF_GLM_PLAIN_NARROW (``packed.plain_narrow``) and TF_GLM_HC_SPLIT (``glue.hc_split``), both on when unset. Either
-    way a reply keeps its bytes; a value outside env_flags' set raises."""
+    TF_GLM_PLAIN_NARROW (``packed.plain_narrow``), TF_GLM_HC_SPLIT (``glue.hc_split``), TF_GLM_MOE_IN_PLACE
+    (``forward.moe_in_place``) and TF_GLM_TOKEN_LIST (``sparse.token_list``), on when unset; TF_GLM_SHARED_STREAM
+    (``forward.shared_stream``), TF_GLM_KDA_WIDE (``kda.decode_wide``) and TF_GLM_EARLY_LAUNCH (``early_launch``, the
+    decode loops), off when unset. Either way a reply keeps its bytes; a value outside env_flags' set raises."""
 
+    from .forward import moe_in_place, shared_stream
     from .glue import hc_split
+    from .kda import decode_wide
     from .packed import plain_narrow
+    from .sparse import token_list
 
-    return {"plain_narrow": plain_narrow(), "hc_split": hc_split()}
+    return {"plain_narrow": plain_narrow(), "hc_split": hc_split(), "moe_in_place": moe_in_place(),
+            "shared_stream": shared_stream(), "kda_wide": decode_wide(), "token_list": token_list(),
+            "early_launch": early_launch()}
 
 
 def _token_id(model_dir: Path, text: str) -> int:

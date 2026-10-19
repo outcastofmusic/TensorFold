@@ -456,12 +456,9 @@ class Drafter:
     def candidates(self, pending: int, depth: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Candidate ids [depth, top_k] for the positions after ``pending``, their logits, the projected rows."""
 
-        self.ids_host[0] = pending
-        self.ids[:1].copy_(self.ids_host, non_blocking=True)
-        if self.block_graph is not None:
-            self.block_graph.replay()
-        else:
-            self._block_compute()
+        if getattr(self, "ahead", None) != (pending, self.context_end):
+            self._launch(pending)
+        self.ahead = None
         g = self.packed[:, :depth].cpu()
         k = self.top_k
         values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy().astype(np.float64)
@@ -504,6 +501,25 @@ class Drafter:
             prev = int(tokens[d, j])
             out.append(prev)
         return out
+
+    def _launch(self, pending: int) -> None:
+        self.ids_host[0] = pending
+        self.ids[:1].copy_(self.ids_host, non_blocking=True)
+        if self.block_graph is not None:
+            self.block_graph.replay()
+        else:
+            self._block_compute()
+
+    def launch_ahead(self, pending: int, most: int) -> None:
+        """TF_GLM_EARLY_LAUNCH: queue the block pass the next ``propose(pending, ...)`` reads (the pass does not depend
+        on the depth; ``most``, the policy's deepest, 0 means no drafts), so the GPU runs it while the host does a
+        round's bookkeeping. ``propose`` reads it only for the same pending token and context end; the caller clears
+        ``ahead`` when the round's proposal never comes."""
+
+        if min(most, self.block - 1) < 1 or self.context_end == 0:
+            return
+        self._launch(pending)
+        self.ahead = (pending, self.context_end)
 
     def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
         """Up to ``depth`` drafts for the positions after the pending token (which sits at context_end)."""

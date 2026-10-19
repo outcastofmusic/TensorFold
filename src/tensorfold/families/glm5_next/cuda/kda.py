@@ -7,7 +7,17 @@ from pathlib import Path
 
 import torch
 
+from tensorfold.env_flags import flag
+
 DK = DV = 128
+DECODE_WIDE_ENV = "TF_GLM_KDA_WIDE"
+
+
+def decode_wide() -> bool:
+    """TF_GLM_KDA_WIDE (unset: off): decode and verify windows run the chain as the prompt's three kernels, the same
+    bits. The engine reads it once at startup into ``Weights.meta``; a value outside env_flags' set raises."""
+
+    return flag(DECODE_WIDE_ENV, False)
 
 
 @lru_cache(maxsize=1)
@@ -73,11 +83,15 @@ def _wide_scratch(rows: int, heads: int, device) -> tuple[torch.Tensor, torch.Te
 def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
           conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
           norm_w: torch.Tensor, eps: float, lower: float, rows: int, scratch: KDAScratch,
-          state_out: torch.Tensor, *, wide: bool | None = None) -> torch.Tensor:
-    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits."""
+          state_out: torch.Tensor, *, wide: bool | None = None,
+          tmp: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
+    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits.
+
+    ``tmp``: the wide path's (q, read-out) rows owned by the caller. A captured decode graph needs its own: the shared
+    ones grow, and so move, when a longer prompt chunk runs."""
 
     if wide if wide is not None else rows >= WIDE_ROWS:
-        q_tmp, y_tmp = _wide_scratch(rows, a_log.numel(), p.device)
+        q_tmp, y_tmp = tmp if tmp is not None else _wide_scratch(rows, a_log.numel(), p.device)
         _ext().chain_wide(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in,
                           a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, state_out,
                           scratch.k, scratch.v, scratch.g, scratch.b, q_tmp, y_tmp)
