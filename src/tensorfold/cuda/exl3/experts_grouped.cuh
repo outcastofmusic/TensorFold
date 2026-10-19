@@ -607,7 +607,7 @@ void decode_launch(const GroupedArgs& a, cudaStream_t stream) {
     else if (a.lo == K2_QUARTER && a.hi == K2_QUARTER) TF_LAUNCH(NT_, PF_, K2_QUARTER, K2_QUARTER);             \
     else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, PF_, 2, 10);                                               \
     else TF_LAUNCH(NT_, PF_, 2, 16);
-    // (4, 4) is the default (decode_config); the others are there for tools/exl3_expert_sweep.py, same bytes
+    // experts.DECODE_TILES picks 4x4 or 4x2; 2x4 and 2x8 stay for tools/exl3_expert_sweep.py; all write the same bytes
     if (a.nt == 4 && a.pf == 4) { TF_RANGES(4, 4) }
     else if (a.nt == 2 && a.pf == 4) { TF_RANGES(2, 4) }
     else if (a.nt == 4 && a.pf == 2) { TF_RANGES(4, 2) }

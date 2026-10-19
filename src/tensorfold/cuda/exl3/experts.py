@@ -25,7 +25,19 @@ GLM_DOWN = (8, 4, 1, 1)
 PROMPT_ROWS = 64          # a window of more rows than this is a prompt's: its experts each serve many rows
 PROMPT_TILES = 2          # row tiles (16 rows each) that share one read of an expert's weights in such a window
 DECODE_ROWS = 16          # a window of at most this many rows fits one row tile: decode_kernel (TF_EXL3_EXPERT_DECODE)
-DECODE_NT, DECODE_PF = 4, 4   # decode_kernel's n tiles a block and k steps in flight a warp (no effect on the sums)
+# decode_kernel's (n tiles a block, k steps in flight a warp) by projection shape (K, N) and window rows: entries
+# (most rows, tile), the first whose rows cover the window; None keeps grouped_kernel. Every tile writes the same bytes.
+# GB10 sweep (tools/exl3_expert_sweep.py, tf-runs/gpu-exl3dec/RESULTS.md, 2026-10-19), against grouped_kernel:
+# Flash Next gate/up 4x4 1.09x at 1 row, 4x2 1.01-1.10x at 2-5 rows and 0.99-1.00x from 6; Flash Next down 4x4
+# 1.06-1.09x at 1-4 rows and 0.98-1.00x from 5, where 4x2 is 1.00-1.04x; GLM-5.3 4x2 1.07-1.23x at every row count,
+# 4x4 0.93-1.07x. 2x4 and 2x8 never won.
+DECODE_TILES: dict[tuple[int, int], tuple[tuple[int, tuple[int, int] | None], ...]] = {
+    (2560, 640): ((1, (4, 4)), (5, (4, 2)), (16, None)),       # Flash Next gate/up
+    (640, 2560): ((4, (4, 4)), (16, (4, 2))),                  # Flash Next down
+    (4096, 2048): ((16, (4, 2)),),                             # GLM-5.3 gate/up
+    (2048, 4096): ((16, (4, 2)),),                             # GLM-5.3 down
+}
+DECODE_TILE = (4, 2)      # another shape: the setting that was at least grouped_kernel's speed (0.99x) everywhere
 
 
 @lru_cache(maxsize=1)
@@ -224,17 +236,28 @@ def prompt_config(cfg: tuple[int, int, int, int]) -> tuple[int, int, int, int, i
     return (nt, w, sk, pf, PROMPT_TILES) if (nt, w, pf) == (8, 4, 1) else (nt, w, sk, pf, 1)
 
 
-def decode_config(cfg: tuple[int, int, int, int], N: int) -> tuple[int, int, int, int] | None:
-    """``cfg`` for decode_kernel: the same warps and K splits, so every sum is ``cfg``'s, with DECODE_NT n tiles and
-    DECODE_PF k steps in flight; None when its n tiles do not divide N (the window stays on grouped_kernel).
+def decode_tile(K: int, N: int, R: int) -> tuple[int, int] | None:
+    """(n tiles, k steps in flight) of decode_kernel for an R-row window of a K -> N projection, or None for
+    grouped_kernel (DECODE_TILES, else DECODE_TILE)."""
+
+    for most, tile in DECODE_TILES.get((K, N), ((DECODE_ROWS, DECODE_TILE),)):
+        if R <= most:
+            return tile
+    return None
+
+
+def decode_config(cfg: tuple[int, int, int, int], K: int, N: int, R: int) -> tuple[int, int, int, int] | None:
+    """``cfg`` for decode_kernel: the same warps and K splits, so every sum is ``cfg``'s, with decode_tile's n tiles
+    and k steps in flight; None when the table keeps grouped_kernel or the n tiles do not divide N.
 
     GB10, Flash Next 3.05 bpw: grouped_kernel's 4-warp blocks ran 3 an SM (168 registers, 32.8 KB of shared memory)
-    with one k step in flight a warp; decode_kernel's run 4 an SM (128 registers, 13.9 KB) with four."""
+    with one k step in flight a warp; decode_kernel's run 4 (4x4: 128 registers) or 5 (4x2: 96) an SM."""
 
-    nt, w, sk, _ = cfg
-    if w != 4 or N % (16 * DECODE_NT):
+    _, w, sk, _ = cfg
+    tile = decode_tile(K, N, R) if R <= DECODE_ROWS else None
+    if tile is None or w != 4 or N % (16 * tile[0]):
         return None
-    return DECODE_NT, w, sk, DECODE_PF
+    return tile[0], w, sk, tile[1]
 
 
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
@@ -283,15 +306,15 @@ def plan(cfg_gu, cfg_d, I: int, D: int, R: int, many: bool, decode: bool) -> tup
     """((nt, warps, splits, pf, row tiles), decode_kernel?) for gate/up (K D -> N I) and down (K I -> N D).
 
     A prompt window takes prompt_config; a window of at most DECODE_ROWS rows with ``decode`` (TF_EXL3_EXPERT_DECODE)
-    takes decode_kernel where decode_config divides N; the rest keep grouped_kernel at their cfg."""
+    takes decode_kernel at decode_config's tile; the rest keep grouped_kernel at their cfg."""
 
-    def one(cfg, N):
+    def one(cfg, K, N):
         if many:
             return prompt_config(cfg), False
-        dc = decode_config(cfg, N) if decode and R <= DECODE_ROWS else None
+        dc = decode_config(cfg, K, N, R) if decode else None
         return ((*dc, 1), True) if dc else ((*cfg, 1), False)
 
-    return one(cfg_gu, I), one(cfg_d, D)
+    return one(cfg_gu, D, I), one(cfg_d, I, D)
 
 
 def dequant(trellis: torch.Tensor, codebook: int | str, window: int = 16) -> torch.Tensor:

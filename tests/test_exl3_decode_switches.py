@@ -76,13 +76,36 @@ def test_use_returns_the_previous_setting():
     assert switches.use(first) is off
 
 
-@pytest.mark.parametrize("model", MODELS)
-@pytest.mark.parametrize("rows", [1, 2, 3, 7, 8, 16])
-def test_a_decode_window_takes_decode_kernel_with_the_same_warps_and_splits(model, rows):
+# (model, rows) -> the (n tiles, k steps) of gate/up and of down, None for grouped_kernel: the GB10 sweep's winners
+WANT = {("flash_next", 1): ((4, 4), (4, 4)), ("flash_next", 2): ((4, 2), (4, 4)),
+        ("flash_next", 4): ((4, 2), (4, 4)), ("flash_next", 5): ((4, 2), (4, 2)),
+        ("flash_next", 6): (None, (4, 2)), ("flash_next", 7): (None, (4, 2)), ("flash_next", 16): (None, (4, 2))}
+WANT.update({("glm53", r): ((4, 2), (4, 2)) for r in (1, 2, 5, 7, 8, 16)})
+
+
+@pytest.mark.parametrize("model, rows", list(WANT))
+def test_a_decode_window_takes_the_sweeps_tile_with_the_same_warps_and_splits(model, rows):
     D, I = MODELS[model]
     gu, dn = experts.plan(FN_GATEUP, FN_DOWN, I, D, rows, False, True)
-    assert gu == ((experts.DECODE_NT, 4, FN_GATEUP[2], experts.DECODE_PF, 1), True)
-    assert dn == ((experts.DECODE_NT, 4, FN_DOWN[2], experts.DECODE_PF, 1), True)
+    for got, cfg, tile in zip((gu, dn), (FN_GATEUP, FN_DOWN), WANT[(model, rows)]):
+        if tile is None:
+            assert got == ((*cfg, 1), False)
+        else:
+            assert got == ((tile[0], 4, cfg[2], tile[1], 1), True)
+
+
+def test_every_row_count_of_every_table_shape_has_a_setting_or_grouped_kernel():
+    for (k, n), entries in experts.DECODE_TILES.items():
+        assert entries[-1][0] == experts.DECODE_ROWS                 # the table covers every decode window
+        assert [m for m, _ in entries] == sorted(m for m, _ in entries)
+        for _, tile in entries:
+            assert tile is None or (tile in ((4, 4), (4, 2)) and n % (16 * tile[0]) == 0)
+
+
+def test_another_shape_takes_the_default_tile():
+    assert experts.decode_tile(1024, 512, 1) == experts.DECODE_TILE
+    assert experts.decode_tile(1024, 512, 16) == experts.DECODE_TILE
+    assert experts.decode_config((8, 4, 2, 1), 1024, 512, 17) is None
 
 
 @pytest.mark.parametrize("model", MODELS)
@@ -97,9 +120,11 @@ def test_wider_windows_prompts_and_the_switch_off_keep_grouped_kernel(model, row
 
 
 def test_a_width_its_n_tiles_do_not_divide_stays_on_grouped_kernel():
-    assert experts.decode_config((8, 4, 2, 1), 640 + 32) is None
-    assert experts.decode_config((4, 4, 1, 2), 96) is None
-    assert experts.decode_config((8, 4, 4, 1), 640) == (experts.DECODE_NT, 4, 4, experts.DECODE_PF)
+    assert experts.decode_config((8, 4, 2, 1), 2560, 640 + 32, 1) is None
+    assert experts.decode_config((4, 4, 1, 2), 2560, 96, 1) is None
+    assert experts.decode_config((8, 4, 4, 1), 2560, 640, 1) == (4, 4, 4, 4)
+    assert experts.decode_config((8, 4, 4, 1), 2560, 640, 3) == (4, 4, 4, 2)
+    assert experts.decode_config((8, 4, 4, 1), 2560, 640, 6) is None
 
 
 class FakeExt:
@@ -139,7 +164,7 @@ def test_routed_hands_each_launch_its_switches(monkeypatch, decode, pdl, rows):
     for _, args in (c for c in fake.calls if c[0] == "grouped"):
         dec, nt, pf = args[-2], args[17], args[19]
         assert dec is (decode and rows <= experts.DECODE_ROWS)
-        assert (nt, pf) == ((experts.DECODE_NT, experts.DECODE_PF) if dec else (8, 1))
+        assert (nt, pf) == (experts.DECODE_TILE if dec else (8, 1))         # a shape outside the table
     wts = torch.zeros((rows, 4), dtype=torch.float32)
     fake.calls.clear()
     experts.routed(x, pick, wts, ex, s, torch.zeros((rows, ex.dims)), rows)
@@ -204,10 +229,10 @@ def _ptxas(kernels: list[str]) -> dict[str, tuple[int, int, bool]]:
 def test_decode_kernel_fits_more_blocks_an_sm_than_grouped_kernel_without_spilling():
     """Flash Next 3.05 bpw's instance (mul1, rates 2..10: 3-bit experts, 5-bit shared expert): grouped_kernel at
     (8 n tiles, 1 k step) holds 3 blocks of 4 warps an SM on GB10 (64K registers, 100 KB shared, 1 KB of it reserved a block); decode_kernel at
-    its default holds 4, with a third of the shared memory."""
+    at 4x2 holds 5, with less than half the shared memory."""
 
     old = "grouped_kernel<2, 8, 4, 1, 2, 10, 1>"
-    new = f"decode_kernel<2, {experts.DECODE_NT}, 4, {experts.DECODE_PF}, 2, 10>"
+    new = "decode_kernel<2, 4, 4, 2, 2, 10>"                         # 4x2, the table's tile from 2 rows
     got = _ptxas([old, new])
     (r_old, s_old, sp_old), (r_new, s_new, sp_new) = (next(v for k, v in got.items() if tag in k)
                                                       for tag in ("grouped_kernel", "decode_kernel"))
@@ -217,5 +242,5 @@ def test_decode_kernel_fits_more_blocks_an_sm_than_grouped_kernel_without_spilli
 
     assert not sp_new
     assert blocks(r_old, s_old) == 3
-    assert blocks(r_new, s_new) >= 4
+    assert blocks(r_new, s_new) >= 5
     assert s_new * 2 < s_old

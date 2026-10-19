@@ -1,14 +1,11 @@
-"""Replies on the real checkpoints with the EXL3 decode switches off, on, off on one load (two loads of some
-checkpoints already differ, so comparing loads would test that): TF_EXL3_EXPERT_DECODE and TF_EXL3_PDL, and on Flash
-Next also TF_FLASHNEXT_F16_NARROW.
+"""Flash Next EXL3 3.05 bpw replies with the EXL3 decode switches off, on, off on one load (two loads of some
+checkpoints already differ, so comparing loads would test that): TF_EXL3_EXPERT_DECODE, TF_EXL3_PDL and
+TF_FLASHNEXT_F16_NARROW. The first token, 64 serial tokens and 64 drafted tokens (MTP at the default depth,
+confidence 0 so every verify window is full) from CUDA graphs, greedy and seeded; drafted equal serial in every
+setting, and every setting equal to the first.
 
-- Flash Next EXL3 3.05 bpw: the first token, 64 serial tokens and 64 drafted tokens (MTP at the default depth,
-  confidence 0 so every verify window is full) from CUDA graphs, greedy and seeded; drafted equal serial in every
-  setting, and every setting equal to the first.
-- GLM-5.3 (the sushi-experts pack and its DFlash2 drafter): eager replies serial and drafted, greedy and seeded, then
-  serial replies from CUDA graphs captured in each setting.
-
-Needs the checkpoints under $MODELS (about 60 GiB free for Flash Next, 100 GiB for GLM-5.3)."""
+GLM-5.3's replies are in test_glm_exl3_decode_replies.py: run the two files in separate pytest processes, as each
+checkpoint needs most of the memory (about 60 GiB free for Flash Next)."""
 
 from __future__ import annotations
 
@@ -27,8 +24,6 @@ from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
 
 MODELS = Path(os.environ.get("MODELS", "/home/agis/models"))
 FN_PACK = MODELS / "Qwen3.8-Flash-Next-exl3-3.05bpw"
-GLM = MODELS / "glm53-flash-sushi-experts-mosaic-dense"
-GLM_DRAFTER = MODELS / "GLM-5.3-Flash-DFlash2-TR3-v3"
 SAMPLINGS = [None, Sampling(1234, 1.0, 20, 0.95)]
 ORDER = (False, True, False)                    # off twice: a difference is the switches', not noise
 
@@ -92,63 +87,3 @@ def test_flash_next_replies_keep_their_bytes_with_the_switches_off_on_off(flash_
         assert g[3] > 0, setting                       # the drafts ran
     assert got[0][:3] == got[2][:3]
     assert got[0][:3] == got[1][:3]
-
-
-# ------------------------------------------------------------------------------------------------- GLM-5.3
-
-
-@pytest.fixture(scope="module")
-def glm():
-    if not (GLM / "config.json").exists() or not (GLM_DRAFTER / "config.json").exists():
-        pytest.skip("the GLM-5.3 pack or its drafter is not here")
-    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
-
-    engine = GlmEngine(GLM, rank=0, master="", port=0, world=1, drafter=GLM_DRAFTER, context=8192, eager=True,
-                       calibrate=False)
-    yield engine
-    del engine
-    _free()
-
-
-def _glm_reply(engine, prompt, sampling, draft, tokens=48):
-    out: list[int] = []
-    engine.cache.clear()
-    engine.live = []
-    engine.request.policy = None
-    engine.request.stop_eos = False
-    stats = engine.generate(list(prompt), tokens, sampling, lambda new: out.extend(new), draft=draft)
-    assert len(out) == tokens
-    if draft:
-        assert stats["rounds"] >= 1, stats
-    return out
-
-
-@pytest.mark.parametrize("sampling", SAMPLINGS, ids=["greedy", "seeded"])
-def test_glm_eager_replies_keep_their_bytes_with_the_switches_off_on_off(glm, sampling):
-    prompt = _prompt(600, 11, 150_000)
-    got = []
-    for on in ORDER:
-        switches.use(switches.Switches(expert_decode=on, pdl=on))
-        got.append((_glm_reply(glm, prompt, sampling, False), _glm_reply(glm, prompt, sampling, True)))
-    for setting, (serial, drafted) in zip(ORDER, got):
-        assert drafted == serial, setting
-    assert got[0] == got[2]
-    assert got[0] == got[1]
-
-
-@pytest.mark.parametrize("sampling", SAMPLINGS, ids=["greedy", "seeded"])
-def test_glm_graph_replies_keep_their_bytes_with_the_switches_off_on_off(glm, sampling):
-    from tensorfold.families.glm5_next.cuda.decode import Engine, prefill, serial_decode
-
-    prompt = _prompt(600, 13, 150_000)
-    got = []
-    for on in ORDER:
-        switches.use(switches.Switches(expert_decode=on, pdl=on))
-        e = Engine(glm.w, capacity=8192, max_rows=8, prefill_rows=128, graphs=True, long_context=True)
-        first = prefill(e, prompt, sampling, mtp=False)
-        got.append(serial_decode(e, first, 48, sampling).tokens)
-        assert e.graphs is not None
-        del e
-        _free()
-    assert got[0] == got[2]
-    assert got[0] == got[1]
