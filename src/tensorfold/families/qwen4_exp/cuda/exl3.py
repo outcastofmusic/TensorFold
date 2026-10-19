@@ -144,8 +144,10 @@ def requant_rows(head, ids: torch.Tensor, device) -> tuple[torch.Tensor, torch.T
 
 
 def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: tuple[int, int] | None = None,
-         draft_vocab: int | str | None = None, table_reads: list | None = None, f16_narrow: bool | None = None):
-    """``f16_narrow`` sets the fp16 matrices' decode tiles (``exl3_mm.f16_narrow``); None reads the flag here."""
+         draft_vocab: int | str | None = None, table_reads: list | None = None, f16_narrow: bool | None = None,
+         hc_fuse: bool | None = None):
+    """``f16_narrow`` sets the fp16 matrices' decode tiles (``exl3_mm.f16_narrow``), ``hc_fuse`` each hyper-connection's
+    prompt write-back and norm in one kernel (``hc_b16.fuse``, TF_FLASHNEXT_HC_FUSE); None reads the flag here."""
 
     from .qmm import make_q4
     from tensorfold.cuda.direct_read import in_background
@@ -154,7 +156,10 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
 
     if tp is not None and tp[1] > 1:
         raise ValueError("EXL3 packs of Flash Next run on one GPU; two ranks read the MLX checkpoint")
+    from .hc_b16 import fuse as hc_fuse_flag
+
     f16_narrow = narrow_flag() if f16_narrow is None else f16_narrow
+    hc_fuse = hc_fuse_flag() if hc_fuse is None else hc_fuse
     model_dir = Path(model_dir)
     cfg = Config.read(model_dir)
     pk = Pack(model_dir)
@@ -174,7 +179,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         if inject:
             rows.append(pk.get(name + ".block_inject_weight.weight"))
         down, up = f16(sc, rows, device), f16(sc, [pk.get(name + ".input_mix_weight_up.weight")], device)
-        return HC(down, up, centred(name + ".hc_norm.weight"), inject, down, up)
+        return HC(down, up, centred(name + ".hc_norm.weight"), inject, down, up, fuse=hc_fuse)
 
     def moe(name: str) -> MoEW:
         router = torch.cat([pk.get(name + ".gate.weight").to(torch.bfloat16),

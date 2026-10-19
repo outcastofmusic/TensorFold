@@ -135,7 +135,7 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
 template <int K2, int CB, int WK>
 __global__ void __launch_bounds__(WK * 32) linear_kernel(
     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
-    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
+    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype, long long ldy,
     float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
     constexpr int TW = tile_words<K2>();
     constexpr int LW = lane_words<K2>();
@@ -240,7 +240,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                         v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
                     }
                     finish(v, lane, svh, bias, col0 + 4 * lane);
-                    store4(y, y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
+                    store4(y, y_dtype, (size_t)(m0 + rlo + r) * ldy + col0 + 4 * lane, v);
                 }
             } else {
                 for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
@@ -271,7 +271,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                     }
                     float v[4] = {s.x, s.y, s.z, s.w};
                     finish(v, lane, svh, bias, col0 + 4 * lane);
-                    store4(y, y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
+                    store4(y, y_dtype, (size_t)(m0 + r) * ldy + col0 + 4 * lane, v);
                 }
                 if (threadIdx.x == 0) counters[pass * NB + nb] = 0;   // every program of the block has arrived
             }
@@ -319,6 +319,7 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
                       const c10::optional<at::Tensor>& Z, at::Tensor& counters, int64_t K2, int64_t cb, int64_t SK,
                       int64_t WK, bool pdl) {
     const int M = (int)xh.size(0), K = (int)xh.size(1), N = (int)y.size(1);
+    const long long ldy = M > 1 ? (long long)y.stride(0) : N;     // a row stride wider than N: columns of a wider y
     TORCH_CHECK(WK == 2 || WK == 4 || WK == 8, "WK must be 2, 4 or 8");
     TORCH_CHECK((K / 16) % (SK * WK) == 0, "K / 16 must split evenly over SK * WK warps");
     dim3 grid((unsigned)(N / 128), (unsigned)SK);
@@ -336,7 +337,7 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
         tf_exl3_pdl::launch(kernel, grid, dim3((unsigned)(WK * 32)), (size_t)smem, stream, early,              \
             reinterpret_cast<const half*>(xh.data_ptr()), reinterpret_cast<const uint32_t*>(T.data_ptr()),      \
             (long long)stride_k, (long long)stride_nb, reinterpret_cast<const half*>(svh.data_ptr()), bptr,     \
-            y.data_ptr(), dtype_of(y), zptr, counters.data_ptr<int>(), M, K, N, (int)SK);                       \
+            y.data_ptr(), dtype_of(y), ldy, zptr, counters.data_ptr<int>(), M, K, N, (int)SK);                  \
         return;                                                                                                 \
     }
     TF_EXL3_ALL(TF_LAUNCH)

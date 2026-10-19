@@ -20,6 +20,18 @@ static void check_io(const at::Tensor& x, const char* name) {
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, name, ": must be 16-byte aligned");
 }
 
+// The output may be a column range of a wider matrix (a stack's part writing its columns in place): rows of unit
+// column stride, any row stride of at least N that keeps every row 16-byte aligned.
+static void check_out(const at::Tensor& y, const char* name) {
+    const auto t = y.scalar_type();
+    TORCH_CHECK(y.is_cuda() && y.dim() == 2 && (t == at::kHalf || t == at::kBFloat16 || t == at::kFloat),
+                name, ": expected a 2-d fp16, bf16 or fp32 CUDA tensor");
+    TORCH_CHECK(y.is_contiguous() || (y.stride(1) == 1 && y.stride(0) >= y.size(1) &&
+                                      y.stride(0) * y.element_size() % 16 == 0),
+                name, ": rows must be contiguous, at a row stride of at least N and a multiple of 16 bytes");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0, name, ": must be 16-byte aligned");
+}
+
 // xh [M, K] fp16 = fp16(((x * suh) @ H) / sqrt(128)); x [M, K] fp16, bf16 or fp32. pdl: TF_EXL3_PDL (pdl.cuh).
 void rot_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor xh, bool pdl) {
     check_io(x, "x");
@@ -31,12 +43,13 @@ void rot_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor xh, bool pdl)
     exl3_rot_in_cuda(x, suh, xh, pdl);
 }
 
-// y [M, N] = (xh @ W_q) @ H * svh + bias; Z [SK, M, N] fp32 when SK > 1; counters int32 [8 * N / 128], left zero.
+// y [M, N] = (xh @ W_q) @ H * svh + bias, y's rows at their own stride (check_out); Z [SK, M, N] fp32 when SK > 1;
+// counters int32 [8 * N / 128], left zero.
 void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb, const at::Tensor& svh,
             const c10::optional<at::Tensor>& bias, at::Tensor y, const c10::optional<at::Tensor>& Z,
             at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK, bool pdl) {
     check(xh, at::kHalf, "xh");
-    check_io(y, "y");
+    check_out(y, "y");
     check(svh, at::kHalf, "svh");
     check(T, at::kInt, "T");
     check(counters, at::kInt, "counters");

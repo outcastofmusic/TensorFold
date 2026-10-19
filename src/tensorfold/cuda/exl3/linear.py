@@ -19,7 +19,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_linear_v4", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
+    return load(name="tensorfold_exl3_linear_v5", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                 verbose=False)
 
@@ -165,7 +165,9 @@ class Exl3Linear:
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None, out_dtype: torch.dtype | None = None,
                  xh: torch.Tensor | None = None, z: torch.Tensor | None = None) -> torch.Tensor:
-        """y [M, N] = x [M, K] @ W + bias for M = 1..128; scratch ``xh`` fp16 [M, K] and ``z`` fp32 (SK > 1) allocated when not given."""
+        """y [M, N] = x [M, K] @ W + bias for M = 1..128; scratch ``xh`` fp16 [M, K] and ``z`` fp32 (SK > 1) allocated when not given.
+
+        ``out`` may be N columns of a wider matrix (unit column stride, rows 16-byte aligned): the rows go there."""
 
         if x.dim() != 2 or x.shape[1] != self.k or not 1 <= x.shape[0] <= 128:
             raise ValueError(f"x must be [1..128, {self.k}], got {tuple(x.shape)}")

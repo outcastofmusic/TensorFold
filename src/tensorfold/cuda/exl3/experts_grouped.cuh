@@ -225,19 +225,39 @@ __host__ __device__ constexpr bool k2_supported(int k2) {
 
 // Program (expert u, n block, split and member group): up to 16 * RT members times W_q over the split's K range; warps
 // added in order. A row's sums do not depend on NT, PF or RT, nor on its place among the members.
+//
+// Two layouts of the same programs. Spanned (items null): grid (experts, n blocks, matrices x splits x member groups),
+// every member group a window's rows could fill, so a prompt window of 1,024 rows launches 32 groups an expert and
+// leaves 31 of a typical routed expert's empty. Listed (TF_EXL3_EXPERT_ITEMS): grid (n blocks, matrices x splits,
+// items), one program a (place << 16 | member group) item group_kernel listed, so only filled groups launch, and an
+// item's n blocks run next to each other while its rows are still in L2. Each program computes the same sums.
 template <int CB, int NT, int W, int PF, int LO, int HI, int RT>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, uint32_t wmask) {
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, uint32_t wmask,
+    const int* __restrict__ items, const int* __restrict__ icount) {
     tf_exl3_pdl::grid_wait();
-    const int u = blockIdx.x;
-    if (u >= ucount[0]) return;
-    const int MT = (maxm + 16 * RT - 1) / (16 * RT);
-    const int mtile = blockIdx.z % MT;
-    const int split = (blockIdx.z / MT) % SK;
-    const int mat = blockIdx.z / MT / SK;
+    int u, mtile, zz, nb;
+    if (items != nullptr) {
+        const int it = blockIdx.z;
+        if (it >= icount[0]) return;
+        const int code = items[it];
+        u = code >> 16;
+        mtile = code & 0xffff;
+        nb = blockIdx.x;
+        zz = blockIdx.y;
+    } else {
+        u = blockIdx.x;
+        if (u >= ucount[0]) return;
+        const int MT = (maxm + 16 * RT - 1) / (16 * RT);
+        mtile = blockIdx.z % MT;
+        zz = blockIdx.z / MT;
+        nb = blockIdx.y;
+    }
+    const int split = zz % SK;
+    const int mat = zz / SK;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -270,7 +290,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = nb * NT;
 
     float acc[RT][NT][2][4];
 #pragma unroll
@@ -563,17 +583,23 @@ struct GroupedArgs {
     int rt = 1;          // row tiles a block (16 rows each) sharing one read of the weights
     uint32_t wmask = 0xffffu;   // the low bits of a 16-bit window that make the codeword
     bool pdl = false;    // programmatic dependent launch (pdl.cuh)
+    const int* items = nullptr;    // grouped_kernel's listed layout: group_kernel's items, their count, the list's size
+    const int* icount = nullptr;
+    int nitems = 0;
 };
 
 template <int CB>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MT = (a.maxm + 16 * a.rt - 1) / (16 * a.rt);
-    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
+    const unsigned nb = (unsigned)(a.N / (16 * a.nt));
+    const dim3 grid = a.items ? dim3(nb, (unsigned)(a.mats * a.SK), (unsigned)a.nitems)
+                              : dim3((unsigned)a.nexp_max, nb, (unsigned)(a.mats * a.SK * MT));
     TORCH_CHECK(a.hi <= 16 || a.lo == a.hi, "a rate between ExLlamaV3's widths must be its layer's only rate");
+    TORCH_CHECK(!a.items || (a.icount && a.nitems > 0 && a.nitems <= 65535), "listed: an item list of 1 to 65,535");
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
     tf_exl3_pdl::launch(grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, TF_RT>, grid, dim3(W_ * 32), 0, stream, a.pdl, \
                         a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, \
-                        a.SK, a.maxm, a.slots, a.wmask)
+                        a.SK, a.maxm, a.slots, a.wmask, a.items, a.icount)
 #define TF_RANGES(NT_, W_, PF_)                                                                                 \
     if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
     else if (a.lo == K2_QUARTER && a.hi == K2_QUARTER) TF_LAUNCH(NT_, W_, PF_, K2_QUARTER, K2_QUARTER);         \

@@ -19,6 +19,51 @@ from .exl3_pack import MOE_WINDOW
 
 ROWS = 128               # most rows one call of the EXL3 linear or a split fp16 matmul takes
 NARROW_ENV = "TF_FLASHNEXT_F16_NARROW"
+STACK_DIRECT_ENV = "TF_FLASHNEXT_STACK_DIRECT"
+INNER_K_ENV = "TF_FLASHNEXT_F16_INNER_K"
+MOE_DIRECT_ENV = "TF_FLASHNEXT_MOE_DIRECT"
+
+
+@dataclass(frozen=True)
+class Switches:
+    """The pack's matmul switches, both unset: on. The engine reads them once at startup (``read``) and installs them
+    (``use``); the matmuls consult ``current()`` at each call, so a CUDA graph keeps the setting it was captured with.
+
+    TF_FLASHNEXT_STACK_DIRECT: a stack's parts write their columns of its output in place at every row count. Rows
+    past one went to scratch and were copied over: 156 copy kernels a 1,660-kernel verify graph (36 DeltaNet stacks of
+    3 parts, 12 attention stacks of 4), 253 us of its 41.4 ms (tf-runs/profile, exl3-mtp).
+    TF_FLASHNEXT_F16_INNER_K: a prompt's fp16 matmul of several K slices (the HC and mixer down projections, DeltaNet's
+    b/a, the PLE value) sums its slices inside each program in one launch over all rows (``_f16_mm_ks``), where it
+    wrote fp32 slices and summed them in a second launch, 128 rows a pair of launches.
+    TF_FLASHNEXT_MOE_DIRECT: a prompt window's routed experts round their slots to bf16 straight into the MoE buffer
+    (``experts.routed(y=...)``), where they wrote fp32 slots that a copy then rounded: 1,024 rows x 11 slots x 2,560
+    is 115 MB of fp32 written and read again a window and layer."""
+
+    stack_direct: bool = True
+    inner_k: bool = True
+    moe_direct: bool = True
+
+
+_current = Switches()
+
+
+def read() -> Switches:
+    """Every switch from the environment; a value outside env_flags' set raises before any weight is read."""
+
+    return Switches(stack_direct=flag(STACK_DIRECT_ENV, True), inner_k=flag(INNER_K_ENV, True),
+                    moe_direct=flag(MOE_DIRECT_ENV, True))
+
+
+def use(switches: Switches) -> Switches:
+    """Install ``switches`` for the calls that follow; returns the previous setting."""
+
+    global _current
+    previous, _current = _current, switches
+    return previous
+
+
+def current() -> Switches:
+    return _current
 
 
 def f16_narrow() -> bool:
@@ -69,7 +114,7 @@ class Scratch:
     def nbytes(self) -> int:
         own = [self.xh, self.z, self.tmp, self.part, self.ple_dev, self.ple_emb]
         moe = [] if self.moe is None else [self.moe.xg, self.moe.xu, self.moe.xd, self.moe.z, self.moe.y,
-                                          self.moe.ids, self.moe.members_buf]
+                                          self.moe.ids, self.moe.members_buf, self.moe.items_buf]
         return sum(t.numel() * t.element_size() for t in own + moe if t is not None) + self.prefill.nbytes()
 
 
@@ -97,6 +142,37 @@ def _f16_mm(X, W, OUT, M, N, x_stride, o_stride, K: tl.constexpr, KS: tl.constex
     else:
         tl.store(OUT + rm[:, None] * o_stride + rn[None, :], acc.to(OUT.dtype.element_ty),
                  mask=m_ok[:, None] & n_ok[None, :])
+
+
+@triton.jit(do_not_specialize=["M"])
+def _f16_mm_ks(X, W, OUT, M, N, x_stride, o_stride, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
+               BN: tl.constexpr, BK: tl.constexpr):
+    """``_f16_mm`` over all SK K slices of one tile, then ``_reduce``'s adds, with no fp32 slices in memory.
+
+    Slice s is ``_f16_mm`` program ``ps = s``: the same K blocks in order from a zero accumulator on the same tile and
+    warps, so each slice's sum is the same fp32 word. The sums then add as ``_reduce`` adds them, from 0.0 in slice
+    order (so a -0.0 slice alone still becomes +0.0), and round once to OUT's dtype. Each slice must hold at least two
+    BK blocks (``inner_k_fits``): Triton folds a one-block slice's ``total + dot(x, w, 0)`` into ``dot(x, w, total)``,
+    which sums in other steps (playbook 6.9)."""
+
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    m_ok = rm < M
+    n_ok = rn < N
+    KS: tl.constexpr = K // SK
+    total = tl.zeros((BM, BN), dtype=tl.float32)
+    for s in range(SK):
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for kk in range(0, KS, BK):
+            x = tl.load(X + rm[:, None] * x_stride + (s * KS + kk + rk)[None, :], mask=m_ok[:, None], other=0.0)
+            w = tl.load(W + rn[:, None] * K + (s * KS + kk + rk)[None, :], mask=n_ok[:, None], other=0.0)
+            acc = tl.dot(x.to(tl.float16), tl.trans(w), acc)
+        total = total + acc
+    tl.store(OUT + rm[:, None] * o_stride + rn[None, :], total.to(OUT.dtype.element_ty),
+             mask=m_ok[:, None] & n_ok[None, :])
 
 
 @triton.jit(do_not_specialize=["M"])
@@ -128,6 +204,24 @@ def narrow_tile(m: int, n: int, sk: int, target: int = 96) -> tuple[int, int, in
     if -(-n // 32) * sk >= target:
         return 32, 2, 4
     return 16, 1, 4
+
+
+INNER_K_PROGRAMS = 96    # tiles (16 rows x 64 columns) a call needs before its slices sum in-program: 2 an SM on GB10
+INNER_K_BLOCKS = 2       # fewest BK blocks a slice for _f16_mm_ks (playbook 6.9)
+BK = 64                  # _f16_mm's K block
+
+
+def inner_k_fits(m: int, n: int, k: int, sk: int) -> bool:
+    """Whether an [m, k] call on an [n, k] matrix of ``sk`` slices takes ``_f16_mm_ks`` (TF_FLASHNEXT_F16_INNER_K).
+
+    Only rows past NARROW_ROWS, which ``_f16_mm`` runs on WIDE_TILE whatever the narrow switch says, so both kernels
+    have the same tile; only slices of two BK blocks or more (``_f16_mm_ks``); and only calls whose tiles fill the GPU
+    without the slices' programs: HC down (n 324) from 241 rows, the mixer's (n 320) from 305, DeltaNet's b/a (n 96)
+    from 753, the PLE value (n 2,560) from 33. A row's bytes are the same either way, so the choice may follow the
+    row count."""
+
+    return (sk > 1 and m > NARROW_ROWS and k // sk // BK >= INNER_K_BLOCKS
+            and -(-m // 16) * -(-n // WIDE_TILE[0]) >= INNER_K_PROGRAMS)
 
 
 def f16_split(n: int, k: int, target: int = 96) -> int:
@@ -170,14 +264,26 @@ class F16:
         bn, warps, stages = narrow_tile(m, self.n, self.sk) if self.sc.narrow else WIDE_TILE
         grid = (triton.cdiv(m, 16), triton.cdiv(self.n, bn), self.sk)
         _f16_mm[grid](x, self.w, out, m, self.n, x.stride(0), self.n if f32 else out.stride(0),
-                      K=self.k, KS=self.k // self.sk, BM=16, BN=bn, BK=64, F32=f32, num_warps=warps,
+                      K=self.k, KS=self.k // self.sk, BM=16, BN=bn, BK=BK, F32=f32, num_warps=warps,
                       num_stages=stages)
+
+    def _launch_ks(self, x: torch.Tensor, out: torch.Tensor) -> None:
+        m = x.shape[0]
+        if x.stride(1) != 1 or x.shape[1] != self.k:
+            raise ValueError(f"F16: x {tuple(x.shape)} does not match K={self.k}")
+        bn, warps, stages = WIDE_TILE
+        _f16_mm_ks[(triton.cdiv(m, 16), triton.cdiv(self.n, bn))](
+            x, self.w, out, m, self.n, x.stride(0), out.stride(0), K=self.k, SK=self.sk, BM=16, BN=bn, BK=BK,
+            num_warps=warps, num_stages=stages)
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         if out.stride(-1) != 1:
             raise ValueError("F16: output rows must be contiguous")
         if self.sk == 1:
             self._launch(x, out, False)
+            return out
+        if current().inner_k and inner_k_fits(x.shape[0], self.n, self.k, self.sk):
+            self._launch_ks(x, out)
             return out
         for r0 in range(0, x.shape[0], ROWS):                 # rows are independent, so slices keep their bits
             xs, m = x[r0:r0 + ROWS], min(ROWS, x.shape[0] - r0)
@@ -261,7 +367,10 @@ class Stack:
         if len(self.parts) == 1 and out.is_contiguous():
             return self.parts[0](x, out)
         m = x.shape[0]
-        if m == 1:                    # one row: a part's slice of ``out`` needs no copy (its row stride is unused)
+        # one row: a part's slice of ``out`` needs no copy (its row stride is unused); more rows write their columns at
+        # out's row stride (TF_FLASHNEXT_STACK_DIRECT) where every part's rows stay 16-byte aligned, or go to scratch
+        # and are copied over
+        if m == 1 or (current().stack_direct and self.aligned(out)):
             at = 0
             for p in self.parts:
                 p(x, out[:, at:at + p.n])
@@ -283,6 +392,18 @@ class Stack:
             p.prefill(x, out[:, at:at + p.n])
             at += p.n
         return out
+
+    def aligned(self, out: torch.Tensor) -> bool:
+        """Whether every part's columns of ``out`` start its rows on 16 bytes (the EXL3 linear's stores need it)."""
+
+        size, at = out.element_size(), 0
+        if out.stride(-1) != 1 or out.stride(0) * size % 16 or out.data_ptr() % 16:
+            return False
+        for p in self.parts:
+            if at * size % 16:
+                return False
+            at += p.n
+        return True
 
 
 def stack(sc: Scratch, parts: list[Any]) -> Stack:

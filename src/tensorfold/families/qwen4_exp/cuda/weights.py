@@ -48,7 +48,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     f16_narrow = exl3.narrow_flag() if f16_narrow is None else f16_narrow
     if exl3.is_exl3(model_dir):                       # an EXL3 pack: its own loader, the same dataclasses
         return exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab, table_reads=table_reads,
-                         f16_narrow=f16_narrow)
+                         f16_narrow=f16_narrow, hc_fuse=hc_fuse)
     from . import hc_b16, nvfp4_moe
 
     prompt_tile = nvfp4_moe.tile_mode() if prompt_tile is None else prompt_tile

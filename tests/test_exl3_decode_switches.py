@@ -128,14 +128,16 @@ def test_a_width_its_n_tiles_do_not_divide_stays_on_grouped_kernel():
 
 
 class FakeExt:
-    """Records each launch's name and its trailing switches."""
+    """Records each launch's name and its trailing switches (keyword arguments in ``kwargs``, by launch)."""
 
     def __init__(self):
         self.calls: list[tuple] = []
+        self.kwargs: list[dict] = []
 
     def __getattr__(self, name):
-        def call(*args):
+        def call(*args, **kw):
             self.calls.append((name, args))
+            self.kwargs.append(kw)
         return call
 
 
@@ -197,9 +199,11 @@ def _ptxas(kernels: list[str]) -> dict[str, tuple[int, int, bool]]:
 
     from torch.utils import cpp_extension
 
+    listed = ", const int*, const int*"                        # grouped_kernel's item list and its count
     src = "#include \"experts_grouped.cuh\"\nnamespace tf_exl3x {\n" + "".join(
         f"template __global__ void {k}(const half*, const half*, const int64_t*, const int64_t*, const int*, "
-        "const int*, const int*, const int*, const int*, float*, int, int, int, int, int, int, uint32_t);\n"
+        "const int*, const int*, const int*, const int*, float*, int, int, int, int, int, int, uint32_t"
+        f"{listed if k.startswith('grouped_kernel') else ''});\n"
         for k in kernels) + "}\n"
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:

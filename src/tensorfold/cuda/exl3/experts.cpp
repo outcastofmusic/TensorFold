@@ -4,9 +4,10 @@
 void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, int64_t, int64_t, bool, bool);
+                        int64_t, int64_t, int64_t, int64_t, bool, bool, const int*, const int*, int64_t);
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t);
-void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, bool);
+void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, bool, int*,
+                      int*, int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                        at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, bool);
 void exl3x_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -23,11 +24,22 @@ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
                 ": expected a contiguous CUDA tensor of the right dtype");
 }
 
+// grouped_kernel's listed layout (TF_EXL3_EXPERT_ITEMS): group's items and their count, or neither.
+static void check_items(const c10::optional<at::Tensor>& items, const c10::optional<at::Tensor>& icount) {
+    TORCH_CHECK(items.has_value() == icount.has_value(), "items and icount come together");
+    if (!items) return;
+    check(*items, at::kInt, "items");
+    check(*icount, at::kInt, "icount");
+    TORCH_CHECK(items->numel() >= 1 && items->numel() <= 65535 && icount->numel() >= 1,
+                "items: 1 to 65,535 entries, icount at least one");
+}
+
 void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
              const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
              int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi,
-             int64_t rt, int64_t window, bool decode, bool pdl) {
+             int64_t rt, int64_t window, bool decode, bool pdl, const c10::optional<at::Tensor>& items,
+             const c10::optional<at::Tensor>& icount) {
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
     check(TP0, at::kLong, "TP0");
@@ -44,8 +56,12 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
     TORCH_CHECK(rt == 1 || rt == 2, "rt: 1 or 2 row tiles a block");
     TORCH_CHECK(window >= 8 && window <= 16, "window: a codeword of 8 to 16 bits");
     TORCH_CHECK(!decode || (members.size(1) <= 16 && rt == 1), "decode: a window of at most 16 rows, one row tile");
+    check_items(items, icount);
+    TORCH_CHECK(!(decode && items), "the item list lays out grouped_kernel; decode_kernel takes none");
     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
-                       pf, lo, hi, rt, (int64_t(1) << window) - 1, decode, pdl);
+                       pf, lo, hi, rt, (int64_t(1) << window) - 1, decode, pdl,
+                       items ? items->data_ptr<int>() : nullptr, icount ? icount->data_ptr<int>() : nullptr,
+                       items ? items->numel() : 0);
 }
 
 void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb, int64_t window) {
@@ -62,7 +78,8 @@ void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb, int64_
 }
 
 void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tensor members, int64_t R, int64_t slots,
-           int64_t E, bool pdl) {
+           int64_t E, bool pdl, const c10::optional<at::Tensor>& items, const c10::optional<at::Tensor>& icount,
+           int64_t tile) {
     check(pick, at::kInt, "pick");
     check(uids, at::kInt, "uids");
     check(ucount, at::kInt, "ucount");
@@ -70,8 +87,15 @@ void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tenso
     TORCH_CHECK(pick.numel() >= R * slots, "pick too small");
     TORCH_CHECK(uids.numel() >= std::min<int64_t>(R * slots, E), "uids too small");
     TORCH_CHECK(members.size(0) >= uids.numel() && members.size(1) >= 1, "members too small");
+    check_items(items, icount);
+    if (items) {
+        // every used expert lists ceil(members / tile) items: at most ceil(R * slots / tile) + its places in all
+        TORCH_CHECK(tile >= 16 && tile % 16 == 0, "tile: the rows of grouped_kernel's member group, 16 a row tile");
+        TORCH_CHECK(items->numel() >= (R * slots + tile - 1) / tile + uids.numel(), "items too small");
+    }
     c10::cuda::CUDAGuard guard(pick.device());
-    exl3x_group_cuda(pick, uids, ucount, members, R, slots, E, pdl);
+    exl3x_group_cuda(pick, uids, ucount, members, R, slots, E, pdl, items ? items->data_ptr<int>() : nullptr,
+                     icount ? icount->data_ptr<int>() : nullptr, tile);
 }
 
 void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
@@ -107,8 +131,9 @@ void down_epilogue(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor
     check(Z, at::kFloat, "Z");
     check(pick, at::kInt, "pick");
     check(svh_d, at::kHalf, "svh_d");
-    check(y, at::kFloat, "y");
+    check(y, y.scalar_type() == at::kBFloat16 ? at::kBFloat16 : at::kFloat, "y");   // fp32, or bf16 rounded once
     TORCH_CHECK(D % 128 == 0, "D must be a multiple of 128");
+    TORCH_CHECK(y.numel() >= P * D, "y too small");
     c10::cuda::CUDAGuard guard(Z.device());
     exl3x_down_epilogue_cuda(Z, pick, svh_d, y, rows, P, D, SK, slots, E, pdl);
 }
@@ -136,17 +161,20 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
 }
 
 // The trailing switches default to off, so a direct call (the GPU tests') launches as before them: ``decode`` takes
-// decode_kernel (TF_EXL3_EXPERT_DECODE), ``pdl`` programmatic dependent launch on GB10 (TF_EXL3_PDL, pdl.cuh).
+// decode_kernel (TF_EXL3_EXPERT_DECODE), ``pdl`` programmatic dependent launch on GB10 (TF_EXL3_PDL, pdl.cuh), and
+// ``items`` with ``icount`` (group's list, TF_EXL3_EXPERT_ITEMS) grouped_kernel's listed layout.
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     namespace py = pybind11;
     m.def("grouped", &grouped, py::arg("X0"), py::arg("X1"), py::arg("TP0"), py::arg("TP1"), py::arg("B0"),
           py::arg("B1"), py::arg("uids"), py::arg("ucount"), py::arg("members"), py::arg("Z"), py::arg("mats"),
           py::arg("K"), py::arg("N"), py::arg("P"), py::arg("SK"), py::arg("slots"), py::arg("cb"), py::arg("nt"),
           py::arg("warps"), py::arg("pf"), py::arg("lo"), py::arg("hi"), py::arg("rt"), py::arg("window"),
-          py::arg("decode") = false, py::arg("pdl") = false);
+          py::arg("decode") = false, py::arg("pdl") = false, py::arg("items") = py::none(),
+          py::arg("icount") = py::none());
     m.def("dequant", &dequant);
     m.def("group", &group, py::arg("pick"), py::arg("uids"), py::arg("ucount"), py::arg("members"), py::arg("R"),
-          py::arg("slots"), py::arg("E"), py::arg("pdl") = false);
+          py::arg("slots"), py::arg("E"), py::arg("pdl") = false, py::arg("items") = py::none(),
+          py::arg("icount") = py::none(), py::arg("tile") = 0);
     m.def("rot_in", &rot_in, py::arg("x"), py::arg("x_stride"), py::arg("pick"), py::arg("suh0"), py::arg("suh1"),
           py::arg("out0"), py::arg("out1"), py::arg("rows"), py::arg("K"), py::arg("slots"), py::arg("E"),
           py::arg("pdl") = false);

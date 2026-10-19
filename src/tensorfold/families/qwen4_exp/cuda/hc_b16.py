@@ -3,8 +3,8 @@
 TF_FLASHNEXT_HC_FUSE (default on) sends prompt chunks of more than ``forward.FUSED_ROWS`` rows through three fusions
 with the old kernels' bytes: the write-back and the norm in one kernel (``hc_check.fuser``, self-checked), the down
 projection's K slices summed inside each program (``bf16.matmul(inner_k=True)``), and the up projection with the
-stream mix (``up_mix``). ``0`` restores the separate kernels. The engine reads the flag once at startup and the loader
-stores it on each bf16 ``HC`` (``HC.fuse``).
+stream mix (``up_mix``). An EXL3 pack's fp16 HC takes the first of them, which reads no matrix. ``0`` restores the
+separate kernels. The engine reads the flag once at startup and the loader stores it on each ``HC`` (``HC.fuse``).
 
 ``_hc_up_mix`` is ported from MiaAI-Lab's Qwen3.8 Flash Next recipe, patch 0008 ``prompt_mm._hc_up_mix`` (MIT
 licence), which builds on the TensorFold contributors' ``bf16._b16mm`` and ``glue._hc_mix``.

@@ -92,6 +92,8 @@ def _f16(n, k, narrow):
 @pytest.mark.parametrize("path", ["call", "partials"])
 def test_a_call_launches_the_tile_the_scratch_switch_picks(monkeypatch, n, k, m, narrow, path):
     mm, red = Spy(), Spy()
+    # the split path's tiles; TF_FLASHNEXT_F16_INNER_K's one launch is tests/test_flashnext_exl3_sweep2.py's
+    monkeypatch.setattr(exl3_mm, "_current", exl3_mm.Switches(inner_k=False))
     monkeypatch.setattr(exl3_mm, "_f16_mm", mm)
     monkeypatch.setattr(exl3_mm, "_reduce", red)
     q = _f16(n, k, narrow)
