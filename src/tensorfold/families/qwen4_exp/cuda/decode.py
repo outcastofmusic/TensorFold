@@ -160,7 +160,8 @@ class Engine:
     """Weights, one sequence's state, buffers for decode windows (main model and MTP head) and for prompt chunks."""
 
     def __init__(self, w: Weights, *, capacity: int = 4096, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
-                 graphs: bool = False, kv_dtype: str = "bf16") -> None:
+                 graphs: bool = False, kv_dtype: str = "bf16", graph_rows: int | None = None) -> None:
+        """``graph_rows``: the widest window graphs capture (default ``max_rows``); wider ones run eagerly."""
         self.w = w
         self.capacity = capacity
         self.rows, self.prefill_rows = max_rows, prefill_rows
@@ -178,7 +179,7 @@ class Engine:
                 print("[tensorfold] CUDA graphs off: this MoE reads its plan's item list on the host, which a "
                       "capture rejects; decode runs eagerly (correct, slower)")
             else:
-                self.graphs = Graphs(self, max_rows=max_rows)
+                self.graphs = Graphs(self, max_rows=min(max_rows, graph_rows or max_rows))
 
     def reset(self) -> None:
         self.st.reset(self.w)
@@ -523,16 +524,18 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
 
     trace = {"probs": [], "steps": 1, "ms": 0.0, "kind": "mtp"}     # what wrote the next round's drafts
 
-    def propose(streams, next_tokens, n):
-        """Copy drafts when the index has a chain (the MTP cache still absorbs the kept rows), else the MTP chain."""
+    def propose(streams, next_tokens, left):
+        """Copy drafts when the index has a chain (the MTP cache still absorbs the kept rows), else the MTP chain;
+        ``left``: tokens the reply still needs, which caps both (the copy's window and ``depth`` cap them first)."""
         t = time.perf_counter()
-        copied = copies.chain(n) if copies is not None else []
+        copied = copies.chain(left) if copies is not None else []
         trace["kind"] = "copy" if copied else "mtp"
         if copied:
             absorb(e, streams, next_tokens)
             if spec is not None:
                 trace.update(probs=[], steps=1, ms=(time.perf_counter() - t) * 1e3)
             return copied
+        n = min(depth, left)
         if spec is None:
             return draft(e, streams, next_tokens, st.pos + 1, n, sampling, confidence)
         drafts, probs, steps = draft_cut(e, streams, next_tokens, st.pos + 1, n, sampling, spec)
@@ -549,7 +552,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
     unabsorbed = None                                  # the last round's kept rows, not yet in the MTP cache
     torch.cuda.synchronize()
     start = time.perf_counter()
-    drafts = propose(e.last_streams, [pending], min(depth, count - len(out)))
+    drafts = propose(e.last_streams, [pending], count - len(out))
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         tokens = [out[-1]] + drafts
         window = constraint.window(tokens, list(range(-1, len(tokens) - 1))) if constraint is not None else None
@@ -579,6 +582,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
                 spec.verified(context, trace["probs"], R, keep - 1, timed=True, verify_ms=ms,
                               draft_ms=trace["ms"], steps=trace["steps"])
         unabsorbed = (keep, sampled[:keep])
+        if R > 1 and trace["kind"] == "copy":
+            copies.verified(R - 1, keep - 1)
         if R > 1:
             by = by_drafter.setdefault(trace["kind"], [0, 0])
             by[0] += R - 1
@@ -598,10 +603,9 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
             break
         if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
             break
-        n = min(depth, count - len(out))
         drafts = []
-        if n > 0:
-            drafts = propose(b.streams[:keep], sampled[:keep], n)
+        if count - len(out) > 0:
+            drafts = propose(b.streams[:keep], sampled[:keep], count - len(out))
             unabsorbed = None
     torch.cuda.synchronize()
     seconds = time.perf_counter() - start

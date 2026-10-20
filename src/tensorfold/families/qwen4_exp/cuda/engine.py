@@ -95,7 +95,7 @@ class FlashNextEngine:
                  copy_drafts: bool | None = None) -> None:
         import torch
 
-        from .copy_drafts import enabled as copy_enabled
+        from .copy_drafts import enabled as copy_enabled, most_rows
         from .exl3_mm import f16_narrow
         from . import exl3_mm
         from .hc_b16 import fuse as hc_fuse
@@ -151,6 +151,8 @@ class FlashNextEngine:
         self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), float(confidence)
         # copy drafts (copy_drafts.py): on unless TENSORFOLD_COPY_DRAFTS=0, and never without MTP drafts
         self.copy_drafts = bool(self.depth > 0 and copy_enabled(True if copy_drafts is None else bool(copy_drafts)))
+        # TENSORFOLD_COPY_ROWS: a copy's window widens up to this many rows while copies land whole
+        self.copy_rows = most_rows(self.depth) if self.copy_drafts else self.depth + 1
         self.streams, self.master, self.graphs_enabled = int(streams), master, bool(graphs)
         self.kv_dtype = check_kv(kv_dtype)
         self.comm = None
@@ -164,7 +166,7 @@ class FlashNextEngine:
             self.comm = open_comm(rank, 2, master, port)
             self.comm.barrier()
         gather = (lambda values: gather_ints(torch, self.comm.all_gather, values)) if tp == 2 else None
-        each, mtp, bits = self.depth + 1, self.depth > 0, BITS_OF[self.kv_dtype]
+        each, mtp, bits = self.copy_rows, self.depth > 0, BITS_OF[self.kv_dtype]
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
         rows0 = chunk or PREFILL_ROWS
         lone = bool(graphs and mtp and (tp == 2 or lone_graphs()))     # two ranks plan their lone rounds: left as is
@@ -274,10 +276,12 @@ class FlashNextEngine:
                                           kv_dtype=self.kv_dtype, share=share, vision=self.vision,
                                           prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=lone,
                                           spec=self.spec, count_drafters=self.count_drafters,
-                                          end_anchor=self.end_anchor, first_early=self.first_early)
+                                          end_anchor=self.end_anchor, first_early=self.first_early,
+                                          copy_rows=self.copy_rows)
                 self.scheduler = Scheduler(self.multi, max_streams=streams)
             else:
-                self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
+                self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.copy_rows), graphs=graphs,
+                                graph_rows=max(8, self.depth + 1),
                                 kv_dtype=self.kv_dtype, prefill_rows=self.prefill_rows)
         except BaseException:
             wait(reads)
@@ -359,7 +363,9 @@ class FlashNextEngine:
                     + (", plain rounds where drafting loses" if self.spec.gate is not None else "")
                     + (f" (verify ms by rows at warm-up: {prior})" if prior else ""))
         if self.copy_drafts:
-            rule += f", or up to {self.depth} copy drafts where the reply repeats earlier text"
+            rule += (f", or up to {self.copy_rows - 1} copy drafts where the reply repeats earlier text"
+                     + (f" (from {self.depth}, doubling while copies land whole)"
+                        if self.copy_rows > self.depth + 1 else ""))
         where = (f"up to {streams} streams, each growing to {self.context_window} prompt/reply tokens while memory "
                  f"lasts ({self.multi.memory_gate.room / 2**30:.1f} GiB free for their caches, "
                  f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), eager" if self.concurrent else
@@ -654,7 +660,8 @@ class FlashNextEngine:
         if self.depth > 0:
             from .copy_drafts import CopyIndex
 
-            copies = CopyIndex(list(prompt) + [first]) if getattr(self, "copy_drafts", False) and constraint is None else None
+            copies = (CopyIndex(list(prompt) + [first], rows=self.depth + 1, most=getattr(self, "copy_rows", None))
+                      if getattr(self, "copy_drafts", False) and constraint is None else None)
             res = mtp_decode(self.e, first, max_tokens, sampling, depth=self.depth, confidence=self.confidence,
                              stop_eos=stop_eos, on_tokens=on_tokens, constraint=constraint, probabilities=probabilities,
                              copies=copies, spec=getattr(self, "spec", None),

@@ -6,6 +6,8 @@ import os
 from collections.abc import Sequence
 
 COPY_MATCH = 8          # the context's last this many tokens must have appeared before, and at least this many follow
+ROWS_ENV = "TENSORFOLD_COPY_ROWS"
+COPY_ROWS = 32          # the widest copy window: 1.25x one stream, 1.23x four (tf-runs/copy-windows, 2026-10-20)
 
 
 def enabled(default: bool = True) -> bool:
@@ -14,11 +16,32 @@ def enabled(default: bool = True) -> bool:
     return default if value is None else value.strip().lower() not in ("0", "off", "false", "no")
 
 
-class CopyIndex:
-    """Longest continuation of an earlier copy of the last ``min_match`` tokens; n-gram starts keep a round O(new)."""
+def most_rows(depth: int) -> int:
+    """TENSORFOLD_COPY_ROWS: the widest window a copy verifies, COPY_ROWS unset; 0 keeps an MTP chain's (depth + 1)."""
+    value = os.environ.get(ROWS_ENV, "").strip()
+    return max(depth + 1, int(value) if value else COPY_ROWS)
 
-    def __init__(self, context: Sequence[int], min_match: int = COPY_MATCH):
+
+def next_rows(rows: int, landed_whole: bool, base: int, most: int) -> int:
+    """A copy's next window: twice as wide after a whole copy, half after a broken one, within [base, most].
+
+    The qwen3_5 path's rule (``next_copy_rows``) starts at 16 rows. Here the floor is the MTP chain's window, because
+    on Flash Next a row past 7 costs 1.8-1.9 ms (tf-runs/verify-rows, 2026-10-20) and a 16-row window pays only once
+    it commits 10 tokens: a copy widens only after one lands whole."""
+    return min(most, max(rows, base) * 2) if landed_whole else max(base, min(rows, most) // 2)
+
+
+class CopyIndex:
+    """Longest continuation of an earlier copy of the last ``min_match`` tokens; n-gram starts keep a round O(new).
+
+    With ``rows`` (the MTP chain's window), a copy drafts at most its own window less the anchor row, which widens
+    toward ``most`` while copies land whole (``verified``); without, it drafts as many as asked."""
+
+    def __init__(self, context: Sequence[int], min_match: int = COPY_MATCH, *, rows: int | None = None,
+                 most: int | None = None):
         self.m = int(min_match)
+        self.base = self.rows = rows
+        self.most = max(rows, most or rows) if rows is not None else None
         self.ctx: list[int] = []
         self.starts: dict[tuple, list[int]] = {}
         self.extend(context)
@@ -31,9 +54,12 @@ class CopyIndex:
                 self.starts.setdefault(tuple(self.ctx[s:]), []).append(s)
 
     def chain(self, max_nodes: int) -> list[int]:
-        """Up to ``max_nodes`` tokens after the tail's latest earlier copy; [] without one or under ``min_match``."""
+        """Up to ``max_nodes`` tokens (and the window's) after the tail's latest earlier copy; [] without one or
+        under ``min_match``."""
 
         ctx, m = self.ctx, self.m
+        if self.rows is not None:
+            max_nodes = min(max_nodes, self.rows - 1)
         if len(ctx) < 2 * m or max_nodes < 1:
             return []
         # A round with fewer than min_match slots (Flash Next drafts 6) still copies: the earlier copy must run
@@ -49,3 +75,8 @@ class CopyIndex:
                 if len(best) == want:
                     break
         return best[:max_nodes] if len(best) >= m else []
+
+    def verified(self, drafted: int, kept: int) -> None:
+        """A copy window's outcome: ``kept`` of its ``drafted`` tokens landed."""
+        if self.rows is not None:
+            self.rows = next_rows(self.rows, kept == drafted, self.base, self.most)

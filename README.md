@@ -85,7 +85,7 @@ swap stops a model, `swap.py` asks it to write the states not on disk yet (`POST
 | Model id | `qwen3.8-flash-next` | `glm-5.3-flash` |
 | Window | 262,144 tokens | 98,304 tokens |
 | Streams | 4 (`--parallel 4`, `--kv-dtype int8`) | 1 |
-| Drafts | MTP head, 1 to 6 a round, and copy drafts | DFlash2 draft model, up to 5 a round |
+| Drafts | MTP head, 1 to 6 a round, and copy drafts in windows of 7 to 32 rows | DFlash2 draft model, up to 5 a round |
 | Thinking | Clef-Flash guard on port 30001, 8,000-token budget | No guard: 8 GiB stays free beside GLM |
 | Images | On | Off |
 | Decode, one stream | prose 60, code 98, json 118, rewrite 124 tok/s | prose 34, code 51, json 56, rewrite 60 tok/s |
@@ -118,6 +118,7 @@ that change them. Three choices need a word:
 | GLM DFlash2 through the packed head | A DFlash2 draft model runs beside the packed checkpoint: 34 / 51 / 56 / 60 tok/s |
 | Lone-stream graph slot off by default | One stream under `--parallel 4`: 70.7 to 90.5 tok/s (`TENSORFOLD_LONE_GRAPHS=1` restores it) |
 | Copy drafts at 6 drafts a round | A 2,252-token prompt's first 128 tokens: 36.5 to 89.0 tok/s; rewrite 108 to 124 |
+| Copy windows widen to 32 rows (`TENSORFOLD_COPY_ROWS`, 20 Oct) | Copy text 119 to 244 tok/s, rewrite 147 to 237; 1.25x one stream and 1.23x four over 12 cells, same replies |
 | EXL3 prompt experts read once for 32 rows | Prefill 780 to 828 tok/s, bit-identical output |
 | EXL3 image tower converted from the pack | `tensorfold.vision.exl3_convert` reads a tower stored inside the pack's shards |
 

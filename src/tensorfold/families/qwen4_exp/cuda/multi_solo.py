@@ -15,17 +15,19 @@ from .forward import commit
 from .state import Buffers
 
 
-def solo(w, st, capacity, depth, pbuf):
+def solo(w, st, capacity, depth, pbuf, copy_rows: int = 0):
+    """The graph slot's engine: graphs up to an MTP window's rows, buffers that also hold a copy's (eager) window."""
     from .graphs import Graphs
 
     if any(getattr(layer.moe.experts, "capturable", True) is False for layer in w.layers):
         return None
     rows = max(8, depth + 1)
     e = object.__new__(Engine)
-    e.w, e.capacity, e.rows, e.prefill_rows = w, capacity, rows, pbuf.rows
+    e.w, e.capacity, e.rows, e.prefill_rows = w, capacity, max(rows, copy_rows), pbuf.rows
+    e.graph_rows = rows
     e.kv_dtype, e.st = st.kv_dtype, st
-    e.buf = Buffers(w, rows, capacity, moe_prefill=True)       # the serial engine and shared rounds use these bits
-    e.mbuf, e.pbuf = Buffers(w, rows, capacity), pbuf
+    e.buf = Buffers(w, e.rows, capacity, moe_prefill=True)     # the serial engine and shared rounds use these bits
+    e.mbuf, e.pbuf = Buffers(w, e.rows, capacity), pbuf
     e.graphs = Graphs(e, max_rows=rows)
     return e
 
@@ -37,7 +39,7 @@ class Alone:
         if not self.planning and self.solo is not None and st is self.solo.st:
             from .graphs import Graphs
 
-            self.solo.graphs = Graphs(self.solo, max_rows=self.solo.rows)
+            self.solo.graphs = Graphs(self.solo, max_rows=self.solo.graph_rows)
 
     def _flush(self, s) -> None:
         """Materialize the shared round's deferred recurrent rows before a graph reads or copies the slot."""
@@ -129,6 +131,8 @@ class Alone:
         s.counted(R)
         if s.drafters is not None and R > 1:
             s.by_drafter(s.drafter, R - 1, len(path) - 1)
+        if s.drafter == "copy" and R > 1:
+            s.copies.verified(R - 1, len(path) - 1)
         new = [tokens[r] for r in path[1:]] + [end]
         last = len(s.out) + len(new) >= s.count or end in self._ends(s)
         if last and getattr(self, "end_anchor", False) and s.splice is None and st.image_positions is None:
@@ -145,7 +149,7 @@ class Alone:
         if s.copies is not None:                         # the copy index sees the round's tokens before the next draft
             s.copies.extend(new)
         if not last and room > 0:
-            copied = s.copies.chain(room) if s.copies is not None else []
+            copied = s.copies.chain(s.count - len(s.out) - len(path)) if s.copies is not None else []
             t = time.perf_counter()
             if copied:                                   # copy drafts; the MTP cache still absorbs the kept rows
                 absorb(e, e.buf.streams[:len(path)], rows[:len(path)])

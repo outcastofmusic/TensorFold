@@ -39,8 +39,8 @@ class Oracle:
     """A copy index that proposes the serial reply's next tokens on every other round (the tiny random model's reply
     never repeats itself, so a real index finds nothing); MTP drafts the rounds between."""
 
-    def __init__(self, prompt, ref):
-        self.n, self.ref, self.ctx, self.asked = len(prompt), ref, [], 0
+    def __init__(self, prompt, ref, rows=4):
+        self.n, self.ref, self.ctx, self.asked, self.rows = len(prompt), ref, [], 0, rows
 
     def extend(self, tokens):
         self.ctx.extend(int(t) for t in tokens)
@@ -48,7 +48,10 @@ class Oracle:
     def chain(self, n):
         self.asked += 1
         at = len(self.ctx) - self.n
-        return self.ref[at:at + n] if self.asked % 2 else []
+        return self.ref[at:at + min(n, self.rows - 1)] if self.asked % 2 else []
+
+    def verified(self, drafted, kept):
+        pass
 
 
 def _reference(w, prompt, count):
@@ -61,7 +64,7 @@ def test_drafts_are_counted_by_drafter_in_shared_rounds(monkeypatch):
 
     w = _model()
     ref = _reference(w, PROMPT, 60)
-    monkeypatch.setattr(multi_fill, "CopyIndex", lambda ctx: _seeded(Oracle(PROMPT, ref), ctx))
+    monkeypatch.setattr(multi_fill, "CopyIndex", lambda ctx, **_: _seeded(Oracle(PROMPT, ref), ctx))
     dec = MultiDecoder(w, slots=2, capacity=1024, depth=3, confidence=0.0, copy=True, count_drafters=True)
     s = Stream(PROMPT, 60, None)
     dec.admit(s)
@@ -88,3 +91,49 @@ def test_drafts_are_counted_by_drafter_on_one_engine():
     assert sum(v[0] for v in res.drafters.values()) == res.drafted
     assert sum(v[1] for v in res.drafters.values()) == res.accepted
     assert res.drafters["copy"][0] > 0 and res.drafters["copy"][0] == res.drafters["copy"][1]
+
+
+class Wide(Oracle):
+    """The oracle with a 16-row copy window, recording the widest copy it proposed."""
+
+    def __init__(self, prompt, ref):
+        super().__init__(prompt, ref, rows=16)
+        self.widest = 0
+
+    def chain(self, n):
+        got = super().chain(n)
+        self.widest = max(self.widest, len(got))
+        return got
+
+
+def test_wide_copy_windows_give_the_serial_tokens_in_shared_rounds(monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda import multi_fill
+
+    w = _model()
+    ref = _reference(w, PROMPT, 60)
+    made = []
+
+    def index(ctx, **_):
+        made.append(_seeded(Wide(PROMPT, ref), ctx))
+        return made[-1]
+
+    monkeypatch.setattr(multi_fill, "CopyIndex", index)
+    dec = MultiDecoder(w, slots=2, capacity=1024, depth=3, confidence=0.0, copy=True, copy_rows=16)
+    streams = [Stream(PROMPT, 60, None), Stream(PROMPT, 60, None)]
+    for s in streams:
+        dec.admit(s)
+    while dec.live():
+        dec.finish(dec.round())
+    assert [s.out for s in streams] == [ref, ref]
+    assert max(o.widest for o in made) == 15                     # wider than the MTP chain's 3 drafts
+
+
+@pytest.mark.parametrize("graphs", [False, True])
+def test_wide_copy_windows_give_the_serial_tokens_on_one_engine(graphs):
+    w = _model()
+    ref = _reference(w, PROMPT, 60)
+    e = Engine(w, capacity=1024, max_rows=16, prefill_rows=16, graphs=graphs, graph_rows=8)  # 9-16 rows run eagerly
+    first = prefill(e, PROMPT, None)
+    oracle = _seeded(Wide(PROMPT, ref), PROMPT + [first])
+    res = mtp_decode(e, first, 60, None, depth=3, confidence=0.0, copies=oracle)
+    assert res.tokens == ref and oracle.widest == 15 and max(res.widths) == 16

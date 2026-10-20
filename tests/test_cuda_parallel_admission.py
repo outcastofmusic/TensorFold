@@ -58,11 +58,13 @@ def test_flash_startup_prebuilds_the_lone_graph_extensions(tmp_path, monkeypatch
 def test_parallel_window_that_cannot_fit_every_stream_is_refused_before_loading(tmp_path, monkeypatch, fake_runtime,
                                                                                 family, world):  # noqa: F811
     from tensorfold.cuda.geometry import indexed_stream_geometry, stream_geometry
+    from tensorfold.families.qwen4_exp.cuda.copy_drafts import most_rows
     checkpoint(tmp_path, small_config(), WEIGHTS)
     calls, capacity = fake_runtime
-    # one GPU: the window is what one stream reaches beside the others' first rows; two ranks: every stream's
+    # one GPU: the window is what one stream reaches beside the others' first rows; two ranks: every stream's.
+    # Flash Next (indexed) reserves each stream's widest window at depth 3: a copy's
     four = (stream_geometry(small_config(), world, 4, 8, first=256 if world == 1 else None) if family == "linear"
-            else indexed_stream_geometry(small_config(), 5, 4, 8, mtp=True))
+            else indexed_stream_geometry(small_config(), 5, most_rows(3), 8, mtp=True))
     budget = four.needed(12000) + 32768                   # the streams fit 12,000 tokens, not 60,000
     monkeypatch.setattr(capacity, "available_bytes", lambda t: budget)
     _, go = start(family, tmp_path, 60000, True, world, 4)
