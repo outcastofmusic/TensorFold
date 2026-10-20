@@ -426,22 +426,25 @@ class FlashNextEngine:
             print("[tensorfold] self-check skipped: two ranks decode in lockstep from requests", flush=True)
             return
         started = time.perf_counter()
-        widths = range(2, self.depth + 2)
+        # every window a round verifies: an MTP chain's up to depth + 1 rows, a copy's up to copy_rows (upstream
+        # 3e3f895e: a path picked by row count changed bits once verify windows grew past 16 rows)
+        most = max(self.depth + 1, getattr(self, "copy_rows", 0))
+        widths, steps = range(2, most + 1), max(32, 2 * most)
         if self.multi is not None:
             start, window, release = self_check.multi_windows(self.multi)
             try:
-                got = self_check.check_widths(start, window, widths=widths)
+                got = self_check.check_widths(start, window, widths=widths, steps=steps)
             finally:
                 release()
         else:
             try:
-                got = self_check.check_widths(*self_check.engine_windows(self.e), widths=widths)
+                got = self_check.check_widths(*self_check.engine_windows(self.e), widths=widths, steps=steps)
             finally:
                 self.e.reset()
         self.drafts_ok = got["ok"]
         self.self_check = got
         verdict = "passed" if got["ok"] else f"FAILED at {got['first_diff']}: drafting is off, every reply is serial"
-        print(f"[tensorfold] self-check: {got['rows_checked']} rows over widths 2-{self.depth + 1} {verdict} "
+        print(f"[tensorfold] self-check: {got['rows_checked']} rows over widths 2-{most} {verdict} "
               f"({time.perf_counter() - started:.1f}s)", flush=True)
 
     def _price_windows(self) -> None:
