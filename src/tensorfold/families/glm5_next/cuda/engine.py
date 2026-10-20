@@ -295,14 +295,12 @@ class GlmEngine:
         from tensorfold.env_flags import flag
         from tensorfold.families.qwen4_exp.cuda.copy_drafts import BACK, most_rows
 
-        from .drafter_choice import COPY_DRAFTS
-
         # TF_GLM_DFLASH_COPIES (unset: off): DFlash2 rounds verify a copy where the reply repeats earlier text; a
         # copy's window widens from 6 rows up to TENSORFOLD_COPY_ROWS while copies land whole
         self.dflash_copies = flag("TF_GLM_DFLASH_COPIES", False)
         # TF_GLM_COPY_BACK=N: a copy only where its match runs N tokens before the 8 it needs (0: any match)
         self.copy_back = int(os.environ.get("TF_GLM_COPY_BACK", "0").strip() or 0)
-        self.copy_rows = most_rows(COPY_DRAFTS)
+        self.copy_rows = most_rows(GRAPH_ROWS[-1] - 1)     # a copy's first window is the widest graph's (COPY_DRAFTS)
         # both ranks must run the same calls: refuse to start when they were given different settings
         mine = [int(drafter is not None), capacity, int(long_context), int(self.serial_only), int(LATENT),
                 prefill_rows, int(self.target_only), int(self.eager), int(self.calibrated), int(self.load_mtp),
