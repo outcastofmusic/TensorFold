@@ -7,6 +7,7 @@ from collections.abc import Sequence
 
 COPY_MATCH = 8          # the context's last this many tokens must have appeared before, and at least this many follow
 ROWS_ENV = "TENSORFOLD_COPY_ROWS"
+COPY_ROWS = 32          # the widest copy window: 1.25x one stream, 1.23x four (tf-runs/copy-windows, 2026-10-20)
 
 
 def enabled(default: bool = True) -> bool:
@@ -16,9 +17,9 @@ def enabled(default: bool = True) -> bool:
 
 
 def most_rows(depth: int) -> int:
-    """TENSORFOLD_COPY_ROWS: the widest window a copy verifies; unset, an MTP chain's (depth + 1)."""
+    """TENSORFOLD_COPY_ROWS: the widest window a copy verifies, COPY_ROWS unset; 0 keeps an MTP chain's (depth + 1)."""
     value = os.environ.get(ROWS_ENV, "").strip()
-    return max(depth + 1, int(value)) if value else depth + 1
+    return max(depth + 1, int(value) if value else COPY_ROWS)
 
 
 def next_rows(rows: int, landed_whole: bool, base: int, most: int) -> int:
