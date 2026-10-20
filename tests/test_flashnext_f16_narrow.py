@@ -45,8 +45,10 @@ def test_a_flag_typo_stops_the_engine_and_the_loaders_before_any_read(monkeypatc
         exl3.load(tmp_path / "missing", "cpu")
 
 
-def test_the_scratch_defaults_on_and_keeps_what_it_is_given():
-    assert exl3_mm.Scratch(11).narrow is True
+def test_the_scratch_keeps_what_it_is_given():
+    """No default: the loader passes the flag it read (unset: off), so no caller gets narrow tiles by omission."""
+
+    assert exl3_mm.Scratch(11, True).narrow is True
     assert exl3_mm.Scratch(11, False).narrow is False
 
 

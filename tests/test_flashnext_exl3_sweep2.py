@@ -83,7 +83,7 @@ class Part:
 
 def _stack(widths):
     log: list = []
-    sc = exl3_mm.Scratch(11)
+    sc = exl3_mm.Scratch(11, True)
     sc.tmp = torch.zeros((exl3_mm.ROWS * max(widths),), dtype=torch.bfloat16)
     return exl3_mm.Stack([Part(n, log) for n in widths], sc), log
 

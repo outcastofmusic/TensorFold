@@ -32,7 +32,7 @@ def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 def _matrix(w: torch.Tensor) -> exl3_mm.F16:
-    sc = exl3_mm.Scratch(11)
+    sc = exl3_mm.Scratch(11, True)
     n, k = w.shape
     sk = exl3_mm.f16_split(n, k)
     sc.part = torch.empty((sk * exl3_mm.ROWS * n,), dtype=torch.float32, device=DEV)

@@ -95,7 +95,7 @@ def f16_narrow() -> bool:
 class Scratch:
     """Buffers for every EXL3 and fp16 matrix of the model (calls run one after another on one stream)."""
 
-    def __init__(self, slots: int, narrow: bool = True) -> None:
+    def __init__(self, slots: int, narrow: bool) -> None:
         self.slots = slots                 # routed experts a row, plus the shared expert
         self.narrow = narrow               # TF_FLASHNEXT_F16_NARROW: every F16 matrix's decode tiles
         self.users: list[Any] = []
