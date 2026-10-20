@@ -360,19 +360,25 @@ status() {
 command -v docker >/dev/null || die "docker is not installed"
 # one start at a time: two direct runs would both stop_all, then load two models side by side. A run that hands the
 # load to the swap endpoint (ask_swap) takes no lock: the endpoint's own run.sh child takes it, and would otherwise wait
-# behind this process for the whole swap
+# behind this process for the whole swap. A load that falls back from ask_swap (the endpoint ended after the first
+# check) takes the lock then
+run_locked=
+take_lock() {
+    [ -n "$run_locked" ] && return
+    mkdir -p "$STATE"; exec 9>"$STATE/run.lock"; flock 9; run_locked=1
+}
 case "${1:-}" in
     qwen-flash-next|glm-5.3-flash|qwen-flash-next-fp4|nemotron-bolt|lfm2-24b|nemotron-3.5-super)
-        if [ -n "${TF_SWAP_CHILD:-}" ] || ! swapping; then mkdir -p "$STATE"; exec 9>"$STATE/run.lock"; flock 9; fi ;;
+        if [ -n "${TF_SWAP_CHILD:-}" ] || ! swapping; then take_lock; fi ;;
 esac
 case "${1:-}" in
     "")              swap qwen-flash-next ;;
-    qwen-flash-next) ask_swap "$1" || qwen ;;
-    glm-5.3-flash)   ask_swap "$1" || glm ;;
-    qwen-flash-next-fp4) ask_swap "$1" || qwen_fp4 ;;
-    nemotron-bolt)   ask_swap "$1" || bolt ;;
-    lfm2-24b)        ask_swap "$1" || lfm2 ;;
-    nemotron-3.5-super) ask_swap "$1" || super ;;
+    qwen-flash-next) ask_swap "$1" || { take_lock; qwen; } ;;
+    glm-5.3-flash)   ask_swap "$1" || { take_lock; glm; } ;;
+    qwen-flash-next-fp4) ask_swap "$1" || { take_lock; qwen_fp4; } ;;
+    nemotron-bolt)   ask_swap "$1" || { take_lock; bolt; } ;;
+    lfm2-24b)        ask_swap "$1" || { take_lock; lfm2; } ;;
+    nemotron-3.5-super) ask_swap "$1" || { take_lock; super; } ;;
     swap)            swap "${2:-}" ;;
     stop)            if swapping; then stop_swap; fi
                      stop_all ;;

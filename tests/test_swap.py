@@ -317,3 +317,46 @@ def test_a_direct_start_under_the_swap_endpoint_takes_no_lock(tmp_path):
     finally:
         fake_swap.kill()
         endpoint.shutdown()
+
+
+def test_a_start_whose_swap_endpoint_ends_after_the_lock_check_still_waits_for_the_lock(tmp_path):
+    """The lock decision and ask_swap each ask whether the endpoint is alive. When it ends between the two, the
+    direct load that follows must take run.lock, or two loads run side by side. A grep shim answers yes for the
+    endpoint's /proc cmdline once, then no; the test holds the lock, so the load must wait and run no docker."""
+
+    import fcntl
+    import os
+    import subprocess
+    import sys
+
+    state = tmp_path / "state" / "tensorfold-run"
+    state.mkdir(parents=True)
+    fake_swap = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "swap.py"])
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ran = tmp_path / "docker-ran"
+    (bin_dir / "docker").write_text(f"#!/bin/sh\ntouch {ran}\nexit 0\n")
+    asked = tmp_path / "asked"
+    real_grep = subprocess.run(["sh", "-c", "command -v grep"], capture_output=True, text=True).stdout.strip()
+    (bin_dir / "grep").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in *swap.py*/proc/*)\n'
+        f'    [ -e {asked} ] && exit 1\n'
+        f'    touch {asked}; exit 0 ;;\n'
+        "esac\n"
+        f'exec {real_grep} "$@"\n')
+    for tool in ("docker", "grep"):
+        (bin_dir / tool).chmod(0o755)
+    try:
+        (state / "swap.pid").write_text(str(fake_swap.pid))
+        with open(state / "run.lock", "w") as held:      # another start, mid-load
+            fcntl.flock(held, fcntl.LOCK_EX)
+            env = dict(os.environ, XDG_STATE_HOME=str(tmp_path / "state"), PATH=f"{bin_dir}:{os.environ['PATH']}")
+            env.pop("TF_SWAP_CHILD", None)
+            with pytest.raises(subprocess.TimeoutExpired):
+                subprocess.run(["bash", str(ROOT / "run.sh"), "qwen-flash-next"], env=env, capture_output=True,
+                               text=True, timeout=5)
+        assert asked.exists()
+        assert not ran.exists()
+    finally:
+        fake_swap.kill()
