@@ -80,7 +80,7 @@ def test_extensions_trailers_and_the_next_request(port, path, expected):
 ])
 def test_bad_framing_is_refused_and_connection_closed(port, headers, body):
     with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
-        client.sendall(f"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n{headers}\r\n\r\n".encode() + body)
+        client.sendall(f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}\r\n\r\n".encode() + body)
         client.shutdown(socket.SHUT_WR)
         response = http.client.HTTPResponse(client)
         response.begin()

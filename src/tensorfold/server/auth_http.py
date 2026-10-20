@@ -1,8 +1,8 @@
-"""Shared authentication before either HTTP server dispatches a request."""
+"""Shared Host and Origin checks, then authentication, before either HTTP server dispatches a request."""
 
 import json
 
-from tensorfold.server import metrics
+from tensorfold.server import metrics, request_guard
 
 
 def gated(path, metrics_open=False):
@@ -45,10 +45,29 @@ class Authenticated:
         self.wfile.write(blob)
         return False
 
+    def _guard(self):
+        """Refuse a Host this bind does not answer to, or a browser Origin other than this server's, with 403."""
+        reason = request_guard.blocked(self.headers.get_all("Host") or [], self.headers.get_all("Origin") or [],
+                                       request_guard.bind_is_loopback(str(self.server.server_address[0])),
+                                       request_guard.allowed_origins())
+        if reason is None:
+            return True
+        message = request_guard.HOST_MESSAGE if reason == "host" else request_guard.ORIGIN_MESSAGE
+        blob = json.dumps({"error": {"message": message, "type": "invalid_request_error"}}).encode()
+        self.close_connection = True
+        self.send_response(403)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(blob)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(blob)
+        return False
+
     def parse_request(self):
         self.key_label = None
         self._auth_counted = [False]
-        return super().parse_request() and self._authenticate()
+        return super().parse_request() and self._guard() and self._authenticate()
 
     def handle_expect_100(self):
         return self._authenticate() and super().handle_expect_100()

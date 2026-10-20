@@ -26,11 +26,15 @@ import os
 import select
 import socket
 import subprocess
+import sys
 import threading
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))   # the checkout's guard, standard library only
+from tensorfold.server import request_guard  # noqa: E402
 
 TARGET = {"qwen3.8-flash-next": "qwen-flash-next", "glm-5.3-flash": "glm-5.3-flash",    # served name: run.sh target
           "qwen3.8-flash-next-fp4": "qwen-flash-next-fp4", "nemotron-3.5-bolt": "nemotron-bolt",
@@ -45,7 +49,9 @@ TIMEOUT = float(os.environ.get("SWAP_TIMEOUT", "3600"))
 PERSIST = float(os.environ.get("SWAP_PERSIST", "120"))
 MAX_BODY = 64 << 20                     # bytes: a request with images inlined fits
 RUN = str(Path(__file__).resolve().parent / "run.sh")
-HOP = {"connection", "keep-alive", "transfer-encoding", "content-length", "host", "te", "upgrade", "proxy-connection"}
+# Origin too: this endpoint checks it, and the server behind listens on another port, so it would refuse it
+HOP = {"connection", "keep-alive", "transfer-encoding", "content-length", "host", "te", "upgrade", "proxy-connection",
+       "origin"}
 
 
 def say(text: str) -> None:
@@ -200,6 +206,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def parse_request(self) -> bool:
+        """Refuse a non-loopback Host (DNS rebinding) or a browser Origin other than this endpoint's, with 403."""
+        if not super().parse_request():
+            return False
+        reason = request_guard.blocked(self.headers.get_all("Host") or [], self.headers.get_all("Origin") or [], True,
+                                       request_guard.allowed_origins())
+        if reason is None:
+            return True
+        self.close_connection = True
+        self.reply(403, {"error": {"message": request_guard.HOST_MESSAGE if reason == "host" else
+                                   request_guard.ORIGIN_MESSAGE, "type": "invalid_request_error"}})
+        return False
 
     def state(self) -> dict:
         return {"loaded": SWAP.current, "loading": SWAP.loading, "running": SWAP.running}
