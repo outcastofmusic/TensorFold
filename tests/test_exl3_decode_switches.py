@@ -34,7 +34,7 @@ def restore():
 @pytest.mark.parametrize("value, on", [(None, False), ("", False), ("1", True), ("on", True), ("0", False),
                                        ("off", False), ("false", False), (" NO ", False)])
 def test_each_flag_is_off_unless_turned_on(monkeypatch, env, value, on):
-    for e in ENVS:
+    for e in switches.ENVS:
         monkeypatch.delenv(e, raising=False)
     if value is not None:
         monkeypatch.setenv(env, value)
@@ -61,16 +61,21 @@ def test_a_flag_typo_stops_both_engines_before_any_read(monkeypatch, tmp_path, e
 def test_an_engine_installs_what_it_reads(monkeypatch, tmp_path):
     from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
 
+    for e in switches.ENVS:
+        monkeypatch.delenv(e, raising=False)
     monkeypatch.setenv(switches.EXPERT_DECODE_ENV, "0")
     monkeypatch.setenv(switches.PDL_ENV, "1")
-    switches.use(switches.Switches())
+    switches.use(switches.Switches(group_scan=False, down_fuse=False, gateup_fuse=False, group_scan_decode=False,
+                                   linear_pair=False))
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
-    assert switches.current() == switches.Switches(expert_decode=False, pdl=True, group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=True, linear_pair=True)
+    assert switches.current() == switches.Switches(expert_decode=False, pdl=True, group_scan=True, down_fuse=True,
+                                                   gateup_fuse=True, group_scan_decode=True, linear_pair=True)
 
 
 def test_use_returns_the_previous_setting():
-    off = switches.Switches(False, False)
+    off = switches.Switches(False, False, group_scan=False, down_fuse=False, gateup_fuse=False,
+                            group_scan_decode=False, linear_pair=False)
     first = switches.use(off)
     assert switches.current() is off
     assert switches.use(first) is off
@@ -154,7 +159,8 @@ def _layer(D=256, I=128, E=8):
 def test_routed_hands_each_launch_its_switches(monkeypatch, decode, pdl, rows):
     fake = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: fake)
-    switches.use(switches.Switches(expert_decode=decode, pdl=pdl))
+    switches.use(switches.Switches(expert_decode=decode, pdl=pdl, group_scan=False, down_fuse=False,
+                                   gateup_fuse=False, group_scan_decode=False, linear_pair=False))
     ex = _layer()
     s = experts.Scratch(ex, 32, 4, device="cpu")
     x = torch.zeros((rows, ex.dims), dtype=torch.bfloat16)
@@ -177,7 +183,8 @@ def test_routed_hands_each_launch_its_switches(monkeypatch, decode, pdl, rows):
 def test_the_linear_hands_its_launches_the_pdl_switch(monkeypatch, pdl):
     fake = FakeExt()
     monkeypatch.setattr(linear, "_ext", lambda: fake)
-    switches.use(switches.Switches(pdl=pdl))
+    switches.use(switches.Switches(pdl=pdl, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                   group_scan_decode=False, linear_pair=False))
     k, n = 256, 128
     lin = linear.Exl3Linear(torch.zeros((n // 128, k // 16, 8, 24), dtype=torch.int32), torch.zeros(k).half(),
                             torch.zeros(n).half(), None, 3.0, "mul1", k, n)

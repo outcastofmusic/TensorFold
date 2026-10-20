@@ -27,11 +27,11 @@ def restore():
 @pytest.mark.parametrize("value, on", [(None, True), ("", True), ("1", True), ("on", True), ("0", False),
                                        ("off", False), ("false", False), (" NO ", False)])
 def test_the_flag_is_on_unless_turned_off(monkeypatch, value, on):
-    for e in (switches.EXPERT_DECODE_ENV, switches.PDL_ENV, ENV):
+    for e in switches.ENVS:
         monkeypatch.delenv(e, raising=False)
     if value is not None:
         monkeypatch.setenv(ENV, value)
-    assert switches.read() == switches.Switches(expert_items=on, group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=True, linear_pair=True)          # prompt switches read on
+    assert switches.read() == switches.Switches(expert_items=on)          # the others at their served defaults
 
 
 @pytest.mark.parametrize("value", ["2", "items", "o", "1.0"])
@@ -50,7 +50,8 @@ def test_an_engine_installs_the_item_switch(monkeypatch, tmp_path):
     from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
 
     monkeypatch.setenv(ENV, "0")
-    switches.use(switches.Switches())
+    switches.use(switches.Switches(group_scan=False, down_fuse=False, gateup_fuse=False, group_scan_decode=False,
+                                   linear_pair=False))
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")
     assert switches.current().expert_items is False
@@ -59,7 +60,8 @@ def test_an_engine_installs_the_item_switch(monkeypatch, tmp_path):
 def _route(monkeypatch, rows, decode, items, slots=4, group=True):
     fake = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: fake)
-    switches.use(switches.Switches(expert_decode=decode, pdl=True, expert_items=items))
+    switches.use(switches.Switches(expert_decode=decode, pdl=True, expert_items=items, group_scan=False,
+                                   down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False))
     ex = _layer()
     s = experts.Scratch(ex, 1024, slots, device="cpu")
     x = torch.zeros((rows, ex.dims), dtype=torch.bfloat16)
@@ -97,7 +99,8 @@ def test_decode_windows_read_no_list(monkeypatch, rows):
 
     fake = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: fake)
-    switches.use(switches.Switches(expert_decode=True, pdl=True, expert_items=True))
+    switches.use(switches.Switches(expert_decode=True, pdl=True, expert_items=True, group_scan=False, down_fuse=False,
+                                   gateup_fuse=False, group_scan_decode=False, linear_pair=False))
     ex = _layer(D=2560, I=640)
     s = experts.Scratch(ex, 64, 4, device="cpu")
     experts.routed(torch.zeros((rows, ex.dims), dtype=torch.bfloat16), torch.zeros((rows, 4), dtype=torch.int32),

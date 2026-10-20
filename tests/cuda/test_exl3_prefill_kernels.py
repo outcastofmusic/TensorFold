@@ -26,13 +26,19 @@ from tensorfold.cuda.exl3 import experts, switches  # noqa: E402
 
 from tests.cuda.test_exl3_decode_kernels import LAYERS, _inputs, _layer, _same  # noqa: E402
 
-OFF = switches.Switches(expert_items=True)                        # today's defaults
+OFF = switches.Switches(expert_items=True, group_scan=False, down_fuse=False, gateup_fuse=False,
+                        group_scan_decode=False, linear_pair=False)                        # today's defaults
 SETTINGS = {
-    "scan": switches.Switches(expert_items=True, group_scan=True),
-    "down": switches.Switches(expert_items=True, down_fuse=True),
-    "gateup": switches.Switches(expert_items=True, gateup_fuse=True),
-    "all": switches.Switches(expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True),
-    "all pdl": switches.Switches(pdl=True, expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True),
+    "scan": switches.Switches(expert_items=True, group_scan=True, down_fuse=False, gateup_fuse=False,
+                              group_scan_decode=False, linear_pair=False),
+    "down": switches.Switches(expert_items=True, down_fuse=True, group_scan=False, gateup_fuse=False,
+                              group_scan_decode=False, linear_pair=False),
+    "gateup": switches.Switches(expert_items=True, gateup_fuse=True, group_scan=False, down_fuse=False,
+                                group_scan_decode=False, linear_pair=False),
+    "all": switches.Switches(expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True,
+                             group_scan_decode=False, linear_pair=False),
+    "all pdl": switches.Switches(pdl=True, expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True,
+                                 group_scan_decode=False, linear_pair=False),
 }
 ROWS = (65, 128, 1000, 1024, 2048)
 

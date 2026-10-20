@@ -53,8 +53,9 @@ def _free():
 
 
 def _set(w, on: bool) -> None:
-    switches.use(switches.Switches(expert_items=on))
-    exl3_mm.use(exl3_mm.Switches(stack_direct=on, inner_k=on, moe_direct=on))
+    switches.use(switches.Switches(expert_items=on, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                   group_scan_decode=False, linear_pair=False))
+    exl3_mm.use(exl3_mm.Switches(stack_direct=on, inner_k=on, moe_direct=on, moe_chunk=False))
     hcs = [w.mixer] + [hc for layer in w.layers for hc in (layer.attn_hc, layer.mlp_hc)]
     if w.mtp is not None:
         hcs += [w.mtp.mixer, w.mtp.layer.attn_hc, w.mtp.layer.mlp_hc]

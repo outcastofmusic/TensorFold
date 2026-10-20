@@ -29,7 +29,8 @@ from tensorfold.engine.exact_sampling import Sampling
 MODELS = Path(os.environ.get("MODELS", "/home/agis/models"))
 FN_PACK = MODELS / "Qwen3.8-Flash-Next-exl3-3.05bpw"
 SAMPLINGS = [None, Sampling(1234, 1.0, 20, 0.95)]
-DEFAULTS = switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True)
+DEFAULTS = switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=False,
+                             linear_pair=False)
 ORDER = (False, True, False)                    # off twice: a difference is the switches', not noise
 
 

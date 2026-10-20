@@ -58,10 +58,11 @@ def test_a_flag_typo_stops_the_engine_before_any_read(monkeypatch, tmp_path, env
 def test_the_engine_installs_what_it_reads(monkeypatch, tmp_path):
     from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
 
+    for e in exl3_mm.ENVS:
+        monkeypatch.delenv(e, raising=False)
     monkeypatch.setenv(exl3_mm.STACK_DIRECT_ENV, "0")
     monkeypatch.setenv(exl3_mm.MOE_DIRECT_ENV, "off")
-    monkeypatch.delenv(exl3_mm.INNER_K_ENV, raising=False)
-    exl3_mm.use(exl3_mm.Switches())
+    exl3_mm.use(exl3_mm.Switches(moe_chunk=False))
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
     assert exl3_mm.current() == exl3_mm.Switches(stack_direct=False, inner_k=False, moe_direct=False, moe_chunk=True)
@@ -92,7 +93,7 @@ def _stack(widths):
 def test_with_the_switch_each_part_writes_its_columns_in_place(widths, m):
     s, log = _stack(widths)
     out = torch.zeros((m, sum(widths)), dtype=torch.bfloat16)
-    exl3_mm.use(exl3_mm.Switches(stack_direct=True))
+    exl3_mm.use(exl3_mm.Switches(stack_direct=True, moe_chunk=False))
     s(torch.zeros((m, 8)), out)
     at = 0
     for (ptr, shape, stride), n in zip(log, widths):
@@ -106,7 +107,7 @@ def test_without_the_switch_rows_go_to_scratch_and_are_copied(m):
     widths = (12288, 512, 512, 640)
     s, log = _stack(widths)
     out = torch.zeros((m, sum(widths)), dtype=torch.bfloat16)
-    exl3_mm.use(exl3_mm.Switches(stack_direct=False))
+    exl3_mm.use(exl3_mm.Switches(stack_direct=False, moe_chunk=False))
     s(torch.zeros((m, 8)), out)
     assert {ptr for ptr, _, _ in log} == {s.sc.tmp.data_ptr()}
     at = 0
@@ -120,7 +121,7 @@ def test_one_row_writes_in_place_either_way():
     for on in (True, False):
         s, log = _stack(widths)
         out = torch.zeros((1, sum(widths)), dtype=torch.bfloat16)
-        exl3_mm.use(exl3_mm.Switches(stack_direct=on))
+        exl3_mm.use(exl3_mm.Switches(stack_direct=on, moe_chunk=False))
         s(torch.zeros((1, 8)), out)
         assert log[1][0] == out.data_ptr() + 10240 * 2
 
@@ -169,7 +170,7 @@ def test_a_call_launches_the_in_program_sum_where_it_fits(monkeypatch, n, k, m, 
     monkeypatch.setattr(exl3_mm, "_f16_mm", mm)
     monkeypatch.setattr(exl3_mm, "_f16_mm_ks", ks)
     monkeypatch.setattr(exl3_mm, "_reduce", red)
-    exl3_mm.use(exl3_mm.Switches(inner_k=on))
+    exl3_mm.use(exl3_mm.Switches(inner_k=on, moe_chunk=False))
     q = _f16(n, k)
     out = torch.empty((m, n + 64), dtype=torch.bfloat16)[:, :n]      # a stack's columns: any row stride
     q(torch.empty((m, k), dtype=torch.bfloat16), out)
@@ -190,7 +191,7 @@ def test_decode_partials_never_take_the_in_program_sum(monkeypatch):
     mm, ks = Spy(), Spy()
     monkeypatch.setattr(exl3_mm, "_f16_mm", mm)
     monkeypatch.setattr(exl3_mm, "_f16_mm_ks", ks)
-    exl3_mm.use(exl3_mm.Switches(inner_k=True))
+    exl3_mm.use(exl3_mm.Switches(inner_k=True, moe_chunk=False))
     _f16(324, 10240).partials(torch.empty((8, 10240), dtype=torch.bfloat16))
     assert ks.calls == [] and len(mm.calls) == 1
 
@@ -312,7 +313,7 @@ def test_a_prompt_windows_slots_go_straight_into_the_buffer(monkeypatch, on, row
     monkeypatch.setattr(experts, "routed", routed)
     monkeypatch.setattr(forward.moe_mod, "router", lambda *a, **k: None)
     monkeypatch.setattr(forward.moe_mod, "select_rows", lambda *a, **k: None)
-    exl3_mm.use(exl3_mm.Switches(moe_direct=on))
+    exl3_mm.use(exl3_mm.Switches(moe_direct=on, moe_chunk=False))
     buf = SimpleNamespace(logits=torch.zeros((rows, 1)), pick=torch.zeros((rows, slots), dtype=torch.int32),
                           wts=torch.zeros((rows, slots)), slots=slots,
                           y=torch.zeros((rows, slots, dims), dtype=torch.bfloat16))

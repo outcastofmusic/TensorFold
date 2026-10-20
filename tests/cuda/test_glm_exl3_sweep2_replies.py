@@ -43,7 +43,8 @@ def _free():
 
 
 def _set(on: bool) -> None:
-    switches.use(switches.Switches(expert_items=on))
+    switches.use(switches.Switches(expert_items=on, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                   group_scan_decode=False, linear_pair=False))
 
 
 # ------------------------------------------------------------------------------------------------- GLM-5.3

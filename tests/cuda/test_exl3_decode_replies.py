@@ -79,7 +79,8 @@ def test_flash_next_replies_keep_their_bytes_with_the_switches_off_on_off(flash_
     prompt = _prompt(1500, 5, 150_000)
     got = []
     for on in ORDER:
-        switches.use(switches.Switches(expert_decode=on, pdl=on))
+        switches.use(switches.Switches(expert_decode=on, pdl=on, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                       group_scan_decode=False, linear_pair=False))
         w.x3.narrow = on
         got.append(_fn_reply(w, prompt, sampling))
     for setting, g in zip(ORDER, got):

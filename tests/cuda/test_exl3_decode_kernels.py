@@ -19,8 +19,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only
 
 from tensorfold.cuda.exl3 import experts, linear, switches  # noqa: E402
 
-OFF = switches.Switches(expert_decode=False, pdl=False)
-SETTINGS = [OFF, switches.Switches(True, False), switches.Switches(False, True), switches.Switches(True, True)]
+OFF = switches.Switches(expert_decode=False, pdl=False, group_scan=False, down_fuse=False, gateup_fuse=False,
+                        group_scan_decode=False, linear_pair=False)
+OLD = dict(group_scan=False, down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False)
+SETTINGS = [OFF, switches.Switches(True, False, **OLD), switches.Switches(False, True, **OLD),
+            switches.Switches(True, True, **OLD)]
 DECODE_ROWS = (1, 2, 3, 4, 5, 6, 7, 8, 16)
 PROMPT_ROWS = (17, 64, 65, 128)
 
@@ -134,7 +137,8 @@ def test_graphs_captured_with_the_switches_on_replay_the_old_bytes(name):
     scratch = experts.Scratch(ex, max(rows), slots)
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
     bufs, graphs = {}, {}
-    switches.use(switches.Switches(True, True))
+    switches.use(switches.Switches(True, True, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                   group_scan_decode=False, linear_pair=False))
     for R in rows:
         x, sel, w = _inputs(name, R, 50 + R)
         out = torch.empty((R, ex.dims), dtype=torch.float32, device="cuda")
@@ -205,7 +209,8 @@ def test_the_linear_keeps_its_bytes_with_pdl(k, n, bits):
         x = torch.randn((m, k), generator=g).to(torch.bfloat16).cuda()
         got = []
         for pdl in (False, True, False):
-            switches.use(switches.Switches(pdl=pdl))
+            switches.use(switches.Switches(pdl=pdl, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                           group_scan_decode=False, linear_pair=False))
             got.append(lin(x).clone())
         torch.cuda.synchronize()
         assert _same(got[0].float(), got[1].float()) and _same(got[0].float(), got[2].float()), (k, n, bits, m)

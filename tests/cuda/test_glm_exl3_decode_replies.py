@@ -77,7 +77,8 @@ def test_glm_eager_replies_keep_their_bytes_with_the_switches_off_on_off(glm, sa
     prompt = _prompt(600, 11, 150_000)
     got = []
     for on in ORDER:
-        switches.use(switches.Switches(expert_decode=on, pdl=on))
+        switches.use(switches.Switches(expert_decode=on, pdl=on, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                       group_scan_decode=False, linear_pair=False))
         got.append((_glm_reply(glm, prompt, sampling, False), _glm_reply(glm, prompt, sampling, True)))
     for setting, (serial, drafted) in zip(ORDER, got):
         assert drafted == serial, setting
@@ -92,7 +93,8 @@ def test_glm_graph_replies_keep_their_bytes_with_the_switches_off_on_off(glm, sa
     prompt = _prompt(600, 13, 150_000)
     got = []
     for on in ORDER:
-        switches.use(switches.Switches(expert_decode=on, pdl=on))
+        switches.use(switches.Switches(expert_decode=on, pdl=on, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                       group_scan_decode=False, linear_pair=False))
         e = Engine(glm.w, capacity=8192, max_rows=8, prefill_rows=128, graphs=True, long_context=True)
         first = prefill(e, prompt, sampling, mtp=False)
         got.append(serial_decode(e, first, 48, sampling).tokens)

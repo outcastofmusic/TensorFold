@@ -24,7 +24,7 @@ from tests.test_exl3_decode_switches import NVCC, FakeExt, _layer, _ptxas  # noq
 
 EXL3_ENVS = {switches.GROUP_SCAN_ENV: "group_scan", switches.DOWN_FUSE_ENV: "down_fuse",
              switches.GATEUP_FUSE_ENV: "gateup_fuse"}
-ALL_EXL3_ENVS = (switches.EXPERT_DECODE_ENV, switches.PDL_ENV, switches.EXPERT_ITEMS_ENV, *EXL3_ENVS)
+ALL_EXL3_ENVS = tuple(switches.ENVS)
 
 
 @pytest.fixture(autouse=True)
@@ -99,16 +99,39 @@ def test_the_engines_install_what_they_read(monkeypatch, tmp_path):
     for e in EXL3_ENVS:
         monkeypatch.setenv(e, "1")
     monkeypatch.setenv(exl3_mm.MOE_CHUNK_ENV, "1")
-    switches.use(switches.Switches())
-    exl3_mm.use(exl3_mm.Switches())
+    switches.use(switches.Switches(group_scan=False, down_fuse=False, gateup_fuse=False, group_scan_decode=False,
+                                   linear_pair=False))
+    exl3_mm.use(exl3_mm.Switches(moe_chunk=False))
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
-    assert switches.current() == switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=True, linear_pair=True)
+    assert switches.current() == switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True,
+                                                   group_scan_decode=True, linear_pair=True)
     assert exl3_mm.current().moe_chunk is True
-    switches.use(switches.Switches())
+    switches.use(switches.Switches(group_scan=False, down_fuse=False, gateup_fuse=False, group_scan_decode=False,
+                                   linear_pair=False))
     with pytest.raises(Exception):
         GlmEngine(tmp_path / "missing", rank=0, master="", port=0, world=1)
-    assert switches.current() == switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=True, linear_pair=True)
+    assert switches.current() == switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True,
+                                                   group_scan_decode=True, linear_pair=True)
+
+
+def test_an_unset_environment_reads_each_dataclass_default(monkeypatch):
+    """One place holds each served default: a launch before any engine's ``use`` (a tool, a test) takes the
+    setting an engine reads, and ENVS names every field, so ``read`` misses none."""
+
+    from dataclasses import fields
+
+    from tensorfold.families.qwen4_exp.cuda import exl3_mm
+
+    for module in (switches, exl3_mm):
+        assert sorted(module.ENVS.values()) == sorted(f.name for f in fields(module.Switches))
+        for e in module.ENVS:
+            monkeypatch.delenv(e, raising=False)
+        assert module.read() == module.Switches()
+    assert switches.Switches() == switches.Switches(expert_decode=False, pdl=False, expert_items=True, group_scan=True,
+                                                    down_fuse=True, gateup_fuse=True, group_scan_decode=True,
+                                                    linear_pair=True)
+    assert exl3_mm.Switches() == exl3_mm.Switches(stack_direct=True, inner_k=False, moe_direct=True, moe_chunk=True)
 
 
 # -- what routed launches -------------------------------------------------------------------------------------------
@@ -126,7 +149,8 @@ def _route(monkeypatch, rows, sw, *, wts=False, slots=4, ex=None, y=None):
     return fake, s, ex, got
 
 
-ALL_ON = switches.Switches(expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True)
+ALL_ON = switches.Switches(expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True,
+                           group_scan_decode=False, linear_pair=False)
 
 
 @pytest.mark.parametrize("rows", [65, 128, 1024])
@@ -147,7 +171,8 @@ def test_a_prompt_window_with_every_switch_launches_three_kernels_after_rot_in(m
 
 @pytest.mark.parametrize("scan, down, gateup", [(True, False, False), (False, True, False), (False, False, True)])
 def test_each_switch_alone_changes_only_its_launch(monkeypatch, scan, down, gateup):
-    sw = switches.Switches(expert_items=True, group_scan=scan, down_fuse=down, gateup_fuse=gateup)
+    sw = switches.Switches(expert_items=True, group_scan=scan, down_fuse=down, gateup_fuse=gateup,
+                           group_scan_decode=False, linear_pair=False)
     fake, _, _, _ = _route(monkeypatch, 1024, sw)
     names = [n for n, _ in fake.calls]
     want = ["group", "rot_in", "grouped"] + ([] if gateup else ["gateup_epilogue"]) + ["grouped"] + \
@@ -175,14 +200,16 @@ def test_with_weights_the_down_combine_stays(monkeypatch):
 @pytest.mark.parametrize("rows", [1, 8, 16, 17, 28, 64])
 @pytest.mark.parametrize("decode", [True, False])
 def test_decode_windows_keep_their_launches(monkeypatch, rows, decode):
-    sw = switches.Switches(expert_decode=decode, expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True)
+    sw = switches.Switches(expert_decode=decode, expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True,
+                           group_scan_decode=False, linear_pair=False)
     fake, _, _, _ = _route(monkeypatch, rows, sw)
     assert [n for n, _ in fake.calls] == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
     assert all(kw == {} for kw in fake.kwargs)
 
 
 def test_without_the_item_list_nothing_fuses_and_the_scan_still_groups(monkeypatch):
-    sw = switches.Switches(expert_items=False, group_scan=True, down_fuse=True, gateup_fuse=True)
+    sw = switches.Switches(expert_items=False, group_scan=True, down_fuse=True, gateup_fuse=True,
+                           group_scan_decode=False, linear_pair=False)
     fake, _, _, _ = _route(monkeypatch, 1024, sw)
     assert [n for n, _ in fake.calls] == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
     assert fake.kwargs[0] == {"scan": True}
@@ -515,8 +542,9 @@ def test_the_bench_sets_each_named_switch_and_keeps_the_rest(on):
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
     from tools.exl3_prefill_bench import _set
 
-    base_sw = switches.Switches(pdl=True, expert_items=False)
-    base_mm = exl3_mm.Switches(stack_direct=False, inner_k=True)
+    base_sw = switches.Switches(pdl=True, expert_items=False, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                group_scan_decode=False, linear_pair=False)
+    base_mm = exl3_mm.Switches(stack_direct=False, inner_k=True, moe_chunk=False)
     _set(base_sw, base_mm, on)
     sw, mm = switches.current(), exl3_mm.current()
     assert (sw.group_scan, sw.down_fuse, sw.gateup_fuse, mm.moe_chunk) == \

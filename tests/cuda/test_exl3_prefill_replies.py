@@ -60,7 +60,7 @@ def _set(w, on: bool | set[str]) -> None:
 
     names = set(NAMES) if on is True else (set() if on is False else on)
     switches.use(switches.Switches(expert_items=True, group_scan="scan" in names, down_fuse="down" in names,
-                                   gateup_fuse="gateup" in names))
+                                   gateup_fuse="gateup" in names, group_scan_decode=False, linear_pair=False))
     exl3_mm.use(exl3_mm.Switches(moe_chunk="chunk" in names))
 
 

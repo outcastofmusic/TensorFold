@@ -29,7 +29,8 @@ NAMES = ("items", "stack", "inner_k", "moe", "hc")
 
 def _set(w, on: set[str]) -> None:
     switches.use(dataclasses.replace(switches.read(), expert_items="items" in on))
-    exl3_mm.use(exl3_mm.Switches(stack_direct="stack" in on, inner_k="inner_k" in on, moe_direct="moe" in on))
+    exl3_mm.use(exl3_mm.Switches(stack_direct="stack" in on, inner_k="inner_k" in on, moe_direct="moe" in on,
+                                 moe_chunk=False))
     hcs = [w.mixer] + [hc for layer in w.layers for hc in (layer.attn_hc, layer.mlp_hc)]
     if w.mtp is not None:
         hcs += [w.mtp.mixer, w.mtp.layer.attn_hc, w.mtp.layer.mlp_hc]

@@ -49,27 +49,30 @@ LINEAR_PAIR_ENV = "TF_EXL3_LINEAR_PAIR"
 
 @dataclass(frozen=True)
 class Switches:
+    """Each field's default is its served setting, the one ``read`` takes for an unset flag."""
+
     expert_decode: bool = False
     pdl: bool = False
     expert_items: bool = True
-    group_scan: bool = False
-    down_fuse: bool = False
-    gateup_fuse: bool = False
-    group_scan_decode: bool = False
-    linear_pair: bool = False
+    group_scan: bool = True
+    down_fuse: bool = True
+    gateup_fuse: bool = True
+    group_scan_decode: bool = True
+    linear_pair: bool = True
 
 
-_current = Switches()
+ENVS = {EXPERT_DECODE_ENV: "expert_decode", PDL_ENV: "pdl", EXPERT_ITEMS_ENV: "expert_items",
+        GROUP_SCAN_ENV: "group_scan", DOWN_FUSE_ENV: "down_fuse", GATEUP_FUSE_ENV: "gateup_fuse",
+        GROUP_SCAN_DECODE_ENV: "group_scan_decode", LINEAR_PAIR_ENV: "linear_pair"}
+
+_current = Switches()          # launches before any engine's ``use`` (tools, tests) take the served setting
 
 
 def read() -> Switches:
     """Every switch from the environment; a typo raises before any weight is read."""
 
-    return Switches(expert_decode=flag(EXPERT_DECODE_ENV, False), pdl=flag(PDL_ENV, False),
-                    expert_items=flag(EXPERT_ITEMS_ENV, True), group_scan=flag(GROUP_SCAN_ENV, True),
-                    down_fuse=flag(DOWN_FUSE_ENV, True), gateup_fuse=flag(GATEUP_FUSE_ENV, True),
-                    group_scan_decode=flag(GROUP_SCAN_DECODE_ENV, True),
-                    linear_pair=flag(LINEAR_PAIR_ENV, True))
+    served = Switches()
+    return Switches(**{field: flag(env, getattr(served, field)) for env, field in ENVS.items()})
 
 
 def use(switches: Switches) -> Switches:

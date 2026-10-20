@@ -31,8 +31,7 @@ def restore():
 
 @pytest.fixture
 def clean_env(monkeypatch):
-    for env in (*ENVS, switches.EXPERT_DECODE_ENV, switches.PDL_ENV, switches.EXPERT_ITEMS_ENV,
-                switches.GROUP_SCAN_ENV, switches.DOWN_FUSE_ENV, switches.GATEUP_FUSE_ENV):
+    for env in switches.ENVS:
         monkeypatch.delenv(env, raising=False)
     return monkeypatch
 
@@ -77,7 +76,8 @@ def test_both_engines_install_what_they_read(clean_env, tmp_path, scan, pair):
                              linear_pair=pair)
     for build in (lambda: FlashNextEngine(tmp_path / "missing"),
                   lambda: GlmEngine(tmp_path / "missing", rank=0, master="", port=0, world=1)):
-        switches.use(switches.Switches())
+        switches.use(switches.Switches(group_scan=False, down_fuse=False, gateup_fuse=False, group_scan_decode=False,
+                                       linear_pair=False))
         # fails at the checkpoint (or, without a GPU, at the device), after the switches
         with pytest.raises(Exception):  # noqa: B017
             build()
@@ -110,7 +110,8 @@ def _layer(D=256, I=128, E=8):
 def test_decode_windows_take_the_scan_on_their_own_switch(monkeypatch, scan, prompt_scan, rows, items):
     fake = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: fake)
-    switches.use(switches.Switches(group_scan=prompt_scan, group_scan_decode=scan))
+    switches.use(switches.Switches(group_scan=prompt_scan, group_scan_decode=scan, down_fuse=False, gateup_fuse=False,
+                                   linear_pair=False))
     ex = _layer()
     s = experts.Scratch(ex, 128, 4, device="cpu")
     x = torch.zeros((rows, ex.dims), dtype=torch.bfloat16)
@@ -121,7 +122,8 @@ def test_decode_windows_take_the_scan_on_their_own_switch(monkeypatch, scan, pro
     assert len(group) == 1 and group[0][2].get("scan", False) is want
     assert ("scan" in group[0][2]) is want                        # off: the launch of before the switch
     assert ("items" in group[0][2]) is items                      # the item list stays a prompt window's
-    switches.use(switches.Switches(group_scan=prompt_scan, group_scan_decode=not scan))
+    switches.use(switches.Switches(group_scan=prompt_scan, group_scan_decode=not scan, down_fuse=False,
+                                   gateup_fuse=False, linear_pair=False))
     again = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: again)
     experts.routed(x, pick, None, ex, s, None, rows)
@@ -139,7 +141,8 @@ def _launches(calls):
 
 def test_no_grouping_launch_without_group():
     fake = FakeExt()
-    switches.use(switches.Switches(group_scan_decode=True))
+    switches.use(switches.Switches(group_scan_decode=True, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                   linear_pair=False))
     ex = _layer()
     s = experts.Scratch(ex, 8, 4, device="cpu")
     from unittest import mock
@@ -161,7 +164,8 @@ def test_only_windows_past_one_row_tile_take_two(m, pair, want):
 def test_the_linear_hands_its_launch_the_row_tiles(monkeypatch, pair, m):
     fake = FakeExt()
     monkeypatch.setattr(linear, "_ext", lambda: fake)
-    switches.use(switches.Switches(linear_pair=pair))
+    switches.use(switches.Switches(linear_pair=pair, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                   group_scan_decode=False))
     k, n = 256, 128
     lin = linear.Exl3Linear(torch.zeros((n // 128, k // 16, 8, 24), dtype=torch.int32), torch.zeros(k).half(),
                             torch.zeros(n).half(), None, 3.0, "mul1", k, n)

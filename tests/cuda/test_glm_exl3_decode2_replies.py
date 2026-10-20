@@ -25,7 +25,8 @@ MODELS = Path(os.environ.get("MODELS", "/home/agis/models"))
 GLM = MODELS / "glm53-flash-sushi-experts-mosaic-dense"
 GLM_DRAFTER = MODELS / "GLM-5.3-Flash-DFlash2-TR3-v3"
 SAMPLINGS = [None, Sampling(1234, 1.0, 20, 0.95)]
-DEFAULTS = switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True)
+DEFAULTS = switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=False,
+                             linear_pair=False)
 ORDER = (False, True, False)                    # off twice: a difference is the switches', not noise
 
 

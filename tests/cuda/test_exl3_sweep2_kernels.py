@@ -30,10 +30,14 @@ from tensorfold.families.qwen4_exp.cuda import exl3_mm  # noqa: E402
 from tests.cuda.test_exl3_decode_kernels import LAYERS, LINEAR, _inputs, _layer, _same, _scale, _trellis  # noqa: E402
 from tests.test_exl3_expert_items import _listing  # noqa: E402
 
-OFF = switches.Switches(expert_decode=False, pdl=False, expert_items=False)
-EXPERT_SETTINGS = [switches.Switches(expert_decode=False, pdl=False, expert_items=True),
-                   switches.Switches(expert_decode=True, pdl=True, expert_items=True),
-                   switches.Switches(expert_decode=False, pdl=True, expert_items=True)]
+OFF = switches.Switches(expert_decode=False, pdl=False, expert_items=False, group_scan=False, down_fuse=False,
+                        gateup_fuse=False, group_scan_decode=False, linear_pair=False)
+EXPERT_SETTINGS = [switches.Switches(expert_decode=False, pdl=False, expert_items=True, group_scan=False,
+                                     down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False),
+                   switches.Switches(expert_decode=True, pdl=True, expert_items=True, group_scan=False,
+                                     down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False),
+                   switches.Switches(expert_decode=False, pdl=True, expert_items=True, group_scan=False,
+                                     down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False)]
 ROWS = (1, 8, 16, 17, 24, 28, 64, 65, 128, 1024)
 
 
@@ -101,7 +105,8 @@ def test_graphs_captured_on_the_item_list_replay_the_old_bytes(name):
     scratch = experts.Scratch(ex, max(rows), slots)
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
     bufs, graphs = {}, {}
-    switches.use(switches.Switches(True, True, True))
+    switches.use(switches.Switches(True, True, True, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                   group_scan_decode=False, linear_pair=False))
     for R in rows:
         x, sel, w = _inputs(name, R, 60 + R)
         out = torch.empty((R, ex.dims), dtype=torch.float32, device="cuda")
@@ -201,7 +206,7 @@ def test_a_stack_writes_the_same_bytes_in_place(which):
         x = torch.randn((m, 2560), generator=g).to(torch.bfloat16).cuda()
         got = []
         for on in (False, True, False):
-            exl3_mm.use(exl3_mm.Switches(stack_direct=on))
+            exl3_mm.use(exl3_mm.Switches(stack_direct=on, moe_chunk=False))
             out = torch.full((m, st.n), float("nan"), dtype=torch.bfloat16, device="cuda")
             got.append(st(x, out).clone())
         torch.cuda.synchronize()
@@ -226,7 +231,7 @@ def test_the_in_program_sum_writes_the_split_sums_bytes(n, k):
         for wide in (False, True):                                    # contiguous, and a stack's columns
             outs = []
             for on in (False, True):
-                exl3_mm.use(exl3_mm.Switches(inner_k=on))
+                exl3_mm.use(exl3_mm.Switches(inner_k=on, moe_chunk=False))
                 full = torch.full((m, n + (128 if wide else 0)), float("nan"), dtype=torch.bfloat16, device="cuda")
                 outs.append(q(x, full[:, :n]).clone())
             torch.cuda.synchronize()

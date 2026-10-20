@@ -50,17 +50,20 @@ class Switches:
     stack_direct: bool = True
     inner_k: bool = False
     moe_direct: bool = True
-    moe_chunk: bool = False
+    moe_chunk: bool = True
 
 
-_current = Switches()
+ENVS = {STACK_DIRECT_ENV: "stack_direct", INNER_K_ENV: "inner_k", MOE_DIRECT_ENV: "moe_direct",
+        MOE_CHUNK_ENV: "moe_chunk"}
+
+_current = Switches()          # each field's default is its served setting, the one ``read`` takes for an unset flag
 
 
 def read() -> Switches:
     """Every switch from the environment; a value outside env_flags' set raises before any weight is read."""
 
-    return Switches(stack_direct=flag(STACK_DIRECT_ENV, True), inner_k=flag(INNER_K_ENV, False),
-                    moe_direct=flag(MOE_DIRECT_ENV, True), moe_chunk=flag(MOE_CHUNK_ENV, True))
+    served = Switches()
+    return Switches(**{field: flag(env, getattr(served, field)) for env, field in ENVS.items()})
 
 
 def use(switches: Switches) -> Switches:

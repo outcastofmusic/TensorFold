@@ -26,7 +26,8 @@ from tensorfold.cuda.exl3 import experts, linear, switches
 from tests.cuda.test_exl3_decode_kernels import LAYERS, LINEAR, _inputs, _layer, _same, _scale, _trellis
 from tests.test_exl3_expert_items import _listing
 
-OFF = switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True)     # the defaults since fba05ef2
+OFF = switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=False,
+                        linear_pair=False)     # the defaults since fba05ef2
 SCAN = dataclasses.replace(OFF, group_scan_decode=True)
 PAIR = dataclasses.replace(OFF, linear_pair=True)
 SENTINEL = -12345
