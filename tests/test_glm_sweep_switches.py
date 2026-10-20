@@ -302,8 +302,11 @@ def test_the_token_list_kernel_writes_the_torch_ops_integers():
     import os
     import subprocess
     import sys
+    from pathlib import Path
 
-    env = {**os.environ, "TRITON_INTERPRET": "1"}
+    # the child imports this tree's tensorfold, not a copy installed in the image
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "TRITON_INTERPRET": "1", "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root)])}
     run = subprocess.run([sys.executable, "-c", INTERPRETED % (TOKEN_CASES,)], env=env, capture_output=True, text=True,
                          check=False, timeout=600)
     assert run.returncode == 0, run.stderr[-3000:]
