@@ -128,12 +128,14 @@ def boot(name: str, env: dict, args) -> None:
         flags += ["-e", f"{k}={v}"]
     sh("docker", "rm", "-f", name, check=False)
     sh("docker", "run", "-d", "--init", "--name", name, "--gpus", "all", "--ipc=host", "--network", "host",
-       "-v", f"{args.model}:{args.model}:ro", "-v", f"{REPO}:/tf:ro", "-e", "PYTHONPATH=/tf/src",
+       "-v", f"{args.model}:{args.model}:ro", *[x for m in args.mount for x in ("-v", f"{m}:{m}:ro")],
+       "-v", f"{REPO}:/tf:ro", "-e", "PYTHONPATH=/tf/src",
        "-v", "tensorfold-ext:/ext", "-e", "TORCH_EXTENSIONS_DIR=/ext", "-e", "TRITON_CACHE_DIR=/ext/triton",
        "-e", "HF_HUB_OFFLINE=1", *flags, args.image,
        "tensorfold", "serve", args.model, "--host", "127.0.0.1", "--port", str(args.port),
-       "--name", "ab", "--context", str(args.context), "--parallel", str(args.parallel),
-       "--kv-dtype", args.kv_dtype, "--no-update-check", *args.serve_arg)
+       "--name", "ab", "--context", str(args.context),
+       *(["--parallel", str(args.parallel)] if args.parallel else []),          # 0: a one-stream engine (GLM)
+       *(["--kv-dtype", args.kv_dtype] if args.kv_dtype else []), "--no-update-check", *args.serve_arg)
     base = f"http://127.0.0.1:{args.port}"
     for _ in range(3600):
         try:
@@ -232,6 +234,8 @@ def main() -> None:
     ap.add_argument("--kv-dtype", default="int8")
     ap.add_argument("--image", default=IMAGE)
     ap.add_argument("--serve-arg", action="append", default=[], help="an extra tensorfold serve argument")
+    ap.add_argument("--mount", action="append", default=[],
+                    help="another host folder the server reads, mounted read-only at the same path (a draft model)")
     ap.add_argument("--concurrency", type=int, default=1, help="requests in flight at once within a rep")
     ap.add_argument("--turns", action="store_true", help="time a follow-up turn (T5) instead of decode speed")
     ap.add_argument("--min-avail-gib", type=float, default=90.0)

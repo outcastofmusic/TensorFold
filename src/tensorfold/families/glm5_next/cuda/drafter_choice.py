@@ -14,7 +14,7 @@ from .decode import DecodeResult, DepthPolicy, Engine, Splice, _fed, _sync, abso
 from .forward import commit
 
 
-COPY_DRAFTS = 5         # a copied chain's drafts: with the pending token, the widest window captured as a graph
+COPY_DRAFTS = 5         # a copy's first window's drafts: with the pending token, the widest window captured as a graph
 
 
 def _other(arm: str) -> str:
@@ -106,7 +106,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         room = count - len(out)
         t0 = time.perf_counter()
         forced = sp.drafts(room) if sp is not None else None
-        copied = copies.chain(min(COPY_DRAFTS, room)) if copies is not None and forced is None else []
+        copied = copies.chain(room) if copies is not None and forced is None else []
         arm = "s" if forced is not None else "c" if copied else choice.pick() if choice is not None else "m"
         if arm == "s":
             backlog, steps, drafts = 0, 0, forced
@@ -161,6 +161,8 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         t5 = time.perf_counter()
         if choice is not None and arm not in ("c", "s"):
             choice.record(arm, R, steps, backlog, keep)
+        if arm == "c":
+            copies.verified(len(drafts), keep - 1)
         if copies is not None:
             copies.extend(new)
         if arm != "s":
