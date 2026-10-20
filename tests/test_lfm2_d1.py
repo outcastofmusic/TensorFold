@@ -242,7 +242,7 @@ def _head_engine(tiny, monkeypatch, head):
 def test_head_choice_defaults_to_per_question_and_refuses_unknown_values(tiny, monkeypatch):
     monkeypatch.delenv("TF_D1_HEAD", raising=False)
     assert Engine(tiny, device="cpu").head == "per_question"
-    with pytest.raises(ValueError, match="TF_D1_HEAD='fused': one of union, per_question, per_question_sync"):
+    with pytest.raises(ValueError, match="TF_D1_HEAD: one of union, per_question, per_question_sync, not 'fused'"):
         _head_engine(tiny, monkeypatch, "fused")
 
 

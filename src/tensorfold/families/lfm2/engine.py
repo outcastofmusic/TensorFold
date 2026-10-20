@@ -8,7 +8,6 @@ continues in the next forward over the same trunk.
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from pathlib import Path
@@ -49,10 +48,9 @@ HEADS = ("union", "per_question", "per_question_sync")
 
 
 def head_choice() -> str:
-    head = os.environ.get("TF_D1_HEAD", "").strip() or "per_question"
-    if head not in HEADS:
-        raise ValueError(f"TF_D1_HEAD={head!r}: one of {', '.join(HEADS)}")
-    return head
+    from tensorfold.env_flags import choice
+
+    return choice("TF_D1_HEAD", HEADS, "per_question")
 
 
 class Engine:
