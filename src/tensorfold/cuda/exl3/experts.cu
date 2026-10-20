@@ -446,13 +446,21 @@ void exl3x_dequant_cuda(const at::Tensor& T, at::Tensor& out, int64_t K, int64_t
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// A kernel's static shared memory, from the compiled kernel: the dynamic size plus this must stay under 48 KiB, or
+// the launch needs the opt-in. Each caller keeps its kernel's value in a function-local static.
+static size_t static_smem(const void* kernel) {
+    cudaFuncAttributes attributes;
+    C10_CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
+    return (size_t)attributes.sharedSizeBytes;
+}
+
 void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucount, at::Tensor& members, int64_t R,
                       int64_t slots, int64_t E, bool pdl, int* items, int* icount, int64_t tile) {
     TORCH_CHECK(E <= GROUP_THREADS * GROUP_PER_THREAD, "too many experts for the grouping kernel");
     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
     const size_t smem = (size_t)R * slots * sizeof(int);
-    constexpr size_t static_smem = 2 * GROUP_THREADS / 32 * sizeof(int);    // warp_tot and item_tot
-    if (smem + static_smem > 48 * 1024) {
+    static const size_t static_bytes = static_smem((const void*)group_kernel);    // warp_tot and item_tot
+    if (smem + static_bytes > 48 * 1024) {
         cudaFuncAttributes attributes;
         C10_CUDA_CHECK(cudaFuncGetAttributes(&attributes, group_kernel));
         const auto* device = at::cuda::getCurrentDeviceProperties();
@@ -477,7 +485,8 @@ void exl3x_group_scan_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor&
     TORCH_CHECK(R * slots < 65536, "the scan grouping ranks at most 65,535 picks");
     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
     const size_t smem = scan_smem(E);
-    if (smem > 48 * 1024) {
+    static const size_t static_bytes = static_smem((const void*)group_scan_kernel);    // 264: 680-682 experts opt in
+    if (smem + static_bytes > 48 * 1024) {
         // raise only, to the device's ceiling (playbook 6.5): a smaller size never lowers what a larger one set
         cudaFuncAttributes attributes;
         C10_CUDA_CHECK(cudaFuncGetAttributes(&attributes, group_scan_kernel));
