@@ -85,10 +85,11 @@ swap stops a model, `swap.py` asks it to write the states not on disk yet (`POST
 | Model id | `qwen3.8-flash-next` | `glm-5.3-flash` |
 | Window | 262,144 tokens | 98,304 tokens |
 | Streams | 4 (`--parallel 4`, `--kv-dtype int8`) | 1 |
-| Drafts | MTP head, 1 to 6 a round, and copy drafts in windows of 7 to 32 rows | DFlash2 draft model, up to 5 a round |
+| Drafts | MTP head, 1 to 6 a round, and copy drafts in windows of 7 to 32 rows | DFlash2 draft model, up to 5 a round, and copy drafts in windows of 6 to 32 rows |
 | Thinking | Clef-Flash guard on port 30001, 8,000-token budget | No guard: 8 GiB stays free beside GLM |
 | Images | On | Off |
 | Decode, one stream | prose 60, code 98, json 118, rewrite 124 tok/s | prose 34, code 51, json 56, rewrite 60 tok/s |
+| Copied text, 20 Oct | A 40-line list 244 tok/s, a 60-line module rewritten 237 (one stream, before the furthest-match choice) | The same list 146 tok/s, the module 100 |
 | TrueScore, 76 scenarios x 2 | 88.4 in 78 min, thinking on | 87.1 in 43 min, thinking off |
 
 Each default is the setting that measured best on one Spark. The script's header lists the environment variables
@@ -124,16 +125,19 @@ that change them. Three choices need a word:
 | EXL3 prompt experts read once for 32 rows | Prefill 780 to 828 tok/s, bit-identical output |
 | EXL3 image tower converted from the pack | `tensorfold.vision.exl3_convert` reads a tower stored inside the pack's shards |
 
-Speeds are from 2026-10-11 and 2026-10-12. Qwen3.8 Flash Next: EXL3 3.05 bpw, `--parallel 4 --kv-dtype int8`,
+Speeds are from 2026-10-11 and 2026-10-12, except the rows marked 20 Oct. Qwen3.8 Flash Next: EXL3 3.05 bpw, `--parallel 4 --kv-dtype int8`,
 262,144-token window. GLM-5.3 Flash: Mosaic 12L, 65,536-token window, greedy. Drafted replies equal their
 `"draft": false` runs on both models (10/10 each).
 
-Three ideas were measured and left out, so nobody needs to repeat them. Skipping low-weight expert picks on GLM is 19
+Four ideas were measured and left out, so nobody needs to repeat them. Skipping low-weight expert picks on GLM is 19
 to 27% faster at a 10% threshold, and replies then fail to stop or open with reasoning text; a sweep of 19 settings
 (thresholds, layer bands, prompt or decode rows, fixed pick counts) found no setting that keeps a gain and passes.
 Chinese-specific experts are 67 of 12,096 on GLM, too few to prune or offload. A second candidate row beside a
 DFlash2 draft would be kept in 16.8% of rounds and needs 34% to pay. The switches behind these measurements
-(`TF_GLM_SKIP_*`, `TF_GLM_TREE_PROBE`, `TF_GLM_ROUTE_LOG`) stay in the tree, off by default.
+(`TF_GLM_SKIP_*`, `TF_GLM_TREE_PROBE`, `TF_GLM_ROUTE_LOG`) stay in the tree, off by default. A TandemLLM-style draft
+tree on Flash Next was not built: TandemLLM's dense 27B verifies 16 rows in the time of 8, while Flash Next's experts
+make each row past 7 cost 1.8 to 1.9 ms on real tokens, so a sibling row must add 0.20 tokens a round to pay. Long
+copies, whose rows nearly all land, are what that cost favours, which is where the copy windows came from.
 
 ## Clef as a thinking control
 
@@ -175,6 +179,8 @@ servers with these flags. `./run.sh glm-5.3-flash` serves GLM with `--thinking-b
   which led to the copy-draft fix here. The fork ports code from four of its patches under the MIT licence: 0002's
   indexer scores kernel, 0005's tiled-select threshold, 0008's vision rotary and image features, and 0014's prompt
   expert tile. `THIRD_PARTY_NOTICES.md` links each one.
+- **[TandemLLM](https://github.com/0xBakeer/TandemLLM)** (AGPL-3.0) measured tree verify, StairCut and its conductor
+  checks on one Spark. The fork reimplemented some of its ideas behind flags and copied no code.
 - **[sxuff/glm53-flash-single-gb10](https://github.com/sxuff/glm53-flash-single-gb10)** supplied the four patches
   that run GLM-5.3 Flash on a single GB10. The fork ports them from v0.6.5 onto `python-0.6`.
 - **[Cloudflare/clef](https://huggingface.co/Cloudflare/clef)** and Clef-Flash are the decision models behind the
