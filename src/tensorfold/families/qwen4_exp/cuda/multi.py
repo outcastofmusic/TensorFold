@@ -57,7 +57,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
                  share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
                  copy: bool = True, spec=None, count_drafters: bool = False, end_anchor: bool = False,
-                 first_early: bool = True) -> None:
+                 first_early: bool = True, copy_rows: int | None = None) -> None:
         self.link = self.follower = None
         self.first_early = bool(first_early)         # TF_FLASH_FIRST_EARLY, read at startup (engine.first_early)
         # staircut.py's Speculation: each stream's chain depth and plain rounds (None: the fixed confidence cut)
@@ -66,13 +66,15 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         self.count_drafters = bool(count_drafters)    # streams count drafts by drafter (Stream.drafters)
         self.end_anchor = bool(end_anchor) and w.comm is None and depth > 0 and w.mtp is not None
         self.copy = bool(copy)                       # copy drafts (copy_drafts.py) for streams that draft
+        # the widest window a copy verifies (TENSORFOLD_COPY_ROWS); every buffer and slot holds it
+        self.copy_rows = max(depth + 1, copy_rows or 0) if self.copy else depth + 1
         self.planning, self.pass_plan, self.mixed_plan = False, None, None
         self.pass_index, self.pass_width = 0, prefill_rows
         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
         self.points = points                         # a prompt's message starts to keep states at, or None
         self.vision = vision
         self.eos = tuple(w.cfg.eos) if stop_eos else ()
-        rows = slots * (depth + 1)
+        rows = slots * self.copy_rows
         # a round's window and a prompt pass share each layer's expert launch: the pass's buffers hold both
         self.converged, self.prefill_rows = converges(w), prefill_rows
         # rounds beside a filling prompt size its pass so decoding keeps ``share`` of the pass's time (0: whole passes)
@@ -83,9 +85,9 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         self.gdn = gdn_multi.Scratch(w, rows)            # every stream's DeltaNet rows, one launch a step
         self.held: dict[int, list[int]] = {}             # stream id -> last round's kept rows, folded in next round
         # slots start small and grow with their stream's context, up to the window, while the gate has room
-        self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
+        self.free = [State(w, min(capacity, FIRST), self.copy_rows, kv_dtype, limit=capacity) for _ in range(slots)]
         self.slots = list(self.free)
-        self.solo = (solo(w, self.free[0], capacity, depth, self.pbuf)
+        self.solo = (solo(w, self.free[0], capacity, depth, self.pbuf, self.copy_rows)
                      if graphs and depth > 0 and self.mbuf is not None else None)
         self.solo_on = self.solo is not None
         # a gate's cut inside a live stream (_spliced): its fix rides as drafts, which one GPU's MTP rounds carry
@@ -492,6 +494,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             s.counted(len(tokens))
             if s.drafters is not None and len(tokens) > 1:
                 s.by_drafter(s.drafter, len(tokens) - 1, len(path) - 1)
+            if s.drafter == "copy" and len(tokens) > 1:
+                s.copies.verified(len(tokens) - 1, len(path) - 1)
             new = [tokens[r] for r in path[1:]] + [end]
             if s.constraint is not None:
                 try:
@@ -627,7 +631,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
 
         for s, _, _ in streams:
             s.drafts, s.drafter = [], "mtp"
-        room = {s.sid: min(self.depth, s.count - len(s.out) - len(keep)) for s, _, keep in streams}
+        left = {s.sid: s.count - len(s.out) - len(keep) for s, _, keep in streams}
+        room = {sid: min(self.depth, n) for sid, n in left.items()}
         todo = [(s, a0, keep) for s, a0, keep in streams if room[s.sid] > 0 and self.mbuf is not None]
         if not todo:
             return
@@ -637,7 +642,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 s.drafts, s.drafter = self._force(s, room[s.sid]), "fix"
                 copying.add(s.sid)
             elif s.copies is not None:
-                copied = s.copies.chain(room[s.sid])
+                copied = s.copies.chain(left[s.sid])
                 if copied:
                     s.drafts, s.drafter = copied, "copy"
                     copying.add(s.sid)

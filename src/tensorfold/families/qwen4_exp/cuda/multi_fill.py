@@ -271,12 +271,13 @@ class PromptPasses:
         """A joined stream's copy index over its prompt and first token, and its first round's drafts."""
 
         copies = mtp and getattr(self, "copy", False) and s.constraint is None
-        s.copies = CopyIndex(list(s.prompt) + [first]) if copies else None
+        s.copies = (CopyIndex(list(s.prompt) + [first], rows=self.depth + 1, most=getattr(self, "copy_rows", None))
+                    if copies else None)
         if not mtp or s.count <= 1:
             return
         st = s.st
         room = min(self.depth, s.count - 1)
-        copied = s.copies.chain(room) if s.copies is not None and not s.forced else []
+        copied = s.copies.chain(s.count - 1) if s.copies is not None and not s.forced else []
         if s.forced:
             absorb(e, last, [first])
             s.drafts, s.drafter = self._force(s, room), "fix"
