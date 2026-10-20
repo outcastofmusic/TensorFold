@@ -383,17 +383,20 @@ def test_models_report_a_failed_load_until_the_next_load_succeeds(swap, tmp_path
     assert _states(swapper)["glm-5.3-flash"] == ("ready", None)
 
 
-def test_models_report_the_model_being_loaded(swap, tmp_path):
+def test_models_report_the_model_being_loaded_and_the_one_it_replaces(swap, tmp_path):
     run = tmp_path / "run.sh"
     run.write_text("#!/bin/sh\nsleep 0.5\n")
     run.chmod(0o755)
     swap.RUN = str(run)
     swapper = swap.Swapper()
+    swapper.current = "qwen3.8-flash-next"
     load = threading.Thread(target=swapper.enter, args=("glm-5.3-flash",))
     load.start()
     deadline = time.monotonic() + 5
     while swapper.loading is None and time.monotonic() < deadline:
         time.sleep(0.02)
     assert _states(swapper)["glm-5.3-flash"] == ("loading", None)
+    assert _states(swapper)["qwen3.8-flash-next"] == ("unloading", None)    # new requests for it wait for the swap
     load.join(5)
     assert _states(swapper)["glm-5.3-flash"] == ("ready", None)
+    assert _states(swapper)["qwen3.8-flash-next"] == ("unloaded", None)

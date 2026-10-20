@@ -5,8 +5,8 @@ A request whose "model" is not the loaded one waits for the running requests to 
 model on BACKEND_PORT, and is then forwarded. A streaming request gets an SSE comment every 5 s while it waits, so
 clients that time out on a silent connection stay connected. Python's standard library only.
 
-    GET  /v1/models      every model, "loaded" on the one in memory and a "state": ready, loading, unloaded or
-                         failed (with the "error" of its last load, kept until a load of it succeeds)
+    GET  /v1/models      every model, "loaded" on the one in memory and a "state": ready, loading, unloading,
+                         unloaded or failed (with the "error" of its last load, kept until a load of it succeeds)
     GET  /swap           {"loaded": ..., "loading": ..., "running": n}
     POST /swap/<model>   load a model now and answer when it is ready
 
@@ -112,8 +112,8 @@ class Swapper:
                 entry = {"id": name, "object": "model", "owned_by": "tensorfold", "loaded": name == self.current}
                 if name == self.loading:
                     entry["state"] = "loading"
-                elif name == self.current:
-                    entry["state"] = "ready"
+                elif name == self.current:              # a swap away from it holds new requests for it
+                    entry["state"] = "ready" if self.loading is None else "unloading"
                 elif name in self.failed:
                     entry["state"], entry["error"] = "failed", self.failed[name]
                 else:
