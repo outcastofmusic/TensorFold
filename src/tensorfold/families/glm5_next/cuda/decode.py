@@ -692,10 +692,12 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
 @torch.no_grad()
 def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
                   policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None,
-                  splice: Splice | None = None,
+                  splice: Splice | None = None, copies=None,
                   lead: Sequence[int] = ()) -> DecodeResult:
     """Verify pending and DFlash2 draft rows through the first mismatch and absorb kept taps, starting from prefill's
-    drafter state; ``splice``: a gate's cut written into the live stream (``Splice``)."""
+    drafter state; ``splice``: a gate's cut written into the live stream (``Splice``). ``copies`` (a ``CopyIndex``
+    of the prompt and reply, TF_GLM_DFLASH_COPIES): where the reply repeats earlier text, the round verifies the
+    earlier continuation in place of a block, and the drafter absorbs its kept rows' taps as any round's."""
 
     w, st, b = e.w, e.st, e.buf
     from . import dflash2
@@ -712,18 +714,19 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
     depth = min(policy.next(0, 0), count - len(out))
     try:
         return _dflash_rounds(e, drafter, w, st, b, dflash2, policy, sp, out, head, depth, count, sampling, stop_eos,
-                              on_tokens, early, stages, depths, keeps, start)
+                              on_tokens, early, stages, depths, keeps, start, copies)
     finally:
         drafter.ahead = None                       # a block pass launched for a round that never came
 
 
 def _dflash_rounds(e, drafter, w, st, b, dflash2, policy, sp, out, head, depth, count, sampling, stop_eos, on_tokens,
-                   early, stages, depths, keeps, start) -> DecodeResult:
+                   early, stages, depths, keeps, start, copies=None) -> DecodeResult:
     rounds = drafted = accepted = 0
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
         forced = sp.drafts(count - len(out)) if sp is not None else None
-        drafts = forced if forced is not None else (
+        copied = copies.chain(count - len(out)) if copies is not None and forced is None else []
+        drafts = forced if forced is not None else copied if copied else (
             drafter.propose(head, depth, sampling, policy.confidence) if depth > 0 else [])
         t1 = time.perf_counter()
         tokens = e.verify_window([head] + drafts)
@@ -738,7 +741,9 @@ def _dflash_rounds(e, drafter, w, st, b, dflash2, policy, sp, out, head, depth, 
             if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
                 break
             keep += 1
-        if dflash2.TREE_PROBE and forced is None:
+        if copied:
+            copies.verified(len(drafts), keep - 1)
+        elif dflash2.TREE_PROBE and forced is None:
             dflash2.tree_probe(drafter.probe, drafts, sampled, keep)
         t3 = time.perf_counter()
         rows, new, follows = (sp.round(tokens, sampled, keep, len(forced or ())) if sp is not None
@@ -755,6 +760,8 @@ def _dflash_rounds(e, drafter, w, st, b, dflash2, policy, sp, out, head, depth, 
         keeps.append(rows)
         e.follow(new)
         out.extend(new)
+        if copies is not None:
+            copies.extend(new)
         head = follows[-1]
         if early and len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
             # the next round's block pass needs only head and the taps just added
@@ -766,6 +773,7 @@ def _dflash_rounds(e, drafter, w, st, b, dflash2, policy, sp, out, head, depth, 
         stages["commit"] += t4 - t3
         if stop:
             break
-        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
+        # a copy round leaves the block policy where its last block put it
+        depth = min(depth if copied else policy.next(len(drafts), keep - 1), count - len(out))
     _sync(w)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
