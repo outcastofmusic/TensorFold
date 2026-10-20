@@ -289,8 +289,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     With TF_EXL3_EXPERT_ITEMS (and ``group``) a prompt window's grouping lists the member groups grouped_kernel's
     launches run. On a prompt window TF_EXL3_GROUP_SCAN groups on group_scan_kernel, and on the listed layout
     TF_EXL3_GATEUP_FUSE and TF_EXL3_DOWN_FUSE (without ``wts``) run the epilogues inside grouped_kernel's launches.
-    ``y`` (without ``wts``): a contiguous bf16 [R * slots, D] that takes the slots rounded once, as a copy of the fp32
-    slots into it would round them."""
+    ``y`` (without ``wts``): a contiguous [R * slots, D] that takes the slots in place of the scratch's: bf16 rounds
+    them once, as a copy of the fp32 slots into it would round them; fp32 takes them as they are."""
 
     ext = _ext()
     D, I, E = ex.dims, ex.width, ex.count

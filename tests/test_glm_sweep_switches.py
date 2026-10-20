@@ -94,14 +94,15 @@ def _fake_routed(calls):
     """``experts.routed``'s writes: every routed slot's row of the scratch's y (its value: the row index + 1); the shared
     slot (pick == E) is left alone."""
 
-    def routed(x, pick, wts, ex, s, out, R, limit, act_mode):
-        y = s.y[:R * s.slots].view(R, s.slots, ex.dims)
-        calls.append(s.y)
+    def routed(x, pick, wts, ex, s, out, R, limit, act_mode, y=None):
+        into = s.y[:R * s.slots] if y is None else y
+        calls.append(into)
+        rows = into.view(R, s.slots, ex.dims)
         for r in range(R):
             for k in range(s.slots):
                 if pick[r, k] < ex.count:
-                    y[r, k] = float(x[r, 0])
-        return s.y[:R * s.slots]
+                    rows[r, k] = float(x[r, 0])
+        return into
     return routed
 
 
@@ -121,7 +122,7 @@ def test_in_place_windows_write_out_and_give_the_copies_values(monkeypatch, rows
         out = torch.zeros((rows, TOP + 1, D))
         out[:, TOP] = 7.0                                    # the caller's shared slot
         prefill.routed_micro_windows(x, pick, ex, s, out, rows, 10.0, in_place=in_place)
-        assert s.y is own                                    # the scratch's own y is back
+        assert s.y is own                                    # the scratch's y is never swapped
         assert len(calls) == -(-rows // window)
         if in_place:
             assert all(t.data_ptr() == out[i * window].data_ptr() for i, t in enumerate(calls))

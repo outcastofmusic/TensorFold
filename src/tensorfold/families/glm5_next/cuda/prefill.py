@@ -81,23 +81,17 @@ def routed_micro_windows(x,pick,ex,scratch,out,rows,limit,in_place=False):
     Scratch slots include the shared slot (pick==E); native leaves that slot to
     caller. Shared output is installed afterward by the normal GLM combine.
     ``in_place`` (TF_GLM_MOE_IN_PLACE): each window's down epilogue writes its
-    rows of ``out`` (contiguous fp32 [rows, slots, D]) instead of the scratch's
-    y, which then needs no copy; the routed kernels read y nowhere else.
+    rows of ``out`` (contiguous fp32 [rows, slots, D], routed's ``y``) instead
+    of the scratch's y, which then needs no copy.
     """
     from tensorfold.cuda.exl3.experts import routed, ACT_BF16
     if in_place and not (out.is_contiguous() and out.dtype==torch.float32):
         raise ValueError('in-place routed windows need contiguous fp32 rows')
-    own=scratch.y if in_place else None
-    try:
-        for start in range(0,rows,scratch.rows):
-            r=min(scratch.rows,rows-start)
-            if in_place:
-                scratch.y=out[start:start+r].view(r*scratch.slots,ex.dims)
-            y=routed(x[start:start+r],pick[start:start+r],None,ex,scratch,None,r,
-                     limit=limit,act_mode=ACT_BF16)
-            if y.data_ptr()!=out[start].data_ptr():
-                out[start:start+r].copy_(y.view(r,scratch.slots,ex.dims))
-    finally:
-        if in_place:
-            scratch.y=own
+    for start in range(0,rows,scratch.rows):
+        r=min(scratch.rows,rows-start)
+        into=out[start:start+r].view(r*scratch.slots,ex.dims) if in_place else None
+        y=routed(x[start:start+r],pick[start:start+r],None,ex,scratch,None,r,
+                 limit=limit,act_mode=ACT_BF16,y=into)
+        if not in_place:
+            out[start:start+r].copy_(y.view(r,scratch.slots,ex.dims))
     return out
