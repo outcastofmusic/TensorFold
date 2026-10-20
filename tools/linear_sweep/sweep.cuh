@@ -5,6 +5,7 @@
 //   orig_kernel<..., MINB, PFD>  linear_kernel (RT = 1) under __launch_bounds__(WK * 32, MINB), which caps the
 //                                registers so MINB blocks fit an SM, and with PFD > 0 an L2 prefetch of the k step
 //                                PFD ahead of the one being loaded.
+//   kind 2: orig_kernel with the shipped kernel's grid_wait, to compare like with like.
 //   wsplit_kernel<..., WKL, MINB> the same warps spread over WK / WKL blocks of WKL warps (more, smaller blocks):
 //                                each warp stores its own partial sums to Z [SK * WK, M, N]; the last block of a
 //                                column block adds them in the same order (warps, then splits). Windows of 1-16 rows.
@@ -17,6 +18,7 @@
 #include <algorithm>
 
 #include "decode.cuh"
+#include "pdl.cuh"
 
 using namespace tf_exl3;
 
@@ -101,7 +103,7 @@ __device__ __forceinline__ void prefetch_l2(const void* p) {
 }
 
 // linear_kernel with RT = 1, launch bounds (WK * 32, MINB) and an optional L2 prefetch PFD steps ahead.
-template <int K2, int CB, int WK, int MINB, int PFD>
+template <int K2, int CB, int WK, int MINB, int PFD, int GW = 0>
 __global__ void __launch_bounds__(WK * 32, MINB) orig_kernel(
     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
     const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype, long long ldy,
@@ -130,6 +132,7 @@ __global__ void __launch_bounds__(WK * 32, MINB) orig_kernel(
         if (s < per_warp)
             for (int w = 32 * lane; w < 8 * TW; w += 32 * 32)
                 prefetch_l2(tiles + (size_t)(kt0 + s) * stride_k + w);
+    if constexpr (GW) tf_exl3_pdl::grid_wait();      // the shipped kernel's griddepcontrol.wait (kind 2)
 
     for (int m0 = 0, pass = 0; m0 < M; m0 += 16, ++pass) {
         const int RP = min(16, M - m0);

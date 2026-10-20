@@ -48,6 +48,14 @@ void launch_k2(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int6
     ORIG(4, 1, 0) ORIG(4, 2, 0) ORIG(4, 3, 0) ORIG(4, 4, 0) ORIG(8, 1, 0) ORIG(8, 2, 0)
     ORIG(4, 1, 2) ORIG(4, 3, 2) ORIG(4, 4, 2) ORIG(8, 1, 2) ORIG(8, 2, 2)
 #undef ORIG
+#define ORIGW(WK_, PF_)                                                                                           \
+    if (kind == 2 && WK == WK_ && minb == 1 && pfd == PF_) {                                                    \
+        go(orig_kernel<K2, 2, WK_, 1, PF_, 1>, grid0, WK_ * 32, smem, xh, T, stride_k, stride_nb, svh, bias, y,  \
+           zptr, counters, (int)SK, 0, false);                                                                  \
+        return;                                                                                                 \
+    }
+    ORIGW(4, 0) ORIGW(8, 0) ORIGW(4, 2) ORIGW(8, 2)
+#undef ORIGW
     TORCH_CHECK(M <= 16, "wsplit: 1-16 rows");
 #define WSPLIT(WKL_, MB_)                                                                                         \
     if (kind == 1 && wkl == WKL_ && minb == MB_) {                                                              \

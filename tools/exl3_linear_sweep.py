@@ -4,6 +4,7 @@ Measurement only: the variants live in tools/linear_sweep/ and nothing in src/ c
 shipped reduction (plan(K, N)'s K range for every warp, warps added in order, then splits in order), and every
 variant's output is compared with the shipped kernel's by torch.equal on every real layer of the shape.
 
+  orig mb<B> [pf2] [gw]  (gw: with the shipped griddepcontrol.wait)
   orig mb<B> [pf2]   linear_kernel under __launch_bounds__(WK * 32, B): registers capped so B blocks fit an SM;
                      pf2 adds an L2 prefetch two k steps past the one being loaded
   wsplit w<L> mb<B>  the same WK warps spread over WK / L blocks of L warps, per-warp sums through Z, the last block
@@ -63,7 +64,7 @@ def _shipped():
 def variants(wk: int) -> list[tuple[str, tuple[int, int, int, int]]]:
     """(label, (kind, wkl, minb, pfd)) for a plan with ``wk`` warps a block."""
 
-    out = [("orig mb1 (copy)", (0, 0, 1, 0))]
+    out = [("orig mb1 (copy)", (0, 0, 1, 0)), ("orig mb1 gw", (2, 0, 1, 0)), ("orig mb1 pf2 gw", (2, 0, 1, 2))]
     out += [(f"orig mb{b}", (0, 0, b, 0)) for b in ((2,) if wk == 8 else (3, 4))]
     out += [("orig mb1 pf2", (0, 0, 1, 2))]
     out += [(f"orig mb{b} pf2", (0, 0, b, 2)) for b in ((2,) if wk == 8 else (3, 4))]

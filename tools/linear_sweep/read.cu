@@ -5,8 +5,8 @@ void read_bytes(const at::Tensor& p, int64_t nbytes, at::Tensor& out, int64_t bl
     auto stream = at::cuda::getCurrentCUDAStream();
     const auto* q = reinterpret_cast<const uint4*>(p.data_ptr());
     if (unroll == 8)
-        sweep::read_kernel<8><<<(unsigned)blocks, (unsigned)threads, 0, stream>>>(q, nbytes / 16, out.data_ptr<unsigned>());
+        sweep::read_kernel<8><<<(unsigned)blocks, (unsigned)threads, 0, stream>>>(q, nbytes / 16, reinterpret_cast<unsigned*>(out.data_ptr()));
     else
-        sweep::read_kernel<4><<<(unsigned)blocks, (unsigned)threads, 0, stream>>>(q, nbytes / 16, out.data_ptr<unsigned>());
+        sweep::read_kernel<4><<<(unsigned)blocks, (unsigned)threads, 0, stream>>>(q, nbytes / 16, reinterpret_cast<unsigned*>(out.data_ptr()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
