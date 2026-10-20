@@ -64,6 +64,8 @@ def stream(base: str, model: str, item: dict, tokens: int, temperature: float, s
                     last = now
                 if piece:
                     text.append(piece)
+    if first is None:
+        raise RuntimeError(f"{item['name']}: the stream carried no text or reasoning token")
     n = int(usage["completion_tokens"]) if usage else None
     return {"ttft_s": first - start, "decode_s": last - first, "tokens": n,
             "decode_tps": (n - 1) / (last - first) if n and last > first else None, "text": "".join(text)}
