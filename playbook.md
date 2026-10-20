@@ -169,6 +169,7 @@ All four equalities compare token SHA-256 or `torch.equal` on rows and states.
 | 10.5 | Measure drafting per text kind | tok/s and accept length on code, prose, chat, tools and long, greedy and sampled, 4+ seeds. Drafted beats serial on every kind, or depth adapts. Bolt at depth 7 ran prose at 22.4 against 29.0 serial. A zero acceptance rate is a bug even with exact tokens (upstream: a draft head read at group 64 for 32) |
 | 10.6 | Add copy drafts for code and edit traffic | Qwen EXL3: a 2,252-token prompt 36.5 to 89.0 tok/s (e773dbdb) |
 | 10.7 | Count a speed number only from a GPU A/B | Arms alternated on the same image and box, `tools/bench_openai.py --tokens 256 --reps 5 --temperatures 1.0,0`, token SHAs checked first. Two GB10s ran identical code 4-6% apart. Run no CPU-heavy job beside it: on 18 Oct two full CPU test suites during a prefill A/B spread one config's 32k prompts over 17.8-24.6 s and flipped 4k between 1.10x and 0.72x |
+| 10.8 | Before tuning a decode kernel, take the row counts from the drafter (Part 2.10) | The served verify-window rows are written down per mode: one stream, four streams, serial. Every kernel sweep times those rows and states its gain at them, not at 1 row |
 
 ### Phase 11. Serving wiring
 
@@ -382,6 +383,15 @@ kernel's time against its byte bound, then sweep these patterns. Each found at l
 | Allocator churn | `cudaMalloc` or `empty_cache` mid-request | 0.4-0.8 s slow windows after cache growth | identical |
 | A one-stream engine | concurrent requests queue | GLM, Bolt, LFM2.5 | identical when concurrent equals solo |
 
+Tune decode at the rows the drafter makes. A drafted model never decodes one row: each round verifies the drafter's
+tokens as a window. Qwen's MTP verifies 5-7 rows a stream, so 20-28 rows at four streams. Serial decode is the only
+1-row case. Read the window sizes from a served trace or the engine's `rounds` and `accepted` counts before writing a
+kernel, then sweep at those rows. On 19 Oct an EXL3 expert kernel ran 6-9% faster at 1-4 rows and lost 2-14% at 5-7.
+Served, it measured 0.994-1.001x and was dropped. The kernels that shipped the next day targeted the windows MTP
+actually makes: grouping at 7 rows ran 2.4x faster, and paired linear tiles above 16 rows gave four streams 1.02-1.06x.
+Even a kernel that wins at the right rows can lose served. GLM's expert kernel swept 7-23% faster at every row count,
+then measured 0.978-0.990x in a real decode step, serial included.
+
 Before trusting a gap, rule out the measurement: a log figure that leaves out work (the done line's prefill missed the last
 pass), contention (two CPU suites spread 32k prompts over 17.8-24.6 s), a cold page cache for mapped tables, and clock or
 thermal throttling (log SM clocks during long runs). Under several streams, also check L2 thrashing: per-stream decode
@@ -428,6 +438,8 @@ RoPE or YaRN check against HF at 32k or 128k either **(gap)**.
 | GLM tree drafts | Oracle sibling kept 16.8% of rounds against 34% needed |
 | GLM `auto` drafter chooser | 3-8% slower than `fc5:0.3` |
 | EXL3 expert tuning | Forecast 1.35-1.65x, measured +6% |
+| EXL3 decode kernel tuned at 1-4 rows (`EXPERT_DECODE`, `F16_NARROW`, `PDL`, 19 Oct) | Served 0.994-1.001x each: MTP verifies 5-7 rows, where the tiles lost |
+| EXL3 `EXPERT_DECODE` on GLM-5.3 (20 Oct) | Swept 7-23% faster, served 0.978x drafted and 0.989x serial |
 | Qwen expert read-ahead thread | No gain, and a `torch.empty` on a worker thread kept 36 GB resident |
 | Deferred n-gram read | First request 1.4-2 s slower |
 | Fixed draft depth on Bolt prose | 22.4 against 29.0 serial |
