@@ -95,3 +95,20 @@ def test_rows_switch(monkeypatch):
     assert most_rows(6) == 32
     monkeypatch.setenv("TENSORFOLD_COPY_ROWS", "4")
     assert most_rows(6) == 7                                        # never narrower than the MTP chain
+
+
+def test_a_templated_list_copies_the_line_that_matches_furthest_back():
+    def line(i):
+        return [1000 + i, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]       # an item number, then a shared template
+    prompt = [5] + [t for i in range(1, 6) for t in line(i)]
+    reply = line(1) + line(2)                                        # the reply repeats the prompt's list
+    index = CopyIndex(prompt + reply)
+    assert index.chain(4) == [1003, 7, 8, 9]                          # the prompt's line 3, not the reply's line 1
+    assert CopyIndex(prompt + reply, min_back=12).chain(4) == [1003, 7, 8, 9]   # its match runs 14 further
+    template = [5] + line(1) + line(2)[:9]                            # only the template repeats: 1 token further
+    assert CopyIndex(template).chain(4) and CopyIndex(template, min_back=4).chain(4) == []
+
+
+def test_a_tie_goes_to_the_latest_occurrence():
+    ctx = [1] + A[:COPY_MATCH] + [2, 3] * 5 + [1] + A[:COPY_MATCH] + [4, 5] * 5 + [1] + A[:COPY_MATCH]
+    assert CopyIndex(ctx).chain(4) == [4, 5, 4, 5]

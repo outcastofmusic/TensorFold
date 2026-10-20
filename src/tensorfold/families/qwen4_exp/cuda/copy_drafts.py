@@ -8,6 +8,10 @@ from collections.abc import Sequence
 COPY_MATCH = 8          # the context's last this many tokens must have appeared before, and at least this many follow
 ROWS_ENV = "TENSORFOLD_COPY_ROWS"
 COPY_ROWS = 32          # the widest copy window: 1.25x one stream, 1.23x four (tf-runs/copy-windows, 2026-10-20)
+# TENSORFOLD_COPY_BACK: a match this many tokens further back counts as the same text, and the longest continuation
+# among those wins; 0 takes the latest occurrence with the longest continuation, the choice before 2026-10-20
+BACK = int(os.environ.get("TENSORFOLD_COPY_BACK", "16").strip() or 16)
+CANDIDATES = 32         # the latest occurrences a choice reads
 
 
 def enabled(default: bool = True) -> bool:
@@ -32,14 +36,21 @@ def next_rows(rows: int, landed_whole: bool, base: int, most: int) -> int:
 
 
 class CopyIndex:
-    """Longest continuation of an earlier copy of the last ``min_match`` tokens; n-gram starts keep a round O(new).
+    """The continuation of the earlier copy of the last ``min_match`` tokens whose match runs furthest back; n-gram
+    starts keep a round O(new).
+
+    Following the latest occurrence copied the previous line of a list whose lines share a template (" EUR and ships
+    in 3 days") where the prompt's own line was meant: a replay of the A/B replies gave 47% of copy drafts kept on GLM
+    and 72% on Qwen, against 100% for the occurrence that matches furthest back (tf-runs/glm-copy-windows, copy_sim).
+    ``min_back`` (GLM's TF_GLM_COPY_BACK, at most BACK): no copy unless the match runs this many tokens past
+    ``min_match``.
 
     With ``rows`` (the MTP chain's window), a copy drafts at most its own window less the anchor row, which widens
     toward ``most`` while copies land whole (``verified``); without, it drafts as many as asked."""
 
     def __init__(self, context: Sequence[int], min_match: int = COPY_MATCH, *, rows: int | None = None,
-                 most: int | None = None):
-        self.m = int(min_match)
+                 most: int | None = None, min_back: int = 0):
+        self.m, self.min_back = int(min_match), int(min_back)
         self.base = self.rows = rows
         self.most = max(rows, most or rows) if rows is not None else None
         self.ctx: list[int] = []
@@ -54,8 +65,8 @@ class CopyIndex:
                 self.starts.setdefault(tuple(self.ctx[s:]), []).append(s)
 
     def chain(self, max_nodes: int) -> list[int]:
-        """Up to ``max_nodes`` tokens (and the window's) after the tail's latest earlier copy; [] without one or
-        under ``min_match``."""
+        """Up to ``max_nodes`` tokens (and the window's) after the earlier copy whose match runs furthest back, the
+        latest on a tie; [] without one, under ``min_match``, or matching less than ``min_back`` further."""
 
         ctx, m = self.ctx, self.m
         if self.rows is not None:
@@ -65,16 +76,32 @@ class CopyIndex:
         # A round with fewer than min_match slots (Flash Next drafts 6) still copies: the earlier copy must run
         # min_match tokens on, and the round takes the first max_nodes of them.
         want = max(max_nodes, m)
-        best: list[int] = []
-        for start in reversed(self.starts.get(tuple(ctx[-m:]), [])):
+        best, score = [], (False, -1, 0)
+        for start in reversed(self.starts.get(tuple(ctx[-m:]), [])[-CANDIDATES:]):
             if start > len(ctx) - m - 1:                 # the needle itself
                 continue
             cont = ctx[start + m:start + m + want]
-            if len(cont) > len(best):
-                best = cont
-                if len(best) == want:
+            if len(cont) < m:
+                continue
+            # a continuation that fills the window first (in periodic text the latest occurrences run into the tail
+            # and every match reaches far back), then the match's reach, then the continuation's length; ties go to
+            # the later occurrence, seen first
+            here = (len(cont) == want, self._back(start), len(cont))
+            if here > score:
+                best, score = cont, here
+                if here == (True, BACK, want):
                     break
+        if score[1] < self.min_back:
+            return []
         return best[:max_nodes] if len(best) >= m else []
+
+    def _back(self, start: int) -> int:
+        """Tokens before the occurrence at ``start`` that equal those before the tail's match, up to BACK."""
+        ctx, n = self.ctx, 0
+        i, j = start - 1, len(self.ctx) - self.m - 1
+        while n < BACK and i >= 0 and ctx[i] == ctx[j]:
+            n, i, j = n + 1, i - 1, j - 1
+        return n
 
     def verified(self, drafted: int, kept: int) -> None:
         """A copy window's outcome: ``kept`` of its ``drafted`` tokens landed."""

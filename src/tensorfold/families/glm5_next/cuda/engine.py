@@ -293,18 +293,20 @@ class GlmEngine:
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
         from tensorfold.env_flags import flag
-        from tensorfold.families.qwen4_exp.cuda.copy_drafts import most_rows
+        from tensorfold.families.qwen4_exp.cuda.copy_drafts import BACK, most_rows
 
         from .drafter_choice import COPY_DRAFTS
 
         # TF_GLM_DFLASH_COPIES (unset: off): DFlash2 rounds verify a copy where the reply repeats earlier text; a
         # copy's window widens from 6 rows up to TENSORFOLD_COPY_ROWS while copies land whole
         self.dflash_copies = flag("TF_GLM_DFLASH_COPIES", False)
+        # TF_GLM_COPY_BACK=N: a copy only where its match runs N tokens before the 8 it needs (0: any match)
+        self.copy_back = int(os.environ.get("TF_GLM_COPY_BACK", "0").strip() or 0)
         self.copy_rows = most_rows(COPY_DRAFTS)
         # both ranks must run the same calls: refuse to start when they were given different settings
         mine = [int(drafter is not None), capacity, int(long_context), int(self.serial_only), int(LATENT),
                 prefill_rows, int(self.target_only), int(self.eager), int(self.calibrated), int(self.load_mtp),
-                int(DRAFT_RING), int(self.dflash_copies), self.copy_rows]
+                int(DRAFT_RING), int(self.dflash_copies), self.copy_rows, self.copy_back, BACK]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = 0 if self.target_only else int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -313,8 +315,9 @@ class GlmEngine:
         if len(both) != world or any(row[:-1] != mine for row in both):
             raise RuntimeError("CUDA ranks were started with different settings (draft model, context, drafts, "
                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, TF_GLM_DFLASH_COPIES, "
-                               f"TENSORFOLD_COPY_ROWS): {both}; pull the draft model on both "
-                               "machines (or pass --drafter none to both) and give both the same flags")
+                               "TENSORFOLD_COPY_ROWS, TF_GLM_COPY_BACK, TENSORFOLD_COPY_BACK): "
+                               f"{both}; pull the draft model on both machines (or pass --drafter none to both) "
+                               "and give both the same flags")
         self.cache_bytes = min(row[-1] for row in both) << 20
         plan["kept_bytes"] = self.cache_bytes
         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
@@ -768,7 +771,8 @@ class GlmEngine:
 
         from .drafter_choice import COPY_DRAFTS
 
-        return (CopyIndex([*prompt, first], rows=COPY_DRAFTS + 1, most=getattr(self, "copy_rows", None))
+        return (CopyIndex([*prompt, first], rows=COPY_DRAFTS + 1, most=getattr(self, "copy_rows", None),
+                          min_back=getattr(self, "copy_back", 0))
                 if enabled() and self.e.constraint is None else None)
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
