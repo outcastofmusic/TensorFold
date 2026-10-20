@@ -392,6 +392,11 @@ actually makes: grouping at 7 rows ran 2.4x faster, and paired linear tiles abov
 Even a kernel that wins at the right rows can lose served. GLM's expert kernel swept 7-23% faster at every row count,
 then measured 0.978-0.990x in a real decode step, serial included.
 
+Measure idle and launch delay with graph-level tracing (`--cuda-graph-trace=graph`) or none, and keep node tracing
+for per-kernel times. On 20 Oct node tracing held `cudaGraphLaunch` 1.04-1.37 ms on the host and showed a 0.97 ms
+launch-to-first-kernel delay a verify; untraced the call costs 3.2 us and splitting the graph saved 0.007 ms.
+Do not time a kernel right behind `torch.cuda._sleep`: the graph after it ran 0.7-1.0 ms slower.
+
 Before trusting a gap, rule out the measurement: a log figure that leaves out work (the done line's prefill missed the last
 pass), contention (two CPU suites spread 32k prompts over 17.8-24.6 s), a cold page cache for mapped tables, and clock or
 thermal throttling (log SM clocks during long runs). Under several streams, also check L2 thrashing: per-stream decode
