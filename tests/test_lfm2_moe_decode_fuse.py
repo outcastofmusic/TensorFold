@@ -115,6 +115,13 @@ def test_conv_fits_one_row_of_three_taps_only():
     assert not fused.conv_fits(1, torch.zeros(2, 300), torch.zeros(300, 3))
 
 
+def test_combine_fits_whole_channel_blocks_only():
+    from tensorfold.families.lfm2_moe.cuda import fused
+
+    assert fused.combine_fits(2048) and fused.combine_fits(fused.BD)
+    assert not fused.combine_fits(300) and not fused.combine_fits(fused.BD + 1)
+
+
 INTERPRETED = r"""
 import torch
 from tensorfold.families.lfm2_moe.cuda import experts as X, fused

@@ -78,6 +78,7 @@ class Engine:
         self.prompt_kernel = os.environ.get("TF_LFM2_PROMPT_KERNEL", "auto").strip() or "auto"
         X.path(self.prompt_kernel, 1, 0, 0)            # refuses an unknown value at startup
         self.fuse = flag("TF_LFM2_DECODE_FUSE", True) and self.cuda      # read once: a graph keeps what it captured
+        self.combine_fits = fused.combine_fits(c.hidden)                 # LFM2.5-24B's 2,048 channels fit
         self.call_rope: tuple[torch.Tensor, ...] | None = None           # a fused call's (cos, sin, rows' positions)
         self.slot = {layer: j for j, layer in enumerate(c.attention_layers)}
         self.slot.update({layer: j for j, layer in enumerate(c.conv_layers)})
@@ -206,7 +207,8 @@ class Engine:
     def _ffn(self, b: Block, x: torch.Tensor, prompt: bool) -> torch.Tensor:
         if b.moe is not None:
             return X.moe(x, b.moe, self.c.top_k, self.c.scaling, few=DECODE_ROWS, work=self.decoded,
-                         kernel=self.prompt_kernel, pairs_rows=PAIRS_ROWS, fuse=self.fuse and not prompt)
+                         kernel=self.prompt_kernel, pairs_rows=PAIRS_ROWS,
+                         fuse=self.fuse and self.combine_fits and not prompt)
         g, u = b.w13(x, prompt).chunk(2, dim=-1)
         act = (torch.nn.functional.silu(g.float()).to(torch.bfloat16).float() * u.float()).to(torch.bfloat16)
         return b.w2(act, prompt)

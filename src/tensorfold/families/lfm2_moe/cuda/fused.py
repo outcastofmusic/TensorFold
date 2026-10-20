@@ -60,6 +60,12 @@ def conv_fits(rows: int, state: torch.Tensor, taps: torch.Tensor) -> bool:
             and taps.is_contiguous())
 
 
+def combine_fits(d: int) -> bool:
+    """``combine`` takes whole BD-channel blocks: its loads and stores have no mask."""
+
+    return d % BD == 0
+
+
 @triton.jit
 def _combine(OUTS, WEIGHTS, Y, K: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
     """Row r, channels c: Y = bf16(sum over picks j in order of fp32(bf16(OUTS[r K + j] * bf16(WEIGHTS[r, j]))))."""
