@@ -5,7 +5,8 @@ A request whose "model" is not the loaded one waits for the running requests to 
 model on BACKEND_PORT, and is then forwarded. A streaming request gets an SSE comment every 5 s while it waits, so
 clients that time out on a silent connection stay connected. Python's standard library only.
 
-    GET  /v1/models      both models, "loaded" on the one in memory
+    GET  /v1/models      every model, "loaded" on the one in memory and a "state": ready, loading, unloaded or
+                         failed (with the "error" of its last load, kept until a load of it succeeds)
     GET  /swap           {"loaded": ..., "loading": ..., "running": n}
     POST /swap/<model>   load a model now and answer when it is ready
 
@@ -100,6 +101,25 @@ class Swapper:
         self.running = 0
         self.since = 0.0                 # when the loaded model became ready
         self.waiting: Counter[str | None] = Counter()   # requests in enter(), by the model they name
+        self.failed: dict[str, str] = {}                # model: why its last load failed
+
+    def models(self) -> list[dict]:
+        """The /v1/models entries, each with the model's state."""
+
+        with self.cond:
+            out = []
+            for name in TARGET:
+                entry = {"id": name, "object": "model", "owned_by": "tensorfold", "loaded": name == self.current}
+                if name == self.loading:
+                    entry["state"] = "loading"
+                elif name == self.current:
+                    entry["state"] = "ready"
+                elif name in self.failed:
+                    entry["state"], entry["error"] = "failed", self.failed[name]
+                else:
+                    entry["state"] = "unloaded"
+                out.append(entry)
+            return out
 
     def ready(self, model: str | None) -> bool:
         with self.cond:
@@ -151,7 +171,9 @@ class Swapper:
             self.loading = None
             self.cond.notify_all()
             if code != 0:
+                self.failed[want] = why
                 raise RuntimeError(f"{want} did not load ({why}); see the swap log")
+            self.failed.pop(want, None)
             self.running += 1
             return want
 
@@ -186,8 +208,7 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         path = self.path.split("?")[0].rstrip("/")
         if path == "/v1/models":
-            self.reply(200, {"object": "list", "data": [
-                {"id": name, "object": "model", "owned_by": "tensorfold", "loaded": name == SWAP.current} for name in TARGET]})
+            self.reply(200, {"object": "list", "data": SWAP.models()})
         elif path == "/swap":
             self.reply(200, self.state())
         elif SWAP.ready(None):

@@ -360,3 +360,40 @@ def test_a_start_whose_swap_endpoint_ends_after_the_lock_check_still_waits_for_t
         assert not ran.exists()
     finally:
         fake_swap.kill()
+
+
+def _states(swapper):
+    return {m["id"]: (m["state"], m.get("error")) for m in swapper.models()}
+
+
+def test_models_report_a_failed_load_until_the_next_load_succeeds(swap, tmp_path):
+    swap.RUN = str(tmp_path / "missing-run.sh")
+    swapper = swap.Swapper()
+    with pytest.raises(RuntimeError):
+        swapper.enter("glm-5.3-flash")
+    state, error = _states(swapper)["glm-5.3-flash"]
+    assert state == "failed" and "run.sh did not start" in error
+    assert _states(swapper)["qwen3.8-flash-next"] == ("unloaded", None)
+
+    log, backend = _run_logger(swap, tmp_path)
+    try:
+        assert swapper.enter("glm-5.3-flash") == "glm-5.3-flash"
+    finally:
+        backend.shutdown()
+    assert _states(swapper)["glm-5.3-flash"] == ("ready", None)
+
+
+def test_models_report_the_model_being_loaded(swap, tmp_path):
+    run = tmp_path / "run.sh"
+    run.write_text("#!/bin/sh\nsleep 0.5\n")
+    run.chmod(0o755)
+    swap.RUN = str(run)
+    swapper = swap.Swapper()
+    load = threading.Thread(target=swapper.enter, args=("glm-5.3-flash",))
+    load.start()
+    deadline = time.monotonic() + 5
+    while swapper.loading is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert _states(swapper)["glm-5.3-flash"] == ("loading", None)
+    load.join(5)
+    assert _states(swapper)["glm-5.3-flash"] == ("ready", None)
