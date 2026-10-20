@@ -103,12 +103,12 @@ def test_the_engines_install_what_they_read(monkeypatch, tmp_path):
     exl3_mm.use(exl3_mm.Switches())
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
-    assert switches.current() == switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True)
+    assert switches.current() == switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=True, linear_pair=True)
     assert exl3_mm.current().moe_chunk is True
     switches.use(switches.Switches())
     with pytest.raises(Exception):
         GlmEngine(tmp_path / "missing", rank=0, master="", port=0, world=1)
-    assert switches.current() == switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True)
+    assert switches.current() == switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=True, linear_pair=True)
 
 
 # -- what routed launches -------------------------------------------------------------------------------------------

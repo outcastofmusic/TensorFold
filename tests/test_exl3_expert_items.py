@@ -31,7 +31,7 @@ def test_the_flag_is_on_unless_turned_off(monkeypatch, value, on):
         monkeypatch.delenv(e, raising=False)
     if value is not None:
         monkeypatch.setenv(ENV, value)
-    assert switches.read() == switches.Switches(expert_items=on, group_scan=True, down_fuse=True, gateup_fuse=True)          # prompt switches read on
+    assert switches.read() == switches.Switches(expert_items=on, group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=True, linear_pair=True)          # prompt switches read on
 
 
 @pytest.mark.parametrize("value", ["2", "items", "o", "1.0"])
