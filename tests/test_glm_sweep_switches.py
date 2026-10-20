@@ -48,6 +48,17 @@ def test_the_engine_reads_every_switch_into_the_weights_meta(monkeypatch):
                                         "early_launch": True}
 
 
+@pytest.mark.parametrize("env", ["TF_GLM_PLAIN_NARROW", "TF_GLM_HC_SPLIT"] + [env for env, _, _ in SWITCHES])
+def test_a_switch_typo_stops_the_engine_before_any_read(monkeypatch, tmp_path, env):
+    """No checkpoint is there, so the flag must fail first: a typo costs no weight load."""
+
+    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
+
+    monkeypatch.setenv(env, "maybe")
+    with pytest.raises(ValueError, match=env):
+        GlmEngine(tmp_path / "missing", rank=0, master="", port=0, world=1)
+
+
 # -- buffers ------------------------------------------------------------------------------------------------------
 D, I, E, TOP = 128, 128, 4, 2
 

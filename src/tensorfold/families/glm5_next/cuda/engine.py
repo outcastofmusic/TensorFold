@@ -212,6 +212,7 @@ class GlmEngine:
         from tensorfold.cuda.exl3 import switches as exl3_switches
 
         exl3_switches.use(exl3_switches.read())        # every TF_EXL3_* kernel switch, before any read
+        switches = kernel_switches()                    # every TF_GLM_* decode switch, before any read too
         from .split import require_full_checkpoint, validate_world
         if comm is not None:
             world = getattr(comm, "world", world)        # a test communicator names its own rank count
@@ -321,7 +322,7 @@ class GlmEngine:
         if not self.load_mtp and w.mtp is not None:
             raise RuntimeError("loader violated load_mtp=False: refusing dormant MTP allocation/work")
         w.meta = {**getattr(w, "meta", {}), "target_only": self.target_only, "load_mtp": self.load_mtp,
-                  **kernel_switches()}
+                  **switches}
         if self.comm is not None:
             self.comm.ready("loading")               # a peer stuck loading is named, not waited on in NCCL
             self.comm.barrier()
