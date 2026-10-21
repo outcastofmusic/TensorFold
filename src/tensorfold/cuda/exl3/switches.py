@@ -26,6 +26,11 @@ TF_EXL3_LINEAR_PAIR (unset: on; served four streams 1.019x alone, 20 Oct) runs t
 each k step's weights once for both 16-row tiles, where each 16-row pass read and decoded every weight again. Each
 row keeps its mma chain, warp order and split order, so its bytes.
 
+TF_EXL3_EXPERT_STAGED (unset: off) runs a prompt window's ``grouped_kernel`` launches with S k steps of weights and
+member rows in flight a warp through shared memory (``warp_tiles_staged``), the same fragments into the same mma
+chains. On a 2,048-row Flash Next window (ncu, 21 Oct) the kernel held 8 warps an SM at 248 registers and no warp was
+ready in 75% of cycles, most of them waiting on global loads.
+
 An engine reads every switch once at startup (``read``) and installs them (``use``). The kernels' Python callers consult
 ``current()`` at each launch, so a CUDA graph keeps the setting it was captured with. A test flips a setting on one
 load by calling ``use`` and building a new engine.
@@ -45,6 +50,7 @@ DOWN_FUSE_ENV = "TF_EXL3_DOWN_FUSE"
 GATEUP_FUSE_ENV = "TF_EXL3_GATEUP_FUSE"
 GROUP_SCAN_DECODE_ENV = "TF_EXL3_GROUP_SCAN_DECODE"
 LINEAR_PAIR_ENV = "TF_EXL3_LINEAR_PAIR"
+EXPERT_STAGED_ENV = "TF_EXL3_EXPERT_STAGED"
 
 
 @dataclass(frozen=True)
@@ -59,11 +65,13 @@ class Switches:
     gateup_fuse: bool = True
     group_scan_decode: bool = True
     linear_pair: bool = True
+    expert_staged: bool = False
 
 
 ENVS = {EXPERT_DECODE_ENV: "expert_decode", PDL_ENV: "pdl", EXPERT_ITEMS_ENV: "expert_items",
         GROUP_SCAN_ENV: "group_scan", DOWN_FUSE_ENV: "down_fuse", GATEUP_FUSE_ENV: "gateup_fuse",
-        GROUP_SCAN_DECODE_ENV: "group_scan_decode", LINEAR_PAIR_ENV: "linear_pair"}
+        GROUP_SCAN_DECODE_ENV: "group_scan_decode", LINEAR_PAIR_ENV: "linear_pair",
+        EXPERT_STAGED_ENV: "expert_staged"}
 
 _current = Switches()          # launches before any engine's ``use`` (tools, tests) take the served setting
 

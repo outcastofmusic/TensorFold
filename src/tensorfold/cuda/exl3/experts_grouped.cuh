@@ -218,6 +218,126 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
     }
 }
 
+// cp.async copies into shared memory (sm_80+): 16 or 8 bytes, or 16 zero bytes when ``ok`` is false.
+__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+__device__ __forceinline__ void cp16(void* dst, const void* src, bool ok = true) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr(dst)), "l"(src),
+                 "r"(ok ? 16 : 0));
+}
+__device__ __forceinline__ void cp8(void* dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(smem_addr(dst)), "l"(src));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+// A staged 16x16 fp16 tile: 16 rows of two 16-byte halves (k 0-7, k 8-15), half c of row r at r * 16 + 8 * (c ^ r / 4
+// % 2) halves, so the 8 rows each ldmatrix reads fall on distinct banks.
+__device__ __forceinline__ int staged_at(int row, int c) { return row * 16 + 8 * (c ^ ((row >> 2) & 1)); }
+
+// The A fragment of a staged tile: the same four registers load_pair builds (rows g and g + 8, k 2t and 2t + 8).
+__device__ __forceinline__ void ldmatrix_a(uint32_t (&a)[4], const half* tile, int lane) {
+    const half* p = tile + staged_at(lane & 15, lane >> 4);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                 : "r"(smem_addr(p)));
+}
+
+// TF_EXL3_EXPERT_STAGED: warp_tiles with the weights and the member rows of several k steps in flight through shared
+// memory (cp.async), where warp_tiles holds one k step of weights in registers and loads the rows when it uses them.
+// A warp's STAGE_BYTES hold as many k steps as fit at the tile's rate, up to S: 6 at 3 bits, 4 at 5 bits.
+// The GB10 profile of a 2,048-row Flash Next window (ncu, 21 Oct): 248 registers held 2 blocks (8 warps) an SM,
+// no warp was ready to issue in 75% of cycles, and long-scoreboard waits were 3.4 of 8.0 cycles an instruction.
+// Each warp stages its own k range, so a __syncwarp orders the copies. Every mma gets the fragments warp_tiles gives
+// it (absent rows are zero-filled, as load_pair returns zero) in the same order: a row's sums are the same bits.
+constexpr int STAGE_BYTES = 11264;     // a warp's share of the staged path's shared memory (2 blocks an SM fit)
+template <int NT, int RT, int TW, int S>
+struct Staged {
+    static constexpr int A_HALVES = RT * 16 * 16;
+    static constexpr int W_WORDS = NT * TW;
+    static constexpr int BYTES = (A_HALVES * 2 + W_WORDS * 4 + 15) / 16 * 16;
+    static constexpr int DEPTH = STAGE_BYTES / BYTES < S ? STAGE_BYTES / BYTES : S;
+    static_assert(DEPTH >= 2, "two k steps in flight at least");
+};
+
+template <int CB, int K2, int NT, int RT, int S>
+__device__ __forceinline__ void warp_tiles_staged(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt,
+                                                  int nt0, const half* __restrict__ X, int K, const int* rows_sh,
+                                                  int nrt, int lane, uint32_t wmask, float (&acc)[RT][NT][2][4],
+                                                  unsigned char* buf) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    using St = Staged<NT, RT, TW, S>;
+    constexpr int D = St::DEPTH;
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt0) * TW;
+    // lane L copies half L & 1 of row L >> 1 of each row tile: 16 bytes a k step
+    const half* xs[RT];
+    bool ok[RT];
+#pragma unroll
+    for (int r = 0; r < RT; ++r) {
+        const int row = rows_sh[16 * r + (lane >> 1)];
+        ok[r] = row >= 0;
+        xs[r] = X + (size_t)(ok[r] ? row : 0) * K + kt0 * 16 + 8 * (lane & 1);
+    }
+    auto issue = [&](int it) {
+        unsigned char* st = buf + (it % D) * St::BYTES;
+        half* sa = reinterpret_cast<half*>(st);
+#pragma unroll
+        for (int r = 0; r < RT; ++r)
+            if (r < nrt) cp16(sa + r * 256 + staged_at(lane >> 1, lane & 1), xs[r] + it * 16, ok[r]);
+        uint32_t* sw = reinterpret_cast<uint32_t*>(st + St::A_HALVES * 2);
+        const uint32_t* src = tp + (size_t)it * kstride;
+        if constexpr (TW % 4 == 0) {      // every tile starts on 16 bytes (2.25 bits, 18 words, on 8)
+#pragma unroll
+            for (int c = lane; c < St::W_WORDS / 4; c += 32) cp16(sw + 4 * c, src + 4 * c);
+        } else {
+#pragma unroll
+            for (int c = lane; c < St::W_WORDS / 2; c += 32) cp8(sw + 2 * c, src + 2 * c);
+        }
+    };
+#pragma unroll
+    for (int d = 0; d < D - 1; ++d) {
+        if (d < nkt) issue(d);
+        cp_commit();
+    }
+    for (int it = 0; it < nkt; ++it) {
+        cp_wait<D - 2>();
+        __syncwarp();                     // every lane's copies of step it landed; every lane is done with step it - 1
+        if (it + D - 1 < nkt) issue(it + D - 1);
+        cp_commit();
+        const unsigned char* st = buf + (it % D) * St::BYTES;
+        const half* sa = reinterpret_cast<const half*>(st);
+        const uint32_t* sw = reinterpret_cast<const uint32_t*>(st + St::A_HALVES * 2);
+        uint32_t a[RT][4];
+#pragma unroll
+        for (int r = 0; r < RT; ++r)
+            if (r < nrt) ldmatrix_a(a[r], sa + r * 256, lane);
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+            uint32_t w[LW];
+#pragma unroll
+            for (int l = 0; l < LW; ++l) {
+                if constexpr ((TW % 32) == 0)
+                    w[l] = sw[i * TW + l * 32 + lane];
+                else
+                    w[l] = (l * 32 + lane < TW) ? sw[i * TW + l * 32 + lane] : 0u;
+            }
+            uint32_t b0[2], b1[2];
+            decode_tile<CB, K2>(w, map, lane, wmask, b0, b1);
+#pragma unroll
+            for (int r = 0; r < RT; ++r)
+                if (r < nrt) {
+                    mma16816(acc[r][i][0], a[r], b0);
+                    mma16816(acc[r][i][1], a[r], b1);
+                }
+        }
+    }
+    cp_wait<0>();
+}
+
 // The rate codes with a kernel instance: half-bits 2..16, and 2.25 bits (sushi's GLM and Flash Next packs).
 constexpr int K2_QUARTER = RATE_WORDS + 18;
 __host__ __device__ constexpr bool k2_supported(int k2) {
@@ -250,7 +370,22 @@ struct Epi {
 // leaves 31 of a typical routed expert's empty. Listed (TF_EXL3_EXPERT_ITEMS): grid (n blocks, matrices x splits,
 // items), one program a (place << 16 | member group) item group_kernel listed, so only filled groups launch, and an
 // item's n blocks run next to each other while its rows are still in L2. Each program computes the same sums.
-template <int CB, int NT, int W, int PF, int LO, int HI, int RT, int EPI>
+//
+// S > 0 (TF_EXL3_EXPERT_STAGED) runs the warps' k ranges through warp_tiles_staged, S k steps in flight a warp, in
+// shared memory that the warps' sums reuse once every warp is done with it.
+template <int NT, int W, bool STAGED>
+struct GroupedSmem {
+    float red[W][16][NT * 16];
+};
+template <int NT, int W>
+struct GroupedSmem<NT, W, true> {
+    union {
+        float red[W][16][NT * 16];
+        __align__(16) unsigned char staged[W * STAGE_BYTES];
+    };
+};
+
+template <int CB, int NT, int W, int PF, int LO, int HI, int RT, int EPI, int S = 0>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
@@ -276,8 +411,12 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
         zz = blockIdx.z / MT;
         nb = blockIdx.y;
     }
-    const int split = zz % SK;
-    const int mat = zz / SK;
+    // the staged path runs a program's K splits itself, in split order (``zz`` is the matrix), and adds their sums
+    // from zero as the epilogues do: one total a matrix reaches Z, which the epilogues then read as one split
+    constexpr bool INNER = S > 0;
+    const int split0 = INNER ? 0 : zz % SK;
+    const int mat = INNER ? zz : zz / SK;
+    const int nsplit = INNER ? SK : 1;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -309,108 +448,154 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     }
 
     const int per_split = KT / SK, per_warp = per_split / W;
-    const int kt0 = split * per_split + warp * per_warp;
     const int nt0 = nb * NT;
+    static_assert(sizeof(GroupedSmem<NT, W, (S > 0)>) <= 48 * 1024, "grouped_kernel's shared memory is static");
+    __shared__ GroupedSmem<NT, W, (S > 0)> sm;
+    auto& red = sm.red;
+    constexpr int PER_THREAD = 16 * NT * 16 / (W * 32);   // a row tile's sums a thread adds up (staged path)
+    float tot[INNER ? RT : 1][INNER ? PER_THREAD : 1];
+    for (int sp = 0; sp < nsplit; ++sp) {
+        const int split = split0 + sp;
+        const int kt0 = split * per_split + warp * per_warp;
 
-    float acc[RT][NT][2][4];
+        float acc[RT][NT][2][4];
 #pragma unroll
-    for (int r = 0; r < RT; ++r)
+        for (int r = 0; r < RT; ++r)
 #pragma unroll
-        for (int i = 0; i < NT; ++i)
+            for (int i = 0; i < NT; ++i)
 #pragma unroll
-            for (int h = 0; h < 2; ++h)
+                for (int h = 0; h < 2; ++h)
 #pragma unroll
-                for (int c = 0; c < 4; ++c) acc[r][i][h][c] = 0.f;
+                    for (int c = 0; c < 4; ++c) acc[r][i][h][c] = 0.f;
 
-    switch (k2) {
+        switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                      \
-    case K2_:                                                                                                   \
-        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            warp_tiles<CB, K2_, NT, PF, RT>(T, NTILES, kt0, per_warp, nt0, x0, x1, ok0, ok1, nrt, lane, wmask,  \
-                                            acc);                                                               \
-        else                                                                                                    \
-            __trap();                                                                                           \
-        break;
-        TF_EXL3X_CASE(2)
-        TF_EXL3X_CASE(3)
-        TF_EXL3X_CASE(4)
-        TF_EXL3X_CASE(5)
-        TF_EXL3X_CASE(6)
-        TF_EXL3X_CASE(7)
-        TF_EXL3X_CASE(8)
-        TF_EXL3X_CASE(9)
-        TF_EXL3X_CASE(10)
-        TF_EXL3X_CASE(11)
-        TF_EXL3X_CASE(12)
-        TF_EXL3X_CASE(13)
-        TF_EXL3X_CASE(14)
-        TF_EXL3X_CASE(15)
-        TF_EXL3X_CASE(16)
-        TF_EXL3X_CASE(K2_QUARTER)
+        case K2_:                                                                                               \
+            if constexpr (K2_ >= LO && K2_ <= HI) {                                                             \
+                if constexpr (S > 0)                                                                            \
+                    warp_tiles_staged<CB, K2_, NT, RT, S>(                                                      \
+                        T, NTILES, kt0, per_warp, nt0, X, K, rows_sh, nrt, lane, wmask, acc,                    \
+                        sm.staged + warp * STAGE_BYTES);                                                        \
+                else                                                                                            \
+                    warp_tiles<CB, K2_, NT, PF, RT>(T, NTILES, kt0, per_warp, nt0, x0, x1, ok0, ok1, nrt, lane, \
+                                                    wmask, acc);                                                \
+            } else                                                                                              \
+                __trap();                                                                                       \
+            break;
+            TF_EXL3X_CASE(2)
+            TF_EXL3X_CASE(3)
+            TF_EXL3X_CASE(4)
+            TF_EXL3X_CASE(5)
+            TF_EXL3X_CASE(6)
+            TF_EXL3X_CASE(7)
+            TF_EXL3X_CASE(8)
+            TF_EXL3X_CASE(9)
+            TF_EXL3X_CASE(10)
+            TF_EXL3X_CASE(11)
+            TF_EXL3X_CASE(12)
+            TF_EXL3X_CASE(13)
+            TF_EXL3X_CASE(14)
+            TF_EXL3X_CASE(15)
+            TF_EXL3X_CASE(16)
+            TF_EXL3X_CASE(K2_QUARTER)
 #undef TF_EXL3X_CASE
-        default:
-            __trap();
-    }
-
-    // warps' partial sums through shared memory, added in warp order; one row tile at a time, so RT costs no shared memory
-    __shared__ float red[W][16][NT * 16];
-#pragma unroll
-    for (int r = 0; r < RT; ++r) {
-        if (r >= nrt) break;
-#pragma unroll
-        for (int i = 0; i < NT; ++i)
-#pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                const int col = i * 16 + h * 8 + 2 * t;
-                red[warp][g][col] = acc[r][i][h][0];
-                red[warp][g][col + 1] = acc[r][i][h][1];
-                red[warp][g + 8][col] = acc[r][i][h][2];
-                red[warp][g + 8][col + 1] = acc[r][i][h][3];
-            }
-        __syncthreads();
-        for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
-            const int row = idx / (NT * 16), col = idx % (NT * 16);
-            const int rr = rows_sh[16 * r + row];
-            if (rr < 0) continue;
-            float sum = red[0][row][col];
-#pragma unroll
-            for (int w = 1; w < W; ++w) sum += red[w][row][col];
-            if constexpr (EPI == EPI_DOWN)
-                red[0][row][col] = sum;                   // only this thread reads this place
-            else
-                Z[(((size_t)mat * SK + split) * P + rr) * N + nt0 * 16 + col] = sum;
+            default:
+                __trap();
         }
-        __syncthreads();
-        if constexpr (EPI == EPI_DOWN) {
-            // down_epilogue_kernel's arithmetic on this row tile: one warp a row, a lane's 4 columns
-            const int n = nt0 * 16 + 4 * lane;
-            for (int row = warp; row < 16; row += W) {
-                const int p = rows_sh[16 * r + row];
-                if (p < 0) continue;
-                float v[4];
+
+        // warps' partial sums through shared memory, added in warp order; one row tile at a time, so RT costs no
+        // shared memory
+        if constexpr (S > 0) __syncthreads();                 // the staged k steps of every warp are spent
 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    float s = 0.f;
-                    s += red[0][row][4 * lane + j];           // SK = 1: the loop over splits from zero
-                    v[j] = s;
+        for (int r = 0; r < RT; ++r) {
+            if (r >= nrt) break;
+#pragma unroll
+            for (int i = 0; i < NT; ++i)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int col = i * 16 + h * 8 + 2 * t;
+                    red[warp][g][col] = acc[r][i][h][0];
+                    red[warp][g][col + 1] = acc[r][i][h][1];
+                    red[warp][g + 8][col] = acc[r][i][h][2];
+                    red[warp][g + 8][col + 1] = acc[r][i][h][3];
                 }
-                if (epi.bf16)
-                    down_tail(v, lane, epi.s0 + (size_t)e * N + n,
-                              reinterpret_cast<__nv_bfloat16*>(epi.out) + (size_t)p * N + n);
-                else
-                    down_tail(v, lane, epi.s0 + (size_t)e * N + n,
-                              reinterpret_cast<float*>(epi.out) + (size_t)p * N + n);
+            __syncthreads();
+            if constexpr (INNER && EPI != EPI_DOWN) {
+                // one split's sums: alone they are the total (as the epilogue reads one split); of several, the
+                // total adds them to 0.f in split order, as the epilogue would (0.f + that total is the total: a sum
+                // that starts at +0.f is never -0)
+#pragma unroll
+                for (int q = 0; q < PER_THREAD; ++q) {
+                    const int idx = threadIdx.x + q * W * 32;
+                    const int row = idx / (NT * 16), col = idx % (NT * 16);
+                    float sum = red[0][row][col];
+#pragma unroll
+                    for (int w = 1; w < W; ++w) sum += red[w][row][col];
+                    if (SK == 1)
+                        tot[r][q] = sum;
+                    else
+                        tot[r][q] = (sp == 0 ? 0.f : tot[r][q]) + sum;
+                }
+            } else {
+                for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
+                    const int row = idx / (NT * 16), col = idx % (NT * 16);
+                    const int rr = rows_sh[16 * r + row];
+                    if (rr < 0) continue;
+                    float sum = red[0][row][col];
+#pragma unroll
+                    for (int w = 1; w < W; ++w) sum += red[w][row][col];
+                    if constexpr (EPI == EPI_DOWN)
+                        red[0][row][col] = sum;               // only this thread reads this place
+                    else
+                        Z[(((size_t)mat * SK + split) * P + rr) * N + nt0 * 16 + col] = sum;
+                }
             }
             __syncthreads();
+            if constexpr (EPI == EPI_DOWN) {
+                // down_epilogue_kernel's arithmetic on this row tile: one warp a row, a lane's 4 columns
+                const int n = nt0 * 16 + 4 * lane;
+                for (int row = warp; row < 16; row += W) {
+                    const int p = rows_sh[16 * r + row];
+                    if (p < 0) continue;
+                    float v[4];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        float s = 0.f;
+                        s += red[0][row][4 * lane + j];           // SK = 1: the loop over splits from zero
+                        v[j] = s;
+                    }
+                    if (epi.bf16)
+                        down_tail(v, lane, epi.s0 + (size_t)e * N + n,
+                                  reinterpret_cast<__nv_bfloat16*>(epi.out) + (size_t)p * N + n);
+                    else
+                        down_tail(v, lane, epi.s0 + (size_t)e * N + n,
+                                  reinterpret_cast<float*>(epi.out) + (size_t)p * N + n);
+                }
+                __syncthreads();
+            }
+        }
+    }
+    if constexpr (INNER && EPI != EPI_DOWN) {
+#pragma unroll
+        for (int r = 0; r < RT; ++r) {
+            if (r >= nrt) break;
+#pragma unroll
+            for (int q = 0; q < PER_THREAD; ++q) {
+                const int idx = threadIdx.x + q * W * 32;
+                const int row = idx / (NT * 16), col = idx % (NT * 16);
+                const int rr = rows_sh[16 * r + row];
+                if (rr >= 0) Z[((size_t)mat * P + rr) * N + nt0 * 16 + col] = tot[r][q];
+            }
         }
     }
     if constexpr (EPI == EPI_GATEUP) {
         // the threadFenceReduction pattern: every program's Z is visible GPU-wide before its arrival counts
+        const int SKZ = INNER ? 1 : SK;                   // the splits Z holds a matrix
         __shared__ bool last;
         __threadfence();
         __syncthreads();
         int* arrivals = epi.arrivals + (size_t)blockIdx.z * gridDim.x + blockIdx.x;
-        if (threadIdx.x == 0) last = atomicAdd(arrivals, 1) == 2 * SK - 1;
+        if (threadIdx.x == 0) last = atomicAdd(arrivals, 1) == 2 * SKZ - 1;
         __syncthreads();
         if (!last) return;
         __threadfence();
@@ -424,9 +609,9 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 float sg = 0.f, su = 0.f;
-                for (int s = 0; s < SK; ++s) {
-                    sg += __ldcg(Z + ((size_t)(0 * SK + s) * P + p) * N + n + j);
-                    su += __ldcg(Z + ((size_t)(1 * SK + s) * P + p) * N + n + j);
+                for (int s = 0; s < SKZ; ++s) {
+                    sg += __ldcg(Z + ((size_t)(0 * SKZ + s) * P + p) * N + n + j);
+                    su += __ldcg(Z + ((size_t)(1 * SKZ + s) * P + p) * N + n + j);
                 }
                 gv[j] = sg;
                 uv[j] = su;
@@ -665,14 +850,18 @@ struct GroupedArgs {
     int nitems = 0;
     int epi = EPI_NONE;            // a fused epilogue (listed layout, prompt setting) and its arguments
     Epi ep;
+    bool staged = false;           // TF_EXL3_EXPERT_STAGED: the prompt setting through warp_tiles_staged
 };
+
+constexpr int STAGES = 8;          // most k steps in flight a warp on the staged path (Staged::DEPTH)
 
 template <int CB>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MT = (a.maxm + 16 * a.rt - 1) / (16 * a.rt);
     const unsigned nb = (unsigned)(a.N / (16 * a.nt));
-    const dim3 grid = a.items ? dim3(nb, (unsigned)(a.mats * a.SK), (unsigned)a.nitems)
-                              : dim3((unsigned)a.nexp_max, nb, (unsigned)(a.mats * a.SK * MT));
+    const int zs = a.staged ? a.mats : a.mats * a.SK;     // the staged path runs the splits inside a program
+    const dim3 grid = a.items ? dim3(nb, (unsigned)zs, (unsigned)a.nitems)
+                              : dim3((unsigned)a.nexp_max, nb, (unsigned)(zs * MT));
     TORCH_CHECK(a.hi <= 16 || a.lo == a.hi, "a rate between ExLlamaV3's widths must be its layer's only rate");
     TORCH_CHECK(!a.items || (a.icount && a.nitems > 0 && a.nitems <= 65535), "listed: an item list of 1 to 65,535");
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
@@ -690,10 +879,15 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
                     "a fused epilogue runs on the listed layout at the prompt setting");
         TORCH_CHECK(a.epi == EPI_GATEUP ? a.mats == 2 : (a.epi == EPI_DOWN && a.mats == 1 && a.SK == 1),
                     "fused epilogues: gate/up (2 matrices) or down (1 matrix, 1 split)");
-#define TF_EPI_LAUNCH(EPI_, LO_, HI_)                                                                           \
-    tf_exl3_pdl::launch(grouped_kernel<CB, 8, 4, 1, LO_, HI_, 2, EPI_>, grid, dim3(128), 0, stream, a.pdl,         \
+#define TF_EPI_KERNEL(EPI_, LO_, HI_, S_)                                                                       \
+    tf_exl3_pdl::launch(grouped_kernel<CB, 8, 4, 1, LO_, HI_, 2, EPI_, S_>, grid, dim3(128), 0, stream, a.pdl,     \
                         a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, \
                         a.SK, a.maxm, a.slots, a.wmask, a.items, a.icount, a.ep)
+#define TF_EPI_LAUNCH(EPI_, LO_, HI_)                                                                           \
+    do {                                                                                                        \
+        if (a.staged) TF_EPI_KERNEL(EPI_, LO_, HI_, STAGES);                                                    \
+        else TF_EPI_KERNEL(EPI_, LO_, HI_, 0);                                                                  \
+    } while (0)
 #define TF_EPI_RANGES(EPI_)                                                                                     \
     if (a.lo == 8 && a.hi == 8) TF_EPI_LAUNCH(EPI_, 8, 8);                                                      \
     else if (a.lo == K2_QUARTER && a.hi == K2_QUARTER) TF_EPI_LAUNCH(EPI_, K2_QUARTER, K2_QUARTER);             \
@@ -703,6 +897,21 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
         else { TF_EPI_RANGES(EPI_DOWN) }
 #undef TF_EPI_RANGES
 #undef TF_EPI_LAUNCH
+#undef TF_EPI_KERNEL
+        return;
+    }
+    if (a.staged) {
+        // the prompt setting alone, at the rates the fused epilogues take (wider tiles outgrow static shared memory)
+        TORCH_CHECK(a.rt == 2 && a.nt == 8 && a.warps == 4 && a.pf == 1, "the staged path runs the prompt setting");
+#define TF_STAGED(LO_, HI_)                                                                                     \
+    tf_exl3_pdl::launch(grouped_kernel<CB, 8, 4, 1, LO_, HI_, 2, EPI_NONE, STAGES>, grid, dim3(128), 0, stream,    \
+                        a.pdl, a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, \
+                        a.P, a.SK, a.maxm, a.slots, a.wmask, a.items, a.icount, Epi{})
+        if (a.lo == 8 && a.hi == 8) TF_STAGED(8, 8);
+        else if (a.lo == K2_QUARTER && a.hi == K2_QUARTER) TF_STAGED(K2_QUARTER, K2_QUARTER);
+        else if (a.lo >= 2 && a.hi <= 10) TF_STAGED(2, 10);
+        else TORCH_CHECK(false, "the staged path takes rates up to 5 bits or 2.25 bits");
+#undef TF_STAGED
         return;
     }
 #define TF_RT 1

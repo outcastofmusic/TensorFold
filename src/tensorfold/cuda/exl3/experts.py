@@ -49,7 +49,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v5", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v6", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -111,6 +111,7 @@ class Exl3RoutedExperts:
     trellis_bytes: torch.Tensor   # int64 [E], gate + up + down trellis bytes of each expert (for GB/s)
     keep: list = field(default_factory=list, repr=False)
     window: int = 16          # the bits of a 16-bit window that make the codeword (a sushi pack names fewer)
+    aligned: bool = True      # every trellis starts on 16 bytes (the staged path's 16-byte copies need it)
 
     def nbytes_read(self, ids: Sequence[int]) -> int:
         return int(self.trellis_bytes[list(ids)].sum())
@@ -158,7 +159,8 @@ def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], c
                        for e in range(E)], dtype=torch.int64)
     return Exl3RoutedExperts(gp, upp, dp, gk, uk, dk, stack(gate, 1, D), stack(up, 1, D), stack(gate, 2, I),
                              stack(up, 2, I), stack(down, 1, I), stack(down, 2, D), E, D, I, cb,
-                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep, window)
+                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep, window,
+                             all(t.data_ptr() % 16 == 0 for t in keep))
 
 
 def prepare_stacked(gt: torch.Tensor, ut: torch.Tensor, dt: torch.Tensor, suh_g, suh_u, svh_g, svh_u, suh_d, svh_d,
@@ -188,9 +190,10 @@ def prepare_stacked(gt: torch.Tensor, ut: torch.Tensor, dt: torch.Tensor, suh_g,
     (gp, gk, g2), (upp, uk, u2), (dp, dk, d2) = table(gt), table(ut), table(dt)
     tb = torch.full((E,), (D * I // 256) * sum(tile_words(k) for k in (g2, u2, d2)) * 4, dtype=torch.int64)
     cb = codebook_id(codebook) if isinstance(codebook, str) else int(codebook)
+    aligned = all(t.data_ptr() % 16 == 0 and t[0].numel() * 2 % 16 == 0 for t in (gt, ut, dt))
     return Exl3RoutedExperts(gp, upp, dp, gk, uk, dk, scales(suh_g, D), scales(suh_u, D), scales(svh_g, I),
                              scales(svh_u, I), scales(suh_d, I), scales(svh_d, D), E, D, I, cb,
-                             (min(g2, u2), max(g2, u2)), (d2, d2), tb, [gt, ut, dt], check_window(window))
+                             (min(g2, u2), max(g2, u2)), (d2, d2), tb, [gt, ut, dt], check_window(window), aligned)
 
 
 def default_config(K: int, N: int, gateup: bool) -> tuple[int, int, int, int]:
@@ -288,7 +291,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     ``prompt`` (default: more than PROMPT_ROWS rows) reads each expert once for 32 of its rows; the values are the same.
     With TF_EXL3_EXPERT_ITEMS (and ``group``) a prompt window's grouping lists the member groups grouped_kernel's
     launches run. On a prompt window TF_EXL3_GROUP_SCAN groups on group_scan_kernel, and on the listed layout
-    TF_EXL3_GATEUP_FUSE and TF_EXL3_DOWN_FUSE (without ``wts``) run the epilogues inside grouped_kernel's launches.
+    TF_EXL3_GATEUP_FUSE and TF_EXL3_DOWN_FUSE (without ``wts``) run the epilogues inside grouped_kernel's launches,
+    and TF_EXL3_EXPERT_STAGED stages its k steps through shared memory.
     ``y`` (without ``wts``): a contiguous [R * slots, D] that takes the slots in place of the scratch's: bf16 rounds
     them once, as a copy of the fp32 slots into it would round them; fp32 takes them as they are."""
 
@@ -313,30 +317,34 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
                   **scan)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E, pdl)
     (nt, w, sk, pf, rt), dec = gu
+    staged = {"staged": True} if sw.expert_staged and many and stageable(gu, ex.k2_gu, ex) else {}
     fuse_gu = sw.gateup_fuse and bool(listed) and fusable(gu, ex.k2_gu)
     fused = {"epi": EPI_GATEUP, "s0": ex.svh_g, "s1": ex.svh_u, "s2": ex.suh_d, "out": s.xd, "arrivals": s.arrivals,
              "limit": float(limit), "act_mode": act_mode} if fuse_gu else {}
     ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
                 P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], rt, ex.window, dec, pdl,
-                **({} if dec else listed), **fused)
+                **({} if dec else listed), **fused, **staged)
     if not fuse_gu:
-        ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit),
-                            act_mode, pdl)
+        # a staged launch writes one total a matrix: its splits summed as the epilogue sums them
+        ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, 1 if staged else sk, slots, E,
+                            float(limit), act_mode, pdl)
     (nt, w, sk, pf, rt), dec = dn
     into = s.y if y is None else y
     fuse_dn = sw.down_fuse and bool(listed) and wts is None and sk == 1 and fusable(dn, ex.k2_d)
     fused = {"epi": EPI_DOWN, "s0": ex.svh_d, "out": into} if fuse_dn else {}
+    staged = {"staged": True} if sw.expert_staged and many and stageable(dn, ex.k2_d, ex) else {}
     ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
                 D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], rt, ex.window, dec, pdl,
-                **({} if dec else listed), **fused)
+                **({} if dec else listed), **fused, **staged)
+    zsk = 1 if staged else sk
     if wts is None:
         if not fuse_dn:
-            ext.down_epilogue(s.z, pick, ex.svh_d, into, R, P, D, sk, slots, E, pdl)
+            ext.down_epilogue(s.z, pick, ex.svh_d, into, R, P, D, zsk, slots, E, pdl)
         return s.y[:P] if y is None else y
     if out is None:
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two)
-    ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E, pdl)
+    ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, zsk, slots, E, pdl)
     return out
 
 
@@ -358,6 +366,13 @@ def fusable(launch: Launch, k2: tuple[int, int]) -> bool:
     lo, hi = k2
     rates = (lo, hi) in ((8, 8), (RATE_WORDS + 18, RATE_WORDS + 18)) or (lo >= 2 and hi <= 10)
     return not dec and (nt, w, pf, rt) == (8, 4, 1, 2) and rates
+
+
+def stageable(launch: Launch, k2: tuple[int, int], ex: Exl3RoutedExperts) -> bool:
+    """Whether TF_EXL3_EXPERT_STAGED has an instance for ``launch``: the fused epilogues' setting and rates (their
+    staged k steps fit static shared memory), on trellises that start on 16 bytes."""
+
+    return ex.aligned and fusable(launch, k2)
 
 
 def listed_tile(gu: Launch, dn: Launch) -> int:

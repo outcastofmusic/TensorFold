@@ -7,7 +7,7 @@ void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                         int64_t, int64_t, int64_t, int64_t, bool, bool, const int*, const int*, int64_t, int64_t,
-                        const void*, const void*, const void*, void*, int*, double, int64_t, bool);
+                        const void*, const void*, const void*, void*, int*, double, int64_t, bool, bool);
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t);
 void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, bool, int*,
                       int*, int64_t);
@@ -47,7 +47,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
              const c10::optional<at::Tensor>& icount, int64_t epi, const c10::optional<at::Tensor>& s0,
              const c10::optional<at::Tensor>& s1, const c10::optional<at::Tensor>& s2,
              const c10::optional<at::Tensor>& out, const c10::optional<at::Tensor>& arrivals, double limit,
-             int64_t act_mode) {
+             int64_t act_mode, bool staged) {
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
     check(TP0, at::kLong, "TP0");
@@ -100,7 +100,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
                        pf, lo, hi, rt, (int64_t(1) << window) - 1, decode, pdl,
                        items ? items->data_ptr<int>() : nullptr, icount ? icount->data_ptr<int>() : nullptr,
-                       items ? items->numel() : 0, epi, e0, e1, e2, eout, earr, limit, act_mode, ebf16);
+                       items ? items->numel() : 0, epi, e0, e1, e2, eout, earr, limit, act_mode, ebf16, staged);
 }
 
 void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb, int64_t window) {
@@ -205,7 +205,7 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
 // decode_kernel (TF_EXL3_EXPERT_DECODE), ``pdl`` programmatic dependent launch on GB10 (TF_EXL3_PDL, pdl.cuh), and
 // ``items`` with ``icount`` (group's list, TF_EXL3_EXPERT_ITEMS) grouped_kernel's listed layout, ``scan`` group's
 // count-scan-scatter kernel (TF_EXL3_GROUP_SCAN), and ``epi`` with its operands a fused epilogue (TF_EXL3_GATEUP_FUSE,
-// TF_EXL3_DOWN_FUSE).
+// TF_EXL3_DOWN_FUSE), and ``staged`` the prompt setting's k steps through shared memory (TF_EXL3_EXPERT_STAGED).
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     namespace py = pybind11;
     m.def("grouped", &grouped, py::arg("X0"), py::arg("X1"), py::arg("TP0"), py::arg("TP1"), py::arg("B0"),
@@ -215,7 +215,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("decode") = false, py::arg("pdl") = false, py::arg("items") = py::none(),
           py::arg("icount") = py::none(), py::arg("epi") = 0, py::arg("s0") = py::none(), py::arg("s1") = py::none(),
           py::arg("s2") = py::none(), py::arg("out") = py::none(), py::arg("arrivals") = py::none(),
-          py::arg("limit") = INFINITY, py::arg("act_mode") = 1);
+          py::arg("limit") = INFINITY, py::arg("act_mode") = 1, py::arg("staged") = false);
     m.def("dequant", &dequant);
     m.def("group", &group, py::arg("pick"), py::arg("uids"), py::arg("ucount"), py::arg("members"), py::arg("R"),
           py::arg("slots"), py::arg("E"), py::arg("pdl") = false, py::arg("items") = py::none(),
