@@ -83,7 +83,7 @@ def test_a_client_that_leaves_a_non_streamed_request_closes_the_backend_connecti
     try:
         body = json.dumps({"model": "qwen3.8-flash-next", "messages": []}).encode()
         client = socket.create_connection(front.server_address)
-        client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         deadline = time.monotonic() + 5
         while swap.SWAP.running == 0 and time.monotonic() < deadline:
@@ -138,7 +138,7 @@ def test_a_body_without_a_usable_length_is_refused(swap, headers, status):
     front = _serve(swap.Handler)
     try:
         client = socket.create_connection(front.server_address, timeout=5)
-        client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" + headers + b"\r\n")
+        client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n" + headers + b"\r\n")
         assert status in client.recv(200).split(b"\r\n")[0] + b" "
     finally:
         front.shutdown()
@@ -414,3 +414,33 @@ def test_the_loaded_model_names_the_backend_it_forwards_to(swap):
     backends = {m["id"]: m["backend"] for m in swapper.models()}
     assert backends.pop("glm-5.3-flash") == address
     assert set(backends.values()) == {None}
+
+
+def _get_swap(port: int, headers: bytes) -> tuple[int, bytes]:
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+        client.sendall(b"GET /swap HTTP/1.1\r\n" + headers + b"\r\n")
+        raw = b""
+        while chunk := client.recv(65536):
+            raw += chunk
+    head, _, body = raw.partition(b"\r\n\r\n")
+    return int(head.split()[1]), body
+
+
+def test_the_endpoint_refuses_a_rebound_host_or_a_foreign_origin_and_never_forwards_origin(swap, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(swap, "SWAP", SimpleNamespace(current=None, loading=None, running=0), raising=False)
+    server = _serve(swap.Handler)
+    try:
+        port = server.server_address[1]
+        here = f"127.0.0.1:{port}".encode()
+        assert _get_swap(port, b"Host: " + here + b"\r\n")[0] == 200
+        assert _get_swap(port, b"Host: " + here + b"\r\nOrigin: http://" + here + b"\r\n")[0] == 200
+        status, body = _get_swap(port, f"Host: rebound.example:{port}\r\n".encode())
+        assert status == 403 and "loopback" in json.loads(body)["error"]["message"]
+        status, body = _get_swap(port, b"Host: " + here + b"\r\nOrigin: http://evil.example\r\n")
+        assert status == 403 and "Origin" in json.loads(body)["error"]["message"]
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert "origin" in swap.HOP                  # the server behind listens on another port and would refuse it

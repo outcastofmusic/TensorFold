@@ -89,7 +89,7 @@ def test_chunked_anthropic_stream_completes(auxiliary_port):
 ])
 def test_auxiliary_routes_close_on_bad_framing(auxiliary_port, path, body, key, headers, wire):
     with socket.create_connection(("127.0.0.1", auxiliary_port), timeout=5) as client:
-        client.sendall(f"POST {path} HTTP/1.1\r\nHost: x\r\n{headers}\r\n\r\n".encode() + wire)
+        client.sendall(f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}\r\n\r\n".encode() + wire)
         client.shutdown(socket.SHUT_WR)
         response = http.client.HTTPResponse(client)
         response.begin()

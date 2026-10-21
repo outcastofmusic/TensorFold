@@ -508,7 +508,7 @@ def _cuda_post(factory, app, body, path="/v1/decisions"):
     from io import BytesIO
 
     payload = json.dumps(body).encode()
-    incoming = (f"POST {path} HTTP/1.0\r\nContent-Type: application/json\r\n"
+    incoming = (f"POST {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                 f"Content-Length: {len(payload)}\r\n\r\n").encode() + payload
 
     class Connection:
@@ -525,6 +525,8 @@ def _cuda_post(factory, app, body, path="/v1/decisions"):
             pass
 
     connection = Connection()
-    factory(app)(connection, ("127.0.0.1", 0), None)
+    from tests.http_fakes import LOOPBACK
+
+    factory(app)(connection, ("127.0.0.1", 0), LOOPBACK)
     headers, response = bytes(connection.output).split(b"\r\n\r\n", 1)
     return int(headers.split()[1]), response.decode()
