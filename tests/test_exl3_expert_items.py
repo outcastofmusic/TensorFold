@@ -61,7 +61,8 @@ def _route(monkeypatch, rows, decode, items, slots=4, group=True):
     fake = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: fake)
     switches.use(switches.Switches(expert_decode=decode, pdl=True, expert_items=items, group_scan=False,
-                                   down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False))
+                                   down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False,
+                                   expert_staged=False))
     ex = _layer()
     s = experts.Scratch(ex, 1024, slots, device="cpu")
     x = torch.zeros((rows, ex.dims), dtype=torch.bfloat16)

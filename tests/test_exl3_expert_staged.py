@@ -43,14 +43,14 @@ def clean_env(monkeypatch):
 
 
 # -- the flag -------------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("value, on", [(None, False), ("", False), ("1", True), ("on", True), ("YES", True),
+@pytest.mark.parametrize("value, on", [(None, True), ("", True), ("1", True), ("on", True), ("YES", True),
                                        ("0", False), ("off", False), (" no ", False)])
-def test_the_flag_is_off_unless_turned_on(clean_env, value, on):
+def test_the_flag_is_on_unless_turned_off(clean_env, value, on):
     if value is not None:
         clean_env.setenv(switches.EXPERT_STAGED_ENV, value)
     got = switches.read()
     assert got.expert_staged is on
-    assert dataclasses.replace(got, expert_staged=False) == switches.Switches()     # the others keep their defaults
+    assert dataclasses.replace(got, expert_staged=True) == switches.Switches()      # the others keep their defaults
 
 
 @pytest.mark.parametrize("value", ["2", "staged", "o", "1.0"])
@@ -103,7 +103,7 @@ def test_decode_windows_keep_their_launches(monkeypatch, rows):
 
 
 def test_switched_off_no_launch_names_it(monkeypatch):
-    fake, _, _, _ = _route(monkeypatch, 1024, switches.Switches())
+    fake, _, _, _ = _route(monkeypatch, 1024, switches.Switches(expert_staged=False))
     assert all("staged" not in kw for kw in fake.kwargs)
 
 
@@ -111,7 +111,7 @@ def test_the_epilogue_kernels_read_one_split_after_a_staged_launch(monkeypatch):
     """Without the fusions the gate/up epilogue kernel reads the staged program's one total a matrix (SK 1), where
     the old launch left its K splits; down has one split either way."""
 
-    unfused = dataclasses.replace(switches.Switches(), gateup_fuse=False, down_fuse=False)
+    unfused = dataclasses.replace(switches.Switches(), gateup_fuse=False, down_fuse=False, expert_staged=False)
     for sw, sk in ((unfused, 4), (dataclasses.replace(unfused, expert_staged=True), 1)):
         fake, s, _, _ = _route(monkeypatch, 1024, sw)
         assert [n for n, _ in fake.calls] == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped",

@@ -26,10 +26,11 @@ TF_EXL3_LINEAR_PAIR (unset: on; served four streams 1.019x alone, 20 Oct) runs t
 each k step's weights once for both 16-row tiles, where each 16-row pass read and decoded every weight again. Each
 row keeps its mma chain, warp order and split order, so its bytes.
 
-TF_EXL3_EXPERT_STAGED (unset: off) runs a prompt window's ``grouped_kernel`` launches with S k steps of weights and
+TF_EXL3_EXPERT_STAGED (unset: on; served Qwen EXL3 cold prefill 1.16-1.19x at 4k-131k, decode within 1%, 21 Oct,
+tf-runs/exl3-prefill-1021) runs a prompt window's ``grouped_kernel`` launches with S k steps of weights and
 member rows in flight a warp through shared memory (``warp_tiles_staged``), the same fragments into the same mma
 chains. On a 2,048-row Flash Next window (ncu, 21 Oct) the kernel held 8 warps an SM at 248 registers and no warp was
-ready in 75% of cycles, most of them waiting on global loads.
+ready in 75% of cycles, most of them waiting on global loads. ``0`` restores ``grouped_kernel``'s launches.
 
 An engine reads every switch once at startup (``read``) and installs them (``use``). The kernels' Python callers consult
 ``current()`` at each launch, so a CUDA graph keeps the setting it was captured with. A test flips a setting on one
@@ -65,7 +66,7 @@ class Switches:
     gateup_fuse: bool = True
     group_scan_decode: bool = True
     linear_pair: bool = True
-    expert_staged: bool = False
+    expert_staged: bool = True
 
 
 ENVS = {EXPERT_DECODE_ENV: "expert_decode", PDL_ENV: "pdl", EXPERT_ITEMS_ENV: "expert_items",
