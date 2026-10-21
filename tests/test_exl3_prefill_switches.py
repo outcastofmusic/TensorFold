@@ -209,7 +209,7 @@ def test_decode_windows_keep_their_launches(monkeypatch, rows, decode):
 
 def test_without_the_item_list_nothing_fuses_and_the_scan_still_groups(monkeypatch):
     sw = switches.Switches(expert_items=False, group_scan=True, down_fuse=True, gateup_fuse=True,
-                           group_scan_decode=False, linear_pair=False)
+                           group_scan_decode=False, linear_pair=False, expert_staged=False)
     fake, _, _, _ = _route(monkeypatch, 1024, sw)
     assert [n for n, _ in fake.calls] == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
     assert fake.kwargs[0] == {"scan": True}

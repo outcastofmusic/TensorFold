@@ -389,7 +389,8 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
                         int64_t hi, int64_t rt, int64_t wmask, bool decode, bool pdl, const int* items,
                         const int* icount, int64_t nitems, int64_t epi, const void* s0, const void* s1,
-                        const void* s2, void* out, int* arrivals, double limit, int64_t act, bool bf16) {
+                        const void* s2, void* out, int* arrivals, double limit, int64_t act, bool bf16,
+                        bool staged) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
@@ -420,7 +421,9 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.ep.limit = (float)limit;
     a.ep.act = (int)act;
     a.ep.bf16 = bf16;
+    a.staged = staged;
     TORCH_CHECK(!(decode && epi), "decode_kernel has no fused epilogue");
+    TORCH_CHECK(!(decode && staged), "the staged path is grouped_kernel's");
     auto stream = at::cuda::getCurrentCUDAStream();
     TORCH_CHECK(cb >= 0 && cb <= 2, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
     if (decode) {
