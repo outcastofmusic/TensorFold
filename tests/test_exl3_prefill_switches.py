@@ -150,7 +150,7 @@ def _route(monkeypatch, rows, sw, *, wts=False, slots=4, ex=None, y=None):
 
 
 ALL_ON = switches.Switches(expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True,
-                           group_scan_decode=False, linear_pair=False)
+                           group_scan_decode=False, linear_pair=False, rot_fuse=False)
 
 
 @pytest.mark.parametrize("rows", [65, 128, 1024])
@@ -172,7 +172,7 @@ def test_a_prompt_window_with_every_switch_launches_three_kernels_after_rot_in(m
 @pytest.mark.parametrize("scan, down, gateup", [(True, False, False), (False, True, False), (False, False, True)])
 def test_each_switch_alone_changes_only_its_launch(monkeypatch, scan, down, gateup):
     sw = switches.Switches(expert_items=True, group_scan=scan, down_fuse=down, gateup_fuse=gateup,
-                           group_scan_decode=False, linear_pair=False)
+                           group_scan_decode=False, linear_pair=False, rot_fuse=False)
     fake, _, _, _ = _route(monkeypatch, 1024, sw)
     names = [n for n, _ in fake.calls]
     want = ["group", "rot_in", "grouped"] + ([] if gateup else ["gateup_epilogue"]) + ["grouped"] + \

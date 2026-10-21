@@ -37,14 +37,14 @@ def clean_env(monkeypatch):
 
 
 # -- the flag -------------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("value, on", [(None, False), ("", False), ("1", True), ("on", True), ("YES", True),
+@pytest.mark.parametrize("value, on", [(None, True), ("", True), ("1", True), ("on", True), ("YES", True),
                                        ("0", False), ("off", False), (" no ", False)])
-def test_the_flag_is_off_unless_turned_on(clean_env, value, on):
+def test_the_flag_is_on_unless_turned_off(clean_env, value, on):
     if value is not None:
         clean_env.setenv(switches.ROT_FUSE_ENV, value)
     got = switches.read()
     assert got.rot_fuse is on
-    assert dataclasses.replace(got, rot_fuse=False) == switches.Switches()      # the others keep their defaults
+    assert dataclasses.replace(got, rot_fuse=True) == switches.Switches()       # the others keep their defaults
 
 
 @pytest.mark.parametrize("value", ["2", "rot", "o", "1.0"])
@@ -117,7 +117,7 @@ def test_decode_windows_keep_rot_in(monkeypatch, rows):
 
 @pytest.mark.parametrize("sw", [dataclasses.replace(ROT, expert_staged=False),
                                 dataclasses.replace(ROT, expert_items=False),
-                                switches.Switches()], ids=["staged off", "spanned", "switch off"])
+                                switches.Switches(rot_fuse=False)], ids=["staged off", "spanned", "switch off"])
 def test_without_a_staged_listed_launch_or_the_switch_rot_in_stays(monkeypatch, sw):
     fake, _, _, _ = _route(monkeypatch, 1024, sw)
     assert _names(fake)[:2] == ["group", "rot_in"]
