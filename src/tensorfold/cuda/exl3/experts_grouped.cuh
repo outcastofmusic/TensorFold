@@ -360,7 +360,109 @@ struct Epi {
     float limit = 0.f;
     int act = 0;                 // gate/up: SwiGLU mode (gateup_epilogue_kernel's act_mode)
     int bf16 = 0;                // down: Y is bf16
+    // TF_EXL3_ROT_FUSE (a staged gate/up launch on the item list, ROT): the rows rot_in_kernel would rotate, bf16 or
+    // fp16 with rows x_stride values apart on 16 bytes, suh_g and suh_u [E, K], and a counter an (item, matrix), zero
+    // between launches
+    const void* x = nullptr;
+    int x_stride = 0;
+    int x_bf16 = 0;
+    const half* suh0 = nullptr;
+    const half* suh1 = nullptr;
+    int* rot_arrivals = nullptr;
 };
+
+// TF_EXL3_ROT_FUSE: a staged gate/up launch writes rot_in_kernel's rows itself. The NB n-block programs of an
+// (item, matrix) each rotate the item's members over 128-wide Hadamard blocks nb, nb + NB, .. of K into X0 or X1,
+// where rot_in_kernel writes them, then wait at a counter for the other NB - 1 and read the rows back through
+// warp_tiles_staged's copies, from L2. rot_in_kernel wrote every pick's rows in pick order before the launch, 230 MB a
+// 2,048-row Flash Next window that gate/up read back from DRAM. Each block of rows is rotated once, as there.
+//
+// The wait needs the NB programs resident together. They are consecutive in the grid (n block fastest), and blocks
+// start in grid order, so the oldest unfinished item's programs have all started or have a free SM slot to start in.
+// grouped_kernel never triggers its dependents early (no grid_launch), so a PDL launch after it takes no slot first.
+//
+// A unit of the rotation is 8 rows of Hadamard block hb (r0, r0 + 2, .. on lanes 0-15, r0 + 1, .. on 16-31), 8
+// consecutive values a lane, so fwht128's butterflies run in its order, strides 1, 2, 4 in registers and 8..64 across
+// lanes. Every butterfly adds or subtracts the same two values, and the first is contracted as the compiler contracts
+// rot_in_kernel's, fma(x0, s0, x1 * s1) (its SASS at 1d2deb4e), with the rounding intrinsics so nothing else is: the
+// same bits. A warp reads ROT_UNITS units (rot_load) before it rotates and stores any (rot_store): the loads cannot
+// pass the stores before them, and the prologue holds no sums yet, so the registers are free.
+constexpr int ROT_UNITS = 4;
+struct RotUnit {
+    uint4 s;                           // suh_mat[e] at the lane's 8 values
+    uint4 x[4];                        // the lane's 8 values of its 4 rows of x (bf16 or fp16 bits)
+};
+
+__device__ __forceinline__ void rot_load(RotUnit& u, const Epi& ep, const half* __restrict__ suh, const int* xrow,
+                                         int hb, int r0, int lane) {
+    const int k = hb * 128 + 8 * (lane & 15), odd = lane >> 4;
+    u.s = __ldg(reinterpret_cast<const uint4*>(suh + k));
+    const half* xh = static_cast<const half*>(ep.x) + k;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int xr = xrow[r0 + 2 * q + odd];
+        u.x[q] = __ldg(reinterpret_cast<const uint4*>(xh + (size_t)(xr >= 0 ? xr : 0) * ep.x_stride));
+    }
+}
+
+__device__ __forceinline__ void rot_store(const RotUnit& u, const Epi& ep, const int* rows_sh, half* __restrict__ X,
+                                          int K, int hb, int r0, int lane) {
+    const int l = lane & 15, odd = lane >> 4;
+    const int k = hb * 128 + 8 * l;
+    float s[8];
+    const half* sh = reinterpret_cast<const half*>(&u.s);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[j] = __half2float(sh[j]);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(&u.x[q]);
+        float x[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (ep.x_bf16) {
+                x[2 * j] = __uint_as_float(w[j] << 16);
+                x[2 * j + 1] = __uint_as_float(w[j] & 0xffff0000u);
+            } else {
+                const half2 h = *reinterpret_cast<const half2*>(&w[j]);
+                x[2 * j] = __low2float(h);
+                x[2 * j + 1] = __high2float(h);
+            }
+        }
+        float v[8];
+#pragma unroll
+        for (int j = 0; j < 8; j += 2) {
+            const float m = __fmul_rn(x[j + 1], s[j + 1]);
+            v[j] = __fmaf_rn(x[j], s[j], m);
+            v[j + 1] = __fmaf_rn(x[j], s[j], -m);
+        }
+#pragma unroll
+        for (int st = 2; st <= 4; st <<= 1)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                if (!(j & st)) {
+                    const float a = v[j], b = v[j + st];
+                    v[j] = __fadd_rn(a, b);
+                    v[j + st] = __fsub_rn(a, b);
+                }
+#pragma unroll
+        for (int m = 1; m < 16; m <<= 1)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float o = __shfl_xor_sync(0xffffffffu, v[j], m);
+                v[j] = (l & m) ? __fsub_rn(o, v[j]) : __fadd_rn(v[j], o);
+            }
+        const int p = rows_sh[r0 + 2 * q + odd];
+        if (p < 0) continue;
+        uint32_t out[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            half2 h = __halves2half2(__float2half_rn(__fmul_rn(v[2 * j], HAD_SCALE)),
+                                     __float2half_rn(__fmul_rn(v[2 * j + 1], HAD_SCALE)));
+            out[j] = *reinterpret_cast<uint32_t*>(&h);
+        }
+        *reinterpret_cast<uint4*>(X + (size_t)p * K + k) = make_uint4(out[0], out[1], out[2], out[3]);
+    }
+}
 
 // Program (expert u, n block, split and member group): up to 16 * RT members times W_q over the split's K range; warps
 // added in order. A row's sums do not depend on NT, PF or RT, nor on its place among the members.
@@ -372,20 +474,29 @@ struct Epi {
 // item's n blocks run next to each other while its rows are still in L2. Each program computes the same sums.
 //
 // S > 0 (TF_EXL3_EXPERT_STAGED) runs the warps' k ranges through warp_tiles_staged, S k steps in flight a warp, in
-// shared memory that the warps' sums reuse once every warp is done with it.
-template <int NT, int W, bool STAGED>
+// shared memory that the warps' sums reuse once every warp is done with it. ROT (TF_EXL3_ROT_FUSE, a staged gate/up
+// launch on the item list) first writes its share of the rows X0 and X1 hold (rot_load, rot_store).
+template <int NT, int W, bool STAGED, bool ROT = false>
 struct GroupedSmem {
     float red[W][16][NT * 16];
 };
 template <int NT, int W>
-struct GroupedSmem<NT, W, true> {
+struct GroupedSmem<NT, W, true, false> {
     union {
         float red[W][16][NT * 16];
         __align__(16) unsigned char staged[W * STAGE_BYTES];
     };
 };
+template <int NT, int W>
+struct GroupedSmem<NT, W, true, true> {
+    union {
+        float red[W][16][NT * 16];
+        __align__(16) unsigned char staged[W * STAGE_BYTES];
+    };
+    int xrow[32];                      // the members' rows of x (-1: none), for rot_load
+};
 
-template <int CB, int NT, int W, int PF, int LO, int HI, int RT, int EPI, int S = 0>
+template <int CB, int NT, int W, int PF, int LO, int HI, int RT, int EPI, int S = 0, bool ROT = false>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
@@ -393,6 +504,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, uint32_t wmask,
     const int* __restrict__ items, const int* __restrict__ icount, const Epi epi) {
     static_assert(EPI == EPI_NONE || NT * 16 == 128, "a fused epilogue takes one 128-wide Hadamard block a program");
+    static_assert(!ROT || (S > 0 && EPI != EPI_DOWN && RT <= 2), "ROT writes a staged gate/up program's rows");
     tf_exl3_pdl::grid_wait();
     int u, mtile, zz, nb;
     if (items != nullptr) {
@@ -449,9 +561,49 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 
     const int per_split = KT / SK, per_warp = per_split / W;
     const int nt0 = nb * NT;
-    static_assert(sizeof(GroupedSmem<NT, W, (S > 0)>) <= 48 * 1024, "grouped_kernel's shared memory is static");
-    __shared__ GroupedSmem<NT, W, (S > 0)> sm;
+    static_assert(sizeof(GroupedSmem<NT, W, (S > 0), ROT>) <= 48 * 1024, "grouped_kernel's shared memory is static");
+    __shared__ GroupedSmem<NT, W, (S > 0), ROT> sm;
     auto& red = sm.red;
+    if constexpr (ROT) {
+        if (threadIdx.x < 16 * RT) {
+            const int m = mtile * 16 * RT + threadIdx.x;
+            const int code = m < maxm ? members[u * maxm + m] : -1;
+            sm.xrow[threadIdx.x] = code >= 0 ? code >> 5 : -1;
+        }
+        __syncthreads();
+        // this program's share: Hadamard blocks nb, nb + NB, .. of K, 8 rows a warp at a time
+        const int NB = gridDim.x, KB = K >> 7;
+        const int units = (KB - nb + NB - 1) / NB * 2 * nrt;
+        const half* suh = (mat ? epi.suh1 : epi.suh0) + (size_t)e * K;
+        half* Xw = const_cast<half*>(X);             // ROT reads X only through warp_tiles_staged's copies
+        for (int u0 = warp; u0 < units; u0 += W * ROT_UNITS) {
+            RotUnit ru[ROT_UNITS];
+#pragma unroll
+            for (int c = 0; c < ROT_UNITS; ++c) {
+                const int unit = u0 + c * W;
+                if (unit < units)
+                    rot_load(ru[c], epi, suh, sm.xrow, nb + unit / (2 * nrt) * NB, unit % (2 * nrt) * 8, lane);
+            }
+#pragma unroll
+            for (int c = 0; c < ROT_UNITS; ++c) {
+                const int unit = u0 + c * W;
+                if (unit < units)
+                    rot_store(ru[c], epi, rows_sh, Xw, K, nb + unit / (2 * nrt) * NB, unit % (2 * nrt) * 8, lane);
+            }
+        }
+        // the threadFenceReduction pattern: every program's rows are visible GPU-wide before its arrival counts; the
+        // last to arrive after the wait leaves the counter zero
+        int* count = epi.rot_arrivals + (size_t)blockIdx.z * gridDim.y + blockIdx.y;
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            atomicAdd(count, 1);
+            while (*reinterpret_cast<volatile int*>(count) < NB) __nanosleep(64);
+            __threadfence();
+            if (atomicAdd(count, 1) == 2 * NB - 1) *count = 0;   // all NB programs have passed the wait
+        }
+        __syncthreads();
+    }
     constexpr int PER_THREAD = 16 * NT * 16 / (W * 32);   // a row tile's sums a thread adds up (staged path)
     float tot[INNER ? RT : 1][INNER ? PER_THREAD : 1];
     for (int sp = 0; sp < nsplit; ++sp) {
@@ -852,6 +1004,7 @@ struct GroupedArgs {
     int epi = EPI_NONE;            // a fused epilogue (listed layout, prompt setting) and its arguments
     Epi ep;
     bool staged = false;           // TF_EXL3_EXPERT_STAGED: the prompt setting through warp_tiles_staged
+    bool rot = false;              // TF_EXL3_ROT_FUSE: a staged gate/up launch writes X0, X1 from ep.x itself
 };
 
 constexpr int STAGES = 8;          // most k steps in flight a warp on the staged path (Staged::DEPTH)
@@ -865,6 +1018,8 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
                               : dim3((unsigned)a.nexp_max, nb, (unsigned)(zs * MT));
     TORCH_CHECK(a.hi <= 16 || a.lo == a.hi, "a rate between ExLlamaV3's widths must be its layer's only rate");
     TORCH_CHECK(!a.items || (a.icount && a.nitems > 0 && a.nitems <= 65535), "listed: an item list of 1 to 65,535");
+    TORCH_CHECK(!a.rot || (a.staged && a.items && a.mats == 2 && a.K % 128 == 0 && a.ep.rot_arrivals),
+                "ROT: a staged gate/up launch on the item list, K a multiple of 128, with its counters");
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
     tf_exl3_pdl::launch(grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, TF_RT, EPI_NONE>, grid, dim3(W_ * 32), 0,      \
                         stream, a.pdl, a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, \
@@ -880,14 +1035,19 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
                     "a fused epilogue runs on the listed layout at the prompt setting");
         TORCH_CHECK(a.epi == EPI_GATEUP ? a.mats == 2 : (a.epi == EPI_DOWN && a.mats == 1 && a.SK == 1),
                     "fused epilogues: gate/up (2 matrices) or down (1 matrix, 1 split)");
-#define TF_EPI_KERNEL(EPI_, LO_, HI_, S_)                                                                       \
-    tf_exl3_pdl::launch(grouped_kernel<CB, 8, 4, 1, LO_, HI_, 2, EPI_, S_>, grid, dim3(128), 0, stream, a.pdl,     \
-                        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, \
-                        a.SK, a.maxm, a.slots, a.wmask, a.items, a.icount, a.ep)
+#define TF_EPI_KERNEL(EPI_, LO_, HI_, S_, ROT_)                                                                 \
+    tf_exl3_pdl::launch(grouped_kernel<CB, 8, 4, 1, LO_, HI_, 2, EPI_, S_, ROT_>, grid, dim3(128), 0, stream,      \
+                        a.pdl, a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, \
+                        a.P, a.SK, a.maxm, a.slots, a.wmask, a.items, a.icount, a.ep)
 #define TF_EPI_LAUNCH(EPI_, LO_, HI_)                                                                           \
     do {                                                                                                        \
-        if (a.staged) TF_EPI_KERNEL(EPI_, LO_, HI_, STAGES);                                                    \
-        else TF_EPI_KERNEL(EPI_, LO_, HI_, 0);                                                                  \
+        if constexpr (EPI_ == EPI_GATEUP)                                                                       \
+            if (a.rot) {                                                                                        \
+                TF_EPI_KERNEL(EPI_, LO_, HI_, STAGES, true);                                                    \
+                break;                                                                                          \
+            }                                                                                                   \
+        if (a.staged) TF_EPI_KERNEL(EPI_, LO_, HI_, STAGES, false);                                             \
+        else TF_EPI_KERNEL(EPI_, LO_, HI_, 0, false);                                                           \
     } while (0)
 #define TF_EPI_RANGES(EPI_)                                                                                     \
     if (a.lo == 8 && a.hi == 8) TF_EPI_LAUNCH(EPI_, 8, 8);                                                      \
@@ -904,15 +1064,21 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     if (a.staged) {
         // the prompt setting alone, at the rates the fused epilogues take (wider tiles outgrow static shared memory)
         TORCH_CHECK(a.rt == 2 && a.nt == 8 && a.warps == 4 && a.pf == 1, "the staged path runs the prompt setting");
+#define TF_STAGED_KERNEL(LO_, HI_, ROT_, EP_)                                                                   \
+    tf_exl3_pdl::launch(grouped_kernel<CB, 8, 4, 1, LO_, HI_, 2, EPI_NONE, STAGES, ROT_>, grid, dim3(128), 0,      \
+                        stream, a.pdl, a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, \
+                        a.K, a.N, a.P, a.SK, a.maxm, a.slots, a.wmask, a.items, a.icount, EP_)
 #define TF_STAGED(LO_, HI_)                                                                                     \
-    tf_exl3_pdl::launch(grouped_kernel<CB, 8, 4, 1, LO_, HI_, 2, EPI_NONE, STAGES>, grid, dim3(128), 0, stream,    \
-                        a.pdl, a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, \
-                        a.P, a.SK, a.maxm, a.slots, a.wmask, a.items, a.icount, Epi{})
+    do {                                                                                                        \
+        if (a.rot) TF_STAGED_KERNEL(LO_, HI_, true, a.ep);       /* its epilogue fields are unset: rows only */  \
+        else TF_STAGED_KERNEL(LO_, HI_, false, Epi{});                                                          \
+    } while (0)
         if (a.lo == 8 && a.hi == 8) TF_STAGED(8, 8);
         else if (a.lo == K2_QUARTER && a.hi == K2_QUARTER) TF_STAGED(K2_QUARTER, K2_QUARTER);
         else if (a.lo >= 2 && a.hi <= 10) TF_STAGED(2, 10);
         else TORCH_CHECK(false, "the staged path takes rates up to 5 bits or 2.25 bits");
 #undef TF_STAGED
+#undef TF_STAGED_KERNEL
         return;
     }
 #define TF_RT 1

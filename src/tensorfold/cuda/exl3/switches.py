@@ -32,6 +32,13 @@ member rows in flight a warp through shared memory (``warp_tiles_staged``), the 
 chains. On a 2,048-row Flash Next window (ncu, 21 Oct) the kernel held 8 warps an SM at 248 registers and no warp was
 ready in 75% of cycles, most of them waiting on global loads. ``0`` restores ``grouped_kernel``'s launches.
 
+TF_EXL3_ROT_FUSE (unset: on; served Qwen EXL3 cold prefill 1.038-1.042x at 4k-131k, decode within 1.1%, 21 Oct) has a staged gate/up launch on the item list write ``rot_in``'s rows itself
+(``rot_store``): an item's n-block programs each rotate a share of its members' Hadamard blocks, meet at a counter,
+and read the rows back from L2. ``rot_in`` wrote every pick's rows before the launch, 230 MB a 2,048-row Flash Next
+window that gate/up read back from DRAM: 1.36 ms of a 9.60 ms routed call, and 0.66 ms of the gate/up launch (GPU,
+21 Oct, tf-runs/exl3-rotfuse-1021). The same bytes. Launches TF_EXL3_EXPERT_STAGED leaves alone, the spanned layout,
+and rows not on 16 bytes keep ``rot_in``. ``0`` restores ``rot_in`` everywhere.
+
 An engine reads every switch once at startup (``read``) and installs them (``use``). The kernels' Python callers consult
 ``current()`` at each launch, so a CUDA graph keeps the setting it was captured with. A test flips a setting on one
 load by calling ``use`` and building a new engine.
@@ -52,6 +59,7 @@ GATEUP_FUSE_ENV = "TF_EXL3_GATEUP_FUSE"
 GROUP_SCAN_DECODE_ENV = "TF_EXL3_GROUP_SCAN_DECODE"
 LINEAR_PAIR_ENV = "TF_EXL3_LINEAR_PAIR"
 EXPERT_STAGED_ENV = "TF_EXL3_EXPERT_STAGED"
+ROT_FUSE_ENV = "TF_EXL3_ROT_FUSE"
 
 
 @dataclass(frozen=True)
@@ -67,12 +75,13 @@ class Switches:
     group_scan_decode: bool = True
     linear_pair: bool = True
     expert_staged: bool = True
+    rot_fuse: bool = True
 
 
 ENVS = {EXPERT_DECODE_ENV: "expert_decode", PDL_ENV: "pdl", EXPERT_ITEMS_ENV: "expert_items",
         GROUP_SCAN_ENV: "group_scan", DOWN_FUSE_ENV: "down_fuse", GATEUP_FUSE_ENV: "gateup_fuse",
         GROUP_SCAN_DECODE_ENV: "group_scan_decode", LINEAR_PAIR_ENV: "linear_pair",
-        EXPERT_STAGED_ENV: "expert_staged"}
+        EXPERT_STAGED_ENV: "expert_staged", ROT_FUSE_ENV: "rot_fuse"}
 
 _current = Switches()          # launches before any engine's ``use`` (tools, tests) take the served setting
 

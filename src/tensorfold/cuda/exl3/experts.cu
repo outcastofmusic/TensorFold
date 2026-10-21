@@ -390,7 +390,8 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
                         int64_t hi, int64_t rt, int64_t wmask, bool decode, bool pdl, const int* items,
                         const int* icount, int64_t nitems, int64_t epi, const void* s0, const void* s1,
                         const void* s2, void* out, int* arrivals, double limit, int64_t act, bool bf16,
-                        bool staged) {
+                        bool staged, const void* rot_x, int64_t rot_stride, bool rot_bf16, const void* rot_s0,
+                        const void* rot_s1, int* rot_arrivals) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
@@ -422,6 +423,13 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.ep.act = (int)act;
     a.ep.bf16 = bf16;
     a.staged = staged;
+    a.rot = rot_x != nullptr;
+    a.ep.x = rot_x;
+    a.ep.x_stride = (int)rot_stride;
+    a.ep.x_bf16 = rot_bf16;
+    a.ep.suh0 = static_cast<const half*>(rot_s0);
+    a.ep.suh1 = static_cast<const half*>(rot_s1);
+    a.ep.rot_arrivals = rot_arrivals;
     TORCH_CHECK(!(decode && epi), "decode_kernel has no fused epilogue");
     TORCH_CHECK(!(decode && staged), "the staged path is grouped_kernel's");
     auto stream = at::cuda::getCurrentCUDAStream();

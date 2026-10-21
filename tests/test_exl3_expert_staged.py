@@ -22,7 +22,7 @@ from tensorfold.cuda.exl3 import experts, switches
 from tests.test_exl3_decode_switches import NVCC, _layer, _ptxas
 from tests.test_exl3_prefill_switches import FLOAT_OPS, HERE, _route
 
-STAGED = dataclasses.replace(switches.Switches(), expert_staged=True)
+STAGED = dataclasses.replace(switches.Switches(), expert_staged=True, rot_fuse=False)      # rot_in's launches
 
 
 @pytest.fixture(autouse=True)
@@ -77,7 +77,7 @@ def test_both_engines_install_what_they_read(clean_env, tmp_path):
         switches.use(switches.Switches())
         with pytest.raises(Exception):  # noqa: B017  # the checkpoint (or, without a GPU, the device) fails after
             build()
-        assert switches.current() == STAGED
+        assert switches.current() == dataclasses.replace(switches.Switches(), expert_staged=True)
 
 
 # -- what routed launches -------------------------------------------------------------------------------------------
@@ -111,7 +111,8 @@ def test_the_epilogue_kernels_read_one_split_after_a_staged_launch(monkeypatch):
     """Without the fusions the gate/up epilogue kernel reads the staged program's one total a matrix (SK 1), where
     the old launch left its K splits; down has one split either way."""
 
-    unfused = dataclasses.replace(switches.Switches(), gateup_fuse=False, down_fuse=False, expert_staged=False)
+    unfused = dataclasses.replace(switches.Switches(), gateup_fuse=False, down_fuse=False, expert_staged=False,
+                                  rot_fuse=False)
     for sw, sk in ((unfused, 4), (dataclasses.replace(unfused, expert_staged=True), 1)):
         fake, s, _, _ = _route(monkeypatch, 1024, sw)
         assert [n for n, _ in fake.calls] == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped",
