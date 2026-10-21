@@ -8,8 +8,11 @@ the bytes on the GPU."""
 from __future__ import annotations
 
 import dataclasses
+import re
 import subprocess
 import sysconfig
+from collections import Counter
+from pathlib import Path
 
 import pytest
 
@@ -17,16 +20,19 @@ torch = pytest.importorskip("torch")
 
 from tensorfold.cuda.exl3 import experts, switches
 from tests.test_exl3_decode_switches import NVCC, _layer, _ptxas
-from tests.test_exl3_prefill_switches import HERE, _route, _sass_ops
+from tests.test_exl3_prefill_switches import FLOAT_OPS, HERE, _route
 
 STAGED = dataclasses.replace(switches.Switches(), expert_staged=True)
 
 
 @pytest.fixture(autouse=True)
 def restore():
-    before = switches.current()
+    from tensorfold.families.qwen4_exp.cuda import exl3_mm
+
+    before, before_mm = switches.current(), exl3_mm.current()
     yield
     switches.use(before)
+    exl3_mm.use(before_mm)
 
 
 @pytest.fixture
@@ -167,11 +173,36 @@ def test_the_staged_instances_do_not_spill_and_keep_two_blocks_an_sm():
         assert 65536 // (-(-regs // 8) * 8 * 128) >= 2, (name, regs)
 
 
+def _sass_values(obj: Path) -> dict[str, Counter]:
+    """tests/test_exl3_prefill_switches.py's float instruction counts, with each F2FP counted by the values it
+    rounds: the staged epilogues store a lane's 4 outputs at once, so one F2FP.PACK_AB rounds two (RN either way)."""
+
+    out, name = {}, None
+    text = subprocess.run([str(Path(NVCC).parent / "cuobjdump"), "-sass", str(obj)], capture_output=True, text=True,
+                          check=True).stdout
+    for line in text.splitlines():
+        m = re.match(r"\s+Function : (\S+)", line)
+        if m:
+            name = m.group(1)
+            out[name] = Counter()
+            continue
+        m = re.match(r"\s+/\*[0-9a-f]{4,}\*/\s+(.*?)\s*;?\s*/\*", line)
+        if not (name and m and (o := FLOAT_OPS.match(m.group(1)))):
+            continue
+        op = o.group(1)
+        if op.startswith("F2FP") and op.endswith("PACK_AB"):
+            sources = [x.strip() for x in m.group(1).split(",")[1:3]]
+            out[name][op] += sum(x != "RZ" for x in sources)
+        else:
+            out[name][op] += 1
+    return out
+
+
 @pytest.mark.skipif(NVCC is None, reason="nvcc builds the sm_121 instances")
 def test_the_staged_fused_epilogues_compile_the_epilogue_kernels_rounding_and_fma_instructions(tmp_path):
     """As tests/test_exl3_prefill_switches.py checks the fused instances: each staged fused instance, less its EPI 0
-    twin, holds the standalone epilogue kernel's multiplies, FMAs, exponents, min/max and conversions in the same
-    counts, so no multiply was contracted into an add the epilogue kernel rounds apart."""
+    twin, holds the standalone epilogue kernel's multiplies, FMAs, exponents and min/max in the same counts, and rounds
+    as many values, so no multiply was contracted into an add the epilogue kernel rounds apart."""
 
     from torch.utils import cpp_extension
 
@@ -185,7 +216,7 @@ def test_the_staged_fused_epilogues_compile_the_epilogue_kernels_rounding_and_fm
            f"-I{HERE}", f"-I{sysconfig.get_paths()['include']}"] + [f"-I{p}" for p in cpp_extension.include_paths()]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, check=False)
     assert out.returncode == 0, out.stderr[-2000:]
-    ops = _sass_ops(obj)
+    ops = _sass_values(obj)
 
     def one(*tags):
         found = [v for k, v in ops.items() if all(t in k for t in tags)]
@@ -197,3 +228,17 @@ def test_the_staged_fused_epilogues_compile_the_epilogue_kernels_rounding_and_fm
     plain = one("grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi2ELi0ELi8E")
     assert one("grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi2ELi1ELi8E") - plain == gateup
     assert one("grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi2ELi2ELi8E") - plain == down + down
+
+
+# -- the bench tool -------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("on", [set(), {"staged"}])
+def test_the_bench_sweeps_the_staged_switch_alone(on):
+    pytest.importorskip("triton")
+    from tensorfold.families.qwen4_exp.cuda import exl3_mm
+    from tools.exl3_prefill_bench import _set
+
+    base_sw = switches.Switches(pdl=True, group_scan=False, down_fuse=True, gateup_fuse=False)
+    base_mm = exl3_mm.Switches(moe_chunk=False)
+    _set(base_sw, base_mm, on, ("staged",))
+    assert switches.current() == dataclasses.replace(base_sw, expert_staged="staged" in on)
+    assert exl3_mm.current() == base_mm

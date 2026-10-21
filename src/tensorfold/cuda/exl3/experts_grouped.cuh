@@ -565,11 +565,12 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
                         v[j] = s;
                     }
                     if (epi.bf16)
-                        down_tail(v, lane, epi.s0 + (size_t)e * N + n,
-                                  reinterpret_cast<__nv_bfloat16*>(epi.out) + (size_t)p * N + n);
+                        down_tail<__nv_bfloat16, (S > 0)>(
+                            v, lane, epi.s0 + (size_t)e * N + n,
+                            reinterpret_cast<__nv_bfloat16*>(epi.out) + (size_t)p * N + n);
                     else
-                        down_tail(v, lane, epi.s0 + (size_t)e * N + n,
-                                  reinterpret_cast<float*>(epi.out) + (size_t)p * N + n);
+                        down_tail<float, (S > 0)>(v, lane, epi.s0 + (size_t)e * N + n,
+                                                  reinterpret_cast<float*>(epi.out) + (size_t)p * N + n);
                 }
                 __syncthreads();
             }
@@ -616,7 +617,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
                 gv[j] = sg;
                 uv[j] = su;
             }
-            gateup_tail(gv, uv, lane, epi.s0 + (size_t)e * N + n, epi.s1 + (size_t)e * N + n,
+            gateup_tail<(S > 0)>(gv, uv, lane, epi.s0 + (size_t)e * N + n, epi.s1 + (size_t)e * N + n,
                         epi.s2 + (size_t)e * N + n, reinterpret_cast<half*>(epi.out) + (size_t)p * N + n, epi.limit,
                         epi.act);
         }
