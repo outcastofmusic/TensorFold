@@ -137,3 +137,20 @@ def test_wide_copy_windows_give_the_serial_tokens_on_one_engine(graphs):
     oracle = _seeded(Wide(PROMPT, ref), PROMPT + [first])
     res = mtp_decode(e, first, 60, None, depth=3, confidence=0.0, copies=oracle)
     assert res.tokens == ref and oracle.widest == 15 and max(res.widths) == 16
+
+
+@pytest.mark.parametrize("graphs", [False, True])
+def test_every_copy_width_gives_the_serial_bits_on_one_engine(graphs):
+    """Copy windows verify up to 32 rows; graphs stop at 8, so 9-32 rows run eagerly (upstream 3e3f895e: a path picked
+    by row count changed bits once verify windows grew past 16)."""
+    e = Engine(_model(), capacity=1024, max_rows=32, prefill_rows=16, graphs=graphs, graph_rows=8)
+    got = check_widths(*engine_windows(e, PROMPT), widths=range(2, 33), steps=64)
+    assert got["ok"], got
+
+
+def test_every_copy_width_gives_the_serial_bits_in_shared_rounds():
+    dec = MultiDecoder(_model(), slots=2, capacity=1024, depth=6, confidence=0.7, graphs=False, copy_rows=32)
+    start, window, release = multi_windows(dec, PROMPT)
+    got = check_widths(start, window, widths=range(2, 33), steps=64)
+    release()
+    assert got["ok"], got

@@ -100,7 +100,7 @@ def multi_windows(dec, prompt: list[int] = PROMPT):
     held: list[list[int]] = [[]]
 
     def start() -> int:
-        if not dec._grow(st, len(prompt) + 2 * 64, alone=True):
+        if not dec._grow(st, len(prompt) + 2 * 128, alone=True):      # a check of up to 64 steps and 64-row windows
             raise RuntimeError("no memory for the self-check's slot")
         held[0] = []
         e = _slot(dec.w, st, dec.buf, dec.mbuf, dec.pbuf, dec.capacity, dec.prefill_rows)
