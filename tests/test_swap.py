@@ -400,3 +400,17 @@ def test_models_report_the_model_being_loaded_and_the_one_it_replaces(swap, tmp_
     load.join(5)
     assert _states(swapper)["glm-5.3-flash"] == ("ready", None)
     assert _states(swapper)["qwen3.8-flash-next"] == ("unloaded", None)
+
+
+def test_the_loaded_model_names_the_backend_it_forwards_to(swap):
+    swapper = swap.Swapper()
+    swap.SWAP = swapper
+    handler = swap.Handler.__new__(swap.Handler)                # state() reads only SWAP
+    assert handler.state()["backend"] is None                   # nothing loaded: nothing to forward to
+    assert all(m["backend"] is None for m in swapper.models())
+    swapper.current = "glm-5.3-flash"
+    address = f"127.0.0.1:{swap.BACKEND}"
+    assert handler.state() == {"loaded": "glm-5.3-flash", "loading": None, "running": 0, "backend": address}
+    backends = {m["id"]: m["backend"] for m in swapper.models()}
+    assert backends.pop("glm-5.3-flash") == address
+    assert set(backends.values()) == {None}

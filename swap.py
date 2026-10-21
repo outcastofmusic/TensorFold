@@ -6,8 +6,9 @@ model on BACKEND_PORT, and is then forwarded. A streaming request gets an SSE co
 clients that time out on a silent connection stay connected. Python's standard library only.
 
     GET  /v1/models      every model, "loaded" on the one in memory and a "state": ready, loading, unloading,
-                         unloaded or failed (with the "error" of its last load, kept until a load of it succeeds)
-    GET  /swap           {"loaded": ..., "loading": ..., "running": n}
+                         unloaded or failed (with the "error" of its last load, kept until a load of it succeeds),
+                         and the "backend" the loaded one is forwarded to ("127.0.0.1:30002", null on the others)
+    GET  /swap           {"loaded": ..., "loading": ..., "running": n, "backend": "127.0.0.1:30002" or null}
     POST /swap/<model>   load a model now and answer when it is ready
 
 Environment: PORT=30000, BACKEND_PORT=30002, SWAP_DEFAULT=qwen3.8-flash-next (for a request that names neither),
@@ -50,6 +51,12 @@ HOP = {"connection", "keep-alive", "transfer-encoding", "content-length", "host"
 
 def say(text: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} swap: {text}", flush=True)
+
+
+def backend() -> str:
+    """Where requests for the loaded model go, so a gateway in front can tell which server answered."""
+
+    return f"127.0.0.1:{BACKEND}"
 
 
 def loaded() -> str | None:
@@ -109,7 +116,8 @@ class Swapper:
         with self.cond:
             out = []
             for name in TARGET:
-                entry = {"id": name, "object": "model", "owned_by": "tensorfold", "loaded": name == self.current}
+                entry = {"id": name, "object": "model", "owned_by": "tensorfold", "loaded": name == self.current,
+                         "backend": backend() if name == self.current else None}
                 if name == self.loading:
                     entry["state"] = "loading"
                 elif name == self.current:              # a swap away from it holds new requests for it
@@ -202,7 +210,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def state(self) -> dict:
-        return {"loaded": SWAP.current, "loading": SWAP.loading, "running": SWAP.running}
+        return {"loaded": SWAP.current, "loading": SWAP.loading, "running": SWAP.running,
+                "backend": backend() if SWAP.current is not None else None}
 
     def do_GET(self) -> None:
         self.close_connection = True
