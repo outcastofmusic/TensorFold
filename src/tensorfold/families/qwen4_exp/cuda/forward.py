@@ -148,7 +148,15 @@ def _down_act(hc: HC, b: Buffers, R: int, streams: int, low: int, inject) -> Non
     elif b.prefill:                                   # an EXL3 pack's fp16 matrix: summed slices, any row count
         got = hc.down(b.normed[:R], out)
     else:
-        got = hc.down.partials(b.normed[:R])          # fp32 slices [SK, R, N] that the activation sums in order
+        # fp32 slices [SK, rows, N] that the activation sums in order, ROWS rows a call: a shared round can pass that
+        # (six streams of 32-row copy windows verify 192, tf-runs/parallel6), and rows are independent
+        from .exl3_mm import ROWS
+
+        for r0 in range(0, R, ROWS):
+            r1 = min(R, r0 + ROWS)
+            glue.hc_reduce_act(hc.down.partials(b.normed[r0:r1]), b.act[r0:r1], b.xs_act[r0:r1],
+                               None if inject is None else inject[r0:r1], streams, low)
+        return
     if got.dim() == 3:
         glue.hc_reduce_act(got, b.act[:R], b.xs_act[:R], inject, streams, low)
     else:

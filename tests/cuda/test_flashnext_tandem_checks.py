@@ -154,3 +154,65 @@ def test_every_copy_width_gives_the_serial_bits_in_shared_rounds():
     got = check_widths(start, window, widths=range(2, 33), steps=64)
     release()
     assert got["ok"], got
+
+
+def _f16_downs(w):
+    """``w`` with every hyper-connection's down projection an EXL3 pack's fp16 matrix (``exl3_mm.F16``), whose decode
+    call takes at most ``exl3_mm.ROWS`` rows."""
+
+    from test_flashnext_forward import DEV, LOW, D, S
+
+    from tensorfold.families.qwen4_exp.cuda import exl3_mm
+
+    sc = exl3_mm.Scratch(11, False)
+    g = torch.Generator().manual_seed(11)
+    hcs = [hc for layer in [*w.layers, w.mtp.layer] for hc in (layer.attn_hc, layer.mlp_hc)] + [w.mixer, w.mtp.mixer]
+    for hc in hcs:
+        n = LOW + (S if hc.inject else 0)
+        hc.down = exl3_mm.f16(sc, [(torch.randn((n, S * D), generator=g) * 0.01).half()], DEV)
+    sc.part = torch.empty((max(hc.down.sk * hc.down.n for hc in hcs) * exl3_mm.ROWS,), dtype=torch.float32,
+                          device=DEV)
+    return w
+
+
+class Always(Oracle):
+    """The oracle copying on every round, so streams that all copy share each round."""
+
+    def chain(self, n):
+        at = len(self.ctx) - self.n
+        return self.ref[at:at + min(n, self.rows - 1)]
+
+
+def test_six_streams_of_full_copy_windows_give_the_serial_tokens(monkeypatch):
+    """Six streams copying 31 drafts each verify 6 x 32 = 192 rows in one round, past the 128 rows an EXL3 pack's HC
+    down projection takes in one call (tf-runs/parallel6, 2026-10-21: four streams fit exactly)."""
+
+    from tensorfold.families.qwen4_exp.cuda import exl3_mm, multi, multi_fill
+
+    w = _f16_downs(_model())
+    prompts = [PROMPT[i:] + PROMPT[:i] for i in range(6)]
+    refs = [_reference(w, p, 100) for p in prompts]
+
+    def index(ctx, **_):
+        i = next(i for i, p in enumerate(prompts) if list(ctx[:len(p)]) == p)
+        return _seeded(Always(prompts[i], refs[i], rows=32), ctx)
+
+    widest = []
+
+    def stage(w, b, windows):
+        segs = real(w, b, windows)
+        widest.append(segs[-1][2])
+        return segs
+
+    real = multi.stage
+    monkeypatch.setattr(multi, "stage", stage)
+    monkeypatch.setattr(multi_fill, "CopyIndex", index)
+    dec = MultiDecoder(w, slots=6, capacity=1024, depth=3, confidence=0.0, copy=True, copy_rows=32)
+    streams = [Stream(p, 100, None) for p in prompts]
+    for s in streams:
+        dec.admit(s)
+    while dec.live():
+        dec.finish(dec.round())
+    assert [s.error for s in streams] == [None] * 6
+    assert [s.out for s in streams] == refs
+    assert max(widest) == 192 > exl3_mm.ROWS

@@ -267,7 +267,8 @@ class F16:
         return self.w.numel() * 2
 
     def partials(self, x: torch.Tensor) -> torch.Tensor:
-        """Unreduced fp32 slices [sk, M, n] (shared scratch) for a consumer that sums them in order; M <= ROWS."""
+        """Unreduced fp32 slices [sk, M, n] (shared scratch) for a consumer that sums them in order; M <= ROWS, so a
+        wider window takes ROWS-row calls, each summed before the next overwrites the scratch (``forward._down_act``)."""
 
         m = x.shape[0]
         if m > ROWS:
