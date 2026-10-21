@@ -286,7 +286,8 @@ default, 0, keeps whole passes.
 
 Prompt pieces are 2,048 rows, or 4,096 while nothing decodes on a DGX Spark serving the MLX checkpoint without
 `--vision`, when the admitted window leaves room (the startup log names the choice). `TENSORFOLD_PREFILL_ROWS=N` (256 to 16,384) sets the rows instead, for one GPU
-or two: the prompt buffers are sized for N rows in the startup estimate, so the window shrinks or grows to match,
+or two and for EXL3 packs (whose pieces are otherwise always 2,048 rows, and whose routed experts take up to 4,096
+rows a call): the prompt buffers are sized for N rows in the startup estimate, so the window shrinks or grows to match,
 and the plan above no longer applies. A round that runs beside live replies still takes at most 2,048 of them.
 Replies are the same tokens at any setting; the best value depends on the machine, so measure it there.
 

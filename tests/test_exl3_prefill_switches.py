@@ -117,14 +117,16 @@ def test_the_engines_install_what_they_read(monkeypatch, tmp_path):
 
 def test_an_unset_environment_reads_each_dataclass_default(monkeypatch):
     """One place holds each served default: a launch before any engine's ``use`` (a tool, a test) takes the
-    setting an engine reads, and ENVS names every field, so ``read`` misses none."""
+    setting an engine reads, and ENVS names every flag field, so ``read`` misses none (exl3_mm's prompt rows, a count,
+    come from TENSORFOLD_PREFILL_ROWS: tests/test_exl3_prompt_rows.py)."""
 
     from dataclasses import fields
 
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
 
+    monkeypatch.delenv("TENSORFOLD_PREFILL_ROWS", raising=False)
     for module in (switches, exl3_mm):
-        assert sorted(module.ENVS.values()) == sorted(f.name for f in fields(module.Switches))
+        assert sorted(module.ENVS.values()) == sorted(f.name for f in fields(module.Switches) if f.name != "prompt_rows")
         for e in module.ENVS:
             monkeypatch.delenv(e, raising=False)
         assert module.read() == module.Switches()
