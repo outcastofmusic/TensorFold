@@ -134,8 +134,8 @@ class FlashNextEngine:
                                               indexed_stream_geometry, indexed_weights)
 
         # TENSORFOLD_PREFILL_ROWS: prompt pieces of that many rows, admitted with the window (not the idle plan); an
-        # EXL3 pack's scratch follows them (exl3_mm.Switches.prompt_rows, installed above)
-        chunk = indexed_prefill_rows()
+        # EXL3 pack's pieces and scratch take exl3_mm.Switches.prompt_rows (installed above), set or not
+        chunk = exl3_mm.current().prompt_rows if exl3 else indexed_prefill_rows()
 
         if tp not in (1, 2) or rank not in range(tp):
             raise ValueError(f"rank {rank} of {tp}: Flash Next runs on one GPU or two")

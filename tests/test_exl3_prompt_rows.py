@@ -14,6 +14,7 @@ torch = pytest.importorskip("torch")
 from tensorfold.cuda.exl3 import experts  # noqa: E402
 from tensorfold.families.qwen4_exp.cuda import exl3_mm, exl3_pack  # noqa: E402
 from tests.test_exl3_decode_switches import _layer  # noqa: E402
+from tests.test_cuda_capacity import HEAD, Loaded, checkpoint, fake_runtime, small_config  # noqa: E402, F401
 
 ENV = "TENSORFOLD_PREFILL_ROWS"
 TEXT = {"hidden_size": 2560, "moe_intermediate_size": 640, "num_experts_per_tok": 10, "num_attention_heads": 24,
@@ -85,3 +86,21 @@ def test_4096_rows_admit_under_three_gib_more():
     two, four = exl3_indexed_scratch(TEXT, 2048, 2048), exl3_indexed_scratch(TEXT, 4096, 4096)
     assert 1.9 < four / two < 2.1
     assert four - two < 3 << 30
+
+
+@pytest.mark.torch
+@pytest.mark.parametrize("value, rows", [(None, 4096), ("2048", 2048)])
+def test_an_exl3_engine_cuts_prompts_in_the_switch_s_rows(tmp_path, monkeypatch, fake_runtime, value, rows):  # noqa: F811
+    """The pieces the engine cuts, and the rows it admits, follow ``prompt_rows`` unset as well as set."""
+
+    from tensorfold.families.qwen4_exp.cuda import engine
+
+    if value is not None:
+        monkeypatch.setenv(ENV, value)
+    checkpoint(tmp_path, small_config(), HEAD)
+    monkeypatch.setattr(exl3_pack, "is_exl3", lambda path: True)
+    monkeypatch.setattr(exl3_pack, "extra_files", lambda path: ())
+    obj = engine.FlashNextEngine.__new__(engine.FlashNextEngine)
+    with pytest.raises(Loaded):
+        obj.__init__(tmp_path, depth=0)
+    assert obj.prefill_rows == rows
