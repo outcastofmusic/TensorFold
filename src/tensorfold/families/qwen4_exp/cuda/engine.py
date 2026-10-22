@@ -133,8 +133,9 @@ class FlashNextEngine:
         from tensorfold.cuda.geometry import (PREFILL_ROWS, gdn_geometry, indexed_prefill_rows,
                                               indexed_stream_geometry, indexed_weights)
 
-        # TENSORFOLD_PREFILL_ROWS: prompt pieces of that many rows, admitted with the window (not the idle plan)
-        chunk = None if is_exl3(model_dir) else indexed_prefill_rows()
+        # TENSORFOLD_PREFILL_ROWS: prompt pieces of that many rows, admitted with the window (not the idle plan); an
+        # EXL3 pack's scratch follows them (exl3_mm.Switches.prompt_rows, installed above)
+        chunk = indexed_prefill_rows()
 
         if tp not in (1, 2) or rank not in range(tp):
             raise ValueError(f"rank {rank} of {tp}: Flash Next runs on one GPU or two")
@@ -185,7 +186,7 @@ class FlashNextEngine:
                                    vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), vision, rank),
                                    rank=rank, world=tp,
                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
-        self.prefill_rows, prompt_workspace = (PREFILL_ROWS, 0) if exl3 else (chunk, 0) if chunk else prompt_plan(
+        self.prefill_rows, prompt_workspace = (chunk or PREFILL_ROWS, 0) if exl3 else (chunk, 0) if chunk else prompt_plan(
             self.capacity_plan, config(model_dir), torch.cuda.get_device_capability(), world=tp, vision=vision,
             fp8=prompt_precision.fp8())
         if prompt_workspace:

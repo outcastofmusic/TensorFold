@@ -44,9 +44,9 @@ def flash_next():
         pytest.skip("the Flash Next EXL3 pack is not here")
     from tensorfold.families.qwen4_exp.cuda.weights import load
 
-    exl3_mm.use(exl3_mm.Switches())                               # served: the 2,048-row routed window
+    exl3_mm.use(exl3_mm.Switches())                               # served: the 4,096-row routed window
     w = load(FN_PACK, mtp=True, draft_vocab=None, f16_narrow=False, hc_fuse=True)
-    assert w.x3.moe.rows == exl3_mm.MOE_CHUNK_WINDOW
+    assert w.x3.moe.rows == exl3_mm.PROMPT_ROWS
     assert all(lay.moe.experts.aligned for lay in w.layers)      # every layer takes the staged kernel
     assert switches.Switches().expert_staged                      # which the switch rides on
     yield w

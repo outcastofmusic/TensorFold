@@ -67,9 +67,9 @@ def flash_next():
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
     from tensorfold.families.qwen4_exp.cuda.weights import load
 
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=True))                 # the routed scratch for 2,048-row calls (default)
+    exl3_mm.use(exl3_mm.Switches(moe_chunk=True))                 # the routed scratch for 4,096-row calls (default)
     w = load(FN_PACK, mtp=True, draft_vocab=None)
-    assert w.x3.moe.rows == exl3_mm.MOE_CHUNK_WINDOW
+    assert w.x3.moe.rows == exl3_mm.PROMPT_ROWS
     yield w
     del w
     _free()

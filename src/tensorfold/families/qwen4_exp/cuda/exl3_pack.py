@@ -27,11 +27,11 @@ def extra_files(model_dir: str | Path) -> tuple[Path, ...]:
 def admission(geometry):
     """The engine's geometry plus the EXL3 path's fixed scratch: routed-expert windows and prompt rows."""
 
-    from tensorfold.cuda.geometry import PREFILL_ROWS, exl3_indexed_scratch, with_fixed
+    from tensorfold.cuda.geometry import exl3_indexed_scratch, with_fixed
 
-    from .exl3_mm import moe_window
+    from .exl3_mm import current, moe_window
 
-    return lambda text: with_fixed(geometry(text), exl3_indexed_scratch(text, moe_window(), PREFILL_ROWS))
+    return lambda text: with_fixed(geometry(text), exl3_indexed_scratch(text, moe_window(), current().prompt_rows))
 
 
 class Pack:

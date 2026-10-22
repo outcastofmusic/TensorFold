@@ -23,7 +23,9 @@ STACK_DIRECT_ENV = "TF_FLASHNEXT_STACK_DIRECT"
 INNER_K_ENV = "TF_FLASHNEXT_F16_INNER_K"
 MOE_DIRECT_ENV = "TF_FLASHNEXT_MOE_DIRECT"
 MOE_CHUNK_ENV = "TF_FLASHNEXT_MOE_CHUNK"
-MOE_CHUNK_WINDOW = 2048   # TF_FLASHNEXT_MOE_CHUNK: a prompt chunk's rows (exl3.PREFILL_ROWS) in one routed call
+MOE_CHUNK_WINDOW = 2048   # TF_FLASHNEXT_MOE_CHUNK: a prompt chunk's rows (geometry.PREFILL_ROWS) in one routed call
+MOE_MOST_ROWS = 4096      # most rows one routed call takes: group_scan_kernel ranks 65,535 picks, 5,957 rows of 11 slots
+PROMPT_ROWS = 4096        # TENSORFOLD_PREFILL_ROWS unset: a prompt chunk's rows on an EXL3 pack
 
 
 @dataclass(frozen=True)
@@ -45,12 +47,19 @@ class Switches:
     (19 Oct) read about 0.96 GB of expert trellis a window and layer and ran grouped_kernel at about 246 GB/s of DRAM
     traffic. In one call an expert's member groups (about 44 rows, two groups of 32) run next to each other, so the
     second group's weights can come from L2. Rows never depend on the window, so the bytes are the same. The routed
-    scratch doubles: 478 to 955 MB at Flash Next's shape."""
+    scratch doubles: 478 to 955 MB at Flash Next's shape.
+    ``prompt_rows`` (TENSORFOLD_PREFILL_ROWS on an EXL3 pack, unset: PROMPT_ROWS; served cold prefill 1.04 to 1.09x
+    at 4k to 131k, 21 Oct, decode within 0.995 to 1.005x; 2,048 restores the old chunks): a prompt chunk's rows. The routed scratch,
+    the prompt matmul workspace and the n-gram staging hold as many, and with moe_chunk one routed call takes up to
+    MOE_MOST_ROWS of them. Rows never depend on the chunk, so the bytes are the same. At 4,096 rows a layer's routed
+    call reads each expert's trellis once for twice the rows: 2 x 8.55 to 14.4 ms a layer (tf-runs/exl3-long-1021);
+    the routed scratch grows from 1.4 to 2.8 GB."""
 
     stack_direct: bool = True
     inner_k: bool = False
     moe_direct: bool = True
     moe_chunk: bool = True
+    prompt_rows: int = PROMPT_ROWS
 
 
 ENVS = {STACK_DIRECT_ENV: "stack_direct", INNER_K_ENV: "inner_k", MOE_DIRECT_ENV: "moe_direct",
@@ -60,10 +69,14 @@ _current = Switches()          # each field's default is its served setting, the
 
 
 def read() -> Switches:
-    """Every switch from the environment; a value outside env_flags' set raises before any weight is read."""
+    """Every switch from the environment; a value outside env_flags' set, or TENSORFOLD_PREFILL_ROWS outside 256 to
+    16,384, raises before any weight is read."""
+
+    from tensorfold.cuda.geometry import indexed_prefill_rows
 
     served = Switches()
-    return Switches(**{field: flag(env, getattr(served, field)) for env, field in ENVS.items()})
+    return Switches(**{field: flag(env, getattr(served, field)) for env, field in ENVS.items()},
+                    prompt_rows=indexed_prefill_rows() or served.prompt_rows)
 
 
 def use(switches: Switches) -> Switches:
@@ -79,9 +92,10 @@ def current() -> Switches:
 
 
 def moe_window() -> int:
-    """Most rows a prompt's routed-expert call takes: MOE_CHUNK_WINDOW with TF_FLASHNEXT_MOE_CHUNK, else MOE_WINDOW."""
+    """Most rows a prompt's routed-expert call takes: the chunk's (at most MOE_MOST_ROWS) with TF_FLASHNEXT_MOE_CHUNK,
+    else MOE_WINDOW."""
 
-    return MOE_CHUNK_WINDOW if _current.moe_chunk else MOE_WINDOW
+    return min(_current.prompt_rows, MOE_MOST_ROWS) if _current.moe_chunk else MOE_WINDOW
 
 
 def f16_narrow() -> bool:

@@ -70,13 +70,14 @@ def test_the_chunk_window_flag(monkeypatch, value, on):
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
 
     monkeypatch.delenv(exl3_mm.MOE_CHUNK_ENV, raising=False)
+    monkeypatch.delenv("TENSORFOLD_PREFILL_ROWS", raising=False)
     if value is not None:
         monkeypatch.setenv(exl3_mm.MOE_CHUNK_ENV, value)
     got = exl3_mm.read()
     assert got.moe_chunk is on
     assert (got.stack_direct, got.inner_k, got.moe_direct) == (True, False, True)
     exl3_mm.use(got)
-    assert exl3_mm.moe_window() == (2048 if on else 1024)
+    assert exl3_mm.moe_window() == (exl3_mm.PROMPT_ROWS if on else 1024)
 
 
 @pytest.mark.parametrize("value", ["2", "chunk", "1.0"])
@@ -117,14 +118,16 @@ def test_the_engines_install_what_they_read(monkeypatch, tmp_path):
 
 def test_an_unset_environment_reads_each_dataclass_default(monkeypatch):
     """One place holds each served default: a launch before any engine's ``use`` (a tool, a test) takes the
-    setting an engine reads, and ENVS names every field, so ``read`` misses none."""
+    setting an engine reads, and ENVS names every flag field, so ``read`` misses none (exl3_mm's prompt rows, a count,
+    come from TENSORFOLD_PREFILL_ROWS: tests/test_exl3_prompt_rows.py)."""
 
     from dataclasses import fields
 
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
 
+    monkeypatch.delenv("TENSORFOLD_PREFILL_ROWS", raising=False)
     for module in (switches, exl3_mm):
-        assert sorted(module.ENVS.values()) == sorted(f.name for f in fields(module.Switches))
+        assert sorted(module.ENVS.values()) == sorted(f.name for f in fields(module.Switches) if f.name != "prompt_rows")
         for e in module.ENVS:
             monkeypatch.delenv(e, raising=False)
         assert module.read() == module.Switches()
@@ -416,7 +419,7 @@ def test_a_chunk_takes_one_routed_call_of_its_rows(monkeypatch, chunk, rows):
     monkeypatch.setattr(experts, "routed", routed)
     monkeypatch.setattr(forward.moe_mod, "router", lambda *a, **k: None)
     monkeypatch.setattr(forward.moe_mod, "select_rows", lambda *a, **k: None)
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk))
+    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk, prompt_rows=exl3_mm.MOE_CHUNK_WINDOW))   # 2,048-row chunks
     buf = SimpleNamespace(logits=torch.zeros((rows, 1)), pick=torch.zeros((rows, slots), dtype=torch.int32),
                           wts=torch.zeros((rows, slots)), slots=slots,
                           y=torch.zeros((rows, slots, dims), dtype=torch.bfloat16))
@@ -436,7 +439,7 @@ def test_the_scratch_and_the_admission_take_the_window(monkeypatch, chunk):
     from tensorfold.cuda import geometry
     from tensorfold.families.qwen4_exp.cuda import exl3_mm, exl3_pack
 
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk))
+    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk, prompt_rows=exl3_mm.MOE_CHUNK_WINDOW))   # 2,048-row chunks
     window = 2048 if chunk else 1024
     seen = []
     monkeypatch.setattr(geometry, "exl3_indexed_scratch", lambda text, w, rows: seen.append(w) or 0)

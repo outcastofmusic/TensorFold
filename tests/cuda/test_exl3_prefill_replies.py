@@ -1,7 +1,7 @@
 """Flash Next EXL3 replies with the prompt-window switches off, on, off on one load (two loads of some checkpoints
 already differ, so comparing loads would test that): TF_EXL3_GROUP_SCAN, TF_EXL3_DOWN_FUSE, TF_EXL3_GATEUP_FUSE and
 TF_FLASHNEXT_MOE_CHUNK, on top of today's defaults (TF_EXL3_EXPERT_ITEMS, TF_FLASHNEXT_STACK_DIRECT and
-TF_FLASHNEXT_MOE_DIRECT on). The pack loads with the chunk window on, so its routed scratch holds 2,048 rows and either
+TF_FLASHNEXT_MOE_DIRECT on). The pack loads with the chunk window on, so its routed scratch holds 4,096 rows and either
 window runs on the one load.
 
 - Flash Next EXL3 3.05 bpw: a 4,700-token prompt in 2,048-row chunks (two whole chunks and a partial one, which every
@@ -73,9 +73,9 @@ def flash_next():
         pytest.skip("the Flash Next EXL3 pack is not here")
     from tensorfold.families.qwen4_exp.cuda.weights import load
 
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=True))                 # the routed scratch for 2,048-row calls
+    exl3_mm.use(exl3_mm.Switches(moe_chunk=True))                 # the routed scratch for 4,096-row calls
     w = load(FN_PACK, mtp=True, draft_vocab=None, f16_narrow=True, hc_fuse=True)
-    assert w.x3.moe.rows == exl3_mm.MOE_CHUNK_WINDOW
+    assert w.x3.moe.rows == exl3_mm.PROMPT_ROWS
     yield w
     del w
     _free()
