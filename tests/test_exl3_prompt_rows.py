@@ -30,14 +30,14 @@ def restore(monkeypatch):
     exl3_mm.use(before)
 
 
-@pytest.mark.parametrize("value, rows, window", [(None, 2048, 2048), ("2048", 2048, 2048), ("4096", 4096, 4096),
+@pytest.mark.parametrize("value, rows, window", [(None, 4096, 4096), ("2048", 2048, 2048), ("4096", 4096, 4096),
                                                  ("1024", 1024, 1024), ("8192", 8192, 4096)])
 def test_the_prompt_rows_and_their_routed_window(monkeypatch, value, rows, window):
     if value is not None:
         monkeypatch.setenv(ENV, value)
     got = exl3_mm.read()
     assert got.prompt_rows == rows
-    assert dataclasses.replace(got, prompt_rows=2048) == exl3_mm.Switches()    # the other switches keep their defaults
+    assert dataclasses.replace(got, prompt_rows=4096) == exl3_mm.Switches()    # the other switches keep their defaults
     exl3_mm.use(got)
     assert exl3_mm.moe_window() == window
     exl3_mm.use(dataclasses.replace(got, moe_chunk=False))
@@ -45,7 +45,7 @@ def test_the_prompt_rows_and_their_routed_window(monkeypatch, value, rows, windo
 
 
 def test_unset_is_the_served_chunk():
-    assert exl3_mm.Switches().prompt_rows == exl3_mm.MOE_CHUNK_WINDOW == 2048
+    assert exl3_mm.Switches().prompt_rows == exl3_mm.PROMPT_ROWS == exl3_mm.MOE_MOST_ROWS == 4096
 
 
 @pytest.mark.parametrize("value", ["255", "16385", "4k"])

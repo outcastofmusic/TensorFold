@@ -70,13 +70,14 @@ def test_the_chunk_window_flag(monkeypatch, value, on):
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
 
     monkeypatch.delenv(exl3_mm.MOE_CHUNK_ENV, raising=False)
+    monkeypatch.delenv("TENSORFOLD_PREFILL_ROWS", raising=False)
     if value is not None:
         monkeypatch.setenv(exl3_mm.MOE_CHUNK_ENV, value)
     got = exl3_mm.read()
     assert got.moe_chunk is on
     assert (got.stack_direct, got.inner_k, got.moe_direct) == (True, False, True)
     exl3_mm.use(got)
-    assert exl3_mm.moe_window() == (2048 if on else 1024)
+    assert exl3_mm.moe_window() == (exl3_mm.PROMPT_ROWS if on else 1024)
 
 
 @pytest.mark.parametrize("value", ["2", "chunk", "1.0"])
@@ -418,7 +419,7 @@ def test_a_chunk_takes_one_routed_call_of_its_rows(monkeypatch, chunk, rows):
     monkeypatch.setattr(experts, "routed", routed)
     monkeypatch.setattr(forward.moe_mod, "router", lambda *a, **k: None)
     monkeypatch.setattr(forward.moe_mod, "select_rows", lambda *a, **k: None)
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk))
+    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk, prompt_rows=exl3_mm.MOE_CHUNK_WINDOW))   # 2,048-row chunks
     buf = SimpleNamespace(logits=torch.zeros((rows, 1)), pick=torch.zeros((rows, slots), dtype=torch.int32),
                           wts=torch.zeros((rows, slots)), slots=slots,
                           y=torch.zeros((rows, slots, dims), dtype=torch.bfloat16))
@@ -438,7 +439,7 @@ def test_the_scratch_and_the_admission_take_the_window(monkeypatch, chunk):
     from tensorfold.cuda import geometry
     from tensorfold.families.qwen4_exp.cuda import exl3_mm, exl3_pack
 
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk))
+    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk, prompt_rows=exl3_mm.MOE_CHUNK_WINDOW))   # 2,048-row chunks
     window = 2048 if chunk else 1024
     seen = []
     monkeypatch.setattr(geometry, "exl3_indexed_scratch", lambda text, w, rows: seen.append(w) or 0)
