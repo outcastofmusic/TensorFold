@@ -537,6 +537,9 @@ class App:
         # the template's calls hide at once; a one-call request filters with ToolCallPolicy instead
         own_opener = self._call_opener() if tools and not policy.single else None
 
+        def accept(envelope: str) -> bool:     # a one-call request's envelope: shown as text unless it is the call
+            return parse_tool_calls(envelope, tools, max_calls=1)[1] is not None
+
         def visible(finished: bool) -> tuple[str, str]:
             raw = stream.final() if finished else stream.text
             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
@@ -549,7 +552,7 @@ class App:
                 reasoning, answer = "", raw
             answer_raw[0] = answer
             if tools:
-                answer = (policy.content(answer, finished=finished) if policy.single
+                answer = (policy.content(answer, finished=finished, accept=accept) if policy.single
                           else hide_tool_calls(answer, finished=finished, opener=own_opener))
             return reasoning, answer
 
@@ -686,7 +689,8 @@ class App:
             text += close_call(text, tools)
         raw_answer = split_thinking(text, finished=True, close_at=stream.close_at)[1] if chat and thinking else text
         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
-        content = policy.content(content) if tools else content
+        if tools and policy.single:      # the stream's filter over the same text, so rejected envelopes stay
+            content = policy.content(raw_answer, accept=accept).strip()
         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
         if tail:
             final["content"] = tail

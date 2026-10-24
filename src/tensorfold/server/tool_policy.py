@@ -1,5 +1,5 @@
 import re
-from typing import Any
+from typing import Any, Callable
 
 from tensorfold.server.errors import RequestError
 from tensorfold.server.text import _CALLS, _LEADS
@@ -13,9 +13,14 @@ _FIXED = tuple((opener, closer, _LEADS.get(opener, ())) for opener, closer in _C
 
 
 class _ToolTextFilter:
-    """Hide tool envelopes while retaining only a partial tag between prose deltas."""
+    """Hide tool envelopes while retaining only a partial tag between prose deltas.
 
-    def __init__(self):
+    With ``accept`` (an envelope's text -> whether it parses to an offered call), a closed envelope that is rejected
+    before the one call shows as text, and the first accepted one is the call; without it every envelope hides."""
+
+    def __init__(self, accept: Callable[[str], bool] | None = None):
+        self.accept, self.called = accept, False
+        self.envelope: list[str] = []   # the hidden envelope's text so far, for ``accept``
         self.pending = ""
         self.hidden = None              # the closer the hidden envelope ends at
         self.opened = None              # (closer, leads) of an opener whose payload has not shown a lead yet
@@ -29,10 +34,19 @@ class _ToolTextFilter:
                 close = self.hidden
                 end = self.pending.lower().find(close)
                 if end < 0:
-                    self.pending = self.pending[-(len(close) - 1):]
+                    keep = len(close) - 1
+                    self.envelope.append(self.pending[:max(0, len(self.pending) - keep)])
+                    self.pending = self.pending[-keep:]
                     break
+                self.envelope.append(self.pending[:end + len(close)])
                 self.pending = self.pending[end + len(close):]
                 self.hidden = None
+                if self.accept is not None and not self.called:
+                    envelope = "".join(self.envelope)
+                    if self.accept(envelope):
+                        self.called = True
+                    else:
+                        out.append(envelope)
                 continue
             if self.opened:
                 closer, leads = self.opened
@@ -43,7 +57,7 @@ class _ToolTextFilter:
                     break
                 self.opened = None
                 if payload.startswith(leads):
-                    self.hidden = closer
+                    self.hidden, self.envelope = closer, list(self.held)
                 else:                                                  # prose that names the opener
                     out.extend(self.held)
                 self.held = []
@@ -64,7 +78,7 @@ class _ToolTextFilter:
                 if leads:
                     self.opened, self.held = (closer.lower(), leads), [opener]
                 else:
-                    self.hidden = closer.lower()
+                    self.hidden, self.envelope = closer.lower(), [opener]
                 continue
             end = self.pending.find(">")
             if end < 0:
@@ -80,7 +94,7 @@ class _ToolTextFilter:
                 continue
             name = self.pending[1:end]
             if re.fullmatch(r"(?:[A-Za-z_][\w.-]*:)?tool_call", name, flags=re.I):
-                self.hidden = f"</{name.lower()}>"
+                self.hidden, self.envelope = f"</{name.lower()}>", [self.pending[:end + 1]]
             else:
                 out.append(self.pending[:end + 1])
             self.pending = self.pending[end + 1:]
@@ -124,9 +138,9 @@ class ToolCallPolicy:
     def flush(self) -> str:
         return self._text.finish() if self.single else ""
 
-    def content(self, text: str, *, finished: bool = True) -> str:
+    def content(self, text: str, *, finished: bool = True, accept: Callable[[str], bool] | None = None) -> str:
         if self.single:
-            filtered = _ToolTextFilter()
+            filtered = _ToolTextFilter(accept)
             return filtered.feed(text) + (filtered.finish() if finished else "")
         return text
 
