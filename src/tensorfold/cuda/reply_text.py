@@ -20,20 +20,26 @@ _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parame
 
 
 class StreamDecoder:
-    """Decode a shared token window to preserve leading spaces and byte boundaries, deferring incomplete characters."""
+    """Decode a shared token window to preserve leading spaces and byte boundaries, deferring incomplete characters.
 
-    def __init__(self, tok, skip: tuple[int, ...] = ()):
-        self.tok, self.skip = tok, frozenset(skip)
+    With ``close``, the think block's close token, ``close_at`` is where that token's text begins (-1 before it
+    comes), for ``split_thinking``; None without it."""
+
+    def __init__(self, tok, skip: tuple[int, ...] = (), close: int | None = None):
+        self.tok, self.skip, self.close = tok, frozenset(skip), close
         self.ids: list[int] = []
         self.text = ""
         self.prefix = 0             # window start
         self.read = 0               # tokens already reflected in ``text``
+        self.close_at: int | None = None if close is None else -1
 
     def _decode(self, ids: list[int]) -> str:
         return self.tok.decode(ids, skip_special_tokens=False)
 
     def add(self, new: list[int]) -> str:
         self.ids.extend(t for t in new if t not in self.skip)
+        if self.close_at == -1 and self.close in new:           # once a reply: the text before its first close
+            self.close_at = len(self._decode(self.ids[:self.ids.index(self.close)]))
         before = self._decode(self.ids[self.prefix:self.read])
         after = self._decode(self.ids[self.prefix:])
         if len(after) > len(before) and not after.endswith("\ufffd"):

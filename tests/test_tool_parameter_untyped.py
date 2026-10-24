@@ -7,8 +7,8 @@ from tensorfold.tool_parameters import decode_parameter, typed_parameter
 
 @pytest.mark.parametrize("schema,value", [
     ({}, "None"),                          # no type at all
-    ({"type": ["integer", "null"]}, "5"),   # a list where a type name belongs
-    ({"type": "weird"}, "None"),            # a name the type dict does not name
+    ({"type": "weird"}, "None"),            # a name that is no JSON kind
+    ({"type": ["weird", "string"]}, "5"),   # a list whose only kind is a string
     ({"type": "string"}, "7.5"),            # a scalar type that takes no decode path
 ])
 def test_untyped_schemas_keep_the_text(schema, value):

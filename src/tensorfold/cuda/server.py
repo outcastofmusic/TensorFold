@@ -530,26 +530,29 @@ class App:
         sent = {"reasoning": 0, "content": 0}
         stopped = {"client": False, "stop": False}
         failed: list[Exception] = []
-        stream = StreamDecoder(self.tok, ends)
+        stream = StreamDecoder(self.tok, ends, self.tok.token_to_id("</think>") if chat and thinking else None)
         # calls stream as argument deltas while written (as on the Mac); one-call requests keep the end parser
         calls_stream = ToolCallStreamer(tools) if tools and not policy.single else None
         answer_raw = [""]
         # the template's calls hide at once; a one-call request filters with ToolCallPolicy instead
         own_opener = self._call_opener() if tools and not policy.single else None
 
+        def accept(envelope: str) -> bool:     # a one-call request's envelope: shown as text unless it is the call
+            return parse_tool_calls(envelope, tools, max_calls=1)[1] is not None
+
         def visible(finished: bool) -> tuple[str, str]:
             raw = stream.final() if finished else stream.text
             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
             raw = stops.visible(raw, partial=not finished) if stops.strings else raw
             if chat and thinking:
-                reasoning, answer = split_thinking(raw, finished=finished)
+                reasoning, answer = split_thinking(raw, finished=finished, close_at=stream.close_at)
                 if loop is not None and loop.fired:      # the loop close's phrase is the model's, not the client's
                     reasoning = think_loop.hide(reasoning, finished=finished)
             else:
                 reasoning, answer = "", raw
             answer_raw[0] = answer
             if tools:
-                answer = (policy.content(answer, finished=finished) if policy.single
+                answer = (policy.content(answer, finished=finished, accept=accept) if policy.single
                           else hide_tool_calls(answer, finished=finished, opener=own_opener))
             return reasoning, answer
 
@@ -684,9 +687,10 @@ class App:
         text = stops.visible(raw_text)
         if tools and out and out[-1] in ends and not stopped["stop"]:   # the end token came inside a call: close it
             text += close_call(text, tools)
-        raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
+        raw_answer = split_thinking(text, finished=True, close_at=stream.close_at)[1] if chat and thinking else text
         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
-        content = policy.content(content) if tools else content
+        if tools and policy.single:      # the stream's filter over the same text, so rejected envelopes stay
+            content = policy.content(raw_answer, accept=accept).strip()
         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
         if tail:
             final["content"] = tail

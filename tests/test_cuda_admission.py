@@ -222,7 +222,7 @@ def test_template_tools_and_thinking_are_prepared_once(model_dir):
         return original_tok.encode(*args, **kwargs)
 
     app.template = SimpleNamespace(render=render)
-    app.tok = SimpleNamespace(encode=encode, decode=original_tok.decode)
+    app.tok = SimpleNamespace(encode=encode, decode=original_tok.decode, token_to_id=original_tok.token_to_id)
     body = request(8, True, max_tokens=1, stream=True,
                    tools=[{"type": "function", "function": {"name": "test"}}],
                    chat_template_kwargs={"enable_thinking": True, "suffix": "extra"})
