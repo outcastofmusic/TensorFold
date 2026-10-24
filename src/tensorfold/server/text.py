@@ -34,8 +34,13 @@ def _partial_tag(text: str, tag: str) -> int:
     return 0
 
 
-def split_thinking(text: str, *, finished: bool, markers: tuple[str, str] = THINK_MARKERS) -> tuple[str, str]:
-    """(reasoning, answer) of a thinking reply; while it streams, a tail that could begin a marker is held back."""
+def split_thinking(text: str, *, finished: bool, markers: tuple[str, str] = THINK_MARKERS,
+                   close_at: int | None = None) -> tuple[str, str]:
+    """(reasoning, answer) of a thinking reply; while it streams, a tail that could begin a marker is held back.
+
+    ``close_at`` is where the model's close token begins in ``text`` (``StreamDecoder.close_at``), -1 before it
+    comes, None when the tokenizer has no such token: then the first spelling of the closer ends the reasoning, so a
+    reply that quotes the tag while it reasons would end there. Read with the default markers only."""
 
     # Gemma 4 can open its thought channel after visible text. Strip that block wherever it opens.
     opener, closer = markers
@@ -52,7 +57,10 @@ def split_thinking(text: str, *, finished: bool, markers: tuple[str, str] = THIN
         return "", text                                      # a finished reply that never opened the block
     if opener:
         text = text[len(opener):].lstrip("\n")
-    end = text.find(closer)
+    if close_at is None:
+        end = text.find(closer)
+    else:                       # the token's place; one the tag is not at (a stop string cut it) closes nothing
+        end = close_at if close_at >= 0 and text.startswith(closer, close_at) else -1
     if end >= 0:
         return text[:end], text[end + len(closer):].lstrip("\n")
     call = min((at for at in (text.find(opener) for opener, _ in _CALLS) if at >= 0), default=-1)
