@@ -6,6 +6,10 @@ import ast
 import json
 from collections.abc import Sequence
 from typing import Any
+from urllib.parse import unquote
+
+_UNIONS = ("anyOf", "oneOf", "allOf")
+_KINDS = frozenset({"array", "object", "boolean", "integer", "number", "null", "string"})
 
 
 def parameter_schemas(tools: Sequence[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
@@ -18,15 +22,87 @@ def parameter_schemas(tools: Sequence[dict[str, Any]] | None) -> dict[str, dict[
         function = tool["function"] if isinstance(tool.get("function"), dict) else tool
         parameters = function.get("parameters") or function.get("input_schema") or {}
         properties = parameters.get("properties") or {} if isinstance(parameters, dict) else {}
+        refs: dict[str, dict[str, Any] | None] = {}
         result[str(function.get("name", "")).lower()] = {
-            name: schema for name, schema in properties.items() if isinstance(schema, dict)
+            name: _resolved(schema, parameters, refs) for name, schema in properties.items() if isinstance(schema, dict)
         } if isinstance(properties, dict) else {}
     return result
 
 
-def typed_parameter(schema: dict[str, Any]) -> bool:
+def _pointer(root: Any, ref: str) -> Any:
+    """The node a local JSON pointer (``#/$defs/a~1b``) names in ``root``, else None."""
+
+    if not ref.startswith("#"):
+        return None
+    node = root
+    for part in unquote(ref[1:]).split("/")[1:]:
+        if "~" in part.replace("~0", "").replace("~1", ""):
+            return None                                     # a tilde that escapes nothing
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return None
+    return node
+
+
+def _resolved(schema: dict[str, Any], root: Any, refs: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
+    """``schema`` with its ``$ref`` (and its unions' refs) inlined as an ``allOf`` branch, each ref resolved once.
+
+    A ref that points nowhere or back into itself (None in ``refs`` while it resolves) constrains nothing."""
+
+    out = {k: ([_resolved(b, root, refs) if isinstance(b, dict) else b for b in v] if k in _UNIONS and isinstance(v, list)
+               else v) for k, v in schema.items() if k != "$ref"}
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        if ref not in refs:
+            refs[ref] = None
+            target = _pointer(root, ref)
+            refs[ref] = _resolved(target, root, refs) if isinstance(target, dict) else None
+        if refs[ref] is not None:
+            out["allOf"] = [*(out.get("allOf") if isinstance(out.get("allOf"), list) else []), refs[ref]]
+    return out
+
+
+def _kind_of(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    return {int: "integer", float: "number", str: "string", list: "array", dict: "object"}.get(type(value), "null")
+
+
+def _widened(kinds: set[str]) -> frozenset[str]:
+    return frozenset(kinds | {"integer"} if "number" in kinds else kinds)     # an integer is a number
+
+
+def schema_kinds(schema: dict[str, Any]) -> frozenset[str] | None:
+    """The JSON kinds a schema takes, from its type or type list, enum, const and unions (refs inlined by
+    ``parameter_schemas``), each a constraint that meets the others; None when nothing constrains it."""
+
+    constraints: list[frozenset[str]] = []
     kind = schema.get("type")
-    return isinstance(kind, str) and kind in {"array", "object", "boolean", "integer", "number", "null"}
+    named = _KINDS & ({kind} if isinstance(kind, str) else set(kind) if isinstance(kind, list) else set())
+    if named:                                   # a type that names no JSON kind constrains nothing
+        constraints.append(_widened(named))
+    if isinstance(schema.get("enum"), list):
+        constraints.append(frozenset(_kind_of(v) for v in schema["enum"]))
+    if "const" in schema:
+        constraints.append(frozenset({_kind_of(schema["const"])}))
+    for key in ("anyOf", "oneOf"):
+        branches = [schema_kinds(b) for b in schema.get(key) or [] if isinstance(b, dict)]
+        if branches and None not in branches:
+            constraints.append(frozenset().union(*branches))
+    for branch in schema.get("allOf") or []:
+        kinds = schema_kinds(branch) if isinstance(branch, dict) else None
+        if kinds is not None:
+            constraints.append(kinds)
+    return frozenset.intersection(*constraints) if constraints else None
+
+
+def typed_parameter(schema: dict[str, Any]) -> bool:
+    kinds = schema_kinds(schema)
+    return kinds is not None and bool(kinds - {"string"})
 
 
 def closed_json(text: str) -> str | None:
@@ -71,19 +147,16 @@ def _python_literal(text: str) -> Any:
 def decode_parameter(value: str, schema: dict[str, Any], *, python: bool = True) -> Any:
     """``value`` as the schema's type when it spells one, else the text; ``python`` also reads Python's spelling."""
 
-    if not typed_parameter(schema):
+    kinds = schema_kinds(schema)
+    if kinds is None or not kinds - {"string"}:
         return value
-    kind = schema["type"]
-    valid = {
-        "array": lambda v: isinstance(v, list),
-        "object": lambda v: isinstance(v, dict),
-        "boolean": lambda v: isinstance(v, bool),
-        "integer": lambda v: type(v) is int,
-        "number": lambda v: type(v) in (int, float),
-        "null": lambda v: v is None,
-    }[kind]
+    taken = kinds - {"string"}                  # a quoted string keeps the text the model wrote
+
+    def valid(v: Any) -> bool:
+        return _kind_of(v) in taken
+
     # a model can end an object or array value one closer short (#87): the value closed is what it meant
-    for text in (value, closed_json(value) if kind in ("array", "object") else None):
+    for text in (value, closed_json(value) if taken & {"array", "object"} else None):
         if text is None:
             continue
         try:
