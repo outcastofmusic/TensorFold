@@ -7,7 +7,7 @@
 #   ./run.sh qwen-flash-next-fp4   Qwen3.8 Flash Next from NVIDIA's FP4-Local checkpoint (QAD NVFP4), Clef-Flash beside it
 #   ./run.sh nemotron-bolt     Nemotron 3.5 Bolt 74B-A9B (24 GB) with its LiLiCorr draft model
 #   ./run.sh lfm2-24b          Liquid's LFM2.5-24B-A2B (block FP8, 24.75 GB): tool routing and sub-agents
-#   ./run.sh nemotron-3.5-super    Nemotron 3.5 Super VL 120B-A12B (NVFP4, 75.1 GB) on upstream's native 1.1.0 server
+#   ./run.sh nemotron-3.5-super    Nemotron 3.5 Super VL 120B-A12B (NVFP4, 75.1 GB) on upstream's native 1.1.3 server
 #                              With D1=1 each model target but GLM also starts d1-3B, Liquid AI's decision model, on :30003 once
 #                              the model answers (POST /v1/systemone and /v1/decisions; docs/d1-sidecar.md)
 #   ./run.sh swap              one endpoint on 127.0.0.1:30000 that loads whichever model a request names (swap.py)
@@ -34,7 +34,7 @@
 # LFM2:  CONTEXT=131072 (KV 20 KiB a token)  THINK_BUDGET=8000 (0: none); one stream, no drafts, no disk states.
 #        LFM Open License v1.0: commercial use is licensed only under US$10M annual revenue
 # Super: CONTEXT=131072  THINK_BUDGET=8000 (0: none); --precision checkpoint, --vision, MTP drafts; no Clef, no disk states
-#        NATIVE=$MODELS/tensorfold-1.1.0-linux-aarch64: the native server's bin/ and lib/ (./prepare.sh nemotron-3.5-super)
+#        NATIVE=$MODELS/tensorfold-1.1.3-linux-aarch64: the native server's bin/ and lib/ (./prepare.sh nemotron-3.5-super)
 set -euo pipefail
 shopt -s inherit_errexit            # a failure inside $(image) stops the caller too
 
@@ -283,16 +283,16 @@ lfm2() {
 # No Clef: it guards Qwen. d1 fits beside it: 7.3 GiB of the 40.
 super() {
     local model="${SUPER_MODEL:-$MODELS/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4}"
-    NATIVE="${NATIVE:-$MODELS/tensorfold-1.1.0-linux-aarch64}"
+    NATIVE="${NATIVE:-$MODELS/tensorfold-1.1.3-linux-aarch64}"
     [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh nemotron-3.5-super)"
     [ -x "$NATIVE/bin/tensorfold-native" ] || die "no native server at $NATIVE/bin/tensorfold-native (run ./prepare.sh nemotron-3.5-super)"
-    # WebP does not serve: 1.1.0 decodes it only through libwebp 1.6.0's libwebpdecoder, which the archive does not ship
+    # WebP does not serve: 1.1.3 decodes it only through libwebp 1.6.0's libwebpdecoder, which the archive does not ship
     [ -e "$NATIVE/lib/libturbojpeg.so.0" ] || echo "run: no $NATIVE/lib/libturbojpeg.so.0, so the server refuses JPEG images (PNG serves)" >&2
     local budget=()
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
     [ "${D1:-0}" = 0 ] || IMAGE=$(image)          # only d1 runs this checkout's image
     stop_all
-    # 1.1.0 allocates its prompt cache up front (16 GiB by default: 49 snapshot slots plus copied rows), where 1.0.12 only
+    # 1.1.0 and later allocate the prompt cache up front (16 GiB by default: 49 snapshot slots plus copied rows), where 1.0.12 only
     # capped it; at 6 GiB Super leaves room for d1 beside it (18 Oct: 20 GiB available alone with the default)
     serve_native tensorfold-super -- "$model" --host 127.0.0.1 --port "$PORT" --name nemotron-3.5-super \
         --context "${CONTEXT:-131072}" --max-tokens "${CONTEXT:-131072}" --precision checkpoint --vision \
