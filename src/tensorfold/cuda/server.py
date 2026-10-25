@@ -91,7 +91,7 @@ class App:
     def __init__(self, engine, model_dir: Path, served: str, *, default_thinking: bool = False,
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
                  context_window: int | None = None, reasoning_effort: str | None = None, thinking_budget: int = 0,
-                 aliases: tuple[str, ...] | list[str] = (), vision_max_images: int | None = None,
+                 answer_budget: int = 0, aliases: tuple[str, ...] | list[str] = (), vision_max_images: int | None = None,
                  vision_image_tokens: int | None = None,
                  background_ids: tuple[str, ...] | frozenset[str] = ()):
         from tokenizers import Tokenizer
@@ -113,6 +113,7 @@ class App:
         self.reasoning_effort, self.thinking_budget = reasoning_effort, int(thinking_budget)   # the Mac's defaults
         self.sampling = {"temperature": 1.0, "top_k": 20, "top_p": 0.95, **(sampling or {})}
         self.max_tokens = int(max_tokens)
+        self.answer_budget = int(answer_budget)       # --answer-budget: thinking off and no max_tokens asked
         self.native_context_window = _native_context(model_dir)
         self.context_window = self.native_context_window if context_window is None else int(context_window)
         if self.context_window < 0:
@@ -332,6 +333,10 @@ class App:
         kwargs.pop("enable_thinking", None)
         kwargs.pop("reasoning_effort", None)
         thinking = bool(fields.get("enable_thinking", self.default_thinking))
+        if not thinking and body.get("max_tokens") is None and body.get("max_completion_tokens") is None:
+            # GLM-5.3 with thinking off reasons in its answer on 3 of 176 coding replies and ran to the 98k window
+            # (tf-runs/bench3, 19 Oct), where its longest finished reply was 18,279 tokens
+            max_tokens = min(max_tokens, getattr(self, "answer_budget", 0) or max_tokens)
         effort = heard_effort(fields.get("reasoning_effort"), getattr(self, "reasoning_effort", None), levels)
         if thinking and effort:
             kwargs["reasoning_effort"] = effort

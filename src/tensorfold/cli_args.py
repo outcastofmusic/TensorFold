@@ -70,6 +70,10 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                                  "rule. xhigh stays xhigh, so GLM-5.3 renders it as Max")
     generation.add_argument("--thinking-budget", type=int, default=0,
                             help="most thinking tokens before the server closes the think block (0: no limit)")
+    generation.add_argument("--answer-budget", type=int, default=0,
+                            help="CUDA: most reply tokens with thinking off for a request that names no max_tokens "
+                                 "(0: --max-tokens). A model that reasons in its answer when thinking is off ends "
+                                 "there with finish_reason length")
     generation.add_argument("--thinking-guard", metavar="URL", default=None,
                             help="CUDA: a decision server's /v1 base (such as a TensorFold serving Clef). After each "
                                  "paragraph of thinking its /systemone is asked whether the thinking is enough; a yes "

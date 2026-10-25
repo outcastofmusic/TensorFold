@@ -27,7 +27,7 @@
 #   QWEN_MODEL, QWEN_FP4_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL, SUPER_MODEL, D1_MODEL   another checkpoint folder under $MODELS
 # Qwen, Qwen FP4, GLM:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused;  Qwen: STATES_ALL=0: each slot's shortest and longest state go to disk (1: every kept state)
 # Qwen:  CONTEXT=262144  PARALLEL=4  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
-# GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)   COPIES=1 (0: no copy drafts in DFlash2 rounds)
+# GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   ANSWER_BUDGET=24576 (thinking off, no max_tokens asked; 0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)   COPIES=1 (0: no copy drafts in DFlash2 rounds)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
 # Qwen FP4-Local: Qwen's settings, VISION=0 by default (the image tower run.sh converts belongs to the EXL3 pack)
 # Bolt:  CONTEXT=131072 (a stream's KV is 8 KiB a token)  THINK_BUDGET=8000 (0: none); no disk states, one stream
@@ -317,6 +317,9 @@ glm() {
     # (2026-10-15/16). Each such turn also costs the next one its reasoning again as prompt, at about 310 tok/s.
     local budget=()
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
+    # with thinking off GLM reasons in its answer on 3 of 176 coding replies and ran to the 98k window (40-45 min);
+    # its longest finished reply was 18,279 tokens (tf-runs/bench3). A request that names max_tokens keeps it
+    budget+=(--answer-budget "${ANSWER_BUDGET:-24576}")
     # kept prompt states also go to disk, so a conversation's next turn after a swap or restart reads its state back
     local states=()
     [ "${STATES:-1}" = 0 ] || states=(-v tensorfold-states:/states -e TENSORFOLD_GLM_STATES=/states -e "TENSORFOLD_GLM_STATES_GIB=${STATES_GIB:-64}" -e "TENSORFOLD_GLM_STATES_TTL_H=${STATES_TTL_H:-72}")
