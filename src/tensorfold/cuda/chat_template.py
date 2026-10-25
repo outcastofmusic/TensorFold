@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from tensorfold.cuda.request_text import RequestText
 from tensorfold.server.messages import _normalize_tool_call_arguments, late_system_role, normalize_messages
 from tensorfold.server.request_options import effort_levels
 
@@ -59,10 +60,30 @@ class ChatTemplate:
             lambda messages: self.template.render(**self.specials, messages=messages, add_generation_prompt=False))
 
     def render(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None,
-               enable_thinking: bool, extra: dict[str, Any] | None = None, allow_images: bool = False) -> str:
+               enable_thinking: bool, extra: dict[str, Any] | None = None, allow_images: bool = False,
+               request: RequestText | None = None) -> str:
+        """The rendered prompt. With ``request``, a control-token spelling in the request's strings renders as an
+        escape (``cuda.request_text``), and only the template's own spellings stay literal."""
+
         messages = _normalize_tool_call_arguments(normalize_messages(messages, late_system=self.late_system,
                                                                      allow_images=allow_images))
         kwargs = dict(self.specials, messages=messages, tools=tools or None, add_generation_prompt=True,
                       enable_thinking=enable_thinking)
         kwargs.update(extra or {})
-        return self.template.render(**kwargs)
+        if request is None or not request.holds([messages, tools, extra]):
+            return self.template.render(**kwargs)
+        import jinja2
+
+        marked = request.seal(self.template.render(**dict(kwargs, messages=request.mark(messages),
+                                                          tools=request.mark(tools) or None,
+                                                          **request.mark(extra or {}))))
+        try:
+            same = request.unmark(marked) == self.template.render(**kwargs)
+        except jinja2.exceptions.TemplateError:
+            same = False
+        if not same:
+            # the template tests the request's text for a spelling (Qwen's ``<tool_response>`` user turns): it saw
+            # the escape instead, and the escaped rendering stands
+            print("[tensorfold] the chat template branched on a control-token spelling in the request; "
+                  "it rendered the spelling as plain text", flush=True)
+        return marked

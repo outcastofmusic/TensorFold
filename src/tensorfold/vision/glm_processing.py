@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -61,7 +61,9 @@ class GLMImageProcessor:
         return cls(config, processor)
 
     def prepare(self, rendered_prompt: str, images: Sequence[Any], *, max_visual_tokens: int = 4096,
-                max_prompt_tokens: int | None = None) -> PreparedGLMVisionPrompt:
+                max_prompt_tokens: int | None = None,
+                encode: Callable[[str], list[int]] | None = None) -> PreparedGLMVisionPrompt:
+        """``encode`` (the server's own, for escaped request text) replaces the checkpoint tokenizer's."""
         if not images or max_visual_tokens < 1:
             raise ValueError("GLM image preprocessing needs images and a positive visual-token budget")
         if rendered_prompt.count(self.image_marker) != len(images):
@@ -99,8 +101,11 @@ class GLMImageProcessor:
             raise ValueError("Processed images exceed the visual-token budget; reduce image resolution or count")
         parts = rendered_prompt.split(self.image_marker)
         expanded = parts[0] + "".join(self.image_marker * n + suffix for n, suffix in zip(counts, parts[1:]))
-        encoded = self.tokenizer(expanded, add_special_tokens=False, return_attention_mask=False)
-        token_ids = tuple(int(t) for t in encoded["input_ids"])
+        if encode is not None:
+            token_ids = tuple(int(t) for t in encode(expanded))
+        else:
+            encoded = self.tokenizer(expanded, add_special_tokens=False, return_attention_mask=False)
+            token_ids = tuple(int(t) for t in encoded["input_ids"])
         if max_prompt_tokens is not None and len(token_ids) > max_prompt_tokens:   # OpenAI's context_length_exceeded
             raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the expanded image prompt has "
                              f"{len(token_ids)} tokens, which exceeds the context window; reduce image resolution or "

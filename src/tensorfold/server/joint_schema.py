@@ -76,9 +76,13 @@ class Encoded:
 
 
 def encode(encode_text: Callable[[str], list[int]], state: Any, questions: dict[str, dict[str, Any]],
-           max_length: int = MAX_LENGTH) -> Encoded:
-    """The release's ``encode_record`` for text: each piece encoded alone, the state cut to fit ``max_length``."""
+           max_length: int = MAX_LENGTH, encode_request: Callable[[str], list[int]] | None = None) -> Encoded:
+    """The release's ``encode_record`` for text: each piece encoded alone, the state cut to fit ``max_length``.
+    ``encode_request`` encodes every piece but the chat frame around them: a control-token spelling in the state or
+    a question (a quoted ``</think>`` in the reasoning a thinking guard sends) is plain text there."""
 
+    frame = encode_text
+    encode_text = encode_request or encode_text
     schema = encode_text("\n\nSCHEMA FIELDS:\n")
     found = []
     for index, (question_id, question) in enumerate(questions.items()):
@@ -101,8 +105,8 @@ def encode(encode_text: Callable[[str], list[int]], state: Any, questions: dict[
         schema += encode_text("END FIELD\n")
         found.append(Question(str(question_id), QUESTION_TYPES[str(question["type"])], span, tuple(spans),
                               tuple(option_ids)))
-    prefix = encode_text(f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\nSTATE:\n")
-    suffix = encode_text("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
+    prefix = frame(f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\nSTATE:\n")
+    suffix = frame("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
     fixed = len(prefix) + len(schema) + len(suffix)
     if fixed > max_length:
         raise DecisionError(f"the schema needs {fixed} tokens before the state; the limit is {max_length}")
@@ -208,10 +212,12 @@ def _head_class():
 class JointSchema:
     """A head over an engine with ``hidden_rows`` (every prompt row's final normed state) and ``head_rows``."""
 
-    def __init__(self, head: Any, engine: Any, encode_text: Callable[[str], list[int]]) -> None:
+    def __init__(self, head: Any, engine: Any, encode_text: Callable[[str], list[int]],
+                 encode_request: Callable[[str], list[int]] | None = None) -> None:
         if not hasattr(engine, "hidden_rows"):
             raise ValueError("this checkpoint has a joint schema head, which this model's CUDA engine cannot run")
         self.head, self.engine, self.encode_text = head, engine, encode_text
+        self.encode_request = encode_request
         self.sessions: OrderedDict[str, tuple[Any, float]] = OrderedDict()   # id -> (kept prefill, last use)
         room = getattr(engine, "room", None)
         if room is not None and hasattr(room, "release"):     # a grow counts the sessions' buffers and may drop them
@@ -220,7 +226,8 @@ class JointSchema:
             room.release = lambda: bool(self.sessions) and self.sessions.popitem(last=False) is not None
 
     @classmethod
-    def load(cls, model_dir: Path, engine: Any, encode_text: Callable[[str], list[int]]) -> JointSchema:
+    def load(cls, model_dir: Path, engine: Any, encode_text: Callable[[str], list[int]],
+             encode_request: Callable[[str], list[int]] | None = None) -> JointSchema:
         """The release's head in bf16 on the GPU, warmed by one small decision so no request pays the kernel builds."""
 
         import torch
@@ -229,7 +236,7 @@ class JointSchema:
         model_dir = Path(model_dir)
         head = _head_class()(**json.loads((model_dir / HEAD_CONFIG).read_text()))
         head.load_state_dict(load_file(str(model_dir / HEAD_FILE)), strict=True)
-        joint = cls(head.to(device="cuda", dtype=torch.bfloat16).eval(), engine, encode_text)
+        joint = cls(head.to(device="cuda", dtype=torch.bfloat16).eval(), engine, encode_text, encode_request)
         joint.logits("warm-up", {"ready": {"type": "noul", "instructions": "Is the server ready?"}})
         return joint
 
@@ -241,7 +248,7 @@ class JointSchema:
         import torch
 
         self._expire()
-        encoded = encode(self.encode_text, state, questions)
+        encoded = encode(self.encode_text, state, questions, encode_request=self.encode_request)
         if not session or not hasattr(self.engine, "hidden_rows_from"):
             hidden, session, cached = self.engine.hidden_rows(encoded.ids), None, 0
         else:

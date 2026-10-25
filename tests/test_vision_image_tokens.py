@@ -39,7 +39,7 @@ def test_each_image_keeps_its_cap_however_large_the_shared_budget():
 
 
 class BudgetFrontend(Frontend):
-    def prepare(self, rendered, images, *, max_prompt_tokens, **budget):
+    def prepare(self, rendered, images, *, max_prompt_tokens, encode=None, **budget):
         self.budget = budget
         return super().prepare(rendered, images, max_prompt_tokens=max_prompt_tokens)
 

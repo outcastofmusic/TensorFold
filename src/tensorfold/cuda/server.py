@@ -121,8 +121,10 @@ class App:
         from tensorfold.server.joint_schema import JointSchema, has_head
 
         if has_head(self.model_dir):          # it answers /v1/decisions and /v1/systemone
+            request = self._prompt_ids().request          # the state and questions encode as plain text
             self.joint = JointSchema.load(self.model_dir, engine,
-                                          lambda text: [int(t) for t in self.tok.encode(text, add_special_tokens=False).ids])
+                                          lambda text: [int(t) for t in self.tok.encode(text, add_special_tokens=False).ids],
+                                          request.ids if request is not None else None)
 
     @property
     def model_ids(self) -> list[str]:
@@ -224,15 +226,13 @@ class App:
 
         def render(content: str) -> str:
             try:
-                return self.template.render([{"role": "user", "content": content}], tools=None, enable_thinking=False)
+                return self.template.render([{"role": "user", "content": content}], tools=None, enable_thinking=False,
+                                            request=self._prompt_ids().request)
             except TemplateError as exc:
                 raise DecisionError(f"the chat template failed: {exc}") from exc
 
-        def encode(text: str) -> list[int]:
-            return [int(token) for token in self.tok.encode(text, add_special_tokens=False).ids]
-
         try:
-            prepared = prompts_for(body, render, encode, context_len=self.effective_context_window)
+            prepared = prompts_for(body, render, self._prompt_ids().encode, context_len=self.effective_context_window)
         except DecisionError as exc:
             raise RequestError(str(exc)) from exc
         turns = self._turns()
@@ -366,7 +366,7 @@ class App:
                     extra = {**kwargs, "add_generation_prompt": False}
                 try:
                     text = self.template.render(messages, tools=tools, enable_thinking=thinking, extra=extra,
-                                                **images)
+                                                request=self._prompt_ids().request, **images)
                 except TemplateError as exc:     # the checkpoint's template refuses the request (``raise_exception``)
                     raise RequestError(f"the chat template rejected the request: {exc}") from exc
                 if continued:
@@ -378,17 +378,23 @@ class App:
                 return text
 
             def answering(text: str) -> bool:
-                """Whether the reply is answer text: thinking is on but the continued turn closed its think block."""
+                """Whether the reply is answer text: thinking is on but the continued turn closed its think block.
+                The rendered text escapes the request's own spellings, so a quoted tag in the reasoning closes nothing."""
 
                 return continued and text.rfind(THINK_MARKERS[1]) > text.rfind("<think>")
 
             if has_images(body["messages"]):
-                rendered = prepare_images(self.vision, body["messages"],
-                                          lambda messages: render(messages, allow_images=True),
+                shown: list[str] = []            # the text the frontend expands, its escapes in place
+
+                def render_images(messages: list[dict[str, Any]]) -> str:
+                    shown.append(render(messages, allow_images=True))
+                    return shown[-1]
+
+                rendered = prepare_images(self.vision, body["messages"], render_images,
                                           context_limit=self._context_limit(),
-                                          limits=getattr(self, "image_limits", DEFAULT_LIMITS))
-                text = self.tok.decode(rendered.tokens, skip_special_tokens=False) if continued else ""
-                thinking = thinking and not answering(text)
+                                          limits=getattr(self, "image_limits", DEFAULT_LIMITS),
+                                          encode=self._prompt_ids().encode)
+                thinking = thinking and not answering(shown[-1] if shown else "")
                 budget = budget if thinking else 0
                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,

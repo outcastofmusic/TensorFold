@@ -40,7 +40,8 @@ def image_slot():
     return IMAGE_SLOTS
 
 
-def prepare_images(frontend, messages, render, *, context_limit=None, limits: ImageLimits = DEFAULT_LIMITS):
+def prepare_images(frontend, messages, render, *, context_limit=None, limits: ImageLimits = DEFAULT_LIMITS,
+                   encode=None):
     from tensorfold.vision.images import ImageInputError, ImageSource, load_images, split_images
 
     if frontend is None:
@@ -56,6 +57,8 @@ def prepare_images(frontend, messages, render, *, context_limit=None, limits: Im
         images = load_images([s for s in sources if isinstance(s, ImageSource)], limits=limits, allow_urls=allow_urls)
         budget = {} if limits.max_visual_tokens == DEFAULT_LIMITS.max_visual_tokens else \
             {"max_visual_tokens": limits.max_visual_tokens}
+        if encode is not None:                          # the server encodes the rendered text itself
+            budget["encode"] = encode
         clips = [s for s in sources if not isinstance(s, ImageSource)]
         if clips:
             from tensorfold.vision.videos import load_videos
