@@ -22,7 +22,6 @@ STACK_DIRECT_ENV = "TF_FLASHNEXT_STACK_DIRECT"
 INNER_K_ENV = "TF_FLASHNEXT_F16_INNER_K"
 MOE_DIRECT_ENV = "TF_FLASHNEXT_MOE_DIRECT"
 MOE_CHUNK_ENV = "TF_FLASHNEXT_MOE_CHUNK"
-MOE_CHUNK_WINDOW = 2048   # TF_FLASHNEXT_MOE_CHUNK: a prompt chunk's rows (geometry.PREFILL_ROWS) in one routed call
 MOE_MOST_ROWS = 4096      # most rows one routed call takes: group_scan_kernel ranks 65,535 picks, 5,957 rows of 11 slots
 PROMPT_ROWS = 4096        # TENSORFOLD_PREFILL_ROWS unset: a prompt chunk's rows on an EXL3 pack
 
@@ -42,7 +41,7 @@ class Switches:
     (``experts.routed(y=...)``), where they wrote fp32 slots that a copy then rounded: 1,024 rows x 11 slots x 2,560
     is 115 MB of fp32 written and read again a window and layer.
     TF_FLASHNEXT_MOE_CHUNK (unset: on; served 8k prefill 1.085x alone, 19 Oct): a prompt chunk's routed experts in one call of
-    MOE_CHUNK_WINDOW rows, where two calls of MOE_WINDOW each read every expert's trellis. The 8,192-token profile
+    all its rows, where two calls of MOE_WINDOW each read every expert's trellis. The 8,192-token profile
     (19 Oct) read about 0.96 GB of expert trellis a window and layer and ran grouped_kernel at about 246 GB/s of DRAM
     traffic. In one call an expert's member groups (about 44 rows, two groups of 32) run next to each other, so the
     second group's weights can come from L2. Rows never depend on the window, so the bytes are the same. The routed

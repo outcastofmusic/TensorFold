@@ -263,6 +263,21 @@ class GlmEngine:
 
         transform = _weight_transform(rule, world, cfg.layers if not self.load_mtp else 0, self.load_mtp,
                                       self.load_mtp or drafter is not None)
+        from tensorfold.env_flags import flag
+        from tensorfold.families.qwen4_exp.cuda.copy_drafts import BACK, most_rows
+
+        # TF_GLM_DFLASH_COPIES (unset: off): DFlash2 rounds verify a copy where the reply repeats earlier text; a
+        # copy's window widens from 6 rows up to TENSORFOLD_COPY_ROWS while copies land whole
+        self.dflash_copies = flag("TF_GLM_DFLASH_COPIES", False)
+        # TF_GLM_COPY_BACK=N: a copy only where its match runs N tokens before the 8 it needs (0: any match)
+        self.copy_back = int(os.environ.get("TF_GLM_COPY_BACK", "0").strip() or 0)
+        if not 0 <= self.copy_back <= BACK:
+            raise ValueError(f"TF_GLM_COPY_BACK: 0 to {BACK} (a match is scored {BACK} tokens back), not {self.copy_back}")
+        from .drafter_choice import COPY_DRAFTS
+
+        self.copy_rows = most_rows(COPY_DRAFTS)           # a copy's first window is the widest graph's
+        # the decode buffers' rows, which the start-up budget counts: copies widen them past MAX_ROWS
+        rows = max(MAX_ROWS, self.copy_rows) if self.dflash_copies and drafter is not None else MAX_ROWS
         self.packed_exl3, adapter_workspace = False, 0
         if world == 1 and getattr(cfg, "quant", "mlx") == "exl3":
             from tensorfold.cuda.capacity import headers
@@ -272,7 +287,7 @@ class GlmEngine:
             if self.packed_exl3:
                 from .weights import packed_residency, workspace_bytes
                 transform = packed_residency(cfg, load_mtp=self.load_mtp)
-                adapter_workspace = workspace_bytes(cfg, checkpoint_headers, rows=MAX_ROWS,
+                adapter_workspace = workspace_bytes(cfg, checkpoint_headers, rows=rows,
                                                     prefill_rows=prefill_rows, load_mtp=self.load_mtp)
 
         def main_geometry(text):
@@ -292,15 +307,6 @@ class GlmEngine:
         self.limit = self.capacity_plan["context_window"]
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
-        from tensorfold.env_flags import flag
-        from tensorfold.families.qwen4_exp.cuda.copy_drafts import BACK, most_rows
-
-        # TF_GLM_DFLASH_COPIES (unset: off): DFlash2 rounds verify a copy where the reply repeats earlier text; a
-        # copy's window widens from 6 rows up to TENSORFOLD_COPY_ROWS while copies land whole
-        self.dflash_copies = flag("TF_GLM_DFLASH_COPIES", False)
-        # TF_GLM_COPY_BACK=N: a copy only where its match runs N tokens before the 8 it needs (0: any match)
-        self.copy_back = int(os.environ.get("TF_GLM_COPY_BACK", "0").strip() or 0)
-        self.copy_rows = most_rows(GRAPH_ROWS[-1] - 1)     # a copy's first window is the widest graph's (COPY_DRAFTS)
         # both ranks must run the same calls: refuse to start when they were given different settings
         mine = [int(drafter is not None), capacity, int(long_context), int(self.serial_only), int(LATENT),
                 prefill_rows, int(self.target_only), int(self.eager), int(self.calibrated), int(self.load_mtp),
@@ -347,7 +353,7 @@ class GlmEngine:
             from .dflash2 import Drafter
 
             self.drafter = Drafter(drafter, w, capacity=capacity, ring=DRAFT_RING)
-        self.e = Engine(w, capacity=capacity, max_rows=max(MAX_ROWS, self.copy_rows), prefill_rows=prefill_rows,
+        self.e = Engine(w, capacity=capacity, max_rows=rows, prefill_rows=prefill_rows,
                         graphs=not self.eager, graph_rows=(1,) if self.serial_only else GRAPH_ROWS,
                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
         if self.drafter is not None and not self.eager:

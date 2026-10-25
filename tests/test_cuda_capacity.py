@@ -1,6 +1,9 @@
 """CUDA startup capacity checks without models or devices."""
 
+import importlib
+import importlib.util
 import json
+import pkgutil
 import math
 import struct
 from types import SimpleNamespace
@@ -9,6 +12,17 @@ import pytest
 
 from tensorfold import cli
 from tensorfold.families.glm5_next.cuda import LATENT
+
+
+@pytest.fixture(autouse=True)
+def glm_switch_modules():
+    """GlmEngine's startup imports GLM's CUDA modules, which import its weights: import them all before a test stubs
+    GLM's weights and decode, so a test does not pass only when an earlier one imported them."""
+    if importlib.util.find_spec("torch") is not None:
+        import tensorfold.families.glm5_next.cuda as glm
+
+        for module in pkgutil.iter_modules(glm.__path__):
+            importlib.import_module(f"{glm.__name__}.{module.name}")
 
 
 def checkpoint(path, config, tensors):

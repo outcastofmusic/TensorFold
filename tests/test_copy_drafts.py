@@ -109,6 +109,15 @@ def test_a_templated_list_copies_the_line_that_matches_furthest_back():
     assert CopyIndex(template).chain(4) and CopyIndex(template, min_back=4).chain(4) == []
 
 
+def test_min_back_takes_the_occurrence_that_reaches_far_enough_over_one_that_fills_the_window():
+    needle, before = list(range(1, 9)), list(range(100, 116))     # the tail's 8 tokens and the 16 before them
+    short = [999] + needle + list(range(300, 380))                  # matches 0 further and fills any window
+    far = before + needle + list(range(60, 70))                     # matches 16 further, 34 tokens follow it
+    context = [5] + short + far + before + needle
+    assert CopyIndex(context).chain(60)[:3] == [300, 301, 302]       # the full window wins without min_back
+    assert CopyIndex(context, min_back=8).chain(60)[:3] == [60, 61, 62]
+
+
 def test_a_tie_goes_to_the_latest_occurrence():
     ctx = [1] + A[:COPY_MATCH] + [2, 3] * 5 + [1] + A[:COPY_MATCH] + [4, 5] * 5 + [1] + A[:COPY_MATCH]
     assert CopyIndex(ctx).chain(4) == [4, 5, 4, 5]

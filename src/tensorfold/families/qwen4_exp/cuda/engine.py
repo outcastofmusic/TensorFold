@@ -184,7 +184,7 @@ class FlashNextEngine:
                                    vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), vision, rank),
                                    rank=rank, world=tp,
                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
-        self.prefill_rows, prompt_workspace = (chunk or PREFILL_ROWS, 0) if exl3 else (chunk, 0) if chunk else prompt_plan(
+        self.prefill_rows, prompt_workspace = (chunk, 0) if exl3 or chunk else prompt_plan(
             self.capacity_plan, config(model_dir), torch.cuda.get_device_capability(), world=tp, vision=vision,
             fp8=prompt_precision.fp8())
         if prompt_workspace:
@@ -430,7 +430,7 @@ class FlashNextEngine:
         most = max(self.depth + 1, getattr(self, "copy_rows", 0))
         widths, steps = range(2, most + 1), max(32, 2 * most)
         if self.multi is not None:
-            start, window, release = self_check.multi_windows(self.multi)
+            start, window, release = self_check.multi_windows(self.multi, steps=steps)
             try:
                 got = self_check.check_widths(start, window, widths=widths, steps=steps)
             finally:

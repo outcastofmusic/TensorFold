@@ -209,3 +209,22 @@ def test_authentication_refuses_before_expect_continue(backend):
             response.read()
         finally:
             connection.close()
+
+
+@pytest.mark.parametrize("backend", ["mlx", "cuda"])
+def test_a_rebound_host_is_refused_before_authentication_on_expect_continue(backend):
+    from tensorfold.server.authentication import KeyStore
+
+    with serving(backend, KeyStore(["fixture-key"])) as (_, port):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            connection.putrequest("POST", "/v1/chat/completions", skip_host=True)
+            connection.putheader("Host", f"rebound.example:{port}")
+            connection.putheader("Content-Length", "100")
+            connection.putheader("Expect", "100-continue")
+            connection.endheaders()
+            response = connection.getresponse()
+            assert response.status == 403
+            response.read()
+        finally:
+            connection.close()

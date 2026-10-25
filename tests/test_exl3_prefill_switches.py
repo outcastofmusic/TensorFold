@@ -419,7 +419,7 @@ def test_a_chunk_takes_one_routed_call_of_its_rows(monkeypatch, chunk, rows):
     monkeypatch.setattr(experts, "routed", routed)
     monkeypatch.setattr(forward.moe_mod, "router", lambda *a, **k: None)
     monkeypatch.setattr(forward.moe_mod, "select_rows", lambda *a, **k: None)
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk, prompt_rows=exl3_mm.MOE_CHUNK_WINDOW))   # 2,048-row chunks
+    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk, prompt_rows=2048))   # 2,048-row chunks
     buf = SimpleNamespace(logits=torch.zeros((rows, 1)), pick=torch.zeros((rows, slots), dtype=torch.int32),
                           wts=torch.zeros((rows, slots)), slots=slots,
                           y=torch.zeros((rows, slots, dims), dtype=torch.bfloat16))
@@ -439,7 +439,7 @@ def test_the_scratch_and_the_admission_take_the_window(monkeypatch, chunk):
     from tensorfold.cuda import geometry
     from tensorfold.families.qwen4_exp.cuda import exl3_mm, exl3_pack
 
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk, prompt_rows=exl3_mm.MOE_CHUNK_WINDOW))   # 2,048-row chunks
+    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk, prompt_rows=2048))   # 2,048-row chunks
     window = 2048 if chunk else 1024
     seen = []
     monkeypatch.setattr(geometry, "exl3_indexed_scratch", lambda text, w, rows: seen.append(w) or 0)

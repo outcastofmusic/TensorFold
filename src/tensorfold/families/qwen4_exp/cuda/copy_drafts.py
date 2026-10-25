@@ -66,7 +66,7 @@ class CopyIndex:
 
     def chain(self, max_nodes: int) -> list[int]:
         """Up to ``max_nodes`` tokens (and the window's) after the earlier copy whose match runs furthest back, the
-        latest on a tie; [] without one, under ``min_match``, or matching less than ``min_back`` further."""
+        latest on a tie, among those matching at least ``min_back`` further; [] without one or under ``min_match``."""
 
         ctx, m = self.ctx, self.m
         if self.rows is not None:
@@ -81,18 +81,17 @@ class CopyIndex:
             if start > len(ctx) - m - 1:                 # the needle itself
                 continue
             cont = ctx[start + m:start + m + want]
-            if len(cont) < m:
+            back = self._back(start)
+            if len(cont) < m or back < self.min_back:
                 continue
             # a continuation that fills the window first (in periodic text the latest occurrences run into the tail
             # and every match reaches far back), then the match's reach, then the continuation's length; ties go to
             # the later occurrence, seen first
-            here = (len(cont) == want, self._back(start), len(cont))
+            here = (len(cont) == want, back, len(cont))
             if here > score:
                 best, score = cont, here
                 if here == (True, BACK, want):
                     break
-        if score[1] < self.min_back:
-            return []
         return best[:max_nodes] if len(best) >= m else []
 
     def _back(self, start: int) -> int:

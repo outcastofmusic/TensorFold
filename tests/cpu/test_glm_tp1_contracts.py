@@ -42,6 +42,12 @@ def definitions(path, names, env=None):
     return scope
 
 
+# the constructor's own imports that the harness keeps real (pure Python): loaded before it replaces their packages
+import tensorfold.cuda.exl3.switches  # noqa: E402,F401
+import tensorfold.env_flags  # noqa: E402,F401
+import tensorfold.families.glm5_next.cuda.drafter_choice  # noqa: E402,F401
+import tensorfold.families.qwen4_exp.cuda.copy_drafts  # noqa: E402,F401
+
 split = source_module(BASE / "cuda/split.py", "split_probe")
 engine = source_module(BASE / "cuda/engine.py", "tensorfold.families.glm5_next.cuda.engine")
 family = source_module(BASE / "__init__.py", "tensorfold.families.glm5_next")
@@ -104,7 +110,9 @@ class ConstructorHarness:
     def construct(self, path, **kwargs):
         def gather(e, values):
             return [list(values) for _ in range(e.world)]
+        # kernel_switches reads its flags from the CUDA modules this harness replaces: their defaults stand
         with patch.dict(sys.modules, self.modules), patch.object(engine.GlmEngine, "_gather_ints", gather), \
+             patch.object(engine, "kernel_switches", lambda: {}), \
              patch.object(engine.GlmEngine, "_calibrate", lambda e: self.calls.append(("calibrate",)) or {"timed": {}, "verify": [1] * 8, "mtp": 0, "mtp_step": 0, "mtp_row": 0, "block": 0, "taps_row": 0}):
             return engine.GlmEngine(path, rank=0, master="test", port=1, **kwargs)
 
