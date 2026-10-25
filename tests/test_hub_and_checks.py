@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from tensorfold import families, hub
-from tensorfold.cli import (_drafter, _dropped_sampling, _generation_config, _model_context, _warn_dropped_sampling,
-                            build_parser, main)
+from tensorfold.cli import (UNREAD_SAMPLING, _drafter, _dropped_sampling, _generation_config, _model_context,
+                            _warn_dropped_sampling, build_parser, main)
 
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
@@ -370,3 +371,26 @@ def test_every_dropped_key_is_named(tmp_path):
         {"repetition_penalty": 1.1, "presence_penalty": 0.5, "no_repeat_ngram_size": 3, "temperature": 0.7}))
     assert _dropped_sampling(tmp_path) == {"repetition_penalty": 1.1, "presence_penalty": 0.5,
                                            "no_repeat_ngram_size": 3}
+
+
+MODELS = Path(os.environ.get("MODELS", str(Path.home() / "models")))
+# each served checkpoint's generation_config.json sampling keys the server drops (d1-3B has no such file)
+SERVED_DROPS = {"Qwen3.8-Flash-Next-exl3-3.05bpw": {}, "Qwen3.8-Flash-Next-FP4-Local": {},
+                "glm53-flash-sushi-experts-mosaic-dense": {}, "Nemotron-3.5-Bolt-74B-A9B-24GB": {},
+                "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4": {}, "LFM2.5-24B-A2B-FP8": {"repetition_penalty": 1.05},
+                "clef-flash": {}, "gemma-4-31B-it-qat-w4a16-ct": {}}
+APPLIED = {"temperature", "top_k", "top_p", "min_p", "do_sample"}
+INERT = {"bos_token_id", "eos_token_id", "pad_token_id", "transformers_version", "_from_model_config", "use_cache",
+         "output_attentions", "output_hidden_states"}       # ids the families read for stops, and bookkeeping
+
+
+@pytest.mark.parametrize("name", sorted(SERVED_DROPS))
+def test_the_served_checkpoints_drops_are_warned_and_every_other_key_is_read_or_inert(name, capsys):
+    path = MODELS / name / "generation_config.json"
+    if not path.is_file():
+        pytest.skip(f"{path} is not here")
+    unknown = set(json.loads(path.read_text())) - APPLIED - INERT - set(UNREAD_SAMPLING)
+    assert unknown == set()             # a new key: apply it, list it in UNREAD_SAMPLING, or show it is inert
+    assert _dropped_sampling(path.parent) == SERVED_DROPS[name]
+    _warn_dropped_sampling(path.parent)
+    assert capsys.readouterr().err.count("[tensorfold] warning: generation_config.json") == bool(SERVED_DROPS[name])
