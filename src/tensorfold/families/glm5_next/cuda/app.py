@@ -22,9 +22,9 @@ class ThinkingOffTemplate:
         self.thinking_switch = getattr(inner, "thinking_switch", False)
         self.clear = clear_thinking() if clear is None else clear
 
-    def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
+    def render(self, messages, *, tools, enable_thinking, extra=None, **options) -> str:
         extra = {"clear_thinking": self.clear, **(extra or {})}       # a request's own value wins
-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
+        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra, **options)
         return text if enable_thinking else thinking_off(text)
 
 

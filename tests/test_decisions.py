@@ -452,7 +452,7 @@ def test_cuda_decisions_scores_through_the_template():
     from tensorfold.cuda.turns import Turns
 
     class Template:
-        def render(self, messages, *, tools, enable_thinking, extra=None):
+        def render(self, messages, *, tools, enable_thinking, extra=None, request=None):
             assert enable_thinking is False
             assert tools is None
             return messages[0]["content"] + "\n"

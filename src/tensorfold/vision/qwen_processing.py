@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 import json
 import re
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -180,8 +180,10 @@ class QwenImageProcessor:
 
     def prepare(self, rendered_prompt: str, images: Sequence[Any], *, videos: Sequence[Any] = (),
                 max_visual_tokens: int = 4096, max_prompt_tokens: int | None = None,
-                max_image_tokens: int | None = None) -> PreparedVisionPrompt:
+                max_image_tokens: int | None = None,
+                encode: Callable[[str], list[int]] | None = None) -> PreparedVisionPrompt:
         """Expand image (and video) markers and calculate request-local rotary metadata without touching the GPU.
+        ``encode`` (the server's own, for escaped request text) replaces the checkpoint tokenizer's.
         A video marker (``<|vision_start|><|video_pad|><|vision_end|>``) becomes one timestamped block a frame group,
         ``<t seconds><|vision_start|>pads<|vision_end|>``, as Qwen3-VL's processor writes it."""
         if (not images and not videos) or max_visual_tokens < 1:
@@ -235,8 +237,11 @@ class QwenImageProcessor:
                                         for t in video.timestamps(int(vision["temporal_patch_size"]))))
             else:
                 expanded.append(piece)
-        encoded = self.tokenizer("".join(expanded), add_special_tokens=False, return_attention_mask=False)
-        tokens = tuple(int(t) for t in encoded["input_ids"])
+        if encode is not None:
+            tokens = tuple(int(t) for t in encode("".join(expanded)))
+        else:
+            encoded = self.tokenizer("".join(expanded), add_special_tokens=False, return_attention_mask=False)
+            tokens = tuple(int(t) for t in encoded["input_ids"])
         if max_prompt_tokens is not None and len(tokens) > max_prompt_tokens:   # OpenAI's context_length_exceeded
             raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the expanded image prompt has {len(tokens)} "
                              "tokens, which exceeds the context window; reduce image resolution or prompt length")

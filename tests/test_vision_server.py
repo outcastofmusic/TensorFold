@@ -45,7 +45,7 @@ class Frontend:
         self.tokens = tokens
         self.calls = []
 
-    def prepare(self, rendered, images, *, max_prompt_tokens):
+    def prepare(self, rendered, images, *, max_prompt_tokens, encode=None):
         self.calls.append((rendered, images, max_prompt_tokens))
         if max_prompt_tokens is not None and len(self.tokens) > max_prompt_tokens:
             raise ValueError("expanded image prompt exceeds the context limit")
@@ -194,7 +194,7 @@ def test_an_image_prompt_past_the_window_is_context_length_exceeded():
     from tensorfold.server.errors import CONTEXT_LIMIT, ContextLengthError
 
     class Long(Frontend):
-        def prepare(self, rendered, images, *, max_prompt_tokens):
+        def prepare(self, rendered, images, *, max_prompt_tokens, encode=None):
             raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the expanded image prompt has 40 tokens")
 
     with pytest.raises(ContextLengthError, match="maximum context length is 8 tokens") as caught:
