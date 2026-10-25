@@ -291,6 +291,26 @@ def _prep_row(P, pos, r, head, QW, KW, IW, INV, Q, KC, VC, KS, VS, IQ, IKC, eps,
               S1: tl.constexpr = 11, S2: tl.constexpr = 10):
     """``_attn_prep``'s head ``head`` of row r at position ``pos``, into the caches given."""
 
+    if IHD > HD:                     # an index head wider than the attention heads: its own width (``_index_row``)
+        if head >= NQ + NKV:
+            _index_row(P, pos, r, head, IW, INV, IQ, IKC, eps, PW, NQ, NKV, HD, NI, IHD, HALF, ROPE, DELTA, length,
+                       MODE, S1, S2)
+        else:
+            _head_row(P, pos, r, head, QW, KW, IW, INV, Q, KC, VC, KS, VS, IQ, IKC, eps, PW, NQ, NKV, HD, NI, IHD,
+                      HALF, BITS, ROPE, DELTA, length, MODE, S1, S2)
+    else:
+        _head_row(P, pos, r, head, QW, KW, IW, INV, Q, KC, VC, KS, VS, IQ, IKC, eps, PW, NQ, NKV, HD, NI, IHD, HALF,
+                  BITS, ROPE, DELTA, length, MODE, S1, S2)
+
+
+@triton.jit
+def _head_row(P, pos, r, head, QW, KW, IW, INV, Q, KC, VC, KS, VS, IQ, IKC, eps, PW: tl.constexpr, NQ: tl.constexpr,
+              NKV: tl.constexpr, HD: tl.constexpr, NI: tl.constexpr, IHD: tl.constexpr, HALF: tl.constexpr,
+              BITS: tl.constexpr, ROPE=None, DELTA=None, length=0, MODE: tl.constexpr = 0,
+              S1: tl.constexpr = 11, S2: tl.constexpr = 10):
+    """Head ``head`` of row r over HD lanes; an index head no wider than HD masks the lanes past IHD."""
+
+
     d = tl.arange(0, HD)
     if head < NQ + NKV + NI:
         width = tl.where(head >= NQ + NKV, IHD, HD)
@@ -364,6 +384,34 @@ def _prep_row(P, pos, r, head, QW, KW, IW, INV, Q, KC, VC, KS, VS, IQ, IKC, eps,
         live = d < IHD
         raw = tl.load(P + r * PW + NQ * 2 * HD + 2 * NKV * HD + NI * IHD + d, mask=live, other=0.0)
         tl.store(IKC + pos.to(tl.int64) * IHD + d, raw, mask=live)
+
+
+@triton.jit
+def _index_row(P, pos, r, head, IW, INV, IQ, IKC, eps, PW: tl.constexpr, NQ: tl.constexpr, NKV: tl.constexpr,
+               HD: tl.constexpr, NI: tl.constexpr, IHD: tl.constexpr, HALF: tl.constexpr, ROPE=None, DELTA=None,
+               length=0, MODE: tl.constexpr = 0, S1: tl.constexpr = 11, S2: tl.constexpr = 10):
+    """An indexer head (or the raw indexer key, the last program) of row r over its own IHD lanes: ``_head_row``'s
+    HD lanes would leave the key's and the queries' columns past HD unwritten, and the cache keeps what it held."""
+
+    d = tl.arange(0, IHD)
+    base = r * PW + NQ * 2 * HD + 2 * NKV * HD
+    if head < NQ + NKV + NI:
+        src = base + (head - NQ - NKV) * IHD
+        x = tl.load(P + src + d).to(tl.float32)
+        rinv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / IHD + eps)
+        xn = (x * rinv * tl.load(IW + d).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        partner = tl.where(d < HALF, d + HALF, tl.where(d < 2 * HALF, d - HALF, d))
+        xp = tl.load(P + src + partner).to(tl.float32)
+        xpn = (xp * rinv * tl.load(IW + partner).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        i = tl.where(d < HALF, d, tl.where(d < 2 * HALF, d - HALF, 0))
+        axis = rope_axis(pos, ROPE, DELTA, length, i, MODE, S1, S2)
+        ang = axis.to(tl.float32) * tl.load(INV + i)
+        cos = tl.cos(ang)
+        sin = tl.sin(ang)
+        rot = tl.where(d < HALF, xn * cos - xpn * sin, tl.where(d < 2 * HALF, xpn * sin + xn * cos, xn))
+        tl.store(IQ + (r * NI + head - NQ - NKV) * IHD + d, rot.to(tl.bfloat16))
+    else:
+        tl.store(IKC + pos.to(tl.int64) * IHD + d, tl.load(P + base + NI * IHD + d))
 
 
 def attn_prep(p: torch.Tensor, pos0: torch.Tensor, q_scale, k_scale, i_scale, inv_freq, q, kc, vc, iq, ikc,
