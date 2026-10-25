@@ -74,8 +74,9 @@ class ChatTemplate:
             return self.template.render(**kwargs)
         import jinja2
 
-        marked = self.template.render(**dict(kwargs, messages=request.mark(messages),
-                                             tools=request.mark(tools) or None, **request.mark(extra or {})))
+        marked = request.seal(self.template.render(**dict(kwargs, messages=request.mark(messages),
+                                                          tools=request.mark(tools) or None,
+                                                          **request.mark(extra or {}))))
         try:
             same = request.unmark(marked) == self.template.render(**kwargs)
         except jinja2.exceptions.TemplateError:
