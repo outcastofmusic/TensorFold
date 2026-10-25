@@ -39,7 +39,7 @@ def shared_stream() -> bool:
 # sweeps settings.
 SKIP_SHARE = float(os.environ.get("TF_GLM_SKIP_SHARE", "0") or 0)
 SKIP_LAYERS = tuple(int(x) for x in (os.environ.get("TF_GLM_SKIP_LAYERS") or "0:1000").split(":"))
-SKIP_RENORM = os.environ.get("TF_GLM_SKIP_RENORM", "1") != "0"
+SKIP_RENORM = flag("TF_GLM_SKIP_RENORM", True)
 SKIP_FILE = os.environ.get("TF_GLM_SKIP_FILE", "")
 SKIP_ON = SKIP_SHARE > 0 or bool(SKIP_FILE)
 _skip: dict = {}

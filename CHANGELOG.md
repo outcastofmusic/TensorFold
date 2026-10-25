@@ -5,6 +5,11 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **A typo in seven more switches stops the start.** `TF_GLM_DRAFT_RING`, `TF_GLM_CALIBRATE`, `TF_GLM_TREE_PROBE`,
+  `TF_GLM_PROFILE`, `TF_GLM_SKIP_RENORM`, `TF_LFM2_GRAPHS` and `TF_FLASH_STAGE_AHEAD` compared the raw string to `0` or
+  `1`, so `TF_GLM_DRAFT_RING=off` kept the ring on and `TF_GLM_PROFILE=on` left profiling off. They now take 0, off,
+  false or no and 1, on, true or yes in any case, and any other value fails at start. 0 and 1 keep their meaning.
+  Flash Next reads `TF_FLASH_STAGE_AHEAD` once per buffer set, where it read it on every prompt pass and decode step.
 - **A direct `tensorfold serve` of GLM-5.3 on CUDA runs what `run.sh` serves.** `TF_GLM_LAZY_SPARSE`,
   `TF_GLM_DFLASH_COPIES` and `TF_GLM_COPY_BACK` now default to 1, 1 and 8, the values `run.sh` passed, and `run.sh`
   no longer passes them. Before, a direct serve, the tests and the tools captured every long-context graph at start

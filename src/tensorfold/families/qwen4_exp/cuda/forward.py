@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -473,15 +472,6 @@ def candidates(w: Weights, b: Buffers, logits: torch.Tensor, R: int, *, id_map: 
     w.comm.all_gather(c, b.cand_all[:b.world * R * (2 * CAND + 1)])
 
 
-STAGE_AHEAD = "TF_FLASH_STAGE_AHEAD"
-
-
-def stage_ahead() -> bool:
-    """Whether ``stage`` reads the n-gram rows before its wait (TF_FLASH_STAGE_AHEAD=0: after it, as before)."""
-
-    return os.environ.get(STAGE_AHEAD, "1").strip().lower() not in ("0", "off", "false", "no")
-
-
 def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]) -> list[Seg]:
     """Host work before a forward (token ids, n-gram rows into static buffers); returns each stream's segment."""
 
@@ -504,7 +494,7 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
                 st.ple_last = (st.ple_history, toks)
                 lookups.append((p, ids, a0 * (ids.size // len(toks))))
     # the table reads before the wait, which ends once the GPU has run the previous step: their faults overlap it
-    ahead = [p.table.gather(ids) for p, ids, _ in lookups] if w.x3 is None and stage_ahead() else None
+    ahead = [p.table.gather(ids) for p, ids, _ in lookups] if w.x3 is None and b.stage_ahead else None
     b.staged.synchronize()               # the previous step's copies out of the pinned buffers are done
     b.ids_host[:R].numpy()[:] = np.asarray([t for _, tokens in windows for t in tokens], dtype=np.int32)
     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)

@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from tensorfold.env_flags import flag
+
 DEFAULT_POLICY = "auto"
 DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 while their probability product holds 0.3
 EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
@@ -21,15 +23,13 @@ MAX_ROWS = 8                          # the widest verify window (a pending toke
 WARM_ROWS = 256                       # a background pass's chunk: a request asking for the GPU waits out one (0.7 s)
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
 # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
-DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
+DRAFT_RING = flag("TF_GLM_DRAFT_RING", True)
 
 
 def early_launch() -> bool:
     """TF_GLM_EARLY_LAUNCH (unset: off): the serial loop launches the next step's forward, and the DFlash2 loop the
     next round's block pass, before the host calls ``on_tokens``; the same tokens. Read once at startup into
     ``Weights.meta``; a value outside env_flags' set raises."""
-
-    from tensorfold.env_flags import flag
 
     return flag("TF_GLM_EARLY_LAUNCH", False)
 
@@ -182,7 +182,8 @@ def calibrates(calibrate: bool, *, eager: bool, serial_only: bool) -> bool:
     """Whether startup times the drafters. TF_GLM_CALIBRATE=0 skips the 5 s of timing: `auto` on an EXL3 pack with a
     draft model is a fixed policy and reads no timings, and a request for the chooser (`auto:...`) is then refused."""
 
-    return bool(calibrate and not eager and not serial_only and os.environ.get("TF_GLM_CALIBRATE", "1") != "0")
+    timing = flag("TF_GLM_CALIBRATE", True)          # read first: a typo stops the start on every path
+    return bool(calibrate and not eager and not serial_only and timing)
 
 
 def _extended(c, others) -> bool:
@@ -255,7 +256,6 @@ class GlmEngine:
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         transform = _weight_transform(rule, world, cfg.layers if not self.load_mtp else 0, self.load_mtp,
                                       self.load_mtp or drafter is not None)
-        from tensorfold.env_flags import flag
         from tensorfold.families.qwen4_exp.cuda.copy_drafts import BACK, most_rows
 
         # TF_GLM_DFLASH_COPIES (unset: on): DFlash2 rounds verify a copy where the reply repeats earlier text; a
