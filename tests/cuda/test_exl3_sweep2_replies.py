@@ -1,5 +1,5 @@
 """Flash Next EXL3 replies with the sweep's switches off, on, off on one load (two loads of some checkpoints already
-differ, so comparing loads would test that): TF_EXL3_EXPERT_ITEMS, TF_FLASHNEXT_STACK_DIRECT, TF_FLASHNEXT_F16_INNER_K,
+differ, so comparing loads would test that): TF_FLASHNEXT_STACK_DIRECT, TF_FLASHNEXT_F16_INNER_K,
 TF_FLASHNEXT_MOE_DIRECT and TF_FLASHNEXT_HC_FUSE on the pack's fp16 hyper-connections (the loader's flag, flipped here
 on every HC of the load).
 
@@ -9,7 +9,7 @@ on every HC of the load).
   setting, and every setting equal to the first. Then four streams decoded together (windows of 4 to 16 rows, past
   16 once the drafts fill) equal each alone, in every setting.
 
-GLM-5.3's replies with the item list are in test_glm_exl3_sweep2_replies.py, which runs in its own pytest process.
+GLM-5.3's served replies are in test_glm_exl3_replies.py, which runs in its own pytest process.
 Needs the Flash Next pack under $MODELS (about 60 GiB free)."""
 
 from __future__ import annotations
@@ -52,8 +52,6 @@ def _free():
 
 
 def _set(w, on: bool) -> None:
-    switches.use(switches.Switches(expert_items=on, group_scan=False, down_fuse=False, gateup_fuse=False,
-                                   group_scan_decode=False, linear_pair=False))
     exl3_mm.use(exl3_mm.Switches(stack_direct=on, inner_k=on, moe_direct=on, moe_chunk=False))
     hcs = [w.mixer] + [hc for layer in w.layers for hc in (layer.attn_hc, layer.mlp_hc)]
     if w.mtp is not None:

@@ -1,13 +1,14 @@
-"""GLM-5.3 (the sushi-experts pack) replies with TF_EXL3_GROUP_SCAN_DECODE and TF_EXL3_LINEAR_PAIR off, on, off on one
-load: GLM shares the EXL3 grouping and linear. Eager replies serial and drafted (the DFlash2 drafter) after a
-2,600-token prompt, greedy and seeded, then serial replies from CUDA graphs captured in each setting.
+"""GLM-5.3 (the sushi-experts pack) replies as served, on the EXL3 kernels ``routed`` picks from the shape: eager
+replies drafted (the DFlash2 drafter) equal serial after a 2,600-token prompt, whose prompt windows of up to 1,024
+rows take the listed layout, the grouping scan and the fused epilogues, greedy and seeded; and serial replies from
+CUDA graphs equal eager ones. Their bytes against the launches of before each kernel are in the kernel tests
+(test_exl3_prefill_kernels.py, test_exl3_decode2_kernels.py, test_exl3_sweep2_kernels.py).
 
-Run it in its own pytest process, not after test_exl3_decode2_replies.py: the GLM engine's memory admission needs
+Run it in its own pytest process, not after test_exl3_prefill_replies.py: the GLM engine's memory admission needs
 about 100 GiB free, which a process that held the Flash Next pack does not give back."""
 
 from __future__ import annotations
 
-import dataclasses
 import gc
 import os
 from pathlib import Path
@@ -18,23 +19,12 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
 
-from tensorfold.cuda.exl3 import switches
-from tensorfold.engine.exact_sampling import Sampling
+from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
 
 MODELS = Path(os.environ.get("MODELS", "/home/agis/models"))
 GLM = MODELS / "glm53-flash-sushi-experts-mosaic-dense"
 GLM_DRAFTER = MODELS / "GLM-5.3-Flash-DFlash2-TR3-v3"
 SAMPLINGS = [None, Sampling(1234, 1.0, 20, 0.95)]
-DEFAULTS = switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=False,
-                             linear_pair=False)
-ORDER = (False, True, False)                    # off twice: a difference is the switches', not noise
-
-
-@pytest.fixture(autouse=True)
-def restore():
-    before = switches.current()
-    yield
-    switches.use(before)
 
 
 def _prompt(n: int, seed: int, top: int) -> list[int]:
@@ -46,10 +36,7 @@ def _free():
     torch.cuda.empty_cache()
 
 
-def _set(on: bool) -> None:
-    """The two switches on or off, every other EXL3 switch at its default (fba05ef2: the prompt switches on)."""
-
-    switches.use(dataclasses.replace(DEFAULTS, group_scan_decode=on, linear_pair=on))
+# ------------------------------------------------------------------------------------------------- GLM-5.3
 
 
 @pytest.fixture(scope="module")
@@ -79,31 +66,22 @@ def _glm_reply(engine, prompt, sampling, draft, tokens=48):
 
 
 @pytest.mark.parametrize("sampling", SAMPLINGS, ids=["greedy", "seeded"])
-def test_glm_eager_replies_keep_their_bytes_with_the_switches_off_on_off(glm, sampling):
+def test_glm_drafted_replies_equal_serial(glm, sampling):
     prompt = _prompt(2600, 11, 150_000)
-    got = []
-    for on in ORDER:
-        _set(on)
-        got.append((_glm_reply(glm, prompt, sampling, False), _glm_reply(glm, prompt, sampling, True)))
-    for setting, (serial, drafted) in zip(ORDER, got):
-        assert drafted == serial, setting
-    assert got[0] == got[2]
-    assert got[0] == got[1]
+    assert _glm_reply(glm, prompt, sampling, True) == _glm_reply(glm, prompt, sampling, False)
 
 
 @pytest.mark.parametrize("sampling", SAMPLINGS, ids=["greedy", "seeded"])
-def test_glm_graph_replies_keep_their_bytes_with_the_switches_off_on_off(glm, sampling):
+def test_glm_graph_replies_equal_eager(glm, sampling):
     from tensorfold.families.glm5_next.cuda.decode import Engine, prefill, serial_decode
 
     prompt = _prompt(600, 13, 150_000)
     got = []
-    for on in ORDER:
-        _set(on)
-        e = Engine(glm.w, capacity=8192, max_rows=8, prefill_rows=128, graphs=True, long_context=True)
+    for graphs in (True, False):
+        e = Engine(glm.w, capacity=8192, max_rows=8, prefill_rows=128, graphs=graphs, long_context=True)
         first = prefill(e, prompt, sampling, mtp=False)
         got.append(serial_decode(e, first, 48, sampling).tokens)
-        assert e.graphs is not None
+        assert (e.graphs is not None) is graphs
         del e
         _free()
-    assert got[0] == got[2]
     assert got[0] == got[1]

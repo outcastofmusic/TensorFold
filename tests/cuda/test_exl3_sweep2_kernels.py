@@ -1,9 +1,11 @@
 """The sweep's kernel switches on the GPU: the same bytes with each switch on or off.
 
-- TF_EXL3_EXPERT_ITEMS: routed experts at Flash Next EXL3's shapes (2560 <-> 640, 3-bit mul1 experts beside a 5-bit
+- The item list: routed experts at Flash Next EXL3's shapes (2560 <-> 640, 3-bit mul1 experts beside a 5-bit
   shared expert, 11 slots) and GLM-5.3's (4096 <-> 2048, mcg at 2.25 and 2.5 bits, 14-bit window, 8 slots): per-slot
   outputs and combined rows of windows from 1 to 1,024 rows (decode windows, multi-stream windows of 17-28 rows,
-  prompt windows), eager and replayed from CUDA graphs; and group_kernel's item list against a Python model of it.
+  prompt windows) on the item list alone and as ``routed`` serves them, against the launches of before
+  (``tests.exl3_fakes.OLD``), eager and replayed from CUDA graphs; and group_kernel's item list against a Python
+  model of it.
 - The down epilogue's bf16 slots (TF_FLASHNEXT_MOE_DIRECT) against a copy of its fp32 slots, at both models' shapes.
 - The EXL3 linear writing N columns of a wider output (TF_FLASHNEXT_STACK_DIRECT) at Flash Next's dense shapes and
   GLM-5.3-sized ones, and Flash Next's two stacks (attention: q, k, v, indexer; DeltaNet: qkv, z, fp16 b/a) with the
@@ -16,6 +18,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import pytest
@@ -27,14 +30,12 @@ from tensorfold.cuda.exl3 import experts, linear, switches  # noqa: E402
 from tensorfold.families.qwen4_exp.cuda import exl3_mm  # noqa: E402
 
 from tests.cuda.exl3_layers import LAYERS, LINEAR, _inputs, _layer, _same, _scale, _trellis  # noqa: E402
+from tests.exl3_fakes import OLD, route
 from tests.test_exl3_expert_items import _listing  # noqa: E402
 
-OFF = switches.Switches(pdl=False, expert_items=False, group_scan=False, down_fuse=False, gateup_fuse=False,
-                        group_scan_decode=False, linear_pair=False)
-EXPERT_SETTINGS = [switches.Switches(pdl=False, expert_items=True, group_scan=False, down_fuse=False,
-                                     gateup_fuse=False, group_scan_decode=False, linear_pair=False),
-                   switches.Switches(pdl=True, expert_items=True, group_scan=False, down_fuse=False,
-                                     gateup_fuse=False, group_scan_decode=False, linear_pair=False)]
+ITEMS = dataclasses.replace(OLD, expert_items=True)
+# (launches, PDL): the item list alone, and routed's own launches (None)
+EXPERT_SETTINGS = [(ITEMS, False), (ITEMS, True), (None, False), (None, True)]
 ROWS = (1, 8, 16, 17, 24, 28, 64, 65, 128, 1024)
 
 
@@ -46,11 +47,11 @@ def restore():
     exl3_mm.use(before_mm)
 
 
-def _run(name, R, x, sel, w, scratch):
+def _run(k, name, R, x, sel, w, scratch):
     ex, slots, E, act = _layer(name)
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
-    y = experts.routed(x, sel, None, ex, scratch, None, R, limit, act).clone()
-    out = experts.routed(x, sel, w, ex, scratch, None, R, limit, act).clone()
+    y = route(k, x, sel, None, ex, scratch, None, R, limit, act).clone()
+    out = route(k, x, sel, w, ex, scratch, None, R, limit, act).clone()
     return y, out
 
 
@@ -61,16 +62,15 @@ def test_routed_experts_keep_their_bytes_on_the_item_list(name, R):
     ex, slots, E, _ = _layer(name)
     scratch = experts.Scratch(ex, max(ROWS), slots)
     x, sel, w = _inputs(name, R, 3000 + R)
-    switches.use(OFF)
-    want = _run(name, R, x, sel, w, scratch)
+    want = _run(OLD, name, R, x, sel, w, scratch)
     torch.cuda.synchronize()
     assert torch.isfinite(want[1]).all()
-    for sw in EXPERT_SETTINGS:
-        switches.use(sw)
-        y, out = _run(name, R, x, sel, w, scratch)
+    for k, pdl in EXPERT_SETTINGS:
+        switches.use(switches.Switches(pdl=pdl))
+        y, out = _run(k, name, R, x, sel, w, scratch)
         torch.cuda.synchronize()
-        assert _same(y, want[0]), (name, R, sw)
-        assert _same(out, want[1]), (name, R, sw)
+        assert _same(y, want[0]), (name, R, k, pdl)
+        assert _same(out, want[1]), (name, R, k, pdl)
 
 
 @pytest.mark.parametrize("name", list(LAYERS))
@@ -102,8 +102,7 @@ def test_graphs_captured_on_the_item_list_replay_the_old_bytes(name):
     scratch = experts.Scratch(ex, max(rows), slots)
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
     bufs, graphs = {}, {}
-    switches.use(switches.Switches(pdl=True, expert_items=True, group_scan=False, down_fuse=False, gateup_fuse=False,
-                                   group_scan_decode=False, linear_pair=False))
+    switches.use(switches.Switches(pdl=True))
     for R in rows:
         x, sel, w = _inputs(name, R, 60 + R)
         out = torch.empty((R, ex.dims), dtype=torch.float32, device="cuda")
@@ -113,12 +112,12 @@ def test_graphs_captured_on_the_item_list_replay_the_old_bytes(name):
         with torch.cuda.graph(graph):
             experts.routed(x, sel, w, ex, scratch, out, R, limit, act)
         bufs[R], graphs[R] = (x, sel, w, out), graph
-    switches.use(OFF)
+    switches.use(switches.Switches())
     for R in rows:
         x, sel, w, out = bufs[R]
         nx, nsel, nw = _inputs(name, R, 95 + R)                   # new picks: the list is the replay's own
         x.copy_(nx), sel.copy_(nsel), w.copy_(nw)
-        eager = experts.routed(x, sel, w, ex, scratch, None, R, limit, act).clone()
+        eager = route(OLD, x, sel, w, ex, scratch, None, R, limit, act).clone()
         out.fill_(float("nan"))
         graphs[R].replay()
         torch.cuda.synchronize()

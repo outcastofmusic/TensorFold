@@ -132,8 +132,8 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
     store4(xh, F16, (size_t)row * K + k, v);
 }
 
-// RT 16-row tiles a pass: RT = 2 (TF_EXL3_LINEAR_PAIR) decodes each k step's weights once for 32 rows, where RT = 1
-// reads and decodes every weight again for each 16 rows. A row's sums stay its own: the same mma chain over the same
+// RT 16-row tiles a pass: RT = 2 (past 16 rows, linear.row_tiles) decodes each k step's weights once for 32 rows,
+// where RT = 1 reads and decodes every weight again for each 16 rows. A row's sums stay its own: the same mma chain over the same
 // K range a warp, warps added in order, then splits in order.
 template <int K2, int CB, int WK, int RT>
 __global__ void __launch_bounds__(WK * 32) linear_kernel(

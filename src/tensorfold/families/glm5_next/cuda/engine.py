@@ -211,7 +211,7 @@ class GlmEngine:
 
         from tensorfold.cuda.exl3 import switches as exl3_switches
 
-        exl3_switches.use(exl3_switches.read())        # every TF_EXL3_* kernel switch, before any read
+        exl3_switches.use(exl3_switches.read())        # TF_EXL3_PDL, before any read
         switches = kernel_switches()                    # every TF_GLM_* decode switch, before any read too
         from .split import require_full_checkpoint, validate_world
         if comm is not None:

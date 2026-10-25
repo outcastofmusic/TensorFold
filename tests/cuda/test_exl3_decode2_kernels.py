@@ -1,20 +1,19 @@
-"""TF_EXL3_GROUP_SCAN_DECODE and TF_EXL3_LINEAR_PAIR on the GPU: the same bytes with either switch on or off, the
-prompt switches (TF_EXL3_GROUP_SCAN, _DOWN_FUSE, _GATEUP_FUSE) at their defaults.
+"""Decode windows' grouping and the linear's two row tiles on the GPU: the same bytes as the launches of before them.
 
-- group_scan_kernel (TF_EXL3_GROUP_SCAN's, here on decode windows) against group_kernel: the expert ids, their count,
+- group_scan_kernel (here on decode windows) against group_kernel: the expert ids, their count,
   the member lists and the item list (every int32 of each buffer, filled with a sentinel first, so a write past what
   group_kernel writes shows), at Flash Next's grouping (513 experts with the shared one, 11 slots) and GLM-5.3's
   (8 or 9 slots), windows of 1 to 128 rows and one of 1,024, with repeated picks in a row, picks of -1 and of E, and
   member lists cut short of the count. tests/cuda/test_exl3_prefill_kernels.py covers its prompt windows.
 - Routed experts at both models' shapes (tests/cuda/exl3_layers.py's layers): per-slot outputs and
-  combined rows with the switch on and off, eager and replayed from CUDA graphs.
+  combined rows as ``routed`` serves them and grouped on group_kernel (``tests.exl3_fakes.routed_with``), eager and
+  replayed from CUDA graphs.
 - The EXL3 linear with two row tiles a pass against one: Flash Next's dense shapes and GLM-5.3-sized ones, mul1 and
   mcg, 1 to 128 rows (one pass, two, a pass of one tile after full ones), split-K shapes, a wider output, and graphs.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import math
 
 import pytest
@@ -22,22 +21,14 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 
-from tensorfold.cuda.exl3 import experts, linear, switches
+from tensorfold.cuda.exl3 import experts, linear
 from tests.cuda.exl3_layers import LAYERS, LINEAR, _inputs, _layer, _same, _scale, _trellis
+from tests.exl3_fakes import Launches, linear_one_tile, route
 from tests.test_exl3_expert_items import _listing
 
-OFF = switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=False,
-                        linear_pair=False)     # the defaults since fba05ef2
-SCAN = dataclasses.replace(OFF, group_scan_decode=True)
-PAIR = dataclasses.replace(OFF, linear_pair=True)
+NO_SCAN = Launches(group_scan_decode=False)     # decode windows on group_kernel, as before 20 Oct
+SCAN = None                                     # routed's own launches
 SENTINEL = -12345
-
-
-@pytest.fixture(autouse=True)
-def restore():
-    before = switches.current()
-    yield
-    switches.use(before)
 
 
 # -- the grouping ---------------------------------------------------------------------------------------------------
@@ -114,11 +105,11 @@ def test_group_scan_kernel_writes_the_same_item_list(model, R, tile):
 
 
 # -- routed experts end to end --------------------------------------------------------------------------------------
-def _run(name, R, x, sel, w, scratch):
+def _run(k, name, R, x, sel, w, scratch):
     ex, _, _, act = _layer(name)
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
-    y = experts.routed(x, sel, None, ex, scratch, None, R, limit, act).clone()
-    out = experts.routed(x, sel, w, ex, scratch, None, R, limit, act).clone()
+    y = route(k, x, sel, None, ex, scratch, None, R, limit, act).clone()
+    out = route(k, x, sel, w, ex, scratch, None, R, limit, act).clone()
     return y, out
 
 
@@ -129,9 +120,8 @@ def test_routed_experts_keep_their_bytes_with_the_scan(name, R):
     scratch = experts.Scratch(ex, 128, slots)
     x, sel, w = _inputs(name, R, 6000 + R)
     got = []
-    for sw in (OFF, SCAN, OFF):
-        switches.use(sw)
-        got.append(_run(name, R, x, sel, w, scratch))
+    for k in (NO_SCAN, SCAN, NO_SCAN):
+        got.append(_run(k, name, R, x, sel, w, scratch))
     torch.cuda.synchronize()
     assert torch.isfinite(got[0][1]).all()
     for y, out in got[1:]:
@@ -145,7 +135,6 @@ def test_graphs_captured_with_the_scan_replay_the_old_bytes(name):
     scratch = experts.Scratch(ex, max(rows), slots)
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
     bufs, graphs = {}, {}
-    switches.use(SCAN)
     for R in rows:
         x, sel, w = _inputs(name, R, 70 + R)
         out = torch.empty((R, ex.dims), dtype=torch.float32, device="cuda")
@@ -155,12 +144,11 @@ def test_graphs_captured_with_the_scan_replay_the_old_bytes(name):
         with torch.cuda.graph(graph):
             experts.routed(x, sel, w, ex, scratch, out, R, limit, act)
         bufs[R], graphs[R] = (x, sel, w, out), graph
-    switches.use(OFF)
     for R in rows:
         x, sel, w, out = bufs[R]
         nx, nsel, nw = _inputs(name, R, 110 + R)                  # new picks: the grouping is the replay's own
         x.copy_(nx), sel.copy_(nsel), w.copy_(nw)
-        eager = experts.routed(x, sel, w, ex, scratch, None, R, limit, act).clone()
+        eager = route(NO_SCAN, x, sel, w, ex, scratch, None, R, limit, act).clone()
         out.fill_(float("nan"))
         graphs[R].replay()
         torch.cuda.synchronize()
@@ -184,10 +172,7 @@ def test_the_linear_keeps_its_bytes_with_two_row_tiles(k, n, bits, codebook):
     lin, g = _lin(k, n, bits, codebook, 3 * k + n + bits)
     for m in ROWS:
         x = torch.randn((m, k), generator=g).to(torch.bfloat16).cuda()
-        got = []
-        for sw in (OFF, PAIR, OFF):
-            switches.use(sw)
-            got.append(lin(x).clone())
+        got = [linear_one_tile(lin, x).clone(), lin(x).clone(), linear_one_tile(lin, x).clone()]
         torch.cuda.synchronize()
         assert torch.isfinite(got[0].float()).all()
         assert _same(got[0].float(), got[1].float()) and _same(got[0].float(), got[2].float()), (k, n, bits, m)
@@ -198,9 +183,7 @@ def test_two_row_tiles_write_their_columns_of_a_wider_output(k, n, bits):
     lin, g = _lin(k, n, bits, "mul1", 11 * k + n)
     for m in (17, 28, 64):
         x = torch.randn((m, k), generator=g).to(torch.bfloat16).cuda()
-        switches.use(OFF)
-        want = lin(x).clone()
-        switches.use(PAIR)
+        want = linear_one_tile(lin, x).clone()
         wide = torch.full((m, n + 384), -3.0, dtype=torch.bfloat16, device="cuda")
         lin(x, out=wide[:, 128:128 + n])
         torch.cuda.synchronize()
@@ -212,7 +195,6 @@ def test_graphs_captured_with_two_row_tiles_replay_the_old_bytes():
     lin, g = _lin(2560, 6144, 5, "mul1", 99)                      # 4 K splits: the counters are reset in the graph
     rows = (17, 28)
     bufs, graphs = {}, {}
-    switches.use(PAIR)
     for m in rows:
         x = torch.randn((m, 2560), generator=g).to(torch.bfloat16).cuda()
         out = torch.empty((m, 6144), dtype=torch.bfloat16, device="cuda")
@@ -224,12 +206,11 @@ def test_graphs_captured_with_two_row_tiles_replay_the_old_bytes():
         with torch.cuda.graph(graph):
             lin(x, out=out, xh=xh, z=z)
         bufs[m], graphs[m] = (x, out), graph
-    switches.use(OFF)
     for _ in range(2):                                            # twice: the counters came back to zero
         for m in rows:
             x, out = bufs[m]
             x.copy_(torch.randn((m, 2560), generator=g).to(torch.bfloat16).cuda())
-            want = lin(x).clone()
+            want = linear_one_tile(lin, x).clone()
             out.fill_(float("nan"))
             graphs[m].replay()
             torch.cuda.synchronize()

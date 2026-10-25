@@ -1,13 +1,15 @@
-"""The prompt-window switches on the CPU: TF_EXL3_GROUP_SCAN, TF_EXL3_DOWN_FUSE, TF_EXL3_GATEUP_FUSE (EXL3 kernels,
-Flash Next and GLM-5.3) and TF_FLASHNEXT_MOE_CHUNK (Flash Next). Their values and where the engines read them, which
-launches ``routed`` makes with each, a Python model of ``group_scan_kernel``'s rounds against ``group_kernel``'s
-outputs (with a planted control that must fail), the 2,048-row routed window and its admission, and (compiled for
-sm_121 without a GPU, when nvcc is present) that the new kernels do not spill, the fused prompt instance keeps 2 blocks
-an SM, and the fused epilogues compile the epilogue kernels' multiply, FMA, exponent and rounding instructions in the
-same counts. tests/cuda/test_exl3_prefill_kernels.py and test_exl3_prefill_replies.py compare the bytes on the GPU."""
+"""The EXL3 kernels' prompt windows on the CPU (Flash Next and GLM-5.3), with TF_FLASHNEXT_MOE_CHUNK (Flash Next):
+which launches ``routed`` makes at each shape, that ``tests.exl3_fakes.routed_with`` (the GPU byte tests' reference)
+makes the same launches at its defaults and the launches from before the fused kernels with ``OLD``, a Python model
+of ``group_scan_kernel``'s rounds against ``group_kernel``'s outputs (with a planted control that must fail), the
+2,048-row routed window and its admission, and (compiled for sm_121 without a GPU, when nvcc is present) that the new
+kernels do not spill, the fused prompt instance keeps 2 blocks an SM, and the fused epilogues compile the epilogue
+kernels' multiply, FMA, exponent and rounding instructions in the same counts. tests/cuda/test_exl3_prefill_kernels.py
+compares the bytes on the GPU."""
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import subprocess
 from collections import Counter
@@ -20,11 +22,7 @@ torch = pytest.importorskip("torch")
 
 from tensorfold.cuda.exl3 import experts, switches  # noqa: E402
 
-from tests.exl3_fakes import NVCC, FakeExt, _layer, _ptxas  # noqa: E402
-
-EXL3_ENVS = {switches.GROUP_SCAN_ENV: "group_scan", switches.DOWN_FUSE_ENV: "down_fuse",
-             switches.GATEUP_FUSE_ENV: "gateup_fuse"}
-ALL_EXL3_ENVS = tuple(switches.ENVS)
+from tests.exl3_fakes import NVCC, OLD, FakeExt, Launches, _layer, _ptxas, routed_with  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -38,33 +36,6 @@ def restore():
 
 
 # -- the flags ------------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("env", list(EXL3_ENVS))
-@pytest.mark.parametrize("value, on", [(None, True), ("", True), ("1", True), ("on", True), ("yes", True),
-                                       ("0", False), ("off", False), (" NO ", False)])
-def test_each_exl3_flag_is_on_unless_turned_off(monkeypatch, env, value, on):
-    for e in ALL_EXL3_ENVS:
-        monkeypatch.delenv(e, raising=False)
-    if value is not None:
-        monkeypatch.setenv(env, value)
-    got = switches.read()
-    assert getattr(got, EXL3_ENVS[env]) is on
-    assert all(getattr(got, f) is True for e, f in EXL3_ENVS.items() if e != env)     # on since 19 Oct's GPU A/B
-    assert (got.pdl, got.expert_items) == (False, True)                               # the others keep defaults
-
-
-@pytest.mark.parametrize("env", list(EXL3_ENVS))
-@pytest.mark.parametrize("value", ["2", "scan", "o", "1.0"])
-def test_an_exl3_flag_typo_stops_both_engines_before_any_read(monkeypatch, tmp_path, env, value):
-    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
-    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
-
-    monkeypatch.setenv(env, value)
-    with pytest.raises(ValueError, match=env):
-        FlashNextEngine(tmp_path / "missing")
-    with pytest.raises(ValueError, match=env):
-        GlmEngine(tmp_path / "missing", rank=0, master="", port=0, world=1)
-
-
 @pytest.mark.parametrize("value, on", [(None, True), ("1", True), ("off", False)])
 def test_the_chunk_window_flag(monkeypatch, value, on):
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
@@ -95,25 +66,20 @@ def test_the_engines_install_what_they_read(monkeypatch, tmp_path):
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
     from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
 
-    for e in ALL_EXL3_ENVS:
+    for e in switches.ENVS:
         monkeypatch.delenv(e, raising=False)
-    for e in EXL3_ENVS:
-        monkeypatch.setenv(e, "1")
+    monkeypatch.setenv(switches.PDL_ENV, "1")
     monkeypatch.setenv(exl3_mm.MOE_CHUNK_ENV, "1")
-    switches.use(switches.Switches(group_scan=False, down_fuse=False, gateup_fuse=False, group_scan_decode=False,
-                                   linear_pair=False))
+    switches.use(switches.Switches())
     exl3_mm.use(exl3_mm.Switches(moe_chunk=False))
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
-    assert switches.current() == switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True,
-                                                   group_scan_decode=True, linear_pair=True)
+    assert switches.current() == switches.Switches(pdl=True)
     assert exl3_mm.current().moe_chunk is True
-    switches.use(switches.Switches(group_scan=False, down_fuse=False, gateup_fuse=False, group_scan_decode=False,
-                                   linear_pair=False))
+    switches.use(switches.Switches())
     with pytest.raises(Exception):
         GlmEngine(tmp_path / "missing", rank=0, master="", port=0, world=1)
-    assert switches.current() == switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True,
-                                                   group_scan_decode=True, linear_pair=True)
+    assert switches.current() == switches.Switches(pdl=True)
 
 
 def test_an_unset_environment_reads_each_dataclass_default(monkeypatch):
@@ -131,36 +97,43 @@ def test_an_unset_environment_reads_each_dataclass_default(monkeypatch):
         for e in module.ENVS:
             monkeypatch.delenv(e, raising=False)
         assert module.read() == module.Switches()
-    assert switches.Switches() == switches.Switches(pdl=False, expert_items=True, group_scan=True, down_fuse=True,
-                                                    gateup_fuse=True, group_scan_decode=True, linear_pair=True)
+    assert switches.Switches() == switches.Switches(pdl=False)
     assert exl3_mm.Switches() == exl3_mm.Switches(stack_direct=True, inner_k=False, moe_direct=True, moe_chunk=True)
 
 
 # -- what routed launches -------------------------------------------------------------------------------------------
-def _route(monkeypatch, rows, sw, *, wts=False, slots=4, ex=None, y=None):
+def _route(monkeypatch, rows, launches=None, *, wts=False, slots=4, ex=None, y=None, group=True):
+    """``routed``'s launches on a recording extension, or ``routed_with(launches)``'s."""
+
     fake = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: fake)
-    switches.use(sw)
     ex = ex or _layer()                                            # 256 -> 128, 3-bit (rate 6): fusable rates
     s = experts.Scratch(ex, 1024, slots, device="cpu")
     x = torch.zeros((rows, ex.dims), dtype=torch.bfloat16)
     pick = torch.zeros((rows, slots), dtype=torch.int32)
     w = torch.zeros((rows, slots)) if wts else None
     out = torch.zeros((rows, ex.dims)) if wts else None
-    got = experts.routed(x, pick, w, ex, s, out, rows, y=y)
+    if launches is None:
+        got = experts.routed(x, pick, w, ex, s, out, rows, y=y, group=group)
+    else:
+        got = routed_with(launches, x, pick, w, ex, s, out, rows, y=y, group=group)
     return fake, s, ex, got
 
 
-ALL_ON = switches.Switches(expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True,
-                           group_scan_decode=False, linear_pair=False, rot_fuse=False)
+def _names(fake):
+    return [n for n, _ in fake.calls]
+
+
+def _grouped(fake):
+    return [kw for (n, _), kw in zip(fake.calls, fake.kwargs) if n == "grouped"]
 
 
 @pytest.mark.parametrize("rows", [65, 128, 1024])
-def test_a_prompt_window_with_every_switch_launches_three_kernels_after_rot_in(monkeypatch, rows):
-    fake, s, ex, got = _route(monkeypatch, rows, ALL_ON)
-    names = [n for n, _ in fake.calls]
-    assert names == ["group", "rot_in", "grouped", "grouped"]
-    group_kw, gu_kw, dn_kw = fake.kwargs[0], fake.kwargs[2], fake.kwargs[3]
+def test_a_prompt_window_launches_the_grouping_and_two_fused_staged_projections(monkeypatch, rows):
+    fake, s, ex, got = _route(monkeypatch, rows)
+    assert _names(fake) == ["group", "grouped", "grouped"]
+    group_kw = fake.kwargs[0]
+    gu_kw, dn_kw = _grouped(fake)
     assert group_kw["scan"] is True and group_kw["tile"] == 32
     assert gu_kw["items"] is group_kw["items"] and dn_kw["items"] is group_kw["items"]
     assert gu_kw["epi"] == experts.EPI_GATEUP
@@ -168,64 +141,85 @@ def test_a_prompt_window_with_every_switch_launches_three_kernels_after_rot_in(m
     assert gu_kw["out"] is s.xd and gu_kw["arrivals"] is s.arrivals
     assert gu_kw["act_mode"] == experts.ACT_F32 and gu_kw["limit"] == float("inf")
     assert dn_kw["epi"] == experts.EPI_DOWN and dn_kw["s0"] is ex.svh_d and dn_kw["out"] is s.y
+    assert gu_kw["staged"] is True and dn_kw["staged"] is True
     assert got.data_ptr() == s.y.data_ptr()
 
 
-@pytest.mark.parametrize("scan, down, gateup", [(True, False, False), (False, True, False), (False, False, True)])
-def test_each_switch_alone_changes_only_its_launch(monkeypatch, scan, down, gateup):
-    sw = switches.Switches(expert_items=True, group_scan=scan, down_fuse=down, gateup_fuse=gateup,
-                           group_scan_decode=False, linear_pair=False, rot_fuse=False)
-    fake, _, _, _ = _route(monkeypatch, 1024, sw)
-    names = [n for n, _ in fake.calls]
-    want = ["group", "rot_in", "grouped"] + ([] if gateup else ["gateup_epilogue"]) + ["grouped"] + \
-        ([] if down else ["down_epilogue"])
-    assert names == want
-    assert ("scan" in fake.kwargs[0]) is scan
-    grouped = [kw for (n, _), kw in zip(fake.calls, fake.kwargs) if n == "grouped"]
-    assert ("epi" in grouped[0]) is gateup and ("epi" in grouped[1]) is down
+def _launches(fake):
+    """Each launch's name, arguments and keyword arguments, tensors by (address, shape)."""
+
+    def plain(v):
+        return (v.data_ptr(), tuple(v.shape)) if isinstance(v, torch.Tensor) else v
+
+    return [(n, [plain(v) for v in a], {k: plain(v) for k, v in kw.items()}) for (n, a), kw in
+            zip(fake.calls, fake.kwargs)]
+
+
+def _wide():
+    ex = _layer()
+    ex.k2_gu, ex.k2_d = (6, 12), (12, 12)
+    return ex
+
+
+@pytest.mark.parametrize("rows", [1, 16, 17, 28, 64, 65, 128, 1024])
+@pytest.mark.parametrize("case", ["slots", "weights", "bf16 y", "1,025 experts", "wide rates", "unaligned",
+                                  "no grouping"])
+def test_the_reference_at_its_defaults_makes_routeds_launches(monkeypatch, rows, case):
+    """The GPU byte tests compare ``routed`` against ``routed_with``: at ``Launches()`` both launch the same."""
+
+    ex = {"1,025 experts": _layer(E=1025), "wide rates": _wide(),
+          "unaligned": dataclasses.replace(_layer(), aligned=False)}.get(case, _layer())
+    s = experts.Scratch(ex, 1024, 4, device="cpu")
+    x = torch.zeros((rows, ex.dims), dtype=torch.bfloat16)
+    pick = torch.zeros((rows, 4), dtype=torch.int32)
+    w, out = (torch.zeros((rows, 4)), torch.zeros((rows, ex.dims))) if case == "weights" else (None, None)
+    y = torch.zeros((rows * 4, ex.dims), dtype=torch.bfloat16) if case == "bf16 y" else None
+    got = []
+    for run in (experts.routed, lambda *a, **kw: routed_with(Launches(), *a, **kw)):
+        fake = FakeExt()
+        monkeypatch.setattr(experts, "_ext", lambda fake=fake: fake)
+        run(x, pick, w, ex, s, out, rows, y=y, group=case != "no grouping")
+        got.append(_launches(fake))
+    assert got[0] == got[1]
+
+
+@pytest.mark.parametrize("rows", [1, 28, 65, 1024])
+def test_the_old_reference_makes_the_launches_of_before_the_fused_kernels(monkeypatch, rows):
+    fake, _, _, _ = _route(monkeypatch, rows, OLD)
+    assert _names(fake) == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
+    assert all(kw == {} for kw in fake.kwargs)
 
 
 def test_the_down_epilogue_writes_a_given_bf16_buffer(monkeypatch):
     y = torch.zeros((1024 * 4, 256), dtype=torch.bfloat16)
-    fake, _, _, got = _route(monkeypatch, 1024, ALL_ON, y=y)
-    assert got is y and fake.kwargs[3]["out"] is y
+    fake, _, _, got = _route(monkeypatch, 1024, y=y)
+    assert got is y and _grouped(fake)[1]["out"] is y
 
 
 def test_with_weights_the_down_combine_stays(monkeypatch):
-    """``wts`` combines the slots in the down epilogue's own launch: down_fuse leaves that path alone."""
+    """``wts`` combines the slots in the down epilogue's own launch: the fused down epilogue leaves that path alone."""
 
-    fake, _, _, _ = _route(monkeypatch, 1024, ALL_ON, wts=True)
-    assert [n for n, _ in fake.calls] == ["group", "rot_in", "grouped", "grouped", "down_combine"]
-    assert "epi" not in fake.kwargs[3]
+    fake, _, _, _ = _route(monkeypatch, 1024, wts=True)
+    assert _names(fake) == ["group", "grouped", "grouped", "down_combine"]
+    assert "epi" not in _grouped(fake)[1]
 
 
 @pytest.mark.parametrize("rows", [1, 8, 16, 17, 28, 64])
-def test_decode_windows_keep_their_launches(monkeypatch, rows):
-    sw = switches.Switches(expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True,
-                           group_scan_decode=False, linear_pair=False)
-    fake, _, _, _ = _route(monkeypatch, rows, sw)
-    assert [n for n, _ in fake.calls] == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
-    assert all(kw == {} for kw in fake.kwargs)
-
-
-def test_without_the_item_list_nothing_fuses_and_the_scan_still_groups(monkeypatch):
-    sw = switches.Switches(expert_items=False, group_scan=True, down_fuse=True, gateup_fuse=True,
-                           group_scan_decode=False, linear_pair=False, expert_staged=False)
-    fake, _, _, _ = _route(monkeypatch, 1024, sw)
-    assert [n for n, _ in fake.calls] == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
+def test_decode_windows_keep_their_launches_and_group_on_the_scan(monkeypatch, rows):
+    fake, _, _, _ = _route(monkeypatch, rows)
+    assert _names(fake) == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
     assert fake.kwargs[0] == {"scan": True}
     assert all(kw == {} for kw in fake.kwargs[1:])
 
 
 def test_rates_past_five_bits_keep_the_epilogue_kernels(monkeypatch):
-    ex = _layer()
-    ex.k2_gu, ex.k2_d = (6, 12), (12, 12)                          # instances of rates 2..16 spilled: none fused
-    fake, _, _, _ = _route(monkeypatch, 1024, ALL_ON, ex=ex)
-    assert [n for n, _ in fake.calls] == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
+    fake, _, _, _ = _route(monkeypatch, 1024, ex=_wide())          # instances of rates 2..16 spilled: none fused
+    assert _names(fake) == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
+    assert all("epi" not in kw and "staged" not in kw for kw in _grouped(fake))
 
 
 def test_more_experts_than_threads_keep_group_kernel(monkeypatch):
-    fake, _, _, _ = _route(monkeypatch, 128, ALL_ON, ex=_layer(E=1025))
+    fake, _, _, _ = _route(monkeypatch, 128, ex=_layer(E=1025))
     assert "scan" not in fake.kwargs[0]
 
 

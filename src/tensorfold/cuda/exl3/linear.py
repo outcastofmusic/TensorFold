@@ -46,12 +46,14 @@ def plan(k: int, n: int, blocks: int = 192, min_tiles: int = 8) -> tuple[int, in
     return sk, wk
 
 
-def row_tiles(m: int, pair: bool) -> int:
-    """16-row tiles a pass of the linear decodes each weight for: 2 past 16 rows with TF_EXL3_LINEAR_PAIR, else 1.
+def row_tiles(m: int) -> int:
+    """16-row tiles a pass of the linear decodes each weight for: 2 past 16 rows, else 1.
 
-    Up to 16 rows one tile is the whole window, so those launches stay as they were."""
+    Two tiles decode each k step's weights once for 32 rows, where a 16-row pass read and decoded every weight again
+    (four streams 1.019x, GPU 20 Oct; TF_EXL3_LINEAR_PAIR turned it off until 25 Oct). Each row keeps its mma chain,
+    warp order and split order, so its bytes. Up to 16 rows one tile is the whole window."""
 
-    return 2 if pair and m > 16 else 1
+    return 2 if m > 16 else 1
 
 
 def strips(words: torch.Tensor) -> torch.Tensor:
@@ -190,12 +192,10 @@ class Exl3Linear:
             z = torch.empty((sk * m * self.n,), dtype=torch.float32, device=x.device)
         sk_stride, nb_stride = self.strides
         ext = _ext()
-        sw = switches.current()
-        pdl = sw.pdl                              # TF_EXL3_PDL
+        pdl = switches.current().pdl              # TF_EXL3_PDL
         ext.rot_in(x, self.suh, xh, pdl)
         ext.linear(xh, self.words, sk_stride, nb_stride, self.svh, self.bias, out, z if sk > 1 else None,
-                   self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk, pdl,
-                   RT=row_tiles(m, sw.linear_pair))
+                   self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk, pdl, RT=row_tiles(m))
         return out
 
     def unpack(self, out: torch.Tensor | None = None) -> torch.Tensor:

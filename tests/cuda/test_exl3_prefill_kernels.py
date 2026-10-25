@@ -1,21 +1,23 @@
-"""The prompt-window switches on the GPU: the same bytes with each switch on or off.
+"""The prompt windows' kernels on the GPU: ``routed``'s bytes against the launches of before each kernel
+(``tests.exl3_fakes.routed_with``).
 
-- TF_EXL3_GROUP_SCAN: group_scan_kernel against group_kernel on the same picks, whole buffers compared (ids, count,
+- group_scan_kernel against group_kernel on the same picks, whole buffers compared (ids, count,
   members, item list and its count, and what neither writes), at Flash Next's grouping (513 experts, 11 slots),
   GLM-5.3's (257, 9), 48 experts and the scan's limit of 1,024, windows of 65 to 2,048 rows, with skewed routing,
   picks of -1 and of E, and PDL on and off.
-- TF_EXL3_DOWN_FUSE, TF_EXL3_GATEUP_FUSE, and all three together: routed experts at Flash Next EXL3's shapes (2560 <->
-  640, 3-bit mul1 experts beside a 5-bit shared expert, 11 slots) and GLM-5.3's (4096 <-> 2048, mcg at 2.25 and 2.5
-  bits, 14-bit window, 8 slots): fp32 slots, bf16 slots into a buffer (TF_FLASHNEXT_MOE_DIRECT's call) and combined
+- The fused down and gate/up epilogues, each alone on the item list and as ``routed`` serves them: routed experts
+  at Flash Next EXL3's shapes (2560 <-> 640, 3-bit mul1 experts beside a 5-bit shared expert, 11 slots) and
+  GLM-5.3's (4096 <-> 2048, mcg at 2.25 and 2.5 bits, 14-bit window, 8 slots): fp32 slots, bf16 slots into a buffer (TF_FLASHNEXT_MOE_DIRECT's call) and combined
   rows, windows of 65 to 2,048 rows, PDL on and off, eager and replayed from a CUDA graph; the arrival counters are
   zero after every launch. A planted control: counters that never reach the last arrival leave Xd unwritten and the
   bytes differ.
-- TF_FLASHNEXT_MOE_CHUNK's call: one routed call of 2,048 rows equals two of 1,024, with the switches off and on.
+- TF_FLASHNEXT_MOE_CHUNK's call: one routed call of 2,048 rows equals two of 1,024, served and with the old launches.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -25,21 +27,12 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only
 from tensorfold.cuda.exl3 import experts, switches  # noqa: E402
 
 from tests.cuda.exl3_layers import LAYERS, _inputs, _layer, _same  # noqa: E402
+from tests.exl3_fakes import OLD, route
 
-OFF = switches.Switches(expert_items=True, group_scan=False, down_fuse=False, gateup_fuse=False,
-                        group_scan_decode=False, linear_pair=False)                        # today's defaults
-SETTINGS = {
-    "scan": switches.Switches(expert_items=True, group_scan=True, down_fuse=False, gateup_fuse=False,
-                              group_scan_decode=False, linear_pair=False),
-    "down": switches.Switches(expert_items=True, down_fuse=True, group_scan=False, gateup_fuse=False,
-                              group_scan_decode=False, linear_pair=False),
-    "gateup": switches.Switches(expert_items=True, gateup_fuse=True, group_scan=False, down_fuse=False,
-                                group_scan_decode=False, linear_pair=False),
-    "all": switches.Switches(expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True,
-                             group_scan_decode=False, linear_pair=False),
-    "all pdl": switches.Switches(pdl=True, expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True,
-                                 group_scan_decode=False, linear_pair=False),
-}
+OFF = OLD                                                          # the launches before the fused kernels
+ITEMS = replace(OLD, expert_items=True)
+SETTINGS = {"scan": replace(ITEMS, group_scan=True), "down": replace(ITEMS, down_fuse=True),
+            "gateup": replace(ITEMS, gateup_fuse=True), "served": None, "served pdl": None}
 ROWS = (65, 128, 1000, 1024, 2048)
 
 
@@ -129,12 +122,12 @@ def test_the_scan_grouping_at_its_pick_limit():
 
 
 # -- routed experts with the fused epilogues ------------------------------------------------------------------------
-def _three(name, R, x, sel, w, scratch, ex, act):
+def _three(k, R, x, sel, w, scratch, ex, act):
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
-    y = experts.routed(x, sel, None, ex, scratch, None, R, limit, act).clone()
+    y = route(k, x, sel, None, ex, scratch, None, R, limit, act).clone()
     into = torch.full((R * scratch.slots, ex.dims), float("nan"), dtype=torch.bfloat16, device="cuda")
-    yb = experts.routed(x, sel, None, ex, scratch, None, R, limit, act, y=into).clone()
-    out = experts.routed(x, sel, w, ex, scratch, None, R, limit, act).clone()
+    yb = route(k, x, sel, None, ex, scratch, None, R, limit, act, y=into).clone()
+    out = route(k, x, sel, w, ex, scratch, None, R, limit, act).clone()
     return y, yb, out
 
 
@@ -144,20 +137,19 @@ def _live(sel, E):
 
 @pytest.mark.parametrize("name", list(LAYERS))
 @pytest.mark.parametrize("R", ROWS)
-def test_routed_experts_keep_their_bytes_with_each_prompt_switch(name, R):
+def test_routed_experts_keep_their_bytes_with_each_prompt_kernel(name, R):
     ex, slots, _, act = _layer(name)
     scratch = experts.Scratch(ex, max(ROWS), slots)
     x, sel, w = _inputs(name, R, 7000 + R)
     live = _live(sel, ex.count)
-    switches.use(OFF)
-    want = _three(name, R, x, sel, w, scratch, ex, act)
+    want = _three(OFF, R, x, sel, w, scratch, ex, act)
     torch.cuda.synchronize()
     assert torch.isfinite(want[2]).all()
-    for label, sw in SETTINGS.items():
-        switches.use(sw)
+    for label, k in SETTINGS.items():
+        switches.use(switches.Switches(pdl=label.endswith("pdl")))
         scratch.y.fill_(float("nan"))
         scratch.xd.fill_(float("nan"))
-        y, yb, out = _three(name, R, x, sel, w, scratch, ex, act)
+        y, yb, out = _three(k, R, x, sel, w, scratch, ex, act)
         torch.cuda.synchronize()
         assert _same(y[live], want[0][live]), (name, R, label)
         assert torch.equal(yb[live].view(torch.int16), want[1][live].view(torch.int16)), (name, R, label)
@@ -173,15 +165,14 @@ def test_a_2048_row_call_equals_two_1024_row_calls(name):
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
     live = _live(sel, ex.count)
     got = {}
-    for label, sw in (("off", OFF), ("all", SETTINGS["all"])):
-        switches.use(sw)
-        whole = experts.routed(x, sel, None, ex, scratch, None, 2048, limit, act).clone()
-        halves = torch.cat([experts.routed(x[r0:r0 + 1024], sel[r0:r0 + 1024], None, ex, scratch, None, 1024, limit,
-                                           act).clone() for r0 in (0, 1024)])
+    for label, k in (("off", OFF), ("served", None)):
+        whole = route(k, x, sel, None, ex, scratch, None, 2048, limit, act).clone()
+        halves = torch.cat([route(k, x[r0:r0 + 1024], sel[r0:r0 + 1024], None, ex, scratch, None, 1024, limit,
+                                  act).clone() for r0 in (0, 1024)])
         torch.cuda.synchronize()
         assert _same(whole[live], halves[live]), (name, label)
         got[label] = whole
-    assert _same(got["off"][live], got["all"][live]), name
+    assert _same(got["off"][live], got["served"][live]), name
 
 
 @pytest.mark.parametrize("name", list(LAYERS))
@@ -193,7 +184,7 @@ def test_a_graph_of_a_fused_prompt_window_replays_the_eager_bytes(name):
     x, sel, w = _inputs(name, R, 8200)
     out = torch.empty((R, ex.dims), dtype=torch.float32, device="cuda")
     into = torch.empty((R * slots, ex.dims), dtype=torch.bfloat16, device="cuda")
-    switches.use(SETTINGS["all pdl"])
+    switches.use(switches.Switches(pdl=True))
     experts.routed(x, sel, w, ex, scratch, out, R, limit, act)
     experts.routed(x, sel, None, ex, scratch, None, R, limit, act, y=into)
     torch.cuda.synchronize()
@@ -202,8 +193,8 @@ def test_a_graph_of_a_fused_prompt_window_replays_the_eager_bytes(name):
         experts.routed(x, sel, None, ex, scratch, None, R, limit, act, y=into)
     nx, nsel, _ = _inputs(name, R, 8300)
     x.copy_(nx), sel.copy_(nsel)
-    switches.use(OFF)
-    want = experts.routed(x, sel, None, ex, scratch, None, R, limit, act, y=torch.empty_like(into)).clone()
+    switches.use(switches.Switches())
+    want = route(OFF, x, sel, None, ex, scratch, None, R, limit, act, y=torch.empty_like(into)).clone()
     into.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
@@ -222,15 +213,13 @@ def test_the_control_counters_that_never_finish_leave_other_bytes(name):
     scratch = experts.Scratch(ex, R, slots)
     x, sel, _ = _inputs(name, R, 8400)
     live = _live(sel, ex.count)
-    switches.use(OFF)
-    want = experts.routed(x, sel, None, ex, scratch, None, R, math.inf, act).clone()
-    switches.use(SETTINGS["gateup"])
+    want = route(OFF, x, sel, None, ex, scratch, None, R, math.inf, act).clone()
     scratch.xd.fill_(float("nan"))
     scratch.arrivals.fill_(1 << 20)
-    got = experts.routed(x, sel, None, ex, scratch, None, R, math.inf, act).clone()
+    got = route(SETTINGS["gateup"], x, sel, None, ex, scratch, None, R, math.inf, act).clone()
     torch.cuda.synchronize()
     scratch.arrivals.zero_()
     assert not _same(got[live], want[live])
-    got = experts.routed(x, sel, None, ex, scratch, None, R, math.inf, act).clone()
+    got = route(SETTINGS["gateup"], x, sel, None, ex, scratch, None, R, math.inf, act).clone()
     torch.cuda.synchronize()
     assert _same(got[live], want[live])

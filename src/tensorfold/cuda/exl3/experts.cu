@@ -121,7 +121,7 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
 }
 
 // group_kernel's outputs (the same uids, ucount, members, items and icount) by a count, a scan and a stable scatter
-// (TF_EXL3_GROUP_SCAN). group_kernel's threads each scan every pick once an expert they hold: on a 1,024-row window
+// (experts.scan_fits). group_kernel's threads each scan every pick once an expert they hold: on a 1,024-row window
 // of Flash Next (11,264 picks, 513 experts) 129 threads of one block ran 2.3 ms. Here every block counts all picks
 // (warps merge equal experts with match_any) and scans the counts to the places in id order; block b then owns
 // experts [b * per, (b + 1) * per): their ids, items and members. Members come out in pick order because the picks

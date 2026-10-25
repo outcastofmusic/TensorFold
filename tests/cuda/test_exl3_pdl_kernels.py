@@ -19,9 +19,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only
 from tensorfold.cuda.exl3 import experts, linear, switches  # noqa: E402
 from tests.cuda.exl3_layers import LAYERS, LINEAR, _inputs, _layer, _same, _scale, _trellis
 
-OLD = dict(group_scan=False, down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False)
-OFF = switches.Switches(pdl=False, **OLD)
-SETTINGS = [OFF, switches.Switches(pdl=True, **OLD)]
+OFF = switches.Switches(pdl=False)
+SETTINGS = [OFF, switches.Switches(pdl=True)]
 DECODE_ROWS = (1, 2, 3, 4, 5, 6, 7, 8, 16)
 PROMPT_ROWS = (17, 64, 65, 128)
 
@@ -95,7 +94,7 @@ def test_the_linear_keeps_its_bytes_with_pdl(k, n, bits):
         x = torch.randn((m, k), generator=g).to(torch.bfloat16).cuda()
         got = []
         for pdl in (False, True, False):
-            switches.use(switches.Switches(pdl=pdl, **OLD))
+            switches.use(switches.Switches(pdl=pdl))
             got.append(lin(x).clone())
         torch.cuda.synchronize()
         assert _same(got[0].float(), got[1].float()) and _same(got[0].float(), got[2].float()), (k, n, bits, m)

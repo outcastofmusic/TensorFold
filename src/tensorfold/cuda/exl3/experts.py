@@ -24,9 +24,9 @@ GLM_GATEUP = (8, 4, 4, 1)
 GLM_DOWN = (8, 4, 1, 1)
 PROMPT_ROWS = 64          # a window of more rows than this is a prompt's: its experts each serve many rows
 PROMPT_TILES = 2          # row tiles (16 rows each) that share one read of an expert's weights in such a window
-SCAN_EXPERTS = 1024       # group_scan_kernel (TF_EXL3_GROUP_SCAN): an expert a thread of a 1,024-thread block
+SCAN_EXPERTS = 1024       # group_scan_kernel: an expert a thread of a 1,024-thread block
 SCAN_PICKS = 65535        # and ranks of 16 bits
-EPI_GATEUP, EPI_DOWN = 1, 2   # grouped_kernel's fused epilogues (TF_EXL3_GATEUP_FUSE, TF_EXL3_DOWN_FUSE)
+EPI_GATEUP, EPI_DOWN = 1, 2   # grouped_kernel's fused epilogues
 
 
 @lru_cache(maxsize=1)
@@ -210,12 +210,12 @@ class Scratch:
         self.ids = torch.zeros((maxu,), dtype=torch.int32, device=device)
         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
         self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
-        # grouped_kernel's listed layout (TF_EXL3_EXPERT_ITEMS): the member groups group_kernel lists, and their count
+        # grouped_kernel's listed layout: the member groups group_kernel lists, and their count
         self.items_buf = torch.zeros((item_bound(P, maxu, 16),), dtype=torch.int32, device=device)
         self.icount = torch.zeros((1,), dtype=torch.int32, device=device)
         # the fused gate/up epilogue's arrivals, an (item, 128-column n block); each launch leaves them zero
         self.arrivals = torch.zeros((self.items_buf.numel() * max(1, I // 128),), dtype=torch.int32, device=device)
-        # TF_EXL3_ROT_FUSE's counters, an (item, matrix) of the gate/up launch; each launch leaves them zero
+        # the rotating gate/up launch's counters, an (item, matrix); each launch leaves them zero
         self.rot_arrivals = torch.zeros((self.items_buf.numel() * 2,), dtype=torch.int32, device=device)
         self.rows, self.slots, self.count_experts = rows, slots, ex.count
 
@@ -253,11 +253,21 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
 
     ``prompt`` (default: more than PROMPT_ROWS rows) reads each expert once for 32 of its rows; the values are the same.
-    With TF_EXL3_EXPERT_ITEMS (and ``group``) a prompt window's grouping lists the member groups grouped_kernel's
-    launches run. On a prompt window TF_EXL3_GROUP_SCAN groups on group_scan_kernel, and on the listed layout
-    TF_EXL3_GATEUP_FUSE and TF_EXL3_DOWN_FUSE (without ``wts``) run the epilogues inside grouped_kernel's launches,
-    and TF_EXL3_EXPERT_STAGED stages its k steps through shared memory, where TF_EXL3_ROT_FUSE has the staged gate/up
-    launch write rot_in's rows itself.
+    Each launch below writes the bytes of the launch it replaced, and shapes it does not take keep that launch. The
+    TF_EXL3_* switches that turned them off went on 25 Oct. Speed-ups are each kernel's alone, served, GPU 19-21 Oct:
+
+    - A prompt window's grouping (with ``group``) lists the member groups grouped_kernel's launches run, where they
+      launched every group a window's rows could fill: a 1,024-row window spans 32 groups an expert and a routed
+      expert fills one (8k prefill 1.34x). Decode windows keep the spanned layout.
+    - group_scan_kernel (a count, a scan and a stable scatter on 8 blocks) groups up to SCAN_EXPERTS experts and
+      SCAN_PICKS picks, group_kernel the rest: group_kernel held 513 experts on 129 threads of one block, 2.3 ms a
+      1,024-row window (8k prefill 1.14x), and costs 0.22 us a pick on decode windows (four streams 1.026x).
+    - On the listed layout at the rates ``fusable`` takes, the gate/up epilogue runs in the last of an (item, n
+      block)'s gate and up programs (1.031x), and without ``wts`` the down epilogue in the down programs (1.036x).
+    - A prompt window's launches on 16-byte trellises at those rates stage S k steps of weights and member rows a
+      warp through shared memory (``stageable``; cold prefill 1.16-1.19x at 4k-131k).
+    - A staged gate/up launch on the item list, with rows of x on 16 bytes (``rot_fits``), rotates them itself where
+      rot_in wrote every pick's rows first, 230 MB a 2,048-row window (cold prefill 1.04x).
     ``y`` (without ``wts``): a contiguous [R * slots, D] that takes the slots in place of the scratch's: bf16 rounds
     them once, as a copy of the fp32 slots into it would round them; fp32 takes them as they are."""
 
@@ -268,25 +278,23 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     if R > s.rows:
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
-    sw = switches.current()
-    pdl = sw.pdl
+    pdl = switches.current().pdl
     many = R > PROMPT_ROWS if prompt is None else bool(prompt)
     gu, dn = plan(s.cfg_gu, s.cfg_d, many)
     # prompt windows only: on decode windows the list cost about 1% decode (GPU 19 Oct, tf-runs/gpu-exl3s2 alone/)
-    tile = listed_tile(gu, dn) if group and sw.expert_items and many else 0
+    tile = listed_tile(gu, dn) if group and many else 0
     listed = {"items": s.items(R, tile), "icount": s.icount} if tile else {}
     if group:
-        # TF_EXL3_GROUP_SCAN on prompt windows, TF_EXL3_GROUP_SCAN_DECODE on decode windows
-        scan = {"scan": True} if (sw.group_scan if many else sw.group_scan_decode) and scan_fits(E, P) else {}
+        scan = {"scan": True} if scan_fits(E, P) else {}
         ext.group(pick, ids, s.count, members, R, slots, E, pdl, **listed, **({"tile": tile} if tile else {}),
                   **scan)
     nt, w, sk, pf, rt = gu
-    staged = {"staged": True} if sw.expert_staged and many and stageable(gu, ex.k2_gu, ex) else {}
+    staged = {"staged": True} if many and stageable(gu, ex.k2_gu, ex) else {}
     rot = {"rot_x": x, "rot_suh0": ex.suh_g, "rot_suh1": ex.suh_u, "rot_arrivals": s.rot_arrivals} \
-        if staged and listed and sw.rot_fuse and rot_fits(x) else {}
+        if staged and listed and rot_fits(x) else {}
     if not rot:
         ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E, pdl)
-    fuse_gu = sw.gateup_fuse and bool(listed) and fusable(gu, ex.k2_gu)
+    fuse_gu = bool(listed) and fusable(gu, ex.k2_gu)
     fused = {"epi": EPI_GATEUP, "s0": ex.svh_g, "s1": ex.svh_u, "s2": ex.suh_d, "out": s.xd, "arrivals": s.arrivals,
              "limit": float(limit), "act_mode": act_mode} if fuse_gu else {}
     ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
@@ -298,9 +306,9 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
                             float(limit), act_mode, pdl)
     nt, w, sk, pf, rt = dn
     into = s.y if y is None else y
-    fuse_dn = sw.down_fuse and bool(listed) and wts is None and sk == 1 and fusable(dn, ex.k2_d)
+    fuse_dn = bool(listed) and wts is None and sk == 1 and fusable(dn, ex.k2_d)
     fused = {"epi": EPI_DOWN, "s0": ex.svh_d, "out": into} if fuse_dn else {}
-    staged = {"staged": True} if sw.expert_staged and many and stageable(dn, ex.k2_d, ex) else {}
+    staged = {"staged": True} if many and stageable(dn, ex.k2_d, ex) else {}
     ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
                 D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], rt, ex.window, pdl, **listed,
                 **fused, **staged)
@@ -337,14 +345,14 @@ def fusable(launch: Launch, k2: tuple[int, int]) -> bool:
 
 
 def stageable(launch: Launch, k2: tuple[int, int], ex: Exl3RoutedExperts) -> bool:
-    """Whether TF_EXL3_EXPERT_STAGED has an instance for ``launch``: the fused epilogues' setting and rates (their
+    """Whether the staged grouped_kernel has an instance for ``launch``: the fused epilogues' setting and rates (their
     staged k steps fit static shared memory), on trellises that start on 16 bytes."""
 
     return ex.aligned and fusable(launch, k2)
 
 
 def rot_fits(x: torch.Tensor) -> bool:
-    """Whether TF_EXL3_ROT_FUSE's 16-byte loads take the rows of ``x``: bf16 or fp16, each row on 16 bytes."""
+    """Whether the rotating gate/up launch's 16-byte loads take the rows of ``x``: bf16 or fp16, rows on 16 bytes."""
 
     return (x.dtype in (torch.bfloat16, torch.float16) and x.dim() == 2 and x.stride(1) == 1
             and x.stride(0) % 8 == 0 and x.data_ptr() % 16 == 0)

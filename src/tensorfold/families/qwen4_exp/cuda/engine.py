@@ -112,7 +112,7 @@ class FlashNextEngine:
         # TF_FLASHNEXT_PROMPT_EXPERT_TILE and TF_FP4_SHARED_DECODE: every NVFP4 layer's expert kernels
         self.prompt_tile, self.shared_decode = tile_mode(), shared_decode()
         self.hc_fuse = hc_fuse()                         # TF_FLASHNEXT_HC_FUSE: every HC's prompt fusions
-        # every TF_EXL3_* switch of the EXL3 kernels (exl3.switches.ENVS)
+        # TF_EXL3_PDL, the EXL3 kernels' one switch (exl3.switches.ENVS)
         exl3_switches.use(exl3_switches.read())
         # TF_FLASHNEXT_STACK_DIRECT, _F16_INNER_K, _MOE_DIRECT, _MOE_CHUNK (before admission: it sizes the scratch)
         exl3_mm.use(exl3_mm.read())
