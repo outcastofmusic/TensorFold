@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only
 
 from tensorfold.cuda.exl3 import experts, switches  # noqa: E402
 
-from tests.cuda.test_exl3_decode_kernels import LAYERS, _inputs, _layer, _same  # noqa: E402
+from tests.cuda.exl3_layers import LAYERS, _inputs, _layer, _same  # noqa: E402
 
 OFF = switches.Switches(expert_items=True, group_scan=False, down_fuse=False, gateup_fuse=False,
                         group_scan_decode=False, linear_pair=False)                        # today's defaults

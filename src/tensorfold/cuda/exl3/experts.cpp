@@ -6,7 +6,7 @@
 void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, int64_t, int64_t, bool, bool, const int*, const int*, int64_t, int64_t,
+                        int64_t, int64_t, int64_t, int64_t, bool, const int*, const int*, int64_t, int64_t,
                         const void*, const void*, const void*, void*, int*, double, int64_t, bool, bool,
                         const void*, int64_t, bool, const void*, const void*, int*);
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t);
@@ -44,7 +44,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
              const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
              int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi,
-             int64_t rt, int64_t window, bool decode, bool pdl, const c10::optional<at::Tensor>& items,
+             int64_t rt, int64_t window, bool pdl, const c10::optional<at::Tensor>& items,
              const c10::optional<at::Tensor>& icount, int64_t epi, const c10::optional<at::Tensor>& s0,
              const c10::optional<at::Tensor>& s1, const c10::optional<at::Tensor>& s2,
              const c10::optional<at::Tensor>& out, const c10::optional<at::Tensor>& arrivals, double limit,
@@ -66,9 +66,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
     c10::cuda::CUDAGuard guard(X0.device());
     TORCH_CHECK(rt == 1 || rt == 2, "rt: 1 or 2 row tiles a block");
     TORCH_CHECK(window >= 8 && window <= 16, "window: a codeword of 8 to 16 bits");
-    TORCH_CHECK(!decode || (members.size(1) <= 16 && rt == 1), "decode: a window of at most 16 rows, one row tile");
     check_items(items, icount);
-    TORCH_CHECK(!(decode && items), "the item list lays out grouped_kernel; decode_kernel takes none");
     // the fused epilogues (TF_EXL3_GATEUP_FUSE 1, TF_EXL3_DOWN_FUSE 2) take the epilogue kernels' operands
     const void *e0 = nullptr, *e1 = nullptr, *e2 = nullptr;
     void* eout = nullptr;
@@ -120,7 +118,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
         TORCH_CHECK(rot_arrivals->numel() >= items->numel() * mats, "rot_arrivals: one an item and matrix");
     }
     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
-                       pf, lo, hi, rt, (int64_t(1) << window) - 1, decode, pdl,
+                       pf, lo, hi, rt, (int64_t(1) << window) - 1, pdl,
                        items ? items->data_ptr<int>() : nullptr, icount ? icount->data_ptr<int>() : nullptr,
                        items ? items->numel() : 0, epi, e0, e1, e2, eout, earr, limit, act_mode, ebf16, staged,
                        rot_x ? rot_x->data_ptr() : nullptr, rot_x ? rot_x->stride(0) : 0,
@@ -227,20 +225,19 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
     exl3x_down_combine_cuda(Z, pick, svh_d, y, wts, out, rows, P, D, SK, slots, E, pdl);
 }
 
-// The trailing switches default to off, so a direct call (the GPU tests') launches as before them: ``decode`` takes
-// decode_kernel (TF_EXL3_EXPERT_DECODE), ``pdl`` programmatic dependent launch on GB10 (TF_EXL3_PDL, pdl.cuh), and
-// ``items`` with ``icount`` (group's list, TF_EXL3_EXPERT_ITEMS) grouped_kernel's listed layout, ``scan`` group's
-// count-scan-scatter kernel (TF_EXL3_GROUP_SCAN), and ``epi`` with its operands a fused epilogue (TF_EXL3_GATEUP_FUSE,
-// TF_EXL3_DOWN_FUSE), and ``staged`` the prompt setting's k steps through shared memory (TF_EXL3_EXPERT_STAGED),
-// and ``rot_x`` with ``rot_suh0``, ``rot_suh1``, ``rot_arrivals`` a staged gate/up launch that writes X0 and X1 itself
-// (TF_EXL3_ROT_FUSE).
+// The trailing switches default to off, so a direct call (the GPU tests') launches as before them: ``pdl`` takes
+// programmatic dependent launch on GB10 (TF_EXL3_PDL, pdl.cuh), ``items`` with ``icount`` (group's list,
+// TF_EXL3_EXPERT_ITEMS) grouped_kernel's listed layout, ``scan`` group's count-scan-scatter kernel
+// (TF_EXL3_GROUP_SCAN), and ``epi`` with its operands a fused epilogue (TF_EXL3_GATEUP_FUSE, TF_EXL3_DOWN_FUSE), and
+// ``staged`` the prompt setting's k steps through shared memory (TF_EXL3_EXPERT_STAGED), and ``rot_x`` with
+// ``rot_suh0``, ``rot_suh1``, ``rot_arrivals`` a staged gate/up launch that writes X0 and X1 itself (TF_EXL3_ROT_FUSE).
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     namespace py = pybind11;
     m.def("grouped", &grouped, py::arg("X0"), py::arg("X1"), py::arg("TP0"), py::arg("TP1"), py::arg("B0"),
           py::arg("B1"), py::arg("uids"), py::arg("ucount"), py::arg("members"), py::arg("Z"), py::arg("mats"),
           py::arg("K"), py::arg("N"), py::arg("P"), py::arg("SK"), py::arg("slots"), py::arg("cb"), py::arg("nt"),
           py::arg("warps"), py::arg("pf"), py::arg("lo"), py::arg("hi"), py::arg("rt"), py::arg("window"),
-          py::arg("decode") = false, py::arg("pdl") = false, py::arg("items") = py::none(),
+          py::arg("pdl") = false, py::arg("items") = py::none(),
           py::arg("icount") = py::none(), py::arg("epi") = 0, py::arg("s0") = py::none(), py::arg("s1") = py::none(),
           py::arg("s2") = py::none(), py::arg("out") = py::none(), py::arg("arrivals") = py::none(),
           py::arg("limit") = INFINITY, py::arg("act_mode") = 1, py::arg("staged") = false,

@@ -3,6 +3,5 @@
 
 namespace tf_exl3x {
 template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
-template void decode_launch<0>(const GroupedArgs&, cudaStream_t);
 template void dequant_launch<0>(const uint32_t*, half*, int, int, int, uint32_t, cudaStream_t);
 }  // namespace tf_exl3x

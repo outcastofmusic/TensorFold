@@ -15,7 +15,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from tensorfold.cuda.exl3 import experts, switches
-from tests.test_exl3_decode_switches import NVCC, FakeExt, _layer, _ptxas
+from tests.exl3_fakes import NVCC, FakeExt, _layer, _ptxas
 from tests.test_exl3_expert_staged import _sass_values
 from tests.test_exl3_prefill_switches import HERE, _route
 

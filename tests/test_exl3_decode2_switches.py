@@ -46,7 +46,7 @@ def test_each_flag_is_on_unless_turned_off(clean_env, env, value, on):
     assert getattr(got, ENVS[env]) is on
     other = next(name for e, name in ENVS.items() if e != env)
     assert getattr(got, other) is True                                    # on since 20 Oct's GPU A/B
-    assert (got.expert_decode, got.pdl, got.expert_items) == (False, False, True)     # the older switches' defaults
+    assert (got.pdl, got.expert_items) == (False, True)                               # the older switches' defaults
     assert (got.group_scan, got.down_fuse, got.gateup_fuse) == (True, True, True)
 
 

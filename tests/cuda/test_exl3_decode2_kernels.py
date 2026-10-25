@@ -6,7 +6,7 @@ prompt switches (TF_EXL3_GROUP_SCAN, _DOWN_FUSE, _GATEUP_FUSE) at their defaults
   group_kernel writes shows), at Flash Next's grouping (513 experts with the shared one, 11 slots) and GLM-5.3's
   (8 or 9 slots), windows of 1 to 128 rows and one of 1,024, with repeated picks in a row, picks of -1 and of E, and
   member lists cut short of the count. tests/cuda/test_exl3_prefill_kernels.py covers its prompt windows.
-- Routed experts at both models' shapes (tests/cuda/test_exl3_decode_kernels.py's layers): per-slot outputs and
+- Routed experts at both models' shapes (tests/cuda/exl3_layers.py's layers): per-slot outputs and
   combined rows with the switch on and off, eager and replayed from CUDA graphs.
 - The EXL3 linear with two row tiles a pass against one: Flash Next's dense shapes and GLM-5.3-sized ones, mul1 and
   mcg, 1 to 128 rows (one pass, two, a pass of one tile after full ones), split-K shapes, a wider output, and graphs.
@@ -23,7 +23,7 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 
 from tensorfold.cuda.exl3 import experts, linear, switches
-from tests.cuda.test_exl3_decode_kernels import LAYERS, LINEAR, _inputs, _layer, _same, _scale, _trellis
+from tests.cuda.exl3_layers import LAYERS, LINEAR, _inputs, _layer, _same, _scale, _trellis
 from tests.test_exl3_expert_items import _listing
 
 OFF = switches.Switches(group_scan=True, down_fuse=True, gateup_fuse=True, group_scan_decode=False,

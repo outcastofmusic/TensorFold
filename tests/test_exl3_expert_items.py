@@ -12,7 +12,7 @@ torch = pytest.importorskip("torch")
 
 from tensorfold.cuda.exl3 import experts, switches  # noqa: E402
 
-from tests.test_exl3_decode_switches import NVCC, FakeExt, _layer, _ptxas  # noqa: E402
+from tests.exl3_fakes import NVCC, FakeExt, _layer, _ptxas  # noqa: E402
 
 ENV = switches.EXPERT_ITEMS_ENV
 
@@ -57,10 +57,10 @@ def test_an_engine_installs_the_item_switch(monkeypatch, tmp_path):
     assert switches.current().expert_items is False
 
 
-def _route(monkeypatch, rows, decode, items, slots=4, group=True):
+def _route(monkeypatch, rows, items, slots=4, group=True):
     fake = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: fake)
-    switches.use(switches.Switches(expert_decode=decode, pdl=True, expert_items=items, group_scan=False,
+    switches.use(switches.Switches(pdl=True, expert_items=items, group_scan=False,
                                    down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False,
                                    expert_staged=False))
     ex = _layer()
@@ -71,10 +71,9 @@ def _route(monkeypatch, rows, decode, items, slots=4, group=True):
 
 
 @pytest.mark.parametrize("rows", [1, 8, 16, 17, 28, 64, 65, 1024])
-@pytest.mark.parametrize("decode", [True, False])
 @pytest.mark.parametrize("items", [True, False])
-def test_grouped_kernels_launches_take_the_list_the_grouping_wrote(monkeypatch, rows, decode, items):
-    fake, s, ex = _route(monkeypatch, rows, decode, items)
+def test_grouped_kernels_launches_take_the_list_the_grouping_wrote(monkeypatch, rows, items):
+    fake, s, ex = _route(monkeypatch, rows, items)
     names = [n for n, _ in fake.calls]
     assert names == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
     tile = 16 * experts.PROMPT_TILES
@@ -89,7 +88,6 @@ def test_grouped_kernels_launches_take_the_list_the_grouping_wrote(monkeypatch, 
     assert group_kw["items"].data_ptr() == s.items_buf.data_ptr()
     for i in (2, 4):                                              # both grouped launches read the same list
         assert fake.kwargs[i]["items"] is group_kw["items"] and fake.kwargs[i]["icount"] is s.icount
-        assert fake.calls[i][1][-2] is False                      # grouped_kernel, not decode_kernel
         assert fake.calls[i][1][22] == tile // 16                 # row tiles a block: the list's member group
 
 
@@ -100,8 +98,8 @@ def test_decode_windows_read_no_list(monkeypatch, rows):
 
     fake = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: fake)
-    switches.use(switches.Switches(expert_decode=True, pdl=True, expert_items=True, group_scan=False, down_fuse=False,
-                                   gateup_fuse=False, group_scan_decode=False, linear_pair=False))
+    switches.use(switches.Switches(pdl=True, expert_items=True, group_scan=False, down_fuse=False, gateup_fuse=False,
+                                   group_scan_decode=False, linear_pair=False))
     ex = _layer(D=2560, I=640)
     s = experts.Scratch(ex, 64, 4, device="cpu")
     experts.routed(torch.zeros((rows, ex.dims), dtype=torch.bfloat16), torch.zeros((rows, 4), dtype=torch.int32),
@@ -110,17 +108,15 @@ def test_decode_windows_read_no_list(monkeypatch, rows):
 
 
 def test_without_grouping_no_list_is_read(monkeypatch):
-    fake, _, _ = _route(monkeypatch, 64, False, True, group=False)
+    fake, _, _ = _route(monkeypatch, 64, True, group=False)
     assert [n for n, _ in fake.calls][0] == "rot_in"
     assert all(kw == {} for kw in fake.kwargs)
 
 
 @pytest.mark.parametrize("gu, dn, tile", [
-    (((8, 4, 4, 1, 2), False), ((8, 4, 1, 1, 2), False), 32),
-    (((8, 4, 4, 1, 1), False), ((8, 4, 1, 1, 1), False), 16),
-    (((4, 4, 4, 4, 1), True), ((4, 4, 1, 4, 1), True), 0),           # decode_kernel takes no list
-    (((4, 4, 4, 4, 1), True), ((8, 4, 1, 1, 1), False), 16),         # down alone on grouped_kernel
-    (((8, 4, 4, 1, 2), False), ((8, 4, 1, 1, 1), False), 0),         # groups of different sizes: no shared list
+    ((8, 4, 4, 1, 2), (8, 4, 1, 1, 2), 32),
+    ((8, 4, 4, 1, 1), (8, 4, 1, 1, 1), 16),
+    ((8, 4, 4, 1, 2), (8, 4, 1, 1, 1), 0),                           # groups of different sizes: no shared list
 ])
 def test_the_listed_tile(gu, dn, tile):
     assert experts.listed_tile(gu, dn) == tile

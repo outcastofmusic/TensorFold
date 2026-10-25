@@ -22,8 +22,8 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 
 from tensorfold.cuda.exl3 import experts, switches
-from tests.cuda.test_exl3_decode_kernels import _flash_next as _fn_layer
-from tests.cuda.test_exl3_decode_kernels import _glm, _same, _scale, _trellis
+from tests.cuda.exl3_layers import _flash_next as _fn_layer
+from tests.cuda.exl3_layers import _glm, _same, _scale, _trellis
 
 SERVED = switches.Switches()                                        # today's defaults: every fusion on
 UNFUSED = dataclasses.replace(SERVED, gateup_fuse=False, down_fuse=False)

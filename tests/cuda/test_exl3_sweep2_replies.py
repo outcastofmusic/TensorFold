@@ -7,8 +7,7 @@ on every HC of the load).
   prompt switches all touch), its last logits, 64 serial tokens and 64 drafted tokens (MTP at the default depth,
   confidence 0 so every verify window is full) from CUDA graphs, greedy and seeded; drafted equal serial in every
   setting, and every setting equal to the first. Then four streams decoded together (windows of 4 to 16 rows, past
-  decode_kernel's 16 once the drafts fill) equal each alone, in every setting. Gate/up of windows of 6 to 16 rows
-  stay on grouped_kernel (experts.DECODE_TILES), so they take the item list too.
+  16 once the drafts fill) equal each alone, in every setting.
 
 GLM-5.3's replies with the item list are in test_glm_exl3_sweep2_replies.py, which runs in its own pytest process.
 Needs the Flash Next pack under $MODELS (about 60 GiB free)."""

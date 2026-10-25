@@ -13,7 +13,7 @@ torch = pytest.importorskip("torch")
 
 from tensorfold.cuda.exl3 import experts  # noqa: E402
 from tensorfold.families.qwen4_exp.cuda import exl3_mm, exl3_pack  # noqa: E402
-from tests.test_exl3_decode_switches import _layer  # noqa: E402
+from tests.exl3_fakes import _layer  # noqa: E402
 from tests.test_cuda_capacity import HEAD, Loaded, checkpoint, fake_runtime, small_config  # noqa: E402, F401
 
 ENV = "TENSORFOLD_PREFILL_ROWS"

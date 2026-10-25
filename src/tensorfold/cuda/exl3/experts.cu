@@ -375,9 +375,6 @@ namespace tf_exl3x {
 extern template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<1>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<2>(const GroupedArgs&, cudaStream_t);
-extern template void decode_launch<0>(const GroupedArgs&, cudaStream_t);
-extern template void decode_launch<1>(const GroupedArgs&, cudaStream_t);
-extern template void decode_launch<2>(const GroupedArgs&, cudaStream_t);
 extern template void dequant_launch<0>(const uint32_t*, half*, int, int, int, uint32_t, cudaStream_t);
 extern template void dequant_launch<1>(const uint32_t*, half*, int, int, int, uint32_t, cudaStream_t);
 extern template void dequant_launch<2>(const uint32_t*, half*, int, int, int, uint32_t, cudaStream_t);
@@ -387,7 +384,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
                         const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
-                        int64_t hi, int64_t rt, int64_t wmask, bool decode, bool pdl, const int* items,
+                        int64_t hi, int64_t rt, int64_t wmask, bool pdl, const int* items,
                         const int* icount, int64_t nitems, int64_t epi, const void* s0, const void* s1,
                         const void* s2, void* out, int* arrivals, double limit, int64_t act, bool bf16,
                         bool staged, const void* rot_x, int64_t rot_stride, bool rot_bf16, const void* rot_s0,
@@ -430,19 +427,11 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.ep.suh0 = static_cast<const half*>(rot_s0);
     a.ep.suh1 = static_cast<const half*>(rot_s1);
     a.ep.rot_arrivals = rot_arrivals;
-    TORCH_CHECK(!(decode && epi), "decode_kernel has no fused epilogue");
-    TORCH_CHECK(!(decode && staged), "the staged path is grouped_kernel's");
     auto stream = at::cuda::getCurrentCUDAStream();
     TORCH_CHECK(cb >= 0 && cb <= 2, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
-    if (decode) {
-        if (cb == 0) tf_exl3x::decode_launch<0>(a, stream);
-        else if (cb == 1) tf_exl3x::decode_launch<1>(a, stream);
-        else tf_exl3x::decode_launch<2>(a, stream);
-    } else {
-        if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
-        else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
-        else tf_exl3x::grouped_launch<2>(a, stream);
-    }
+    if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
+    else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
+    else tf_exl3x::grouped_launch<2>(a, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
