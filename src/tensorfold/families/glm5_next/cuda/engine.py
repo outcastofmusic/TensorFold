@@ -258,11 +258,13 @@ class GlmEngine:
         from tensorfold.env_flags import flag
         from tensorfold.families.qwen4_exp.cuda.copy_drafts import BACK, most_rows
 
-        # TF_GLM_DFLASH_COPIES (unset: off): DFlash2 rounds verify a copy where the reply repeats earlier text; a
-        # copy's window widens from 6 rows up to TENSORFOLD_COPY_ROWS while copies land whole
-        self.dflash_copies = flag("TF_GLM_DFLASH_COPIES", False)
-        # TF_GLM_COPY_BACK=N: a copy only where its match runs N tokens before the 8 it needs (0: any match)
-        self.copy_back = int(os.environ.get("TF_GLM_COPY_BACK", "0").strip() or 0)
+        # TF_GLM_DFLASH_COPIES (unset: on): DFlash2 rounds verify a copy where the reply repeats earlier text; a
+        # copy's window widens from 6 rows up to TENSORFOLD_COPY_ROWS while copies land whole. With TF_GLM_COPY_BACK
+        # at 8: batch 48.6 to 54.5 tok/s, list copy 2.19x, rewrite 1.58x, json unchanged, the same replies
+        # (tf-runs/copy-longest, 2026-10-20)
+        self.dflash_copies = flag("TF_GLM_DFLASH_COPIES", True)
+        # TF_GLM_COPY_BACK=N (unset: 8): a copy only where its match runs N tokens before the 8 it needs (0: any match)
+        self.copy_back = int(os.environ.get("TF_GLM_COPY_BACK", "8").strip() or 8)
         if not 0 <= self.copy_back <= BACK:
             raise ValueError(f"TF_GLM_COPY_BACK: 0 to {BACK} (a match is scored {BACK} tokens back), not {self.copy_back}")
         from .drafter_choice import COPY_DRAFTS

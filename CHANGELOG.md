@@ -5,6 +5,12 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **A direct `tensorfold serve` of GLM-5.3 on CUDA runs what `run.sh` serves.** `TF_GLM_LAZY_SPARSE`,
+  `TF_GLM_DFLASH_COPIES` and `TF_GLM_COPY_BACK` now default to 1, 1 and 8, the values `run.sh` passed, and `run.sh`
+  no longer passes them. Before, a direct serve, the tests and the tools captured every long-context graph at start
+  (7 s at 98,304 tokens) and verified no copies in DFlash2 rounds. `TF_GLM_LAZY_SPARSE=0`, `TF_GLM_DFLASH_COPIES=0`
+  (`COPIES=0` in `run.sh`) and `TF_GLM_COPY_BACK=0` restore the old behaviour. `TF_GLM_DENSE_PROMPT` and
+  `TF_GLM_CALIBRATE` keep their defaults of 0 and 1, and `run.sh` still sets 1 and 0.
 - **GLM-5.3 on CUDA drops five switches whose other branch production never ran.** `TF_GLM_LATENT=0` (per-head
   keys and values, 0.3.6's attention), `TF_GLM_PLAIN_NARROW=0`, `TF_GLM_HC_SPLIT=0`, `TF_GLM_MOE_IN_PLACE=0` and
   `TF_GLM_TOKEN_LIST=0` (the decode kernels before the 1.078x serial speed-up of tf-runs/gpu-glmdec and gpu-glm2) are
