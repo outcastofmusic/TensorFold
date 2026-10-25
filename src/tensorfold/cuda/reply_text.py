@@ -10,12 +10,11 @@ from typing import Any
 from tensorfold.server import pythonic_calls
 from tensorfold.server.stopping import StopPolicy
 from tensorfold.server.text import hide_tool_calls  # noqa: F401  (the CUDA server's, with the Mac's four formats)
-from tensorfold.server.tools import parse_glm_tool_call_block, tool_call_blocks, tool_spec_name
+from tensorfold.server.tools import parse_glm_tool_call_block, tool_call_blocks, tool_parameters, tool_spec_name
 from tensorfold.tool_parameters import closed_json, decode_parameter, parameter_schemas
 
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
 _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
-_TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
 
 
 
@@ -120,14 +119,13 @@ def _parse_tagged(text: str, tools: list[dict[str, Any]],
         except (json.JSONDecodeError, AttributeError):
             m = _TOOL_FUNCTION_BLOCK_RE.match(block)
             if m:
-                if max_calls is not None and _TOOL_PARAMETER_BLOCK_RE.sub("", m.group(2)).strip():
+                parameters, rest = tool_parameters(m.group(2))
+                if max_calls is not None and rest.strip():
                     continue
                 name = m.group(1).strip()
                 # typed parameters (array, object, number...) decode per the tool's schema, as the Mac server does
                 props = schemas.get(name.lower(), {})
-                args = {key: decode_parameter(value, props.get(key, {}))
-                        for key, value in ((p.group(1).strip(), p.group(2))
-                                           for p in _TOOL_PARAMETER_BLOCK_RE.finditer(m.group(2)))}
+                args = {key: decode_parameter(value, props.get(key, {})) for key, value in parameters}
             else:
                 glm = parse_glm_tool_call_block(block, tools, complete=max_calls is not None)
                 if glm is not None:
