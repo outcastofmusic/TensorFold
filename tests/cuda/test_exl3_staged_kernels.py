@@ -1,11 +1,12 @@
-"""TF_EXL3_EXPERT_STAGED on the GPU: a prompt window's routed experts write the same bytes with the staged kernel.
+"""The staged grouped_kernel on the GPU: a prompt window's routed experts write the same bytes as unstaged.
 
 - Routed experts at Flash Next EXL3's shapes (2560 <-> 640, 3-bit mul1 experts beside a 5-bit shared expert, 11
   slots), at 4 bits in each codebook, and at GLM-5.3's (4096 <-> 2048, mcg at 2.25 bits, whose 18-word tiles take
-  8-byte copies, and at 2.5 bits, 14-bit window, 8 slots): bf16 slots into a buffer (TF_FLASHNEXT_MOE_DIRECT's
-  call), fp32 slots and combined rows, windows of 65 to 2,048 rows, with the served switches, with the epilogue
+  8-byte copies, and at 2.5 bits, 14-bit window, 8 slots): bf16 slots into a buffer (the MoE buffer's
+  call), fp32 slots and combined rows, windows of 65 to 2,048 rows, as ``routed`` serves them, with the epilogue
   kernels (no fusion, so they read the staged path's one total a matrix), on the spanned layout (no item list) and
-  with PDL. Uniform and skewed routing (experts holding hundreds of rows, so many member groups an expert).
+  with PDL; each against the same launches unstaged (``tests.exl3_fakes.routed_with``). Uniform and skewed routing
+  (experts holding hundreds of rows, so many member groups an expert).
 - A CUDA graph captured on the staged path replays the eager bytes; the arrival counters end at zero.
 - A layer whose trellises do not start on 16 bytes keeps grouped_kernel's launches and its bytes.
 - Planted control: one flipped trellis word changes the bytes the comparison sees.
@@ -24,12 +25,13 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only
 from tensorfold.cuda.exl3 import experts, switches
 from tests.cuda.exl3_layers import _flash_next as _fn_layer
 from tests.cuda.exl3_layers import _glm, _same, _scale, _trellis
+from tests.exl3_fakes import Launches, route
 
-SERVED = switches.Switches()                                        # today's defaults: every fusion on
-UNFUSED = dataclasses.replace(SERVED, gateup_fuse=False, down_fuse=False)
-SPANNED = dataclasses.replace(SERVED, expert_items=False)
-PDL = dataclasses.replace(SERVED, pdl=True)
-BASES = {"served": SERVED, "unfused": UNFUSED, "spanned": SPANNED, "pdl": PDL}
+SERVED = Launches()                                                 # routed's own launches
+UNSTAGED = dataclasses.replace(SERVED, expert_staged=False)
+# None runs ``experts.routed`` itself
+BASES = {"served": None, "unfused": dataclasses.replace(SERVED, gateup_fuse=False, down_fuse=False),
+         "spanned": dataclasses.replace(SERVED, expert_items=False), "pdl": None}
 ROWS = (65, 128, 1000, 2048)
 
 
@@ -79,12 +81,12 @@ def _inputs(name, R, seed, hot=False):
     return x, sel.cuda().contiguous(), w.float().cuda().contiguous()
 
 
-def _three(x, sel, w, ex, scratch, R, act):
+def _three(k, x, sel, w, ex, scratch, R, act):
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
     into = torch.full((R * scratch.slots, ex.dims), float("nan"), dtype=torch.bfloat16, device="cuda")
-    yb = experts.routed(x, sel, None, ex, scratch, None, R, limit, act, y=into).clone()
-    y = experts.routed(x, sel, None, ex, scratch, None, R, limit, act).clone()
-    out = experts.routed(x, sel, w, ex, scratch, None, R, limit, act).clone()
+    yb = route(k, x, sel, None, ex, scratch, None, R, limit, act, y=into).clone()
+    y = route(k, x, sel, None, ex, scratch, None, R, limit, act).clone()
+    out = route(k, x, sel, w, ex, scratch, None, R, limit, act).clone()
     return yb, y, out
 
 
@@ -98,12 +100,12 @@ def _check(name, R, base, hot=False, seed=0):
     scratch = experts.Scratch(ex, R, slots)
     x, sel, w = _inputs(name, R, 9000 + R + seed, hot)
     live = _live(sel, ex.count)
-    switches.use(base)
-    want = _three(x, sel, w, ex, scratch, R, act)
-    switches.use(dataclasses.replace(base, expert_staged=True))
+    switches.use(switches.Switches(pdl=base == "pdl"))
+    k = BASES[base]
+    want = _three(dataclasses.replace(k or SERVED, expert_staged=False), x, sel, w, ex, scratch, R, act)
     scratch.y.fill_(float("nan"))
     scratch.xd.fill_(float("nan"))
-    got = _three(x, sel, w, ex, scratch, R, act)
+    got = _three(k, x, sel, w, ex, scratch, R, act)
     torch.cuda.synchronize()
     assert torch.isfinite(want[2]).all()
     assert torch.equal(got[0][live].view(torch.int16), want[0][live].view(torch.int16)), (name, R, "bf16 slots")
@@ -116,13 +118,13 @@ def _check(name, R, base, hot=False, seed=0):
 @pytest.mark.parametrize("R", ROWS)
 @pytest.mark.parametrize("base", list(BASES))
 def test_the_staged_kernel_keeps_the_bytes(name, R, base):
-    _check(name, R, BASES[base])
+    _check(name, R, base)
 
 
 @pytest.mark.parametrize("name", ["flash_next", "glm53_2.25bit"])
 @pytest.mark.parametrize("base", ["served", "unfused"])
 def test_the_staged_kernel_keeps_the_bytes_on_skewed_routing(name, base):
-    _check(name, 2048, BASES[base], hot=True)
+    _check(name, 2048, base, hot=True)
 
 
 @pytest.mark.parametrize("name", ["flash_next", "glm53_2.25bit"])
@@ -133,7 +135,7 @@ def test_a_graph_of_the_staged_path_replays_the_eager_bytes(name):
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
     x, sel, _ = _inputs(name, R, 9300)
     into = torch.empty((R * slots, ex.dims), dtype=torch.bfloat16, device="cuda")
-    switches.use(dataclasses.replace(PDL, expert_staged=True))
+    switches.use(switches.Switches(pdl=True))
     experts.routed(x, sel, None, ex, scratch, None, R, limit, act, y=into)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -141,8 +143,8 @@ def test_a_graph_of_the_staged_path_replays_the_eager_bytes(name):
         experts.routed(x, sel, None, ex, scratch, None, R, limit, act, y=into)
     nx, nsel, _ = _inputs(name, R, 9301)
     x.copy_(nx), sel.copy_(nsel)
-    switches.use(SERVED)
-    want = experts.routed(x, sel, None, ex, scratch, None, R, limit, act, y=torch.empty_like(into)).clone()
+    switches.use(switches.Switches())
+    want = route(UNSTAGED, x, sel, None, ex, scratch, None, R, limit, act, y=torch.empty_like(into)).clone()
     into.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
@@ -152,7 +154,7 @@ def test_a_graph_of_the_staged_path_replays_the_eager_bytes(name):
 
 
 def test_trellises_off_16_bytes_keep_grouped_kernels_launches():
-    """Each trellis 8 bytes into its storage: ``aligned`` is false, so the switch leaves the launches as they were."""
+    """Each trellis 8 bytes into its storage: ``aligned`` is false, so ``routed`` keeps the unstaged launches."""
 
     D, I, E = 2560, 640, 16
     g = torch.Generator().manual_seed(5)
@@ -170,9 +172,7 @@ def test_trellises_off_16_bytes_keep_grouped_kernels_launches():
     x = (torch.randn((R, D), generator=gx) * 0.5).to(torch.bfloat16).cuda()
     sel = torch.stack([torch.randperm(E, generator=gx)[:10] for _ in range(R)]).to(torch.int32)
     sel = torch.cat([sel, torch.full((R, 1), E, dtype=torch.int32)], 1).cuda().contiguous()
-    switches.use(SERVED)
-    want = experts.routed(x, sel, None, ex, scratch, None, R).clone()
-    switches.use(dataclasses.replace(SERVED, expert_staged=True))
+    want = route(UNSTAGED, x, sel, None, ex, scratch, None, R).clone()
     got = experts.routed(x, sel, None, ex, scratch, None, R).clone()
     torch.cuda.synchronize()
     assert _same(got, want)
@@ -186,7 +186,6 @@ def test_the_control_a_flipped_trellis_word_changes_the_bytes():
     ex, slots, _, _ = _layer(name)
     scratch = experts.Scratch(ex, R, slots)
     x, sel, _ = _inputs(name, R, 9400)
-    switches.use(dataclasses.replace(SERVED, expert_staged=True))
     want = experts.routed(x, sel, None, ex, scratch, None, R).clone()
     e = int(sel[0, 0])
     gate = next(t for t in ex.keep if t.data_ptr() == int(ex.gate_ptr[e]))

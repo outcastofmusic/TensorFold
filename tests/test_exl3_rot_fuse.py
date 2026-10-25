@@ -1,8 +1,7 @@
-"""TF_EXL3_ROT_FUSE on the CPU: the flag's values and where the engines read it, which launches ``routed`` hands the
-switch (a staged gate/up launch on the item list, with rows of x on 16 bytes; everything else keeps rot_in), and
-(compiled for sm_121 without a GPU, when nvcc is present) that the switch's instances do not spill, keep 2 blocks an
-SM, and compile rot_in_kernel's multiplies, FMAs and roundings a value. tests/cuda/test_exl3_rot_fuse_kernels.py
-compares the bytes on the GPU."""
+"""The rotating gate/up launch on the CPU: which launches of ``routed`` rotate x themselves (a staged gate/up launch on
+the item list, with rows of x on 16 bytes; everything else keeps rot_in), and (compiled for sm_121 without a GPU, when
+nvcc is present) that the rotating instances do not spill, keep 2 blocks an SM, and compile rot_in_kernel's
+multiplies, FMAs and roundings a value. tests/cuda/test_exl3_rot_fuse_kernels.py compares the bytes on the GPU."""
 
 from __future__ import annotations
 
@@ -14,64 +13,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from tensorfold.cuda.exl3 import experts, switches
+from tensorfold.cuda.exl3 import experts
 from tests.exl3_fakes import NVCC, FakeExt, _layer, _ptxas
 from tests.test_exl3_expert_staged import _sass_values
 from tests.test_exl3_prefill_switches import HERE, _route
-
-ROT = dataclasses.replace(switches.Switches(), rot_fuse=True)
-
-
-@pytest.fixture(autouse=True)
-def restore():
-    before = switches.current()
-    yield
-    switches.use(before)
-
-
-@pytest.fixture
-def clean_env(monkeypatch):
-    for env in switches.ENVS:
-        monkeypatch.delenv(env, raising=False)
-    return monkeypatch
-
-
-# -- the flag -------------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("value, on", [(None, True), ("", True), ("1", True), ("on", True), ("YES", True),
-                                       ("0", False), ("off", False), (" no ", False)])
-def test_the_flag_is_on_unless_turned_off(clean_env, value, on):
-    if value is not None:
-        clean_env.setenv(switches.ROT_FUSE_ENV, value)
-    got = switches.read()
-    assert got.rot_fuse is on
-    assert dataclasses.replace(got, rot_fuse=True) == switches.Switches()       # the others keep their defaults
-
-
-@pytest.mark.parametrize("value", ["2", "rot", "o", "1.0"])
-def test_a_flag_typo_stops_both_engines_before_any_read(clean_env, tmp_path, value):
-    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
-    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
-
-    clean_env.setenv(switches.ROT_FUSE_ENV, value)
-    with pytest.raises(ValueError, match=switches.ROT_FUSE_ENV):
-        switches.read()
-    with pytest.raises(ValueError, match=switches.ROT_FUSE_ENV):
-        FlashNextEngine(tmp_path / "missing")
-    with pytest.raises(ValueError, match=switches.ROT_FUSE_ENV):
-        GlmEngine(tmp_path / "missing", rank=0, master="", port=0, world=1)
-
-
-def test_both_engines_install_what_they_read(clean_env, tmp_path):
-    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
-    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
-
-    clean_env.setenv(switches.ROT_FUSE_ENV, "1")
-    for build in (lambda: FlashNextEngine(tmp_path / "missing"),
-                  lambda: GlmEngine(tmp_path / "missing", rank=0, master="", port=0, world=1)):
-        switches.use(switches.Switches())
-        with pytest.raises(Exception):  # noqa: B017  # the checkpoint (or, without a GPU, the device) fails after
-            build()
-        assert switches.current() == ROT
 
 
 # -- what routed launches -------------------------------------------------------------------------------------------
@@ -85,7 +30,7 @@ def _grouped(fake):
 
 @pytest.mark.parametrize("rows", [65, 128, 1024])
 def test_a_prompt_window_rotates_inside_the_staged_gate_up_launch(monkeypatch, rows):
-    fake, s, ex, _ = _route(monkeypatch, rows, ROT)
+    fake, s, ex, _ = _route(monkeypatch, rows)
     assert _names(fake) == ["group", "grouped", "grouped"]                  # no rot_in
     gu, dn = _grouped(fake)
     x = fake.calls[1][1][0]                                                 # X0 is the scratch's xg, as before
@@ -96,31 +41,21 @@ def test_a_prompt_window_rotates_inside_the_staged_gate_up_launch(monkeypatch, r
     assert not any(k.startswith("rot_") for k in dn)
 
 
-def test_the_unfused_epilogue_keeps_the_switch_on_the_staged_launch(monkeypatch):
-    sw = dataclasses.replace(ROT, gateup_fuse=False, down_fuse=False)
-    fake, _, _, _ = _route(monkeypatch, 1024, sw)
-    assert _names(fake) == ["group", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
-    assert "rot_x" in _grouped(fake)[0]
-
-
-def test_the_combined_rows_keep_the_switch(monkeypatch):
-    fake, _, _, _ = _route(monkeypatch, 1024, ROT, wts=True)
+def test_the_combined_rows_keep_the_rotating_launch(monkeypatch):
+    fake, _, _, _ = _route(monkeypatch, 1024, wts=True)
     assert _names(fake) == ["group", "grouped", "grouped", "down_combine"]
 
 
 @pytest.mark.parametrize("rows", [1, 8, 16, 17, 28, 64])
 def test_decode_windows_keep_rot_in(monkeypatch, rows):
-    fake, _, _, _ = _route(monkeypatch, rows, ROT)
+    fake, _, _, _ = _route(monkeypatch, rows)
     assert "rot_in" in _names(fake)
     assert all(not any(k.startswith("rot_") for k in kw) for kw in _grouped(fake))
 
 
-@pytest.mark.parametrize("sw", [dataclasses.replace(ROT, expert_staged=False),
-                                dataclasses.replace(ROT, expert_items=False),
-                                switches.Switches(rot_fuse=False)], ids=["staged off", "spanned", "switch off"])
-def test_without_a_staged_listed_launch_or_the_switch_rot_in_stays(monkeypatch, sw):
-    fake, _, _, _ = _route(monkeypatch, 1024, sw)
-    assert _names(fake)[:2] == ["group", "rot_in"]
+def test_without_the_item_list_rot_in_stays(monkeypatch):
+    fake, _, _, _ = _route(monkeypatch, 1024, group=False)        # the spanned layout, staged
+    assert _names(fake)[0] == "rot_in" and _grouped(fake)[0]["staged"] is True
     assert all(not any(k.startswith("rot_") for k in kw) for kw in fake.kwargs)
 
 
@@ -129,14 +64,13 @@ def test_layers_the_staged_path_leaves_keep_rot_in(monkeypatch):
     wide.k2_gu, wide.k2_d = (6, 12), (12, 12)
     off16 = dataclasses.replace(_layer(), aligned=False)
     for ex in (wide, off16):
-        fake, _, _, _ = _route(monkeypatch, 1024, ROT, ex=ex)
+        fake, _, _, _ = _route(monkeypatch, 1024, ex=ex)
         assert "rot_in" in _names(fake)
 
 
 def _x_route(monkeypatch, x):
     fake = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: fake)
-    switches.use(ROT)
     ex = _layer()
     s = experts.Scratch(ex, 1024, 4, device="cpu")
     experts.routed(x, torch.zeros((x.shape[0], 4), dtype=torch.int32), None, ex, s, None, x.shape[0])

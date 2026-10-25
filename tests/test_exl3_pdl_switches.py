@@ -50,17 +50,14 @@ def test_an_engine_installs_what_it_reads(monkeypatch, tmp_path):
     for e in switches.ENVS:
         monkeypatch.delenv(e, raising=False)
     monkeypatch.setenv(ENV, "1")
-    switches.use(switches.Switches(group_scan=False, down_fuse=False, gateup_fuse=False, group_scan_decode=False,
-                                   linear_pair=False))
+    switches.use(switches.Switches())
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
-    assert switches.current() == switches.Switches(pdl=True, group_scan=True, down_fuse=True, gateup_fuse=True,
-                                                   group_scan_decode=True, linear_pair=True)
+    assert switches.current() == switches.Switches(pdl=True)
 
 
 def test_use_returns_the_previous_setting():
-    off = switches.Switches(pdl=False, group_scan=False, down_fuse=False, gateup_fuse=False,
-                            group_scan_decode=False, linear_pair=False)
+    off = switches.Switches(pdl=False)
     first = switches.use(off)
     assert switches.current() is off
     assert switches.use(first) is off
@@ -71,8 +68,7 @@ def test_use_returns_the_previous_setting():
 def test_routed_hands_each_launch_its_switches(monkeypatch, pdl, rows):
     fake = FakeExt()
     monkeypatch.setattr(experts, "_ext", lambda: fake)
-    switches.use(switches.Switches(pdl=pdl, group_scan=False, down_fuse=False, gateup_fuse=False,
-                                   group_scan_decode=False, linear_pair=False))
+    switches.use(switches.Switches(pdl=pdl))
     ex = _layer()
     s = experts.Scratch(ex, 32, 4, device="cpu")
     x = torch.zeros((rows, ex.dims), dtype=torch.bfloat16)
@@ -93,8 +89,7 @@ def test_routed_hands_each_launch_its_switches(monkeypatch, pdl, rows):
 def test_the_linear_hands_its_launches_the_pdl_switch(monkeypatch, pdl):
     fake = FakeExt()
     monkeypatch.setattr(linear, "_ext", lambda: fake)
-    switches.use(switches.Switches(pdl=pdl, group_scan=False, down_fuse=False, gateup_fuse=False,
-                                   group_scan_decode=False, linear_pair=False))
+    switches.use(switches.Switches(pdl=pdl))
     k, n = 256, 128
     lin = linear.Exl3Linear(torch.zeros((n // 128, k // 16, 8, 24), dtype=torch.int32), torch.zeros(k).half(),
                             torch.zeros(n).half(), None, 3.0, "mul1", k, n)

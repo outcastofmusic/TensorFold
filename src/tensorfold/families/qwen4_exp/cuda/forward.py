@@ -54,26 +54,26 @@ def hc_block(hc: HC, b: Buffers, R: int, eps: float, streams: int, low: int, mod
              inject_out, h: torch.Tensor, branch=None, y=None, wts=None) -> None:
     """Write the pending branch back into the streams h (in place), then the hyper-connection's read-out: b.mixed [R, D] (+ group sums), and its inject gates into ``inject_out``.
 
-    A bf16 HC with ``hc.fuse`` (TF_FLASHNEXT_HC_FUSE) takes its prompt fusions here. Its read-out feeds the layer's
-    DeltaNet or attention projection and its experts, and none of their bf16, FP8 or NVFP4 kernels reads b.xs_mixed.
-    ``finish`` keeps the separate kernels and the sums, which the MTP draft head's 4-bit matmul reads. An EXL3 pack's
-    fp16 HC with ``hc.fuse`` takes the first fusion alone, the write-back and the norm in one kernel, which leaves
-    the same bytes in h, b.pss, b.normed and b.xs_normed whatever the matrices."""
+    A bf16 HC takes its prompt fusions here (``hc_b16``). Its read-out feeds the layer's DeltaNet or attention
+    projection and its experts, and none of their bf16, FP8 or NVFP4 kernels reads b.xs_mixed. ``finish`` keeps the
+    separate kernels and the sums, which the MTP draft head's 4-bit matmul reads. An EXL3 pack's fp16 HC and a 4-bit
+    HC take the first fusion alone, the write-back and the norm in one kernel, which leaves the same bytes in h,
+    b.pss, b.normed and b.xs_normed whatever the matrices."""
 
     prompt = b.prefill and R > FUSED_ROWS
     inject = inject_out[:R] if hc.inject else None
-    if prompt and (isinstance(hc.down, qmm.Q4) or hc.fuse):
+    if prompt:
         fused = _hc_fuser(h.device)
         if fused is not None:
             fused(h[:R], b.pss[:R], hc.scale, b.normed[:R], b.xs_normed[:R], streams, eps, mode,
                   branch=branch, inject=inject_prev, y=y, wts=wts)
-            if hc.fuse and getattr(hc.down, "kernel", "qmm") == "b16":
+            if getattr(hc.down, "kernel", "qmm") == "b16":
                 _readout_b16(hc, b, h, R, eps, streams, low, inject, normed=True, fuse=True)
             else:
                 _readout_plain(hc, b, h, R, eps, streams, low, inject, normed=True)
             return
     glue.hc_writeback(h[:R], h[:R], b.pss[:R], streams, mode, branch=branch, inject=inject_prev, y=y, wts=wts)
-    _readout(hc, b, h, R, eps, streams, low, inject, fuse=prompt and hc.fuse)
+    _readout(hc, b, h, R, eps, streams, low, inject, fuse=prompt)
 
 
 FUSED_ROWS = 16      # decode windows: the read-out in 3 kernels; wider windows (prefill) in 5, the same bits
@@ -349,7 +349,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
     m = layer.moe
     if getattr(m.experts, "kernel", "qmm") == "nvfp4":      # an NVFP4 checkpoint: the FP4 experts
         buf = b.moe
-        nvfp4_moe.moe(b.mixed[:R], b.xs_mixed[:R], m.router, m.experts, buf, _MoECfg(w.cfg), decode=not b.prefill)
+        nvfp4_moe.moe(b.mixed[:R], b.xs_mixed[:R], m.router, m.experts, buf, _MoECfg(w.cfg))
     elif w.x3 is not None:                              # an EXL3 pack: each expert at its own width, one GPU
         return _exl3_moe(m, w, b, R)
     else:
@@ -365,7 +365,7 @@ def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
 
     from tensorfold.cuda.exl3.experts import routed
 
-    from .exl3_mm import current, moe_window
+    from .exl3_mm import moe_window
     from .exl3_pack import MOE_WINDOW
 
     buf = b.moe
@@ -374,9 +374,11 @@ def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
     if not b.prefill and R <= MOE_WINDOW:
         y = routed(b.mixed[:R], buf.pick[:R], None, m.experts, w.x3.moe, None, R)
         return 2, y.view(R, buf.slots, -1), buf.wts[:R]
-    # a window's bf16 slots go straight into buf.y (TF_FLASHNEXT_MOE_DIRECT), or come as fp32 and a copy rounds them
-    direct = current().moe_direct and buf.y.dtype == torch.bfloat16
-    window = moe_window()                    # TF_FLASHNEXT_MOE_CHUNK: a prompt chunk in one call
+    # a prompt window's slots round to bf16 straight into buf.y, where fp32 slots and the copy that rounded them wrote
+    # and read 115 MB more a 1,024-row window and layer (served 8k prefill 1.040x, 19 Oct; TF_FLASHNEXT_MOE_DIRECT
+    # turned it off until 25 Oct); fp32 buffers take a copy of the fp32 slots
+    direct = buf.y.dtype == torch.bfloat16
+    window = moe_window()                    # a prompt chunk in one call
     for r0 in range(0, R, window):
         n = min(window, R - r0)
         into = buf.y[r0:r0 + n].view(n * buf.slots, -1) if direct else None

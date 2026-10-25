@@ -81,8 +81,8 @@ void unpack(const at::Tensor& T, at::Tensor W, int64_t stride_k, int64_t stride_
     exl3_unpack_cuda(T, W, stride_k, stride_nb, K2, cb);
 }
 
-// pdl (TF_EXL3_PDL, pdl.cuh) defaults to off and RT (TF_EXL3_LINEAR_PAIR: 2, two 16-row tiles a pass) to 1, so a
-// direct call launches as before the switches.
+// pdl (TF_EXL3_PDL, pdl.cuh) defaults to off and RT (2: two 16-row tiles a pass, linear.row_tiles) to 1, so a
+// direct call launches one tile a pass.
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     namespace py = pybind11;
     m.def("rot_in", &rot_in, py::arg("x"), py::arg("suh"), py::arg("xh"), py::arg("pdl") = false);

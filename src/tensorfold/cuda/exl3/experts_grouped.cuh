@@ -245,7 +245,7 @@ __device__ __forceinline__ void ldmatrix_a(uint32_t (&a)[4], const half* tile, i
                  : "r"(smem_addr(p)));
 }
 
-// TF_EXL3_EXPERT_STAGED: warp_tiles with the weights and the member rows of several k steps in flight through shared
+// Staged: warp_tiles with the weights and the member rows of several k steps in flight through shared
 // memory (cp.async), where warp_tiles holds one k step of weights in registers and loads the rows when it uses them.
 // A warp's STAGE_BYTES hold as many k steps as fit at the tile's rate, up to S: 6 at 3 bits, 4 at 5 bits.
 // The GB10 profile of a 2,048-row Flash Next window (ncu, 21 Oct): 248 registers held 2 blocks (8 warps) an SM,
@@ -360,7 +360,7 @@ struct Epi {
     float limit = 0.f;
     int act = 0;                 // gate/up: SwiGLU mode (gateup_epilogue_kernel's act_mode)
     int bf16 = 0;                // down: Y is bf16
-    // TF_EXL3_ROT_FUSE (a staged gate/up launch on the item list, ROT): the rows rot_in_kernel would rotate, bf16 or
+    // ROT (a staged gate/up launch on the item list): the rows rot_in_kernel would rotate, bf16 or
     // fp16 with rows x_stride values apart on 16 bytes, suh_g and suh_u [E, K], and a counter an (item, matrix), zero
     // between launches
     const void* x = nullptr;
@@ -371,7 +371,7 @@ struct Epi {
     int* rot_arrivals = nullptr;
 };
 
-// TF_EXL3_ROT_FUSE: a staged gate/up launch writes rot_in_kernel's rows itself. The NB n-block programs of an
+// ROT: a staged gate/up launch writes rot_in_kernel's rows itself. The NB n-block programs of an
 // (item, matrix) each rotate the item's members over 128-wide Hadamard blocks nb, nb + NB, .. of K into X0 or X1,
 // where rot_in_kernel writes them, then wait at a counter for the other NB - 1 and read the rows back through
 // warp_tiles_staged's copies, from L2. rot_in_kernel wrote every pick's rows in pick order before the launch, 230 MB a
@@ -469,13 +469,13 @@ __device__ __forceinline__ void rot_store(const RotUnit& u, const Epi& ep, const
 //
 // Two layouts of the same programs. Spanned (items null): grid (experts, n blocks, matrices x splits x member groups),
 // every member group a window's rows could fill, so a prompt window of 1,024 rows launches 32 groups an expert and
-// leaves 31 of a typical routed expert's empty. Listed (TF_EXL3_EXPERT_ITEMS): grid (n blocks, matrices x splits,
+// leaves 31 of a typical routed expert's empty. Listed (prompt windows): grid (n blocks, matrices x splits,
 // items), one program a (place << 16 | member group) item group_kernel listed, so only filled groups launch, and an
 // item's n blocks run next to each other while its rows are still in L2. Each program computes the same sums.
 //
-// S > 0 (TF_EXL3_EXPERT_STAGED) runs the warps' k ranges through warp_tiles_staged, S k steps in flight a warp, in
-// shared memory that the warps' sums reuse once every warp is done with it. ROT (TF_EXL3_ROT_FUSE, a staged gate/up
-// launch on the item list) first writes its share of the rows X0 and X1 hold (rot_load, rot_store).
+// S > 0 (experts.stageable) runs the warps' k ranges through warp_tiles_staged, S k steps in flight a warp, in
+// shared memory that the warps' sums reuse once every warp is done with it. ROT (a staged gate/up launch on the item
+// list) first writes its share of the rows X0 and X1 hold (rot_load, rot_store).
 template <int NT, int W, bool STAGED, bool ROT = false>
 struct GroupedSmem {
     float red[W][16][NT * 16];
@@ -820,8 +820,8 @@ struct GroupedArgs {
     int nitems = 0;
     int epi = EPI_NONE;            // a fused epilogue (listed layout, prompt setting) and its arguments
     Epi ep;
-    bool staged = false;           // TF_EXL3_EXPERT_STAGED: the prompt setting through warp_tiles_staged
-    bool rot = false;              // TF_EXL3_ROT_FUSE: a staged gate/up launch writes X0, X1 from ep.x itself
+    bool staged = false;           // the prompt setting through warp_tiles_staged
+    bool rot = false;              // a staged gate/up launch writes X0, X1 from ep.x itself
 };
 
 constexpr int STAGES = 8;          // most k steps in flight a warp on the staged path (Staged::DEPTH)

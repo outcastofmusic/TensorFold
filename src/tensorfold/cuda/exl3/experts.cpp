@@ -30,7 +30,7 @@ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
                 ": expected a contiguous CUDA tensor of the right dtype");
 }
 
-// grouped_kernel's listed layout (TF_EXL3_EXPERT_ITEMS): group's items and their count, or neither.
+// grouped_kernel's listed layout: group's items and their count, or neither.
 static void check_items(const c10::optional<at::Tensor>& items, const c10::optional<at::Tensor>& icount) {
     TORCH_CHECK(items.has_value() == icount.has_value(), "items and icount come together");
     if (!items) return;
@@ -67,7 +67,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
     TORCH_CHECK(rt == 1 || rt == 2, "rt: 1 or 2 row tiles a block");
     TORCH_CHECK(window >= 8 && window <= 16, "window: a codeword of 8 to 16 bits");
     check_items(items, icount);
-    // the fused epilogues (TF_EXL3_GATEUP_FUSE 1, TF_EXL3_DOWN_FUSE 2) take the epilogue kernels' operands
+    // the fused epilogues (gate/up 1, down 2) take the epilogue kernels' operands
     const void *e0 = nullptr, *e1 = nullptr, *e2 = nullptr;
     void* eout = nullptr;
     int* earr = nullptr;
@@ -98,7 +98,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
         e0 = s0->data_ptr();
         eout = out->data_ptr();
     }
-    // TF_EXL3_ROT_FUSE: a staged gate/up launch rotates the rows of x itself (rot_in's operands; X0, X1 go unread)
+    // a staged gate/up launch rotates the rows of x itself (rot_in's operands; X0, X1 go unread)
     TORCH_CHECK(rot_x.has_value() == rot_suh0.has_value() && rot_x.has_value() == rot_suh1.has_value() &&
                     rot_x.has_value() == rot_arrivals.has_value(),
                 "rot_x, rot_suh0, rot_suh1 and rot_arrivals come together");
@@ -157,7 +157,7 @@ void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tenso
         TORCH_CHECK(items->numel() >= (R * slots + tile - 1) / tile + uids.numel(), "items too small");
     }
     c10::cuda::CUDAGuard guard(pick.device());
-    // ``scan``: group_scan_kernel (TF_EXL3_GROUP_SCAN), the same outputs
+    // ``scan``: group_scan_kernel, the same outputs
     (scan ? exl3x_group_scan_cuda : exl3x_group_cuda)(pick, uids, ucount, members, R, slots, E, pdl,
                                                       items ? items->data_ptr<int>() : nullptr,
                                                       icount ? icount->data_ptr<int>() : nullptr, tile);
@@ -226,11 +226,11 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
 }
 
 // The trailing switches default to off, so a direct call (the GPU tests') launches as before them: ``pdl`` takes
-// programmatic dependent launch on GB10 (TF_EXL3_PDL, pdl.cuh), ``items`` with ``icount`` (group's list,
-// TF_EXL3_EXPERT_ITEMS) grouped_kernel's listed layout, ``scan`` group's count-scan-scatter kernel
-// (TF_EXL3_GROUP_SCAN), and ``epi`` with its operands a fused epilogue (TF_EXL3_GATEUP_FUSE, TF_EXL3_DOWN_FUSE), and
-// ``staged`` the prompt setting's k steps through shared memory (TF_EXL3_EXPERT_STAGED), and ``rot_x`` with
-// ``rot_suh0``, ``rot_suh1``, ``rot_arrivals`` a staged gate/up launch that writes X0 and X1 itself (TF_EXL3_ROT_FUSE).
+// programmatic dependent launch on GB10 (TF_EXL3_PDL, pdl.cuh), ``items`` with ``icount`` (group's list)
+// grouped_kernel's listed layout, ``scan`` group's count-scan-scatter kernel, and ``epi`` with its operands a fused
+// epilogue (gate/up or down), and ``staged`` the prompt setting's k steps through shared memory, and ``rot_x`` with
+// ``rot_suh0``, ``rot_suh1``, ``rot_arrivals`` a staged gate/up launch that writes X0 and X1 itself
+// (experts.routed picks each from the shape).
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     namespace py = pybind11;
     m.def("grouped", &grouped, py::arg("X0"), py::arg("X1"), py::arg("TP0"), py::arg("TP1"), py::arg("B0"),

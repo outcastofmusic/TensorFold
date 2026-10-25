@@ -1,6 +1,6 @@
-"""TF_FLASHNEXT_HC_FUSE on the CPU: the flag's values, where the engine and loader read it, which kernels a bf16
-hyper-connection's read-out launches with it on or off, and (in the Triton interpreter) that the fused kernels write
-the old kernels' bytes. tests/cuda/test_hc_fusions.py checks the bytes on the GPU."""
+"""The bf16 hyper-connection's prompt fusions on the CPU: which kernels its read-out launches at each window, and (in
+the Triton interpreter) that the fused kernels write the old kernels' bytes. tests/cuda/test_hc_fusions.py checks the
+bytes on the GPU."""
 
 from __future__ import annotations
 
@@ -16,45 +16,13 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
 
 from tensorfold.families.qwen4_exp.cuda import bf16, forward, hc_b16  # noqa: E402
-from tensorfold.families.qwen4_exp.cuda.weight_types import HC  # noqa: E402
-
-ENV = hc_b16.FUSE_ENV
-
-
-@pytest.mark.parametrize("value, on", [(None, True), ("", True), ("1", True), ("on", True), ("0", False),
-                                       ("off", False), ("false", False), (" NO ", False)])
-def test_the_flag_is_on_unless_turned_off(monkeypatch, value, on):
-    if value is None:
-        monkeypatch.delenv(ENV, raising=False)
-    else:
-        monkeypatch.setenv(ENV, value)
-    assert hc_b16.fuse() is on
-
-
-@pytest.mark.parametrize("value", ["2", "fused", "o", "1.0"])
-def test_a_flag_typo_stops_the_engine_and_the_loader_before_any_read(monkeypatch, tmp_path, value):
-    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
-    from tensorfold.families.qwen4_exp.cuda.weights import load
-
-    monkeypatch.setenv(ENV, value)
-    with pytest.raises(ValueError, match=ENV):
-        hc_b16.fuse()
-    with pytest.raises(ValueError, match=ENV):
-        FlashNextEngine(tmp_path / "missing")                      # no checkpoint there: the flag fails first
-    with pytest.raises(ValueError, match=ENV):
-        load(tmp_path / "missing", "cpu")
-
-
-def test_an_hc_fuses_only_when_the_loader_says_so():
-    assert HC(None, None, None, True).fuse is False                 # MLX and EXL3 hyper-connections
-
 
 ROWS = 2048
 
 
-def _hc(fuse: bool):
+def _hc():
     return SimpleNamespace(down=SimpleNamespace(kernel="b16", n=324, b="down"),
-                           up=SimpleNamespace(kernel="b16", n=10240, b="up"), scale="scale", inject=True, fuse=fuse)
+                           up=SimpleNamespace(kernel="b16", n=10240, b="up"), scale="scale", inject=True)
 
 
 def _buffers(prefill: bool):
@@ -97,21 +65,20 @@ OLD = ["hc_writeback", "hc_normed", "down inner_k=False", "hc_act", "up", "hc_mi
 
 @pytest.mark.parametrize("rows", [17, 128, 129, 2048])
 def test_a_prompt_chunk_takes_the_three_fusions(launches, rows):
-    _block(_hc(True), _buffers(True), rows)
+    _block(_hc(), _buffers(True), rows)
     assert launches.calls == ["write_norm", "down inner_k=True", "hc_act", "up_mix"]
 
 
 def test_without_the_checked_write_norm_the_other_two_fusions_stay(launches):
     launches.fused = None                       # another GPU, an older Triton, or bytes that differed
-    _block(_hc(True), _buffers(True), ROWS)
+    _block(_hc(), _buffers(True), ROWS)
     assert launches.calls == ["hc_writeback", "hc_normed", "down inner_k=True", "hc_act", "up_mix"]
 
 
-@pytest.mark.parametrize("fuse, prefill, rows", [(False, True, ROWS), (False, True, 17), (True, True, 16),
-                                                 (True, True, 1), (True, False, 17), (True, False, 2048)])
-def test_the_switch_off_decode_windows_and_short_chunks_keep_the_separate_kernels(launches, fuse, prefill, rows):
+@pytest.mark.parametrize("prefill, rows", [(True, 16), (True, 1), (False, 17), (False, 2048)])
+def test_decode_windows_and_short_chunks_keep_the_separate_kernels(launches, prefill, rows):
     launches.fused = lambda *a, **k: pytest.fail("the write-norm fusion ran")
-    _block(_hc(fuse), _buffers(prefill), rows)
+    _block(_hc(), _buffers(prefill), rows)
     assert launches.calls == OLD
 
 
@@ -119,7 +86,7 @@ def test_the_final_read_out_keeps_the_group_sums_the_draft_head_reads(launches):
     """``finish`` reads the mixer out through ``_readout`` with no ``fuse``: b.xs_mixed is written."""
 
     b = _buffers(True)
-    forward._readout(_hc(True), b, torch.zeros((ROWS, 1)), ROWS, 1e-6, 4, 320, None)
+    forward._readout(_hc(), b, torch.zeros((ROWS, 1)), ROWS, 1e-6, 4, 320, None)
     assert launches.calls == ["hc_normed", "down inner_k=False", "hc_act", "up", "hc_mix"]
 
 

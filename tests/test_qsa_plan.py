@@ -1,5 +1,5 @@
-"""The prompt indexer's CPU side: TF_FLASHNEXT_QSA's values, which scratches take qsa_scores.cu, and which select runs
-at which block counts. tests/cuda/test_qsa_scores.py checks the kernels' bytes and lists on the GPU."""
+"""The prompt indexer's CPU side: which scratches take qsa_scores.cu, and which select runs at which block counts.
+tests/cuda/test_qsa_scores.py checks the kernels' bytes and lists on the GPU."""
 
 from __future__ import annotations
 
@@ -12,46 +12,17 @@ from tensorfold.families.qwen4_exp.cuda import attention as att  # noqa: E402
 from tensorfold.families.qwen4_exp.cuda import attn_multi, qsa  # noqa: E402
 
 
-@pytest.mark.parametrize("value, mode", [(None, "cuda"), ("", "cuda"), ("cuda", "cuda"), ("torch", "torch"),
-                                         (" CUDA ", "cuda"), ("Torch", "torch")])
-def test_the_flag_reads_cuda_by_default_or_torch(monkeypatch, value, mode):
-    if value is None:
-        monkeypatch.delenv(qsa.ENV, raising=False)
-    else:
-        monkeypatch.setenv(qsa.ENV, value)
-    assert qsa.mode() == mode
-
-
-@pytest.mark.parametrize("value", ["triton", "1", "0", "off", "cuda,torch"])
-def test_an_unknown_flag_value_raises_naming_the_flag(monkeypatch, value):
-    monkeypatch.setenv(qsa.ENV, value)
-    with pytest.raises(ValueError, match=qsa.ENV):
-        qsa.mode()
-
-
-def test_an_unknown_flag_value_stops_the_engine_before_it_reads_the_model(monkeypatch, tmp_path):
-    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
-
-    monkeypatch.setenv(qsa.ENV, "fast")
-    with pytest.raises(ValueError, match=qsa.ENV):
-        FlashNextEngine(tmp_path / "missing")          # no checkpoint there: the flag fails first
-
-
 def test_the_kernel_covers_the_shipped_indexer_only():
     assert qsa.fits(4, 128)                            # FP4-Local and EXL3 3.05bpw: indexer_n_heads 4, head_dim 128
     assert not qsa.fits(8, 128) and not qsa.fits(4, 64)
 
 
-@pytest.mark.parametrize("value, prefill, heads, dim, fast", [
-    (None, True, 4, 128, True), ("cuda", True, 4, 128, True), ("torch", True, 4, 128, False),
-    (None, False, 4, 128, False),                      # decode windows keep the Triton kernels
-    (None, True, 8, 128, False),                       # an indexer the kernel does not cover
+@pytest.mark.parametrize("prefill, heads, dim, fast", [
+    (True, 4, 128, True),
+    (False, 4, 128, False),                            # decode windows keep the Triton kernels
+    (True, 8, 128, False),                             # an indexer the kernel does not cover
 ])
-def test_prompt_buffers_take_the_cuda_kernels_with_the_flag(monkeypatch, value, prefill, heads, dim, fast):
-    if value is None:
-        monkeypatch.delenv(qsa.ENV, raising=False)
-    else:
-        monkeypatch.setenv(qsa.ENV, value)
+def test_prompt_buffers_take_the_cuda_kernels(prefill, heads, dim, fast):
     assert qsa.fast(prefill, heads, dim) is fast
 
 
@@ -65,11 +36,11 @@ def test_the_tiled_select_runs_from_8192_blocks_on_a_fast_scratch_and_past_the_r
     assert qsa.tiled(blocks, att.triton.next_power_of_2(blocks), fast, att.SELECT_REGS) is tiled
 
 
-@pytest.mark.parametrize("qsa_cuda, indexer, built", [
-    (True, (4, 128), True), (False, (4, 128), False),
-    (True, (8, 128), False), (True, (4, 64), False),       # an indexer qsa_scores.cu does not cover keeps Triton
+@pytest.mark.parametrize("indexer, built", [
+    ((4, 128), True),
+    ((8, 128), False), ((4, 64), False),                   # an indexer qsa_scores.cu does not cover keeps Triton
 ])
-def test_the_qsa_extension_builds_only_under_the_flag_for_an_indexer_it_covers(monkeypatch, qsa_cuda, indexer, built):
+def test_the_qsa_extension_builds_only_for_an_indexer_it_covers(monkeypatch, indexer, built):
     from tensorfold.cuda import experts
     from tensorfold.cuda.kernels import gdn as shared_gdn
     from tensorfold.cuda.kernels import qmm
@@ -78,7 +49,7 @@ def test_the_qsa_extension_builds_only_under_the_flag_for_an_indexer_it_covers(m
     loaded = []
     for module in (experts, shared_gdn, qmm, gdn, gdn_io, qsa):
         monkeypatch.setattr(module, "_ext", lambda module=module: loaded.append(module))
-    engine.build_kernels(qsa_cuda=qsa_cuda, indexer=indexer)
+    engine.build_kernels(indexer=indexer)
     assert (qsa in loaded) is built and len(loaded) == 5 + built
 
 

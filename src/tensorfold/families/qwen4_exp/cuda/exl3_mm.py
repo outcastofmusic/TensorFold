@@ -13,68 +13,37 @@ import triton.language as tl
 from tensorfold.cuda.exl3 import experts as x3experts
 from tensorfold.cuda.exl3 import prefill as x3prefill
 from tensorfold.cuda.exl3.linear import Exl3Linear
-from tensorfold.env_flags import flag
-
-from .exl3_pack import MOE_WINDOW
 
 ROWS = 128               # most rows one call of the EXL3 linear or a split fp16 matmul takes
-STACK_DIRECT_ENV = "TF_FLASHNEXT_STACK_DIRECT"
-INNER_K_ENV = "TF_FLASHNEXT_F16_INNER_K"
-MOE_DIRECT_ENV = "TF_FLASHNEXT_MOE_DIRECT"
-MOE_CHUNK_ENV = "TF_FLASHNEXT_MOE_CHUNK"
 MOE_MOST_ROWS = 4096      # most rows one routed call takes: group_scan_kernel ranks 65,535 picks, 5,957 rows of 11 slots
 PROMPT_ROWS = 4096        # TENSORFOLD_PREFILL_ROWS unset: a prompt chunk's rows on an EXL3 pack
 
 
 @dataclass(frozen=True)
 class Switches:
-    """The pack's matmul switches (unset: stack and moe on, inner_k off; GPU 19 Oct, inner_k 0.994x prefill). The engine reads them once at startup (``read``) and installs them
-    (``use``); the matmuls consult ``current()`` at each call, so a CUDA graph keeps the setting it was captured with.
+    """The pack's matmul setting. The engine reads it once at startup (``read``) and installs it (``use``); the
+    matmuls consult ``current()`` at each call.
 
-    TF_FLASHNEXT_STACK_DIRECT: a stack's parts write their columns of its output in place at every row count. Rows
-    past one went to scratch and were copied over: 156 copy kernels a 1,660-kernel verify graph (36 DeltaNet stacks of
-    3 parts, 12 attention stacks of 4), 253 us of its 41.4 ms (tf-runs/profile, exl3-mtp).
-    TF_FLASHNEXT_F16_INNER_K: a prompt's fp16 matmul of several K slices (the HC and mixer down projections, DeltaNet's
-    b/a, the PLE value) sums its slices inside each program in one launch over all rows (``_f16_mm_ks``), where it
-    wrote fp32 slices and summed them in a second launch, 128 rows a pair of launches.
-    TF_FLASHNEXT_MOE_DIRECT: a prompt window's routed experts round their slots to bf16 straight into the MoE buffer
-    (``experts.routed(y=...)``), where they wrote fp32 slots that a copy then rounded: 1,024 rows x 11 slots x 2,560
-    is 115 MB of fp32 written and read again a window and layer.
-    TF_FLASHNEXT_MOE_CHUNK (unset: on; served 8k prefill 1.085x alone, 19 Oct): a prompt chunk's routed experts in one call of
-    all its rows, where two calls of MOE_WINDOW each read every expert's trellis. The 8,192-token profile
-    (19 Oct) read about 0.96 GB of expert trellis a window and layer and ran grouped_kernel at about 246 GB/s of DRAM
-    traffic. In one call an expert's member groups (about 44 rows, two groups of 32) run next to each other, so the
-    second group's weights can come from L2. Rows never depend on the window, so the bytes are the same. The routed
-    scratch doubles: 478 to 955 MB at Flash Next's shape.
     ``prompt_rows`` (TENSORFOLD_PREFILL_ROWS on an EXL3 pack, unset: PROMPT_ROWS; served cold prefill 1.04 to 1.09x
-    at 4k to 131k, 21 Oct, decode within 0.995 to 1.005x; 2,048 restores the old chunks): a prompt chunk's rows. The routed scratch,
-    the prompt matmul workspace and the n-gram staging hold as many, and with moe_chunk one routed call takes up to
-    MOE_MOST_ROWS of them. Rows never depend on the chunk, so the bytes are the same. At 4,096 rows a layer's routed
-    call reads each expert's trellis once for twice the rows: 2 x 8.55 to 14.4 ms a layer (tf-runs/exl3-long-1021);
-    the routed scratch grows from 1.4 to 2.8 GB."""
+    at 4k to 131k, 21 Oct, decode within 0.995 to 1.005x; 2,048 restores the old chunks): a prompt chunk's rows. The
+    routed scratch, the prompt matmul workspace and the n-gram staging hold as many, and one routed call takes up to
+    MOE_MOST_ROWS of them (``moe_window``). Rows never depend on the chunk, so the bytes are the same. At 4,096 rows a
+    layer's routed call reads each expert's trellis once for twice the rows: 2 x 8.55 to 14.4 ms a layer
+    (tf-runs/exl3-long-1021); the routed scratch grows from 1.4 to 2.8 GB."""
 
-    stack_direct: bool = True
-    inner_k: bool = False
-    moe_direct: bool = True
-    moe_chunk: bool = True
     prompt_rows: int = PROMPT_ROWS
 
 
-ENVS = {STACK_DIRECT_ENV: "stack_direct", INNER_K_ENV: "inner_k", MOE_DIRECT_ENV: "moe_direct",
-        MOE_CHUNK_ENV: "moe_chunk"}
-
-_current = Switches()          # each field's default is its served setting, the one ``read`` takes for an unset flag
+_current = Switches()          # the default is the served setting, the one ``read`` takes for an unset variable
 
 
 def read() -> Switches:
-    """Every switch from the environment; a value outside env_flags' set, or TENSORFOLD_PREFILL_ROWS outside 256 to
-    16,384, raises before any weight is read."""
+    """The setting from the environment; TENSORFOLD_PREFILL_ROWS outside 256 to 16,384 raises before any weight is
+    read."""
 
     from tensorfold.cuda.geometry import indexed_prefill_rows
 
-    served = Switches()
-    return Switches(**{field: flag(env, getattr(served, field)) for env, field in ENVS.items()},
-                    prompt_rows=indexed_prefill_rows() or served.prompt_rows)
+    return Switches(prompt_rows=indexed_prefill_rows() or PROMPT_ROWS)
 
 
 def use(switches: Switches) -> Switches:
@@ -90,10 +59,16 @@ def current() -> Switches:
 
 
 def moe_window() -> int:
-    """Most rows a prompt's routed-expert call takes: the chunk's (at most MOE_MOST_ROWS) with TF_FLASHNEXT_MOE_CHUNK,
-    else MOE_WINDOW."""
+    """Most rows a prompt's routed-expert call takes: the chunk's, at most MOE_MOST_ROWS.
 
-    return min(_current.prompt_rows, MOE_MOST_ROWS) if _current.moe_chunk else MOE_WINDOW
+    One call of all a chunk's rows, where calls of 1,024 rows (exl3_pack.MOE_WINDOW) each read every expert's
+    trellis (served 8k prefill 1.085x, 19 Oct; TF_FLASHNEXT_MOE_CHUNK turned it off until 25 Oct). The 8,192-token
+    profile (19 Oct) read about 0.96 GB of expert trellis a window and layer and ran grouped_kernel at about 246 GB/s
+    of DRAM traffic. In one call an expert's member groups (about 44 rows, two groups of 32) run next to each other,
+    so the second group's weights can come from L2. Rows never depend on the window, so the bytes are the same. The
+    routed scratch doubles: 478 to 955 MB at Flash Next's shape and 1,024-row windows."""
+
+    return min(_current.prompt_rows, MOE_MOST_ROWS)
 
 
 class Scratch:
@@ -167,37 +142,6 @@ def _f16_mm(X, W, OUT, M, N, x_stride, o_stride, K: tl.constexpr, KS: tl.constex
 
 
 @triton.jit(do_not_specialize=["M"])
-def _f16_mm_ks(X, W, OUT, M, N, x_stride, o_stride, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
-               BN: tl.constexpr, BK: tl.constexpr):
-    """``_f16_mm`` over all SK K slices of one tile, then ``_reduce``'s adds, with no fp32 slices in memory.
-
-    Slice s is ``_f16_mm`` program ``ps = s``: the same K blocks in order from a zero accumulator on the same tile and
-    warps, so each slice's sum is the same fp32 word. The sums then add as ``_reduce`` adds them, from 0.0 in slice
-    order (so a -0.0 slice alone still becomes +0.0), and round once to OUT's dtype. Each slice must hold at least two
-    BK blocks (``inner_k_fits``): Triton folds a one-block slice's ``total + dot(x, w, 0)`` into ``dot(x, w, total)``,
-    which sums in other steps (playbook 6.9)."""
-
-    pm = tl.program_id(0)
-    pn = tl.program_id(1)
-    rm = pm * BM + tl.arange(0, BM)
-    rn = pn * BN + tl.arange(0, BN)
-    rk = tl.arange(0, BK)
-    m_ok = rm < M
-    n_ok = rn < N
-    KS: tl.constexpr = K // SK
-    total = tl.zeros((BM, BN), dtype=tl.float32)
-    for s in range(SK):
-        acc = tl.zeros((BM, BN), dtype=tl.float32)
-        for kk in range(0, KS, BK):
-            x = tl.load(X + rm[:, None] * x_stride + (s * KS + kk + rk)[None, :], mask=m_ok[:, None], other=0.0)
-            w = tl.load(W + rn[:, None] * K + (s * KS + kk + rk)[None, :], mask=n_ok[:, None], other=0.0)
-            acc = tl.dot(x.to(tl.float16), tl.trans(w), acc)
-        total = total + acc
-    tl.store(OUT + rm[:, None] * o_stride + rn[None, :], total.to(OUT.dtype.element_ty),
-             mask=m_ok[:, None] & n_ok[None, :])
-
-
-@triton.jit(do_not_specialize=["M"])
 def _reduce(P, OUT, M, N, o_stride, SK: tl.constexpr, BLOCK: tl.constexpr):
     r = tl.program_id(0)
     c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -209,23 +153,7 @@ def _reduce(P, OUT, M, N, o_stride, SK: tl.constexpr, BLOCK: tl.constexpr):
 
 
 WIDE_TILE = (64, 4, 3)        # (BN, warps, stages) of every fp16 call
-
-
-INNER_K_PROGRAMS = 96    # tiles (16 rows x 64 columns) a call needs before its slices sum in-program: 2 an SM on GB10
-INNER_K_BLOCKS = 2       # fewest BK blocks a slice for _f16_mm_ks (playbook 6.9)
 BK = 64                  # _f16_mm's K block
-
-
-def inner_k_fits(m: int, n: int, k: int, sk: int) -> bool:
-    """Whether an [m, k] call on an [n, k] matrix of ``sk`` slices takes ``_f16_mm_ks`` (TF_FLASHNEXT_F16_INNER_K).
-
-    Only calls of more than one m tile (16 rows), as when ``_f16_mm`` also had narrow tiles for one; only slices of two BK blocks or more (``_f16_mm_ks``); and only calls whose tiles fill the GPU
-    without the slices' programs: HC down (n 324) from 241 rows, the mixer's (n 320) from 305, DeltaNet's b/a (n 96)
-    from 753, the PLE value (n 2,560) from 33. A row's bytes are the same either way, so the choice may follow the
-    row count."""
-
-    return (sk > 1 and m > 16 and k // sk // BK >= INNER_K_BLOCKS
-            and -(-m // 16) * -(-n // WIDE_TILE[0]) >= INNER_K_PROGRAMS)
 
 
 def f16_split(n: int, k: int, target: int = 96) -> int:
@@ -272,23 +200,11 @@ class F16:
                       K=self.k, KS=self.k // self.sk, BM=16, BN=bn, BK=BK, F32=f32, num_warps=warps,
                       num_stages=stages)
 
-    def _launch_ks(self, x: torch.Tensor, out: torch.Tensor) -> None:
-        m = x.shape[0]
-        if x.stride(1) != 1 or x.shape[1] != self.k:
-            raise ValueError(f"F16: x {tuple(x.shape)} does not match K={self.k}")
-        bn, warps, stages = WIDE_TILE
-        _f16_mm_ks[(triton.cdiv(m, 16), triton.cdiv(self.n, bn))](
-            x, self.w, out, m, self.n, x.stride(0), out.stride(0), K=self.k, SK=self.sk, BM=16, BN=bn, BK=BK,
-            num_warps=warps, num_stages=stages)
-
     def __call__(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         if out.stride(-1) != 1:
             raise ValueError("F16: output rows must be contiguous")
         if self.sk == 1:
             self._launch(x, out, False)
-            return out
-        if current().inner_k and inner_k_fits(x.shape[0], self.n, self.k, self.sk):
-            self._launch_ks(x, out)
             return out
         for r0 in range(0, x.shape[0], ROWS):                 # rows are independent, so slices keep their bits
             xs, m = x[r0:r0 + ROWS], min(ROWS, x.shape[0] - r0)
@@ -373,9 +289,10 @@ class Stack:
             return self.parts[0](x, out)
         m = x.shape[0]
         # one row: a part's slice of ``out`` needs no copy (its row stride is unused); more rows write their columns at
-        # out's row stride (TF_FLASHNEXT_STACK_DIRECT) where every part's rows stay 16-byte aligned, or go to scratch
-        # and are copied over
-        if m == 1 or (current().stack_direct and self.aligned(out)):
+        # out's row stride where every part's rows stay 16-byte aligned, or go to scratch and are copied over. The
+        # copies were 156 kernels of a 1,660-kernel verify graph, 253 us of its 41.4 ms (tf-runs/profile, exl3-mtp;
+        # served 0.999-1.006x, 19 Oct; TF_FLASHNEXT_STACK_DIRECT turned the in-place writes off until 25 Oct)
+        if m == 1 or self.aligned(out):
             at = 0
             for p in self.parts:
                 p(x, out[:, at:at + p.n])
