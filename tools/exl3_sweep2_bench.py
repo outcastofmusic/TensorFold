@@ -3,9 +3,9 @@ one load, so a served A/B's difference can be split by switch.
 
 Switches: TF_EXL3_EXPERT_ITEMS ("items"), TF_FLASHNEXT_STACK_DIRECT ("stack"), TF_FLASHNEXT_F16_INNER_K ("inner_k"),
 TF_FLASHNEXT_MOE_DIRECT ("moe"), and TF_FLASHNEXT_HC_FUSE on the pack's fp16 hyper-connections ("hc"). The other
-switches (TF_EXL3_EXPERT_DECODE, TF_EXL3_PDL) keep their environment's setting. Per setting: a fresh prefill of a ``--prompt``-token prompt in 2,048-row chunks
+switches (TF_EXL3_PDL) keep their environment's setting. Per setting: a fresh prefill of a ``--prompt``-token prompt in 2,048-row chunks
 (median of ``--reps`` after one untimed), and the forward of decode windows of 1, 4 and 7 rows from CUDA graphs
-(serial and MTP verify) and 17 and 28 rows eager (four streams' windows past decode_kernel's 16), each the median of
+(serial and MTP verify) and 17 and 28 rows eager (four streams' windows past one 16-row tile), each the median of
 ``--reps`` after one untimed (``decode.time_windows``). The settings run off, each alone, all, off again; a setting's
 last-row prompt logits are compared with the first off run's bytes. Prints one JSON line a (setting, measure).
 

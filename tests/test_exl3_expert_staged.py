@@ -19,7 +19,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from tensorfold.cuda.exl3 import experts, switches
-from tests.test_exl3_decode_switches import NVCC, _layer, _ptxas
+from tests.exl3_fakes import NVCC, _layer, _ptxas
 from tests.test_exl3_prefill_switches import FLOAT_OPS, HERE, _route
 
 STAGED = dataclasses.replace(switches.Switches(), expert_staged=True, rot_fuse=False)      # rot_in's launches
@@ -140,11 +140,11 @@ def test_rates_past_five_bits_and_unaligned_trellises_keep_grouped_kernels_launc
 
 def test_only_aligned_layers_at_the_fused_setting_stage():
     ex = _layer()
-    prompt = ((8, 4, 4, 1, 2), False)
+    prompt = (8, 4, 4, 1, 2)
     assert experts.stageable(prompt, (6, 10), ex)
     assert experts.stageable(prompt, (118, 118), ex) and experts.stageable(prompt, (8, 8), ex)
     assert not experts.stageable(prompt, (6, 11), ex)
-    assert not experts.stageable(((8, 4, 4, 1, 1), False), (6, 6), ex)
+    assert not experts.stageable((8, 4, 4, 1, 1), (6, 6), ex)
     assert not experts.stageable(prompt, (6, 6), dataclasses.replace(ex, aligned=False))
 
 

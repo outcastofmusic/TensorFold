@@ -20,7 +20,7 @@ torch = pytest.importorskip("torch")
 
 from tensorfold.cuda.exl3 import experts, switches  # noqa: E402
 
-from tests.test_exl3_decode_switches import NVCC, FakeExt, _layer, _ptxas  # noqa: E402
+from tests.exl3_fakes import NVCC, FakeExt, _layer, _ptxas  # noqa: E402
 
 EXL3_ENVS = {switches.GROUP_SCAN_ENV: "group_scan", switches.DOWN_FUSE_ENV: "down_fuse",
              switches.GATEUP_FUSE_ENV: "gateup_fuse"}
@@ -49,7 +49,7 @@ def test_each_exl3_flag_is_on_unless_turned_off(monkeypatch, env, value, on):
     got = switches.read()
     assert getattr(got, EXL3_ENVS[env]) is on
     assert all(getattr(got, f) is True for e, f in EXL3_ENVS.items() if e != env)     # on since 19 Oct's GPU A/B
-    assert (got.expert_decode, got.pdl, got.expert_items) == (False, False, True)     # the others keep defaults
+    assert (got.pdl, got.expert_items) == (False, True)                               # the others keep defaults
 
 
 @pytest.mark.parametrize("env", list(EXL3_ENVS))
@@ -131,9 +131,8 @@ def test_an_unset_environment_reads_each_dataclass_default(monkeypatch):
         for e in module.ENVS:
             monkeypatch.delenv(e, raising=False)
         assert module.read() == module.Switches()
-    assert switches.Switches() == switches.Switches(expert_decode=False, pdl=False, expert_items=True, group_scan=True,
-                                                    down_fuse=True, gateup_fuse=True, group_scan_decode=True,
-                                                    linear_pair=True)
+    assert switches.Switches() == switches.Switches(pdl=False, expert_items=True, group_scan=True, down_fuse=True,
+                                                    gateup_fuse=True, group_scan_decode=True, linear_pair=True)
     assert exl3_mm.Switches() == exl3_mm.Switches(stack_direct=True, inner_k=False, moe_direct=True, moe_chunk=True)
 
 
@@ -201,9 +200,8 @@ def test_with_weights_the_down_combine_stays(monkeypatch):
 
 
 @pytest.mark.parametrize("rows", [1, 8, 16, 17, 28, 64])
-@pytest.mark.parametrize("decode", [True, False])
-def test_decode_windows_keep_their_launches(monkeypatch, rows, decode):
-    sw = switches.Switches(expert_decode=decode, expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True,
+def test_decode_windows_keep_their_launches(monkeypatch, rows):
+    sw = switches.Switches(expert_items=True, group_scan=True, down_fuse=True, gateup_fuse=True,
                            group_scan_decode=False, linear_pair=False)
     fake, _, _, _ = _route(monkeypatch, rows, sw)
     assert [n for n, _ in fake.calls] == ["group", "rot_in", "grouped", "gateup_epilogue", "grouped", "down_epilogue"]
@@ -232,15 +230,14 @@ def test_more_experts_than_threads_keep_group_kernel(monkeypatch):
 
 
 @pytest.mark.parametrize("launch, k2, ok", [
-    (((8, 4, 4, 1, 2), False), (6, 6), True),                     # Flash Next 3-bit experts
-    (((8, 4, 1, 1, 2), False), (6, 10), True),
-    (((8, 4, 4, 1, 2), False), (118, 118), True),                 # GLM-5.3's 2.25 bits
-    (((8, 4, 4, 1, 2), False), (8, 8), True),
-    (((8, 4, 4, 1, 2), False), (6, 11), False),                   # a 2..16 instance
-    (((8, 4, 4, 1, 2), False), (6, 118), False),
-    (((8, 4, 4, 1, 1), False), (6, 6), False),                    # one row tile: not the prompt setting
-    (((4, 4, 4, 4, 1), True), (6, 6), False),                     # decode_kernel
-    (((4, 4, 2, 2, 2), False), (6, 6), False),
+    ((8, 4, 4, 1, 2), (6, 6), True),                              # Flash Next 3-bit experts
+    ((8, 4, 1, 1, 2), (6, 10), True),
+    ((8, 4, 4, 1, 2), (118, 118), True),                          # GLM-5.3's 2.25 bits
+    ((8, 4, 4, 1, 2), (8, 8), True),
+    ((8, 4, 4, 1, 2), (6, 11), False),                            # a 2..16 instance
+    ((8, 4, 4, 1, 2), (6, 118), False),
+    ((8, 4, 4, 1, 1), (6, 6), False),                             # one row tile: not the prompt setting
+    ((4, 4, 2, 2, 2), (6, 6), False),
 ])
 def test_which_launches_fuse(launch, k2, ok):
     assert experts.fusable(launch, k2) is ok

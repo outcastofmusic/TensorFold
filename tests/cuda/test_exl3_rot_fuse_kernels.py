@@ -21,7 +21,7 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 
 from tensorfold.cuda.exl3 import experts, switches
-from tests.cuda.test_exl3_decode_kernels import _same
+from tests.cuda.exl3_layers import _same
 from tests.cuda.test_exl3_staged_kernels import LAYERS, ROWS, _inputs, _layer, _live, _three
 
 SERVED = switches.Switches()                                        # today's defaults: staged and every fusion on

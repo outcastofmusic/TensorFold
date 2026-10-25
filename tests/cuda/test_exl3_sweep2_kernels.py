@@ -2,9 +2,8 @@
 
 - TF_EXL3_EXPERT_ITEMS: routed experts at Flash Next EXL3's shapes (2560 <-> 640, 3-bit mul1 experts beside a 5-bit
   shared expert, 11 slots) and GLM-5.3's (4096 <-> 2048, mcg at 2.25 and 2.5 bits, 14-bit window, 8 slots): per-slot
-  outputs and combined rows of windows from 1 to 1,024 rows (decode windows on grouped_kernel with the decode switch
-  off, multi-stream windows of 17-28 rows, prompt windows), eager and replayed from CUDA graphs; and group_kernel's
-  item list against a Python model of it.
+  outputs and combined rows of windows from 1 to 1,024 rows (decode windows, multi-stream windows of 17-28 rows,
+  prompt windows), eager and replayed from CUDA graphs; and group_kernel's item list against a Python model of it.
 - The down epilogue's bf16 slots (TF_FLASHNEXT_MOE_DIRECT) against a copy of its fp32 slots, at both models' shapes.
 - The EXL3 linear writing N columns of a wider output (TF_FLASHNEXT_STACK_DIRECT) at Flash Next's dense shapes and
   GLM-5.3-sized ones, and Flash Next's two stacks (attention: q, k, v, indexer; DeltaNet: qkv, z, fp16 b/a) with the
@@ -27,17 +26,15 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only
 from tensorfold.cuda.exl3 import experts, linear, switches  # noqa: E402
 from tensorfold.families.qwen4_exp.cuda import exl3_mm  # noqa: E402
 
-from tests.cuda.test_exl3_decode_kernels import LAYERS, LINEAR, _inputs, _layer, _same, _scale, _trellis  # noqa: E402
+from tests.cuda.exl3_layers import LAYERS, LINEAR, _inputs, _layer, _same, _scale, _trellis  # noqa: E402
 from tests.test_exl3_expert_items import _listing  # noqa: E402
 
-OFF = switches.Switches(expert_decode=False, pdl=False, expert_items=False, group_scan=False, down_fuse=False,
-                        gateup_fuse=False, group_scan_decode=False, linear_pair=False)
-EXPERT_SETTINGS = [switches.Switches(expert_decode=False, pdl=False, expert_items=True, group_scan=False,
-                                     down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False),
-                   switches.Switches(expert_decode=True, pdl=True, expert_items=True, group_scan=False,
-                                     down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False),
-                   switches.Switches(expert_decode=False, pdl=True, expert_items=True, group_scan=False,
-                                     down_fuse=False, gateup_fuse=False, group_scan_decode=False, linear_pair=False)]
+OFF = switches.Switches(pdl=False, expert_items=False, group_scan=False, down_fuse=False, gateup_fuse=False,
+                        group_scan_decode=False, linear_pair=False)
+EXPERT_SETTINGS = [switches.Switches(pdl=False, expert_items=True, group_scan=False, down_fuse=False,
+                                     gateup_fuse=False, group_scan_decode=False, linear_pair=False),
+                   switches.Switches(pdl=True, expert_items=True, group_scan=False, down_fuse=False,
+                                     gateup_fuse=False, group_scan_decode=False, linear_pair=False)]
 ROWS = (1, 8, 16, 17, 24, 28, 64, 65, 128, 1024)
 
 
@@ -105,7 +102,7 @@ def test_graphs_captured_on_the_item_list_replay_the_old_bytes(name):
     scratch = experts.Scratch(ex, max(rows), slots)
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
     bufs, graphs = {}, {}
-    switches.use(switches.Switches(True, True, True, group_scan=False, down_fuse=False, gateup_fuse=False,
+    switches.use(switches.Switches(pdl=True, expert_items=True, group_scan=False, down_fuse=False, gateup_fuse=False,
                                    group_scan_decode=False, linear_pair=False))
     for R in rows:
         x, sel, w = _inputs(name, R, 60 + R)

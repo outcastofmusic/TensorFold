@@ -1,13 +1,11 @@
 """The EXL3 kernels' switches, shared by every family on these kernels (Flash Next EXL3, GLM-5.3).
 
-TF_EXL3_EXPERT_DECODE (unset: off) runs the routed experts of a decode window of at most 16 rows on ``decode_kernel``,
-which keeps ``grouped_kernel``'s sums bit for bit (``experts_grouped.cuh``). TF_EXL3_PDL (unset: off) launches the EXL3
-kernels with programmatic dependent launch on GB10 (``pdl.cuh``), which changes no arithmetic. TF_EXL3_EXPERT_ITEMS
-(unset: on) launches ``grouped_kernel``'s prompt windows over the member groups
-``group_kernel`` lists, where it launched every group a window's rows could fill: a 1,024-row prompt window spans 32
-groups an expert, and a routed expert fills one of them. The programs and their sums are the same. ``0`` restores the
-old launches, and any value outside env_flags' set raises. Served on Qwen EXL3 (GPU 19 Oct), EXPERT_DECODE and PDL
-were 0.99-1.00x on decode, so they stay off; the item list took cold prefill 1.41x.
+TF_EXL3_PDL (unset: off) launches the EXL3 kernels with programmatic dependent launch on GB10 (``pdl.cuh``), which
+changes no arithmetic. TF_EXL3_EXPERT_ITEMS (unset: on) launches ``grouped_kernel``'s prompt windows over the member
+groups ``group_kernel`` lists, where it launched every group a window's rows could fill: a 1,024-row prompt window
+spans 32 groups an expert, and a routed expert fills one of them. The programs and their sums are the same. ``0``
+restores the old launches, and any value outside env_flags' set raises. Served on Qwen EXL3 (GPU 19 Oct), PDL with
+the since-removed decode expert kernel was 0.99-1.00x on decode, so it stays off; the item list took cold prefill 1.41x.
 
 Three prompt-window switches (unset: on; served 8k prefill alone 1.142x, 1.041x, 1.036x, 19 Oct), each the same bytes as without it:
 TF_EXL3_GROUP_SCAN groups the picks with ``group_scan_kernel`` (a count, a scan and a stable scatter on 8 blocks),
@@ -50,7 +48,6 @@ from dataclasses import dataclass
 
 from tensorfold.env_flags import flag
 
-EXPERT_DECODE_ENV = "TF_EXL3_EXPERT_DECODE"
 PDL_ENV = "TF_EXL3_PDL"
 EXPERT_ITEMS_ENV = "TF_EXL3_EXPERT_ITEMS"
 GROUP_SCAN_ENV = "TF_EXL3_GROUP_SCAN"
@@ -66,7 +63,6 @@ ROT_FUSE_ENV = "TF_EXL3_ROT_FUSE"
 class Switches:
     """Each field's default is its served setting, the one ``read`` takes for an unset flag."""
 
-    expert_decode: bool = False
     pdl: bool = False
     expert_items: bool = True
     group_scan: bool = True
@@ -78,9 +74,8 @@ class Switches:
     rot_fuse: bool = True
 
 
-ENVS = {EXPERT_DECODE_ENV: "expert_decode", PDL_ENV: "pdl", EXPERT_ITEMS_ENV: "expert_items",
-        GROUP_SCAN_ENV: "group_scan", DOWN_FUSE_ENV: "down_fuse", GATEUP_FUSE_ENV: "gateup_fuse",
-        GROUP_SCAN_DECODE_ENV: "group_scan_decode", LINEAR_PAIR_ENV: "linear_pair",
+ENVS = {PDL_ENV: "pdl", EXPERT_ITEMS_ENV: "expert_items", GROUP_SCAN_ENV: "group_scan", DOWN_FUSE_ENV: "down_fuse",
+        GATEUP_FUSE_ENV: "gateup_fuse", GROUP_SCAN_DECODE_ENV: "group_scan_decode", LINEAR_PAIR_ENV: "linear_pair",
         EXPERT_STAGED_ENV: "expert_staged", ROT_FUSE_ENV: "rot_fuse"}
 
 _current = Switches()          # launches before any engine's ``use`` (tools, tests) take the served setting
