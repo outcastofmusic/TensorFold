@@ -97,12 +97,12 @@ held (4-bit copies and its selector's codebooks, 0.63 GiB a rank), not at 4 byte
 The DSA layers are NoPE MLA: head h's key is `Wk_h c` and its value `Wv_h c`, with `c` the token's 512-wide
 normalized latent and `Wk_h`, `Wv_h` blocks of `kv_b_proj`. So `score_h = (Wk_h^T q_h) . c` and
 `out_h = Wv_h (sum_j p_j c_j)`. The CUDA engine caches `c` only (bf16, 1 KB a token and layer, shared by the
-heads and both ranks; `TF_GLM_LATENT=0` returns to per-head keys and values), absorbs the query once per row,
+heads and both ranks), absorbs the query once per row,
 attends over latents and expands the attended latent once. Past 2,051 tokens a row attends to its top 512 index
 pools (2,048 tokens) plus its incomplete pool; the pools are ranked by one radix-select kernel over the pools the
 chunk can see, rounded up to a power of two. Every kernel computes a row alone in an order fixed by its own
 position, so a decode window's rows keep the serial steps' bits; prompt chunks give the same bits for any
-chunking. The memory estimate sizes the latent cache (`mla_geometry(latent=True)`).
+chunking. The memory estimate sizes the latent cache (`mla_geometry`).
 
 Measured on two DGX Sparks (GB10, 128 GB each) with the MLX 4-bit checkpoint, MTP drafts only,
 `--context 262144`, a synthetic codebase with one hidden fact, cold prompts:
@@ -124,7 +124,7 @@ window, not measured that far.
 Short prompts, with the recipe's default drafting (DFlash2, `auto`), decode at 53.8 / 43.4 / 85.0 / 50.0 tok/s
 (code and chat, sampled and greedy, 64 tokens, median of 5 seeds) against 0.3.6's 53.4 / 44.1 / 63.7 / 45.5. The
 latent path rounds attention differently, so some replies differ from 0.3.6 (the greedy cells' texts, hence their
-speeds); `TF_GLM_LATENT=0` gives 0.3.6's replies exactly.
+speeds). The per-head path that gave 0.3.6's replies (`TF_GLM_LATENT=0`) was removed on 25 Oct 2026.
 
 ## Apple Silicon (MLX)
 

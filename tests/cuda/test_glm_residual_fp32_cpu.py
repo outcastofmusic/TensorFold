@@ -106,7 +106,6 @@ def make_weights(world=1, is_packed=True, has_mtp=False):
 def test_buffers_keep_only_carrier_wide(monkeypatch, world, is_packed, has_mtp, prefill):
     # Actual Buffers allocations; only optional model projection enumeration is bounded to the fixture head.
     monkeypatch.setattr(packed, 'projections', lambda w: [w.head])
-    monkeypatch.setattr(forward.latent, 'ENABLED', False)
     w = make_weights(world, is_packed, has_mtp)
     b = forward.Buffers(w, 4, capacity=16, prefill=prefill)
     enabled = is_packed and world == 1
@@ -149,14 +148,13 @@ def test_layer_routes_both_updates(monkeypatch):
     h=NS(fn=None,base=None,scale=None)
     layer=NS(attn_hc=h,ffn_hc=h,in_norm=None,post_norm=None,kind='kda',mlp=object())
     b=NS(x=torch.empty(1,512),normed=torch.empty(1,128),xs=torch.empty(1,2),post=torch.empty(1,4),
-         comb=torch.empty(1,16),hcpart=torch.empty(1,16,32),fp32_residual=True,hc_split=True)
+         comb=torch.empty(1,16),hcpart=torch.empty(1,16,32),fp32_residual=True)
     forward.layer_forward(layer, NS(cfg=NS(eps=1e-5,hc_eps=1e-6,hc_iters=20)), None,b,1)
     assert seen == [True,True]
 
 
 def test_graph_capture_uses_preallocated_fp32_carrier(monkeypatch):
     from contextlib import nullcontext
-    monkeypatch.setattr(forward.latent, 'ENABLED', False)
     w = make_weights()
     w.embed = torch.ones(256,128,dtype=torch.bfloat16)
     w.norm = torch.ones(128,dtype=torch.bfloat16)
@@ -191,7 +189,6 @@ def test_graph_capture_uses_preallocated_fp32_carrier(monkeypatch):
 
 def test_mtp_plain_residual_stays_bf16_not_mhc(monkeypatch):
     monkeypatch.setattr(packed,'projections',lambda w: [w.head])
-    monkeypatch.setattr(forward.latent,'ENABLED',False)
     w=make_weights(has_mtp=True)
     w.embed=torch.ones(256,128,dtype=torch.bfloat16)
     w.cfg.eps=1e-5
@@ -216,7 +213,7 @@ def test_mtp_plain_residual_stays_bf16_not_mhc(monkeypatch):
     monkeypatch.setattr(forward.qmm,'group_sums',lambda x,out: out)
     monkeypatch.setattr(mtp,'dsa_block',lambda *a: g)
     monkeypatch.setattr(mtp,'moe_block',lambda *a: g)
-    mtp.mtp_compute(w,NS(mtp_kc=None,mtp_vc=None,mtp_pos_dev=None,index=None),b,1)
+    mtp.mtp_compute(w,NS(mtp_kc=None,mtp_pos_dev=None,index=None),b,1)
     assert residuals==[b.mx.data_ptr(),b.mx.data_ptr()]
     assert b.x.dtype==torch.float32 and b.mx.dtype==torch.bfloat16
 
@@ -232,7 +229,7 @@ def test_embed_pre_mean_forward_fp32_pointer_without_conversion(monkeypatch):
     def forbidden(*a,**kw): raise AssertionError('allocating/casting carrier in wrapper')
     monkeypatch.setattr(torch,'empty',forbidden)
     glue.embed(ids,table,128,4,x)
-    glue.hc_pre(x,None,None,None,table[0],norm,None,None,None,None,1e-5,1e-6,20)
+    glue.hc_pre(x,torch.zeros(24,512),None,None,table[0],norm,None,None,None,None,1e-5,1e-6,20)   # 512: no split
     glue.stream_mean(x,norm)
     assert embed.calls[0][1][2] is x
     assert partial.calls[0][1][0] is x and finish.calls[0][1][0] is x

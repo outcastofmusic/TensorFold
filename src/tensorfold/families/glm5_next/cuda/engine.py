@@ -36,20 +36,14 @@ def early_launch() -> bool:
 
 def kernel_switches() -> dict[str, bool]:
     """The decode kernels' switches, read once at startup into ``Weights.meta`` (``forward.Buffers`` takes them):
-    TF_GLM_PLAIN_NARROW (``packed.plain_narrow``), TF_GLM_HC_SPLIT (``glue.hc_split``), TF_GLM_MOE_IN_PLACE
-    (``forward.moe_in_place``) and TF_GLM_TOKEN_LIST (``sparse.token_list``), on when unset; TF_GLM_SHARED_STREAM
-    (``forward.shared_stream``), TF_GLM_KDA_WIDE (``kda.decode_wide``) and TF_GLM_EARLY_LAUNCH (``early_launch``, the
-    decode loops), off when unset. Either way a reply keeps its bytes; a value outside env_flags' set raises."""
+    TF_GLM_SHARED_STREAM (``forward.shared_stream``), TF_GLM_KDA_WIDE (``kda.decode_wide``) and TF_GLM_EARLY_LAUNCH
+    (``early_launch``, the decode loops), off when unset. Either way a reply keeps its bytes; a value outside
+    env_flags' set raises."""
 
-    from .forward import moe_in_place, shared_stream
-    from .glue import hc_split
+    from .forward import shared_stream
     from .kda import decode_wide
-    from .packed import plain_narrow
-    from .sparse import token_list
 
-    return {"plain_narrow": plain_narrow(), "hc_split": hc_split(), "moe_in_place": moe_in_place(),
-            "shared_stream": shared_stream(), "kda_wide": decode_wide(), "token_list": token_list(),
-            "early_launch": early_launch()}
+    return {"shared_stream": shared_stream(), "kda_wide": decode_wide(), "early_launch": early_launch()}
 
 
 def _token_id(model_dir: Path, text: str) -> int:
@@ -259,8 +253,6 @@ class GlmEngine:
             raise ValueError(f"prefill_rows must be between 1 and {PREFILL_ROWS}; admission bounds this chunk size")
         # Without --context the window stays dense, attending every key without indexer work.
         explicit = context is not None if context_explicit is None else bool(context_explicit)
-        from . import LATENT
-
         transform = _weight_transform(rule, world, cfg.layers if not self.load_mtp else 0, self.load_mtp,
                                       self.load_mtp or drafter is not None)
         from tensorfold.env_flags import flag
@@ -292,7 +284,7 @@ class GlmEngine:
 
         def main_geometry(text):
             geometry = mla_geometry(_target_text(text, self.load_mtp), world, MAX_ROWS,
-                                    minimum_slots=DENSE_CAPACITY, latent=LATENT, mtp=self.load_mtp)
+                                    minimum_slots=DENSE_CAPACITY, mtp=self.load_mtp)
             if adapter_workspace:
                 from tensorfold.cuda.geometry import with_fixed
                 geometry = with_fixed(geometry, adapter_workspace)
@@ -308,7 +300,7 @@ class GlmEngine:
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
         # both ranks must run the same calls: refuse to start when they were given different settings
-        mine = [int(drafter is not None), capacity, int(long_context), int(self.serial_only), int(LATENT),
+        mine = [int(drafter is not None), capacity, int(long_context), int(self.serial_only),
                 prefill_rows, int(self.target_only), int(self.eager), int(self.calibrated), int(self.load_mtp),
                 int(DRAFT_RING), int(self.dflash_copies), self.copy_rows, self.copy_back, BACK]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
@@ -318,7 +310,7 @@ class GlmEngine:
         both = self._gather_ints(mine + [spare >> 20])
         if len(both) != world or any(row[:-1] != mine for row in both):
             raise RuntimeError("CUDA ranks were started with different settings (draft model, context, drafts, "
-                               "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, TF_GLM_DFLASH_COPIES, "
+                               "TF_GLM_MTP, TF_GLM_DRAFT_RING, TF_GLM_DFLASH_COPIES, "
                                "TENSORFOLD_COPY_ROWS, TF_GLM_COPY_BACK, TENSORFOLD_COPY_BACK): "
                                f"{both}; pull the draft model on both machines (or pass --drafter none to both) "
                                "and give both the same flags")

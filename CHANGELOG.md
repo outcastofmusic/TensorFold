@@ -5,6 +5,11 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **GLM-5.3 on CUDA drops five switches whose other branch production never ran.** `TF_GLM_LATENT=0` (per-head
+  keys and values, 0.3.6's attention), `TF_GLM_PLAIN_NARROW=0`, `TF_GLM_HC_SPLIT=0`, `TF_GLM_MOE_IN_PLACE=0` and
+  `TF_GLM_TOKEN_LIST=0` (the decode kernels before the 1.078x serial speed-up of tf-runs/gpu-glmdec and gpu-glm2) are
+  gone with the per-head attention and sparse-attention kernels. The engine no longer reads the five names, so
+  setting one does nothing. Served replies and speed stay the same: production ran the remaining branch of each.
 - **Qwen3.8 Flash Next FP4-Local prompt chunks run the bf16 hyper-connections in fewer kernels, with the same bytes.**
   In a 32,768-token prefill on 18 Oct 2026, the 98 HC read-outs of a 2,048-row chunk took 102 ms for the down projection
   and its split-K reduce, 72 ms for the up projection and the stream mix, and 105 ms for the write-back and the norm.

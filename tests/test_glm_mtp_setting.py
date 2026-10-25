@@ -46,16 +46,15 @@ TEXT = {"hidden_size": 512, "num_attention_heads": 8, "num_hidden_layers": 4,
         "moe_intermediate_size": 512, "num_experts_per_tok": 2}
 
 
-@pytest.mark.parametrize("latent", [True, False])
-def test_the_geometry_follows_the_setting_not_the_config(latent):
+def test_the_geometry_follows_the_setting_not_the_config():
     """mla_geometry(mtp=False) with a head equals the geometry without one, smaller by the head's cache rows."""
 
     with_head = {**TEXT, "num_nextn_predict_layers": 1}
     without = {**TEXT, "num_nextn_predict_layers": 0}
     for slots in (2560, 65536, 1 << 20):
-        off = geometry.mla_geometry(with_head, 2, 16, latent=latent, mtp=False).bytes_at(slots)
-        assert off == geometry.mla_geometry(without, 2, 16, latent=latent).bytes_at(slots)
-        on = geometry.mla_geometry(with_head, 2, 16, latent=latent).bytes_at(slots)
-        assert on == geometry.mla_geometry(without, 2, 16, latent=latent, mtp=True).bytes_at(slots)
-        rows = slots * 512 * 2 if latent else slots * 4 * 512 * 2
+        off = geometry.mla_geometry(with_head, 2, 16, mtp=False).bytes_at(slots)
+        assert off == geometry.mla_geometry(without, 2, 16).bytes_at(slots)
+        on = geometry.mla_geometry(with_head, 2, 16).bytes_at(slots)
+        assert on == geometry.mla_geometry(without, 2, 16, mtp=True).bytes_at(slots)
+        rows = slots * 512 * 2
         assert on - off > rows + (2 * slots + slots // 4 + 2) * 128 * 2

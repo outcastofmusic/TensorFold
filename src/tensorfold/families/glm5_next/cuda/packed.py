@@ -22,13 +22,6 @@ DENSE_PROMPT = flag('TF_GLM_DENSE_PROMPT')
 # TF_GLM_PACKED_COPIES=1: every projection stages its rows in the scratch and copies its output back, and decode
 # computes the group sums packed projections never read (forward.group_sums): the old path, kept as the byte reference
 COPIES = flag('TF_GLM_PACKED_COPIES')
-PLAIN_NARROW_ENV = 'TF_GLM_PLAIN_NARROW'
-
-
-def plain_narrow() -> bool:
-    """TF_GLM_PLAIN_NARROW (unset: on): decode rows of fp16 projections on ``prefill._plain_narrow``, the old bytes.
-    The engine reads it once at startup into ``Weights.meta``; a value outside env_flags' set raises."""
-    return flag(PLAIN_NARROW_ENV, True)
 
 
 @dataclass
@@ -83,12 +76,11 @@ class ProjectionScratch:
     the EXL3 kernels take contiguous rows only. Copying to composed output slices
     happens AFTER its output rotation/rounding, never before.
     """
-    def __init__(self, projections, rows, device, prefill=False, narrow=True):
+    def __init__(self, projections, rows, device, prefill=False):
         if rows < 1:
             raise ValueError('scratch rows must be positive')
         mats = [p for q in projections for p in leaves(q)]
         self.rows, self.chunk = rows, min(rows, 128)
-        self.narrow = narrow                              # TF_GLM_PLAIN_NARROW: plain projections' decode kernel
         self.k = max((q.k for q in mats), default=1)
         self.n = max((q.n for q in mats), default=1)
         self.xh = torch.empty(self.chunk*self.k,dtype=torch.float16,device=device)
@@ -115,10 +107,10 @@ class ProjectionScratch:
                    [self.xh,self.z,self.xs,*self.inputs.values(),*self.outputs.values()])
 
 
-def _plain_cuda(q,x,out,narrow):
+def _plain_cuda(q,x,out):
     # Import is lazy: CPU contracts never compile or load CUDA extensions.
     from .prefill import plain_matmul
-    return plain_matmul(q.weight,x,out,narrow)
+    return plain_matmul(q.weight,x,out)
 
 
 def _overlap(a, b):
@@ -194,7 +186,7 @@ def matmul(q, x, out, scratch):
                 # Real CPU plain contract, NOT a packed/CUDA arithmetic oracle.
                 yi.copy_(xi.float() @ q.weight.float().T)
             else:
-                _plain_cuda(q,xi,yi,scratch.narrow)
+                _plain_cuda(q,xi,yi)
         else:
             raise TypeError(f'unsupported packed adapter projection {type(q)}')
         if yi is not yr:
@@ -214,7 +206,7 @@ def projections(w):
             for k in ('proj','fb','gb','o'):
                 yield getattr(l.kda,k)
         if l.dsa is not None:
-            for k in ('proj','q_b','o','kv_k','kv_v'):
+            for k in ('proj','q_b','o'):
                 q=getattr(l.dsa,k)
                 if q is not None: yield q
             if l.dsa.index is not None:

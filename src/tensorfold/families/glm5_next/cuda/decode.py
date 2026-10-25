@@ -149,7 +149,7 @@ class Engine:
             self.replays[kind] += 1
             g.replay()
             return self.mbuf.logits[:1, :self.draft_n]
-        from .attention import CHUNK
+        from .latent import CHUNK
 
         return mtp_compute(self.w, self.st, self.mbuf, n, nch=-(-(self.st.mtp_len + n) // CHUNK),
                            host_pos=self.st.mtp_len)
@@ -288,16 +288,14 @@ def _put_ring_window(drafter, n: int, rows: list[torch.Tensor]) -> None:
 
 
 def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
-    """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values, indexer keys, gates and pools."""
-    views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
+    """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents, indexer keys, gates and pools."""
+    views = [kc[:n] for kc in st.kc]
     idx = st.index or []
     main_idx = idx[:len(st.kc)]
     for ik, ig, pk in main_idx:
         views += [ik[:n], ig[:n], pk[:n // 4 + 1]]
     if m > 0 and hasattr(st, "mtp_kc"):
         views.append(st.mtp_kc[:m])
-        if getattr(st, "mtp_vc", None) is not None:
-            views.append(st.mtp_vc[:m])
         if len(idx) > len(st.kc):
             ik, ig, pk = idx[-1]
             views += [ik[:m], ig[:m], pk[:m // 4 + 1]]

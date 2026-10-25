@@ -265,8 +265,8 @@ def _state(e) -> list[torch.Tensor]:
     """What a prompt leaves: the KDA states and conv windows, the attention and MTP cache rows below the position."""
 
     st = e.st
-    caches = [x[:st.pos] for x in st.kc + st.vc if x is not None]            # the latent cache keeps no values
-    mtp = [x[:st.mtp_len] for x in (st.mtp_kc, getattr(st, "mtp_vc", None)) if x is not None]
+    caches = [x[:st.pos] for x in st.kc]                    # the latent cache keeps no values
+    mtp = [x[:st.mtp_len] for x in (getattr(st, "mtp_kc", None),) if x is not None]
     return [st.rec[st.cur[0]], st.conv] + caches + mtp
 
 
@@ -296,7 +296,7 @@ def test_prompt_chunks_leave_the_same_state(engine):
     a, b = want[0], dec.st.rec[dec.st.cur[0]]
     assert float((a - b).abs().max()) <= 2e-2 * float(b.abs().max())
     ka, kb = want[2].float(), dec.st.kc[0][:len(prompt)].float()
-    tol = 3e-2 if dec.st.vc[0] is None else 2e-2           # latent rows (up to ~4): a few bf16 steps of 1/32
+    tol = 3e-2                                             # latent rows (up to ~4): a few bf16 steps of 1/32
     assert float((ka - kb).abs().max()) <= tol * float(kb.abs().max())
     assert float(torch.nn.functional.cosine_similarity(logits, last, dim=1)) > 0.999
 
@@ -687,7 +687,7 @@ def test_three_resends_preserve_every_kept_glm_state(engine, sampling):
             assert snap.mtp_len == fresh.mtp_len == len(snap.ids) - 1
             views = decode._row_views(engine.e.st, len(snap.ids), snap.mtp_len)
             stored = views if snap.rows is None else snap.rows
-            for name in ("mtp_kc", "mtp_vc"):
+            for name in ("mtp_kc",):
                 live = getattr(engine.e.st, name, None)
                 if live is not None and snap.mtp_len:
                     index = next(i for i, v in enumerate(views) if v.data_ptr() == live.data_ptr())

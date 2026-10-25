@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from . import latent, prof
+from . import prof
 from .forward import compute
 from .mtp import mtp_compute
 
@@ -59,7 +59,7 @@ class Graphs:
                     with torch.cuda.graph(g, pool=self.pool):
                         mtp_compute(w, st, e.mbuf, n)
                     self.mtp[n] = g
-            if st.index is not None and latent.ENABLED:
+            if st.index is not None:
                 self._capture_sparse(e, main_rows, mtp_rows, parities)
         torch.cuda.synchronize()
 

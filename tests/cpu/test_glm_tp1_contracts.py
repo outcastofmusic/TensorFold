@@ -66,7 +66,6 @@ class ConstructorHarness:
             self.modules[name] = ModuleType(name)
         torch = self.modules["torch"]
         torch.cuda = NS(set_device=lambda n: self.calls.append(("device", n)))
-        self.modules["tensorfold.families.glm5_next.cuda"].LATENT = True
         self.comm = NS(barrier=lambda: self.calls.append(("barrier",)), all_gather=lambda *_: None,
                        ready=lambda *_, **__: None)
         def nccl(rank, world, master, port):
@@ -485,7 +484,7 @@ class GraphContracts(unittest.TestCase):
     def test_target_only_graphs_skip_mtp_and_keep_recurrence_parities(self):
         calls = []
         cuda = NS(graph_pool_handle=lambda: 1, synchronize=lambda: None, CUDAGraph=lambda: object(), graph=lambda *a, **k: nullcontext())
-        env = {"torch": NS(cuda=cuda, no_grad=nullcontext), "prof": NS(active=True), "latent": NS(ENABLED=True),
+        env = {"torch": NS(cuda=cuda, no_grad=nullcontext), "prof": NS(active=True),
                "compute": lambda w, st, b, r, **k: calls.append(tuple(st.cur)),
                "mtp_compute": lambda *a, **k: self.fail("MTP capture in target-only"),
                "pool_buckets": lambda n: [n]}

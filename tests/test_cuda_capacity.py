@@ -11,7 +11,6 @@ from types import SimpleNamespace
 import pytest
 
 from tensorfold import cli
-from tensorfold.families.glm5_next.cuda import LATENT
 
 
 @pytest.fixture(autouse=True)
@@ -209,7 +208,7 @@ def test_real_constructors_shrink_default_and_refuse_explicit_before_loading(tmp
     calls, capacity = fake_runtime
     from tensorfold.cuda.geometry import gdn_geometry, mla_geometry
     text = small_config()
-    geometry = (mla_geometry(text, world, 8, latent=LATENT) if family == "mla" else
+    geometry = (mla_geometry(text, world, 8) if family == "mla" else
                 gdn_geometry(text, world, 1 if family == "indexed" else 12, indexed=family == "indexed"))
     budget = geometry.needed(12000) + 32768
     monkeypatch.setattr(capacity, "available_bytes", lambda t: budget)
@@ -307,7 +306,7 @@ def test_actual_distributed_startup_agrees_on_smaller_rank_before_loading(tmp_pa
 
     checkpoint(tmp_path, small_config(), HEAD)
     calls, capacity = fake_runtime
-    geom = (mla_geometry(small_config(), 2, 8, latent=LATENT) if family == "mla" else
+    geom = (mla_geometry(small_config(), 2, 8) if family == "mla" else
             gdn_geometry(small_config(), 2, 1, indexed=True, kept=5) if family == "indexed" else
             gdn_geometry(small_config(), 2, 12, rows=12, prompt=4096))     # the 27B engine's, prompt chunks on a GB10
     transform = split_weights(rule) if family == "mla" else indexed_weights(2, False) if family == "indexed" else linear_weights
