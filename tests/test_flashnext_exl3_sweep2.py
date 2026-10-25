@@ -1,13 +1,10 @@
 """The EXL3 pack's matmuls on the CPU: a stack's parts writing their columns in place (and the copies rows off 16
-bytes keep), TF_FLASHNEXT_F16_INNER_K (its values, where the engine reads it, what each call launches with it on or
-off), the write-back and norm fusion on the pack's fp16 hyper-connections, a prompt window's expert slots rounding
-straight into the MoE buffer, and (compiled for sm_121 without a GPU) that ``_f16_mm_ks`` keeps ``_f16_mm``'s chain
-of MMA steps and adds its slices after their loops. tests/cuda/test_exl3_sweep2_kernels.py compares the bytes on the
-GPU."""
+bytes keep), what an fp16 call launches, the write-back and norm fusion on the pack's fp16 hyper-connections, and a
+prompt window's expert slots rounding straight into the MoE buffer. tests/cuda/test_exl3_sweep2_kernels.py compares
+the bytes on the GPU."""
 
 from __future__ import annotations
 
-import re
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +18,6 @@ from tensorfold.families.qwen4_exp.cuda.weight_types import HC  # noqa: E402
 # Flash Next EXL3's fp16 matrices [n, k]: HC down with the inject rows, HC up, the mixer's down, DeltaNet's b/a, and
 # the PLE key and value projections
 SHAPES = [(324, 10240), (10240, 320), (320, 10240), (96, 2560), (10240, 2560), (2560, 2560)]
-MMA = re.compile(r"mma\.sync\.aligned\.(\S+) \{ ([^}]*) \}, \{ ([^}]*) \}, \{ ([^}]*) \}, \{ ([^}]*) \};")
 
 
 class Spy:
@@ -36,62 +32,11 @@ class Spy:
         return call
 
 
-def _chain(ptx):
-    """A warp's MMAs of one BK step as (accumulator, A fragment) in issue order, each accumulating in place."""
-
-    accs, frags, out = {}, {}, []
-    for kind, d, a, _b, c in MMA.findall(ptx):
-        assert kind == "m16n8k16.row.col.f32.f16.f16.f32" and d == c
-        out.append((accs.setdefault(d, len(accs)), frags.setdefault(a, len(frags))))
-    return out
-
-
-ENVS = (exl3_mm.INNER_K_ENV,)
-FIELDS = dict(zip(ENVS, ("inner_k",)))
-DEFAULTS = dict(zip(ENVS, (False,)))      # inner_k off: 0.994x prefill served (19 Oct)
-
-
 @pytest.fixture(autouse=True)
 def restore():
     before = exl3_mm.current()
     yield
     exl3_mm.use(before)
-
-
-# -- the flags ------------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("env", ENVS)
-@pytest.mark.parametrize("value, on", [(None, True), ("", True), ("1", True), ("on", True), ("0", False),
-                                       ("off", False), ("false", False), (" NO ", False)])
-def test_each_flag_takes_its_default_unless_set(monkeypatch, env, value, on):
-    for e in ENVS:
-        monkeypatch.delenv(e, raising=False)
-    if value is not None:
-        monkeypatch.setenv(env, value)
-    got = exl3_mm.read()
-    assert getattr(got, FIELDS[env]) is (DEFAULTS[env] if value in (None, "") else on)
-    assert all(getattr(got, f) is DEFAULTS[e] for e, f in FIELDS.items() if e != env)
-
-
-@pytest.mark.parametrize("env", ENVS)
-@pytest.mark.parametrize("value", ["2", "direct", "o", "1.0"])
-def test_a_flag_typo_stops_the_engine_before_any_read(monkeypatch, tmp_path, env, value):
-    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
-
-    monkeypatch.setenv(env, value)
-    with pytest.raises(ValueError, match=env):
-        FlashNextEngine(tmp_path / "missing")
-
-
-def test_the_engine_installs_what_it_reads(monkeypatch, tmp_path):
-    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
-
-    for e in exl3_mm.ENVS:
-        monkeypatch.delenv(e, raising=False)
-    monkeypatch.setenv(exl3_mm.INNER_K_ENV, "1")
-    exl3_mm.use(exl3_mm.Switches())
-    with pytest.raises(Exception):
-        FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
-    assert exl3_mm.current() == exl3_mm.Switches(inner_k=True)
 
 
 # -- a stack's parts write their columns in place ------------------------------------------------------------------
@@ -159,26 +104,7 @@ def test_a_part_that_would_start_off_16_bytes_falls_back_to_the_copies(widths, o
     assert s.aligned(torch.zeros((4, width + 1), dtype=torch.bfloat16)[:, :sum(widths)]) is False
 
 
-# -- the prompt's fp16 matmuls sum their K slices in-program -----------------------------------------------------------
-@pytest.mark.parametrize("n, k", SHAPES)
-@pytest.mark.parametrize("m", [1, 16, 17, 47, 48, 255, 256, 767, 768, 2048, 2050])
-def test_which_calls_fit_the_in_program_sum(n, k, m):
-    sk = exl3_mm.f16_split(n, k)
-    want = sk > 1 and m > 16 and -(-m // 16) * -(-n // 64) >= 96
-    assert exl3_mm.inner_k_fits(m, n, k, sk) is want
-    if want:
-        assert k // sk // 64 >= 2                                 # every slice two K blocks or more (playbook 6.9)
-
-
-def test_the_programs_each_matrix_needs():
-    first = {}
-    for n, k in SHAPES:
-        sk = exl3_mm.f16_split(n, k)
-        first[(n, k)] = next((m for m in range(17, 4096) if exl3_mm.inner_k_fits(m, n, k, sk)), None)
-    assert first == {(324, 10240): 241, (10240, 320): None, (320, 10240): 305, (96, 2560): 753,
-                     (10240, 2560): None, (2560, 2560): 33}
-
-
+# -- the prompt's fp16 matmuls: K slices, then their sum ---------------------------------------------------------------
 def _f16(n, k):
     sc = exl3_mm.Scratch(11)
     sc.part = torch.empty((exl3_mm.f16_split(n, k) * exl3_mm.ROWS * n,), dtype=torch.float32)
@@ -187,67 +113,23 @@ def _f16(n, k):
 
 @pytest.mark.parametrize("n, k", SHAPES)
 @pytest.mark.parametrize("m", [8, 17, 256, 2048, 2050])
-@pytest.mark.parametrize("on", [True, False])
-def test_a_call_launches_the_in_program_sum_where_it_fits(monkeypatch, n, k, m, on):
-    mm, ks, red = Spy(), Spy(), Spy()
+def test_a_call_launches_its_slices_and_their_sum_a_block_of_rows(monkeypatch, n, k, m):
+    mm, red = Spy(), Spy()
     monkeypatch.setattr(exl3_mm, "_f16_mm", mm)
-    monkeypatch.setattr(exl3_mm, "_f16_mm_ks", ks)
     monkeypatch.setattr(exl3_mm, "_reduce", red)
-    exl3_mm.use(exl3_mm.Switches(inner_k=on))
     q = _f16(n, k)
     out = torch.empty((m, n + 64), dtype=torch.bfloat16)[:, :n]      # a stack's columns: any row stride
     q(torch.empty((m, k), dtype=torch.bfloat16), out)
-    if on and exl3_mm.inner_k_fits(m, n, k, q.sk):
-        assert mm.calls == [] and red.calls == []
-        (grid, kw), = ks.calls
-        assert grid == (-(-m // 16), -(-n // 64))
-        bn, warps, stages = exl3_mm.WIDE_TILE
-        assert (kw["BM"], kw["BN"], kw["BK"], kw["num_warps"], kw["num_stages"]) == (16, bn, 64, warps, stages)
-        assert kw["SK"] == q.sk and kw["K"] == k
-        return
-    assert ks.calls == []
     blocks = 1 if q.sk == 1 else -(-m // exl3_mm.ROWS)
     assert len(mm.calls) == blocks and len(red.calls) == (blocks if q.sk > 1 else 0)
 
 
-def test_decode_partials_never_take_the_in_program_sum(monkeypatch):
-    mm, ks = Spy(), Spy()
+def test_decode_partials_launch_the_slices_alone(monkeypatch):
+    mm, red = Spy(), Spy()
     monkeypatch.setattr(exl3_mm, "_f16_mm", mm)
-    monkeypatch.setattr(exl3_mm, "_f16_mm_ks", ks)
-    exl3_mm.use(exl3_mm.Switches(inner_k=True))
+    monkeypatch.setattr(exl3_mm, "_reduce", red)
     _f16(324, 10240).partials(torch.empty((8, 10240), dtype=torch.bfloat16))
-    assert ks.calls == [] and len(mm.calls) == 1
-
-
-SIG_KS = {"X": "*bf16", "W": "*fp16", "OUT": "*bf16", "M": "i32", "N": "i32", "x_stride": "i32", "o_stride": "i32",
-          "K": "constexpr", "SK": "constexpr", "BM": "constexpr", "BN": "constexpr", "BK": "constexpr"}
-
-
-def _compile_ks(k, sk, bn, warps, stages, out="*bf16"):
-    from triton.backends.compiler import GPUTarget
-    from triton.compiler import ASTSource, compile
-
-    names = list(SIG_KS)
-    attrs = {(names.index(a),): [["tt.divisibility", 16]] for a in names if SIG_KS[a].startswith("*")}
-    src = ASTSource(fn=exl3_mm._f16_mm_ks, signature={**SIG_KS, "OUT": out},
-                    constexprs={"K": k, "SK": sk, "BM": 16, "BN": bn, "BK": 64}, attrs=attrs)
-    got = compile(src, target=GPUTarget("cuda", 121, 32), options={"num_warps": warps, "num_stages": stages})
-    return got.asm["ttgir"], got.asm["ptx"]
-
-
-@pytest.mark.parametrize("n, k", [(324, 10240), (320, 10240), (96, 2560), (2560, 2560)])
-def test_the_in_program_sum_keeps_each_slices_mma_chain_and_adds_after_the_loop(n, k):
-    """``_f16_mm_ks`` on WIDE_TILE: the same layout and per-step chain of m16n8k16 steps as ``_f16_mm`` (one BK step:
-    two n8 accumulators a warp, each taking the step's four k16 fragments in order), and the slice's sum added to the
-    total by an fp32 add after the slice's loop, not folded into the MMA chain (playbook 6.9)."""
-
-    sk = exl3_mm.f16_split(n, k)
-    ir, ptx = _compile_ks(k, sk, *exl3_mm.WIDE_TILE)
-    assert "warpsPerCTA = [1, 4], instrShape = [16, 8]" in ir
-    want = [(acc, frag) for frag in range(4) for acc in range(2)]
-    assert _chain(ptx) == want
-    # the slice loop's result reaches the total through an add on the MMA layout
-    assert re.search(r"arith\.addf %\S+, %\S+ : tensor<16x64xf32, #mma", ir), "no slice add on the accumulators"
+    assert red.calls == [] and len(mm.calls) == 1
 
 
 # -- the pack's fp16 hyper-connections take the write-back and norm fusion -------------------------------------------

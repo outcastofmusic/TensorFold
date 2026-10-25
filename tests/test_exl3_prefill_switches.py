@@ -67,13 +67,11 @@ def test_an_unset_environment_reads_each_dataclass_default(monkeypatch):
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
 
     monkeypatch.delenv("TENSORFOLD_PREFILL_ROWS", raising=False)
-    for module in (switches, exl3_mm):
-        assert sorted(module.ENVS.values()) == sorted(f.name for f in fields(module.Switches) if f.name != "prompt_rows")
-        for e in module.ENVS:
-            monkeypatch.delenv(e, raising=False)
-        assert module.read() == module.Switches()
-    assert switches.Switches() == switches.Switches(pdl=False)
-    assert exl3_mm.Switches() == exl3_mm.Switches(inner_k=False)
+    assert sorted(switches.ENVS.values()) == sorted(f.name for f in fields(switches.Switches))
+    for e in switches.ENVS:
+        monkeypatch.delenv(e, raising=False)
+    assert switches.read() == switches.Switches() == switches.Switches(pdl=False)
+    assert exl3_mm.read() == exl3_mm.Switches() == exl3_mm.Switches(prompt_rows=exl3_mm.PROMPT_ROWS)
 
 
 # -- what routed launches -------------------------------------------------------------------------------------------

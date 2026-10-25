@@ -30,12 +30,8 @@ def _plain(name: str, w: torch.Tensor) -> torch.Tensor:
 
 
 def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: tuple[int, int] | None = None,
-         draft_vocab: int | str | None = None, ple_on_ssd: bool = False, table_reads: list | None = None,
-         shared_decode: str | None = None) -> Weights:
-    """Load rank ``tp``'s shares; ``draft_vocab`` selects default/file ids or ids below N, None scores all ids.
-
-    ``shared_decode`` sets every NVFP4 layer's shared-expert decode kernel (``nvfp4_moe``); None reads its flag here,
-    before any weight."""
+         draft_vocab: int | str | None = None, ple_on_ssd: bool = False, table_reads: list | None = None) -> Weights:
+    """Load rank ``tp``'s shares; ``draft_vocab`` selects default/file ids or ids below N, None scores all ids."""
 
     import time
     from dataclasses import replace
@@ -47,7 +43,6 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         return exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab, table_reads=table_reads)
     from . import nvfp4_moe
 
-    shared_decode = nvfp4_moe.shared_decode() if shared_decode is None else shared_decode
     full = Config.read(model_dir)
     rank, world = tp if tp is not None else (0, 1)
     cfg = full if world == 1 else replace(full, heads=full.heads // world, kv_heads=full.kv_heads // world,
@@ -327,7 +322,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
             if world > 1:
                 gu, dn = gu[:, lo:hi], dn[:, :, dlo * gs:dhi * gs]
             moe4 = nvfp4_moe.moe4_from_bf16(gu, dn, shared)
-        return MoEW(router, replace(moe4, shared_decode=shared_decode))
+        return MoEW(router, moe4)
 
     def attention(name: str) -> AttnW:
         hd = full.head_dim

@@ -1,5 +1,5 @@
 """The NVFP4 expert tile's CPU side: which calls take the tile, and the 64-pair plan it runs on (items, tails, the
-scratch that holds them, the units a launch covers); and TF_FP4_SHARED_DECODE's values."""
+scratch that holds them, the units a launch covers)."""
 
 from __future__ import annotations
 
@@ -34,41 +34,6 @@ def counted_picks(counts: list[int], experts: int) -> torch.Tensor:
     routed = torch.cat([torch.full((c,), e, dtype=torch.int32) for e, c in enumerate(counts)])
     routed = routed[torch.randperm(routed.numel(), generator=torch.Generator().manual_seed(5))]
     return torch.stack([routed, torch.full_like(routed, experts)], dim=1)
-
-
-@pytest.mark.parametrize("value, mode", [(None, "prompt"), ("", "prompt"), ("qmmf", "qmmf"), ("prompt", "prompt"),
-                                         (" prompt ", "prompt")])
-def test_the_shared_decode_flag_reads_qmmf_or_prompt(monkeypatch, value, mode):
-    if value is None:
-        monkeypatch.delenv(nvfp4_moe.SHARED_DECODE_ENV, raising=False)
-    else:
-        monkeypatch.setenv(nvfp4_moe.SHARED_DECODE_ENV, value)
-    assert nvfp4_moe.shared_decode() == mode
-
-
-@pytest.mark.parametrize("value", ["QMMF", "Prompt", "0", "1", "lane", "qmmf,prompt"])
-def test_the_shared_decode_flag_rejects_any_other_value(monkeypatch, value):
-    monkeypatch.setenv(nvfp4_moe.SHARED_DECODE_ENV, value)
-    with pytest.raises(ValueError, match=nvfp4_moe.SHARED_DECODE_ENV):
-        nvfp4_moe.shared_decode()
-
-
-@pytest.mark.parametrize("env, value", [(nvfp4_moe.SHARED_DECODE_ENV, "lane")])
-def test_a_flag_typo_stops_the_engine_and_the_loader_before_any_read(monkeypatch, tmp_path, env, value):
-    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
-    from tensorfold.families.qwen4_exp.cuda.weights import load
-
-    monkeypatch.setenv(env, value)
-    with pytest.raises(ValueError, match=env):
-        FlashNextEngine(tmp_path / "missing")                      # no checkpoint there: the flag fails first
-    with pytest.raises(ValueError, match=env):
-        load(tmp_path / "missing", "cpu")
-
-
-def test_a_layer_takes_the_values_it_is_given_and_not_the_environment(monkeypatch):
-    monkeypatch.setenv(nvfp4_moe.SHARED_DECODE_ENV, "qmmf")
-    layer = nvfp4_moe.MoE4(None, None)
-    assert layer.shared_decode == "prompt"                               # the default; weights.load sets the flag's
 
 
 @pytest.mark.parametrize("rows, prompt, tiled", [

@@ -7,24 +7,8 @@ from dataclasses import dataclass
 import torch
 
 from tensorfold.cuda.nvfp4 import experts as nvx
-from tensorfold.env_flags import choice
 
 from . import nvfp4
-
-SHARED_DECODE_ENV = "TF_FP4_SHARED_DECODE"
-SHARED_DECODE_MODES = ("qmmf", "prompt")
-
-
-def shared_decode() -> str:
-    """TF_FP4_SHARED_DECODE: the kernel of a decode window's MXFP8 shared expert (unset: prompt).
-
-    Decode windows keep bf16 slots (``moe_prefill``), which once sent their shared expert to the prompt GEMM. ``qmmf``
-    runs it on the lane matmul like every other decode linear; ``prompt`` keeps the prompt GEMM's bits. Prompt rows
-    take the prompt GEMM either way. ``prompt`` is the default: on FP4-Local (GB10, 18 Oct) its 16-row tile gave
-    1.059x decode with the old replies' bytes, against 1.064x for ``qmmf``, whose replies differ."""
-
-    return choice(SHARED_DECODE_ENV, SHARED_DECODE_MODES, "prompt")      # lower case only: QMMF raises
-
 
 def tiled(rows: int, prompt: bool) -> bool:
     """Whether gate/up and down run the shared-memory tile kernel: prompt buffers of at least ``nvx.TILE_ROWS`` rows.
@@ -51,7 +35,6 @@ class MoE4:
     routed_experts: nvx.Experts4
     shared: Expert4
     kernel: str = "nvfp4"
-    shared_decode: str = "prompt"  # shared_decode(): ``weights.load`` sets the value the engine read
 
     capturable = True     # the plan stays on the device
 
@@ -125,23 +108,23 @@ def moe4_from_experts(gate: list, up: list, down: list, shared: tuple) -> MoE4:
     return moe4_from_checkpoint(stack(gate), stack(up), stack(down), shared)
 
 
-def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, buf, cfg, *,
-        decode: bool = False) -> None:
+def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, buf, cfg) -> None:
     """Route rows x [R, D] and run their experts into buf (the shared ``moe`` contract); ``xs`` unused: no biases.
 
-    ``decode``: a decode window's rows, whose bf16 slots alone do not tell them from a prompt's."""
+    Buffers of bf16 slots, a prompt's and a decode window's (``moe_prefill``), run the shared expert on the prompt
+    GEMM. On FP4-Local (GB10, 18 Oct) its 16-row tile gave decode windows 1.059x with the old replies' bytes. The
+    lane matmul gave 1.064x with replies that differ, and TF_FP4_SHARED_DECODE=qmmf chose it until 25 Oct."""
 
     from tensorfold.cuda import moe as moe_mod
 
     rows, top_k = x.shape[0], int(cfg.num_experts_per_tok)
     prompt = buf.y.dtype != torch.float32                  # a prompt's buffers keep bf16 slots
     tile = tiled(rows, prompt)
-    shared_prompt = prompt and not (decode and ex.shared_decode == "qmmf")
     moe_mod.router(x, router_rows, buf.logits[:rows])
     moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, nvx.TILE_ITEM if tile else nvx.PREFILL_TILE)
     nvx.gate_up(x, ex.routed_experts, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed, tile=tile)
-    buf.act[:rows, top_k] = ex.shared_act(x, shared_prompt)
+    buf.act[:rows, top_k] = ex.shared_act(x, prompt)
     nvx.down(buf.act.view(-1, ex.width), ex.routed_experts, buf.plan, buf.y.view(-1, ex.dims), rows, skip=ex.routed,
              tile=tile)
-    buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], shared_prompt, not prompt)
+    buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], prompt, not prompt)
     return buf

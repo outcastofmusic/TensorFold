@@ -1,12 +1,10 @@
-"""TF_FP4_SHARED_DECODE: a decode window's MXFP8 shared expert on the lane matmul (qmmf) or the prompt GEMM (prompt).
-
-The prompt GEMM keeps a row's bits in its few-row tile. Prompt rows take the prompt GEMM under either value, so a
-prompt's bits never move. Decode rows take the flag's kernel, and both values keep drafted == serial, streams
-together == alone, and resumed == fresh."""
+"""A decode window's MXFP8 shared expert on the prompt GEMM, as a prompt's: the prompt GEMM keeps a row's bits in its
+few-row tile, a decode row alone has its bits in the window, and the tiny FP4-Local layout keeps drafted == serial,
+streams together == alone, and resumed == fresh. The lane matmul (TF_FP4_SHARED_DECODE=qmmf until 25 Oct) stays for
+the other decode linears."""
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,7 +24,6 @@ from tensorfold.cuda.nvfp4 import linear  # noqa: E402
 from tensorfold.cuda.nvfp4.linear import Fp4Linear, Fp8Linear, Mx8Linear  # noqa: E402
 from tensorfold.families.qwen4_exp.cuda import nvfp4_moe  # noqa: E402
 
-ENV = nvfp4_moe.SHARED_DECODE_ENV
 SHAPES = [(2560, 1280), (1280, 1280), (320, 1024)]     # FP4-Local's shared gate/up and down, and a padded one
 
 
@@ -105,34 +102,27 @@ def _moe4(dev: str = "cuda"):
     return ex, cfg, router
 
 
-@pytest.mark.parametrize("mode", ["qmmf", "prompt"])
-def test_decode_rows_take_the_flags_kernel_and_prompt_rows_the_prompt_gemm(monkeypatch, mode):
+def test_bf16_slot_rows_take_the_prompt_gemm():
     from tensorfold.cuda import moe as moe_mod
 
     ex, cfg, router = _moe4()
-    ex = replace(ex, shared_decode=mode)                  # the flag's value, as weights.load sets it
     x = (torch.randn(8, cfg.hidden_size, device="cuda") * 0.5).to(torch.bfloat16)
     ni = ex.width
 
-    def run(rows, decode):
+    def run(rows):
         buf = moe_mod.MoEBuffers(8, cfg, "cuda", prefill=True)              # bf16 slots, as ``moe_prefill`` gives
-        nvfp4_moe.moe(rows, None, router, ex, buf, cfg, decode=decode)
+        nvfp4_moe.moe(rows, None, router, ex, buf, cfg)
         return buf.act[:rows.shape[0]].clone(), buf.y[:rows.shape[0]].clone()
 
-    got = {decode: run(x, decode) for decode in (False, True)}
-    for decode, (act, y) in got.items():
-        lane = decode and mode == "qmmf"
-        mm = (lambda lin, v: lin(v)) if lane else (lambda lin, v: lin.prefill(v))
-        g = mm(ex.shared.gu, x).float()
-        gate, up = g[:, :ni], g[:, ni:]
-        want = ((gate / (1.0 + torch.exp(-gate))).to(torch.bfloat16).float() * up).to(torch.bfloat16)
-        assert torch.equal(act[:, 1], want), decode
-        assert torch.equal(y[:, 1], mm(ex.shared.down, want)), decode
-    assert torch.equal(got[False][1][:, 0], got[True][1][:, 0])            # routed slots: the same kernels
-    assert torch.equal(got[False][0][:, 0], got[True][0][:, 0])
+    act, y = run(x)
+    g = ex.shared.gu.prefill(x).float()
+    gate, up = g[:, :ni], g[:, ni:]
+    want = ((gate / (1.0 + torch.exp(-gate))).to(torch.bfloat16).float() * up).to(torch.bfloat16)
+    assert torch.equal(act[:, 1], want)
+    assert torch.equal(y[:, 1], ex.shared.down.prefill(want))
     for r in (0, 5):                                                       # a decode row alone: its bits in the window
-        act, y = run(x[r:r + 1].contiguous(), True)
-        assert torch.equal(y[0], got[True][1][r]) and torch.equal(act[0], got[True][0][r]), r
+        one_act, one_y = run(x[r:r + 1].contiguous())
+        assert torch.equal(one_y[0], y[r]) and torch.equal(one_act[0], act[r]), r
 
 
 # A tiny FP4-Local layout: NVFP4 routed experts, MXFP8 DeltaNet, attention and shared expert, NVFP4 n-gram table.
@@ -155,16 +145,14 @@ def tiny(tmp_path_factory) -> Path:
 _LOADED: dict[str, object] = {}
 
 
-def _weights(tiny: Path, mode: str, monkeypatch):
-    """The tiny checkpoint loaded under TF_FP4_SHARED_DECODE=mode (``load`` reads the flag before any weight)."""
+def _weights(tiny: Path):
+    """The tiny checkpoint, loaded once."""
 
     from tensorfold.families.qwen4_exp.cuda.weights import load
 
-    if mode not in _LOADED:
-        monkeypatch.setenv(ENV, mode)
-        _LOADED[mode] = load(tiny, mtp=True, draft_vocab=None)
-    w = _LOADED[mode]
-    assert all(layer.moe.experts.shared_decode == mode for layer in w.layers)
+    if "w" not in _LOADED:
+        _LOADED["w"] = load(tiny, mtp=True, draft_vocab=None)
+    w = _LOADED["w"]
     assert isinstance(w.layers[0].moe.experts.shared.gu, Mx8Linear)
     return w
 
@@ -180,11 +168,10 @@ def _sampling(kind):
 
 @pytest.mark.parametrize("graphs", [False, True])
 @pytest.mark.parametrize("kind", SAMPLINGS)
-@pytest.mark.parametrize("mode", ["qmmf", "prompt"])
-def test_drafted_equals_serial(tiny, monkeypatch, mode, kind, graphs):
+def test_drafted_equals_serial(tiny, kind, graphs):
     from tensorfold.families.qwen4_exp.cuda.decode import Engine, mtp_decode, prefill, serial_decode
 
-    w, sampling = _weights(tiny, mode, monkeypatch), _sampling(kind)
+    w, sampling = _weights(tiny), _sampling(kind)
     e = Engine(w, capacity=512, max_rows=8, prefill_rows=16, graphs=graphs)
     first = prefill(e, PROMPT, sampling)
     ref = serial_decode(e, first, 24, sampling).tokens
@@ -193,13 +180,12 @@ def test_drafted_equals_serial(tiny, monkeypatch, mode, kind, graphs):
         assert mtp_decode(e, first, 24, sampling, depth=depth, confidence=confidence).tokens == ref, depth
 
 
-@pytest.mark.parametrize("mode", ["qmmf", "prompt"])
-def test_streams_decoded_together_equal_each_alone(tiny, monkeypatch, mode):
+def test_streams_decoded_together_equal_each_alone(tiny):
     from tensorfold.cuda.streams import Stream
     from tensorfold.families.qwen4_exp.cuda.decode import Engine, prefill, serial_decode
     from tensorfold.families.qwen4_exp.cuda.multi import MultiDecoder
 
-    w = _weights(tiny, mode, monkeypatch)
+    w = _weights(tiny)
     prompts = [PROMPT[:9], PROMPT[3:17], PROMPT[:4], PROMPT]
     samplings = [_sampling(None), _sampling("seeded"), _sampling(None), _sampling("seeded")]
     refs = []
@@ -216,11 +202,10 @@ def test_streams_decoded_together_equal_each_alone(tiny, monkeypatch, mode):
 
 
 @pytest.mark.parametrize("kind", SAMPLINGS)
-@pytest.mark.parametrize("mode", ["qmmf", "prompt"])
-def test_a_resumed_prompt_equals_a_fresh_one(tiny, monkeypatch, mode, kind):
+def test_a_resumed_prompt_equals_a_fresh_one(tiny, kind):
     from tensorfold.families.qwen4_exp.cuda.decode import Engine, prefill, serial_decode
 
-    w, sampling = _weights(tiny, mode, monkeypatch), _sampling(kind)
+    w, sampling = _weights(tiny), _sampling(kind)
     head, full = PROMPT[:13], PROMPT + [90, 91, 92]
     warm = Engine(w, capacity=512, max_rows=8, prefill_rows=16)
     prefill(warm, head, sampling, keep_at=len(head) - 1)
@@ -231,15 +216,3 @@ def test_a_resumed_prompt_equals_a_fresh_one(tiny, monkeypatch, mode, kind):
     want = prefill(fresh, full, sampling)
     assert got == want and torch.equal(warm.last_streams, fresh.last_streams)
     assert serial_decode(warm, got, 12, sampling).tokens == serial_decode(fresh, want, 12, sampling).tokens
-
-
-def test_prompt_rows_keep_their_bits_under_either_value(tiny, monkeypatch):
-    """The flag reaches decode windows only: a prompt's last streams and first token match bit for bit."""
-
-    from tensorfold.families.qwen4_exp.cuda.decode import Engine, prefill
-
-    got = {}
-    for mode in ("qmmf", "prompt"):
-        e = Engine(_weights(tiny, mode, monkeypatch), capacity=512, max_rows=8, prefill_rows=16)
-        got[mode] = (prefill(e, PROMPT, None), e.last_streams.clone())
-    assert got["qmmf"][0] == got["prompt"][0] and torch.equal(got["qmmf"][1], got["prompt"][1])

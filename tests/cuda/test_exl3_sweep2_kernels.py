@@ -10,8 +10,6 @@
 - The EXL3 linear writing N columns of a wider output at Flash Next's dense shapes and GLM-5.3-sized ones, and Flash
   Next's two stacks (attention: q, k, v, indexer; DeltaNet: qkv, z, fp16 b/a) writing in place against the scratch
   copies an output off 16 bytes takes, 1 to 128 rows.
-- ``_f16_mm_ks`` (TF_FLASHNEXT_F16_INNER_K) against ``_f16_mm`` + ``_reduce`` at the pack's fp16 shapes and prompt
-  row counts, into contiguous and stack-column outputs.
 - An fp16 hyper-connection's prompt read-out with the write-back and norm fused against the separate kernels, in the
   write-back modes the layers use.
 """
@@ -208,33 +206,6 @@ def test_a_stack_writes_the_same_bytes_in_place_as_through_the_copies(which):
         torch.cuda.synchronize()
         assert torch.isfinite(got[0].float()).all(), (which, m)
         assert _same(got[0].float(), got[1].float()) and _same(got[0].float(), got[2].float()), (which, m)
-
-
-# -- the prompt's fp16 matmuls with their K slices summed in-program ----------------------------------------------
-F16_SHAPES = [(324, 10240), (320, 10240), (96, 2560), (2560, 2560)]          # HC down, mixer down, b/a, PLE value
-F16_ROWS = (17, 33, 48, 129, 241, 256, 305, 753, 768, 1024, 2048, 2050, 2061)
-
-
-@pytest.mark.parametrize("n, k", F16_SHAPES)
-def test_the_in_program_sum_writes_the_split_sums_bytes(n, k):
-    g = torch.Generator().manual_seed(n + k)
-    sc = exl3_mm.Scratch(11)
-    q = _f16(sc, n, k, g)
-    _scratch([q])
-    used = 0
-    for m in F16_ROWS:
-        x = (torch.randn((m, k), generator=g) * 0.3).to(torch.bfloat16).cuda()
-        for wide in (False, True):                                    # contiguous, and a stack's columns
-            outs = []
-            for on in (False, True):
-                exl3_mm.use(exl3_mm.Switches(inner_k=on))
-                full = torch.full((m, n + (128 if wide else 0)), float("nan"), dtype=torch.bfloat16, device="cuda")
-                outs.append(q(x, full[:, :n]).clone())
-            torch.cuda.synchronize()
-            assert torch.isfinite(outs[0].float()).all(), (n, k, m)
-            assert _same(outs[0].float(), outs[1].float()), (n, k, m, wide)
-        used += exl3_mm.inner_k_fits(m, n, k, q.sk)
-    assert used > 0                                                    # some row counts took _f16_mm_ks
 
 
 # -- an fp16 hyper-connection's prompt write-back and norm in one kernel -------------------------------------------

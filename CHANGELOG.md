@@ -32,8 +32,7 @@ GitHub has the full notes and the measurements behind them.
 - **Qwen3.8 Flash Next FP4-Local decodes 1.059x faster with the same replies.** Decode rows of the shared expert ran
   the prompt GEMM on 128x128 blocks, 3.9 ms a serial token. They now take a 16x64 tile with six stages, whose bits
   equal the other tiles'. On 18 Oct 2026 at `--parallel 4 --kv-dtype int8`, decode ran 1.042-1.071x faster on code
-  and 1.048-1.074x on chat, and greedy replies stayed byte-equal. `TF_FP4_SHARED_DECODE=qmmf` takes the lane matmul
-  instead (1.064x, replies change), and any other value than `prompt` or `qmmf` fails the load.
+  and 1.048-1.074x on chat, and greedy replies stayed byte-equal.
 - **Under `--parallel`, Qwen3.8 Flash Next sends a prompt's first token before its first drafts.** The copy index
   and up to six MTP draft steps ran first. Median time to first token at `--parallel 5` went from 2.32 to 2.09 s at
   4k, 19.01 to 18.09 s at 32k and 82.47 to 82.53 s at 131k on 18 Oct 2026, with the same tokens. The done line's

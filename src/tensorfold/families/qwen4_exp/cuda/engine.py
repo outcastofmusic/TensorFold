@@ -84,17 +84,15 @@ class FlashNextEngine:
         from .copy_drafts import enabled as copy_enabled, most_rows
         from . import exl3_mm
         from tensorfold.cuda.exl3 import switches as exl3_switches
-        from .nvfp4_moe import shared_decode
 
         from .exl3_pack import admission, extra_files, is_exl3
 
         from tensorfold.families import quant_method, read_config
 
         # the kernel flags, read once here: an unknown value stops the start before any read
-        self.shared_decode = shared_decode()             # TF_FP4_SHARED_DECODE: every NVFP4 layer's shared expert
         # TF_EXL3_PDL, the EXL3 kernels' one switch (exl3.switches.ENVS)
         exl3_switches.use(exl3_switches.read())
-        # TF_FLASHNEXT_F16_INNER_K and TENSORFOLD_PREFILL_ROWS (before admission: the rows size the scratch)
+        # TENSORFOLD_PREFILL_ROWS (before admission: the rows size the scratch)
         exl3_mm.use(exl3_mm.read())
         exl3 = is_exl3(model_dir)
         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
@@ -187,7 +185,7 @@ class FlashNextEngine:
         try:
             w = load(model_dir, mtp=self.depth > 0, tp=(rank, 2) if tp == 2 else None,
                      draft_vocab=draft_vocab if self.depth > 0 else None, ple_on_ssd=ple_on_ssd,
-                     table_reads=reads if prefetch and not ple_on_ssd else None, shared_decode=self.shared_decode)
+                     table_reads=reads if prefetch and not ple_on_ssd else None)
         except BaseException:
             wait(reads)                               # a failed load leaves no table read behind it
             raise
