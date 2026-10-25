@@ -18,7 +18,7 @@ from .forward import Cut, commit, compute, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
 from .state import CAND, ENDS
 from .multi_tp import OutOfStep
-from .prompt_plan import pass_limit
+from .prompt_plan import pass_limit, piece_rows
 
 PASS_MIN = 512
 FILL_GUARD = 8
@@ -36,10 +36,13 @@ class PromptPasses:
         return ended
 
     def _pass_rows(self) -> int:
-        """A round's prompt rows: its decode (a round alone) takes ``share`` of the pass's time, by the last rounds."""
+        """A round's prompt rows: its decode (a round alone) takes ``share`` of the pass's time, by the last rounds.
+        An idle pass narrows with ``piece_rows`` by the rows every filling prompt has left."""
 
         live = any(not s.done for s in self.streams.values())
-        return pass_limit(self.prefill_rows, live, self.share, self.round_s, self.row_s, PASS_MIN)
+        rows = self.prefill_rows if live else piece_rows(
+            self.prefill_rows, sum(len(s.prompt) - self.fills[s.sid][2] for s in self.filling))
+        return pass_limit(rows, live, self.share, self.round_s, self.row_s, PASS_MIN)
 
     def _waiting_request(self) -> bool:
         """Both ranks use the leader's sampled arrival decision; one GPU reads its queue directly."""

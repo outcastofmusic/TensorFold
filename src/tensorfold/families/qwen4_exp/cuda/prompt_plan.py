@@ -1,8 +1,70 @@
 """Reuse expert weights in wider idle prompt pieces only when the admitted window leaves enough room."""
 
+import os
+from contextlib import contextmanager
+
 from tensorfold.cuda.geometry import PREFILL_ROWS, indexed_prompt_bytes
 
 IDLE_ROWS = 4096
+LONG_PIECE_ENV = "TENSORFOLD_LONG_PIECE_TOKENS"
+_long_from = 0          # the installed threshold (use): 0 keeps every idle piece at its buffers' rows
+
+
+def long_piece_tokens() -> int:
+    """TENSORFOLD_LONG_PIECE_TOKENS (unset or empty: 0): an NVFP4 checkpoint's idle pieces take 4,096 rows while at
+    least this many prompt rows remain to fill, else 2,048. 0 keeps 2,048 rows, the released width. On 18 Oct 2026
+    4,096-row pieces ran 131k-token prompts 1.03-1.09x faster and 4k-token prompts 0.72-0.97x as fast (tf-runs/
+    gpu-chunks); a sweep picks the threshold. A value that is not a whole number stops the start."""
+
+    value = os.environ.get(LONG_PIECE_ENV, "").strip()
+    if not value:
+        return 0
+    if not value.isdecimal():
+        raise ValueError(f"{LONG_PIECE_ENV}: a token count of 0 or more, not {value!r}")
+    return int(value)
+
+
+def use(tokens: int) -> int:
+    """Install ``tokens`` as the threshold ``piece_rows`` reads; returns the previous one."""
+
+    global _long_from
+    previous, _long_from = _long_from, int(tokens)
+    return previous
+
+
+@contextmanager
+def long_pieces(tokens: int):
+    """``use(tokens)`` for the block, then the previous threshold again."""
+
+    previous = use(tokens)
+    try:
+        yield
+    finally:
+        use(previous)
+
+
+def piece_rows(rows: int, left: int) -> int:
+    """An idle piece's rows when ``left`` prompt rows remain to fill: the buffers' ``rows``, or PREFILL_ROWS while
+    fewer than the installed threshold remain. A row's bits do not depend on its piece, so the switch keeps them."""
+
+    if not _long_from or rows <= PREFILL_ROWS or left >= _long_from:
+        return rows
+    return PREFILL_ROWS
+
+
+def warm_widths(rows: int) -> list[int]:
+    """The piece widths a warm-up prefills so no request compiles a prompt kernel: ``rows``, and PREFILL_ROWS too
+    while a threshold switches between them."""
+
+    return [rows, PREFILL_ROWS] if _long_from and rows > PREFILL_ROWS else [rows]
+
+
+@contextmanager
+def pieces_of(width: int, rows: int):
+    """Every idle piece ``width`` rows for the block (``rows``: the buffers'): a warm-up's fixed widths."""
+
+    with long_pieces(0 if width == rows else 1 << 62):     # no prompt reaches 2^62 rows: every piece narrows
+        yield
 
 
 def storage(quant: dict) -> str | None:
@@ -47,14 +109,17 @@ def nvfp4_temporary_row(text: dict, mtp: bool) -> int:
 
 
 def choose(receipt: dict, text: dict, capability: tuple[int, int], *, world: int = 1,
-           vision: bool = False, fp8: bool = False, mtp: bool = False) -> tuple[int, int]:
+           vision: bool = False, fp8: bool = False, mtp: bool = False, long_from: int = 0) -> tuple[int, int]:
     """Keep the baseline window; spend spare budget on the measured GB10 shape's prompt workspace (``mtp``: the
-    engine loads the MTP head, whose prompt rows an NVFP4 checkpoint runs on bf16 linears)."""
+    engine loads the MTP head, whose prompt rows an NVFP4 checkpoint runs on bf16 linears). An NVFP4 checkpoint
+    widens only with ``long_from`` (TENSORFOLD_LONG_PIECE_TOKENS) above 0, and then budgets the 4,096-row piece at
+    any threshold: a prompt long enough to take one must fit the window admitted at the start."""
 
     shape = tuple(text.get(k) for k in ("hidden_size", "num_experts", "num_experts_per_tok",
                                        "moe_intermediate_size", "hc_count", "hc_lowrank"))
     kind = storage(text.get("_quantization") or {})
-    if capability != (12, 1) or world != 1 or vision or fp8 or shape != (2560, 512, 10, 640, 4, 320) or not kind:
+    if (capability != (12, 1) or world != 1 or vision or fp8 or shape != (2560, 512, 10, 640, 4, 320) or not kind
+            or (kind == "nvfp4" and not long_from)):
         return PREFILL_ROWS, 0
     temporary = nvfp4_temporary_row(text, mtp) if kind == "nvfp4" else 0
     extra = indexed_prompt_bytes(text, IDLE_ROWS - PREFILL_ROWS) + (IDLE_ROWS - PREFILL_ROWS) * temporary

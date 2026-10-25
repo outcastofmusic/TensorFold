@@ -1,5 +1,6 @@
-"""NVFP4 prompt pieces of 2,048 and 4,096 rows commit the same bits: the last row's logits, a greedy reply, and
-states kept inside a piece that resume to what a fresh prefill leaves.
+"""NVFP4 prompt pieces of 2,048 and 4,096 rows, and a fill that switches from one to the other near its end, commit
+the same bits: the last row's logits, a greedy reply, and states kept inside a piece that resume to what a fresh
+prefill leaves.
 
 The tiny ModelOpt checkpoint (NVFP4 experts, MXFP8 linears, an NVFP4 n-gram table) runs wherever a GPU does.
 NVIDIA's Qwen3.8 Flash Next FP4-Local runs too when TF_FP4_LOCAL names its folder (its server plans 78 GiB), and
@@ -35,6 +36,8 @@ CUTS = (3073, 4097)        # kept points inside a piece at both widths
 REPLY = 48
 CAPACITY = 8448
 WIDTHS = (2048, 4096)
+MIXED = 6000               # a threshold the 8,193-row prompt falls under after its first 4,096-row piece
+MIXED_CUT = 5121           # a kept point inside the first narrow piece (4,096, 6,144]
 
 
 @pytest.fixture(scope="module", params=["tiny", "fp4-local"])
@@ -146,6 +149,34 @@ def test_a_state_kept_inside_a_piece_resumes_to_the_fresh_prefill_at_both_widths
         assert serial_decode(e, first, REPLY, None, stop_eos=False).tokens == reply, rows
 
 
+@pytest.mark.parametrize("kv_dtype", ["bf16", "int8"])
+def test_a_fill_that_narrows_near_its_end_gives_the_same_bits(model, kv_dtype):
+    """TENSORFOLD_LONG_PIECE_TOKENS at MIXED: the 8,193-row prompt takes one 4,096-row piece, then 2,048, 2,048 and
+    1 once fewer than MIXED rows remain. Logits, state and reply equal the 2,048-row fill's, and a state kept inside
+    a narrow piece (resumed narrow too) equals the fresh prefill of its rows."""
+
+    from tensorfold.families.qwen4_exp.cuda.prompt_plan import long_pieces
+
+    engines = _engines(model, kv_dtype)
+    prompt = _prompt(LENGTH, model.cfg.vocab)
+    with long_pieces(MIXED):
+        plan = chunk_plan(0, LENGTH, 4096, ())
+        assert [end - start for start, end, _ in plan] == [4096, 2048, 2048, 1]
+        mixed = _bits(_last_logits(engines[4096], prompt))
+    assert mixed == _bits(_last_logits(engines[2048], prompt))
+    _assert_same_state(engines[4096].st, engines[2048].st)
+    first = prefill(engines[2048], prompt, None)
+    reply = serial_decode(engines[2048], first, REPLY, None, stop_eos=False).tokens
+    with long_pieces(MIXED):
+        assert prefill(engines[4096], prompt, None, keep_at=MIXED_CUT) == first
+        assert serial_decode(engines[4096], first, REPLY, None, stop_eos=False).tokens == reply
+        kept = engines[4096].kept
+        fresh = Engine(model, capacity=CAPACITY, max_rows=8, prefill_rows=2048, kv_dtype=kv_dtype)
+        prefill(fresh, prompt[:MIXED_CUT], None)
+        assert _snap_diff(kept["state"], fresh.st.snapshot()) == []
+        assert _bits(_last_logits(engines[4096], prompt, resume=kept)) == mixed
+
+
 def _device_bytes(obj, seen: set) -> int:
     """Device bytes of the tensors ``obj`` holds (its attributes, lists and dicts), each storage once."""
 
@@ -175,7 +206,7 @@ def test_a_4096_row_piece_stays_inside_the_planned_workspace(model):
     text = config(model.root)
     plan = {"serving_peak_bytes_estimate": 0, "startup_peak_bytes_estimate": 0, "budget_bytes": 1 << 50,
             "cache_workspace_bytes_estimate": 0, "mapped_table_bytes": 0}
-    rows, workspace = choose(plan, text, (12, 1), mtp=True)
+    rows, workspace = choose(plan, text, (12, 1), mtp=True, long_from=MIXED)
     assert rows == IDLE_ROWS == 4096
     e = Engine(model, capacity=CAPACITY, max_rows=8, prefill_rows=rows, kv_dtype="int8")
     buffers = _device_bytes(e.pbuf, set()) - _device_bytes(e.pbuf.attn, set())

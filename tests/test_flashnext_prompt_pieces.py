@@ -38,6 +38,7 @@ def modelopt(dense: str | None = "MXFP8", experts: str = "NVFP4", prefix: str = 
 
 
 MLX = {"bits": 4, "group_size": 32, "mode": "affine"}
+LONG = 16384        # a TENSORFOLD_LONG_PIECE_TOKENS threshold: NVFP4 checkpoints plan wide pieces only with one
 
 
 def text(quant=None):
@@ -72,7 +73,7 @@ def test_larger_pieces_count_every_extra_byte_without_reducing_the_window(quant,
     extra = indexed_prompt_bytes(t, 2048) + 2048 * temporary(t, mtp)
     plan = receipt(t, extra, loading=loading)
     old = copy.deepcopy(plan)
-    rows, workspace = choose(plan, t, (12, 1), mtp=mtp)
+    rows, workspace = choose(plan, t, (12, 1), mtp=mtp, long_from=LONG)
     assert rows == 4096 and workspace == indexed_prompt_bytes(t, rows) + rows * temporary(t, mtp)
     assert plan["prefill_rows"] == rows and plan["prompt_workspace_bytes_estimate"] == workspace
     for key in ("context_window", "cache_slots", "largest_window", "budget_bytes"):
@@ -89,7 +90,7 @@ def test_insufficient_headroom_keeps_the_original_window_and_estimates(quant, mt
     t = text(quant)
     plan = receipt(t, indexed_prompt_bytes(t, 2048) + 2048 * temporary(t, mtp) - 1)
     old = copy.deepcopy(plan)
-    assert choose(plan, t, (12, 1), mtp=mtp) == (2048, 0)
+    assert choose(plan, t, (12, 1), mtp=mtp, long_from=LONG) == (2048, 0)
     assert plan == old
 
 
@@ -99,8 +100,8 @@ def test_nvfp4_pieces_also_need_room_for_the_bf16_partials():
 
     mlx, nvfp4 = text(), text(modelopt())
     spare = indexed_prompt_bytes(mlx, 2048)
-    assert choose(receipt(mlx, spare), mlx, (12, 1)) == (4096, indexed_prompt_bytes(mlx, 4096))
-    assert choose(receipt(nvfp4, spare), nvfp4, (12, 1)) == (2048, 0)
+    assert choose(receipt(mlx, spare), mlx, (12, 1), long_from=LONG) == (4096, indexed_prompt_bytes(mlx, 4096))
+    assert choose(receipt(nvfp4, spare), nvfp4, (12, 1), long_from=LONG) == (2048, 0)
 
 
 @pytest.mark.torch
@@ -115,7 +116,7 @@ def test_the_nvfp4_temporary_is_the_mtp_heads_fc_hidden_partials_or_the_hyper_co
 @pytest.mark.parametrize("quant", [MLX, pytest.param(modelopt(), marks=pytest.mark.torch)], ids=["mlx", "nvfp4"])
 def test_opt_in_fp8_keeps_the_released_piece_size(quant):
     plan = {"untouched": True}
-    assert choose(plan, text(quant), (12, 1), fp8=True) == (2048, 0)
+    assert choose(plan, text(quant), (12, 1), fp8=True, long_from=LONG) == (2048, 0)
     assert plan == {"untouched": True}
 
 
@@ -143,7 +144,7 @@ def test_storage_names_the_checkpoints_the_wide_pieces_serve(quant, kind):
 def test_unqualified_models_and_devices_keep_released_pieces(quant, change, capability, world, vision):
     t = {**text(quant), **change}
     plan = {"untouched": True}
-    assert choose(plan, t, capability, world=world, vision=vision) == (2048, 0)
+    assert choose(plan, t, capability, world=world, vision=vision, long_from=LONG) == (2048, 0)
     assert plan == {"untouched": True}
 
 
@@ -169,7 +170,7 @@ def test_the_extra_nvfp4_rows_fit_the_bytes_the_plan_adds(monkeypatch, allocatio
         sizes[rows] = bytes_in(arrays)
     plan = receipt(t, 1 << 40)
     old = plan["serving_peak_bytes_estimate"]
-    assert choose(plan, t, (12, 1), mtp=mtp)[0] == 4096
+    assert choose(plan, t, (12, 1), mtp=mtp, long_from=LONG)[0] == 4096
     temp = temporary(t, mtp)
     assert sizes[4096] - sizes[2048] + 2048 * temp <= plan["serving_peak_bytes_estimate"] - old
 
@@ -206,3 +207,101 @@ def test_both_planner_paths_bound_live_pieces_and_restore_idle_width():
     assert dec._pieces() == [(prompt, 0, 960)]
     reply.done = True
     assert dec._pieces() == [(prompt, 0, 4096)]
+
+
+@pytest.mark.torch
+@pytest.mark.parametrize("mtp", [False, True])
+def test_without_a_threshold_nvfp4_keeps_the_released_pieces_and_mlx_its_wide_ones(mtp):
+    t = text(modelopt())
+    plan = receipt(t, 1 << 40)
+    old = copy.deepcopy(plan)
+    assert choose(plan, t, (12, 1), mtp=mtp) == (2048, 0)
+    assert plan == old
+    mlx = text()
+    assert choose(receipt(mlx, 1 << 40), mlx, (12, 1))[0] == 4096
+
+
+@pytest.mark.torch
+@pytest.mark.parametrize("long_from", [1, 4096, 8192, 131072])
+def test_any_threshold_budgets_the_whole_wide_piece(long_from):
+    """A start that fits at one threshold fits a prompt that takes 4,096-row pieces at any other."""
+
+    t = text(modelopt())
+    plans = {k: receipt(t, 1 << 40) for k in (long_from, LONG)}
+    picked = {k: choose(plan, t, (12, 1), mtp=True, long_from=k) for k, plan in plans.items()}
+    assert picked[long_from] == picked[LONG] == (4096, indexed_prompt_bytes(t, 4096) + 4096 * temporary(t, True))
+    assert plans[long_from] == plans[LONG]
+
+
+def test_the_threshold_comes_from_the_environment(monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda.prompt_plan import long_piece_tokens
+
+    monkeypatch.delenv("TENSORFOLD_LONG_PIECE_TOKENS", raising=False)
+    assert long_piece_tokens() == 0
+    for value, tokens in [(" ", 0), ("0", 0), ("8192", 8192), (" 32768 ", 32768)]:
+        monkeypatch.setenv("TENSORFOLD_LONG_PIECE_TOKENS", value)
+        assert long_piece_tokens() == tokens
+    for value in ["-1", "8k", "8192.0", "off"]:
+        monkeypatch.setenv("TENSORFOLD_LONG_PIECE_TOKENS", value)
+        with pytest.raises(ValueError, match="TENSORFOLD_LONG_PIECE_TOKENS"):
+            long_piece_tokens()
+
+
+def test_pieces_are_wide_while_the_threshold_remains_and_narrow_after():
+    from tensorfold.families.qwen4_exp.cuda.prompt_plan import long_pieces, piece_rows, pieces_of, warm_widths
+
+    assert piece_rows(4096, 10) == 4096 and warm_widths(4096) == [4096]        # nothing installed: one width
+    with long_pieces(8192):
+        assert [piece_rows(4096, left) for left in (131072, 8192, 8191, 100)] == [4096, 4096, 2048, 2048]
+        assert piece_rows(2048, 131072) == 2048 and piece_rows(1024, 100) == 1024
+        assert warm_widths(4096) == [4096, 2048] and warm_widths(2048) == [2048]
+        with pieces_of(4096, 4096):
+            assert piece_rows(4096, 100) == 4096
+        with pieces_of(2048, 4096):
+            assert piece_rows(4096, 131072) == 2048
+        assert piece_rows(4096, 100) == 2048
+    assert piece_rows(4096, 100) == 4096
+
+
+@pytest.mark.torch
+@pytest.mark.parametrize("long_from,widths", [
+    (0, [4096] * 4 + [3616]),
+    (8192, [4096] * 3 + [2048] * 3 + [1568]),         # 7,712 rows left after three wide pieces
+    (20000, [4096] + [2048] * 7 + [1568]),
+    (20001, [2048] * 9 + [1568]),
+])
+def test_the_serial_plan_switches_width_once_the_rows_left_fall_under_the_threshold(long_from, widths):
+    pytest.importorskip("triton")
+    from tensorfold.families.qwen4_exp.cuda.decode import chunk_plan
+    from tensorfold.families.qwen4_exp.cuda.prompt_plan import long_pieces
+
+    with long_pieces(long_from):
+        plan = chunk_plan(0, 20000, 4096, [10000])
+    assert [end - start for start, end, _ in plan] == widths
+    assert plan[-1][1] == 20000 and [p for *_, here in plan for p in here] == [10000]
+
+
+@pytest.mark.torch
+def test_an_idle_pass_narrows_by_the_rows_every_filling_prompt_has_left():
+    pytest.importorskip("torch")
+    pytest.importorskip("triton")
+    from tensorfold.families.qwen4_exp.cuda.multi import MultiDecoder
+    from tensorfold.families.qwen4_exp.cuda.prompt_plan import long_pieces
+
+    dec = object.__new__(MultiDecoder)
+    dec.prefill_rows, dec.share, dec.round_s, dec.row_s = 4096, 0.0, None, None
+    dec.streams, dec.passed, dec.slots = {}, {}, [None, None]
+    a = SimpleNamespace(sid=1, prompt=[1] * 9000, background=False)
+    b = SimpleNamespace(sid=2, prompt=[1] * 3000, background=False)
+    dec.filling = [a]
+    dec.fills = {1: [SimpleNamespace(stops=[]), False, 0, None], 2: [SimpleNamespace(stops=[]), False, 0, None]}
+    with long_pieces(8192):
+        assert dec._pieces() == [(a, 0, 4096)]               # 9,000 rows left
+        dec.fills[1][2] = 4096
+        assert dec._pieces() == [(a, 4096, 2048)]            # 4,904 left
+        dec.filling = [a, b]
+        assert dec._pieces() == [(b, 0, 2048)]               # 7,904 left between them: fewest rows first
+        dec.fills[1][2] = 0
+        assert dec._pieces() == [(b, 0, 3000), (a, 0, 1096)]     # 12,000 left
+        dec.streams[3] = SimpleNamespace(done=False)
+        assert dec._pass_rows() == 2048                      # live replies keep the released bound

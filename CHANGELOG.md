@@ -5,13 +5,16 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
-- **Qwen3.8 Flash Next FP4-Local prefills idle prompts in 4,096-row pieces when memory allows.** At one GPU on the
-  GB10, the engine widens idle pieces from 2,048 rows when the admitted window leaves room. That room is the wider
-  buffers plus the fp32 K-slice partials of the bf16 linears: 2.50 GiB of workspace with MTP drafts, 2.04 GiB
-  without. Each expert then gets 80 routed rows a weight read instead of 40, and pieces beside live replies stay at
-  2,048 rows or fewer. The checkpoint must keep NVFP4 experts and MXFP8 for every other quantized linear. A row's
-  bits do not depend on its piece, so replies and kept states stay the same. `TENSORFOLD_PREFILL_ROWS=2048` keeps
-  the old width.
+- **`TENSORFOLD_LONG_PIECE_TOKENS=N` gives Qwen3.8 Flash Next FP4-Local 4,096-row idle prompt pieces while N or
+  more prompt rows remain to fill.** Pieces narrow to 2,048 rows once fewer remain. On 18 Oct 2026, 4,096-row pieces
+  everywhere ran 131k-token prompts 1.03-1.09x faster and 4k-token prompts 0.72-0.97x as fast, so a sweep will pick
+  N. Unset or 0 keeps 2,048 rows, the served width, and any other value than a whole number stops the start. At any
+  N above 0 the start budgets the 4,096-row piece: the wider buffers plus the fp32 K-slice partials of the bf16
+  linears, 2.50 GiB of workspace with MTP drafts and 2.04 GiB without. A window that leaves no room keeps 2,048 rows.
+  Each expert then gets 80 routed rows a weight read instead of 40. Pieces beside live replies stay at 2,048 rows or
+  fewer, and one GPU on the GB10 is required, with NVFP4 experts and MXFP8 for every other quantized linear. A
+  row's bits do not depend on its piece, so replies and kept states stay the same. The MLX checkpoint keeps its
+  4,096-row idle pieces, and a set `TENSORFOLD_PREFILL_ROWS` keeps its one width.
 - **Qwen3.8 Flash Next FP4-Local prompt chunks run the bf16 hyper-connections in fewer kernels, with the same bytes.**
   In a 32,768-token prefill on 18 Oct 2026, the 98 HC read-outs of a 2,048-row chunk took 102 ms for the down projection
   and its split-K reduce, 72 ms for the up projection and the stream mix, and 105 ms for the write-back and the norm.

@@ -26,6 +26,7 @@ from .state import Buffers, State
 from .copy_drafts import CopyIndex
 from .multi_solo import Alone, solo
 from .multi_fill import FILL_GUARD, PASS_MIN, PromptPasses
+from .prompt_plan import pieces_of, warm_widths
 from .multi_tp import Link as Link
 from .multi_tp import OutOfStep, TwoRanks
 from ..cuda import CONFIDENCE, DEPTH
@@ -278,15 +279,17 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
 
         self.solo_on = False
         try:
-            s = Stream([0] * min(self.prefill_rows + WARM_TAIL + 1, self.capacity - self.depth - 2), 2)
-            self.admit(s)
-            if not s.done:
-                self.round()                                 # the whole prompt (nothing else decodes), then a round
-            self.streams.pop(s.sid, None)
-            self._drop_kept(s.st)
-            self._shrink(s.st)
-            if all(f is not s.st for f in self.free):
-                self.free.append(s.st)
+            for width in warm_widths(self.prefill_rows):     # each width TENSORFOLD_LONG_PIECE_TOKENS switches to
+                with pieces_of(width, self.prefill_rows):
+                    s = Stream([0] * min(width + WARM_TAIL + 1, self.capacity - self.depth - 2), 2)
+                    self.admit(s)
+                    if not s.done:
+                        self.round()                         # the whole prompt (nothing else decodes), then a round
+                    self.streams.pop(s.sid, None)
+                    self._drop_kept(s.st)
+                    self._shrink(s.st)
+                    if all(f is not s.st for f in self.free):
+                        self.free.append(s.st)
         finally:
             self.solo_on = self.solo is not None
         if self.solo is not None:                    # last: the graph slot's rows are the ones requests will find
