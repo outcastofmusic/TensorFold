@@ -26,7 +26,7 @@ def test_every_indexer_column_is_written_when_the_index_is_wider_than_a_head(bit
     nq, nkv, hd, ni, ihd, half, rows, cap = 2, 1, 64, 4, 128, 8, 5, 16
     g = torch.Generator(device="cuda").manual_seed(3)
     p = torch.randn((rows, nq * 2 * hd + 2 * nkv * hd + ni * ihd + ihd), generator=g, device="cuda").to(torch.bfloat16)
-    nan = dict(dtype=torch.bfloat16, device="cuda")
+    nan = {"dtype": torch.bfloat16, "device": "cuda"}
     q, iq, ikc = (torch.full(shape, float("nan"), **nan) for shape in ((rows, nq, hd), (rows, ni, ihd), (cap, ihd)))
     if bits:
         kc = torch.zeros((cap * nkv, hd), dtype=torch.int8, device="cuda")
