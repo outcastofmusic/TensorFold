@@ -72,7 +72,7 @@ def test_the_admission_and_the_scratch_take_the_prompt_rows(monkeypatch, rows):
     base = SimpleNamespace(bytes_at=lambda slots: 0, reserve=0, minimum_slots=1)
     exl3_pack.admission(lambda text: base)({})
     assert seen == [(rows, rows)]
-    sc = exl3_mm.Scratch(4, True)
+    sc = exl3_mm.Scratch(4)
     sc.allocate("cpu", experts=_layer(), rows=rows, ple_words=3, ple_heads=2, ple_dim=8)
     assert sc.moe.rows == rows
     assert sc.ple_dev.shape == (rows * 2, 3) and sc.ple_emb.shape == (rows, 8)

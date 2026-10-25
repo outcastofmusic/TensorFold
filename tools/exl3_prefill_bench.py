@@ -52,7 +52,7 @@ def main() -> None:
 
     base_sw, base_mm = switches.read(), exl3_mm.read()
     exl3_mm.use(dataclasses.replace(base_mm, moe_chunk=True))       # the routed scratch for 2,048-row calls
-    w = load(a.model, mtp=True, draft_vocab=None, f16_narrow=exl3_mm.f16_narrow(), hc_fuse=True)
+    w = load(a.model, mtp=True, draft_vocab=None, hc_fuse=True)
     lengths = [int(n) for n in a.prompts.split(",")]
     names = tuple(a.names.split(","))
     if not set(names) <= set(NAMES) | set(EXTRA):

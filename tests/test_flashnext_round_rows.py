@@ -53,7 +53,7 @@ def test_a_round_past_one_calls_rows_gives_each_row_its_own_bits(monkeypatch, ro
     monkeypatch.setattr(forward.glue, "hc_reduce_act", _reduce_act)
     g = torch.Generator().manual_seed(rows)
     n = LOW + (S if inject else 0)
-    sc = exl3_mm.Scratch(11, False)
+    sc = exl3_mm.Scratch(11)
     down = _Down(torch.randn((n, K), generator=g).half(), n, K, 2, sc)
     sc.part = torch.empty((down.sk * exl3_mm.ROWS * n,), dtype=torch.float32)
     x = torch.randn((rows, K), generator=g).to(torch.bfloat16)

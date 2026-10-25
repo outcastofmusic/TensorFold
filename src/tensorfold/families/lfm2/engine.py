@@ -40,19 +40,6 @@ def weight_bytes(name: str, info: dict) -> tuple[int, int]:
     return size(info, name), 0
 
 
-# How `_scores` reads the option logits, chosen at startup with TF_D1_HEAD while the choice is measured:
-# union        one head matmul of every question's row over the union of their option tokens, one read-back;
-# per_question one matmul a question at its own shape (the bits per_question_sync gives), one read-back;
-# per_question_sync  one matmul and one read-back a question.
-HEADS = ("union", "per_question", "per_question_sync")
-
-
-def head_choice() -> str:
-    from tensorfold.env_flags import choice
-
-    return choice("TF_D1_HEAD", HEADS, "per_question")
-
-
 class Engine:
     eos: tuple[int, ...] = ()
     supports_logprobs = False
@@ -62,7 +49,6 @@ class Engine:
                  processor: Any = None):
         from tokenizers import Tokenizer
 
-        self.head = head_choice()
         self.model_dir = Path(model_dir)
         raw, text = read_text_config(self.model_dir)
         self.cfg = Config.of(text)
@@ -155,29 +141,22 @@ class Engine:
         return answers, len(trunk) + sum(map(len, branches))
 
     def _scores(self, hidden: torch.Tensor, groups: list[list[list[int]]]) -> list[list[float]]:
-        """Each question's options' best logits among their forms, read from the head as `self.head` says."""
+        """Each question's options' best logits among their forms: its row times its own options' head rows, so a
+        question's logits do not depend on the others in the request, read back once."""
 
-        if self.head == "union":
-            ids = sorted({t for group in groups for forms in group for t in forms})
-            logits = self.model.logits(hidden, ids).tolist()
-            where = {t: i for i, t in enumerate(ids)}
-            return [[max(row[where[t]] for t in forms) for forms in group] for row, group in zip(logits, groups)]
         own = [sorted({t for forms in group for t in forms}) for group in groups]
-        if self.head == "per_question_sync":
-            logits = [self.model.logits(row[None], ids)[0].tolist() for row, ids in zip(hidden, own)]
-        else:
-            # Model.logits uploads its ids, a blocking copy, so the head rows are gathered with one upload. Each
-            # question then multiplies its own contiguous slice of them at the shape per_question_sync uses.
-            heads = self.model.embed[torch.tensor([t for ids in own for t in ids], device=hidden.device)]
-            parts, start = [], 0
-            for row, ids in zip(hidden, own):
-                parts.append(F.linear(row[None], heads[start:start + len(ids)]).float()[0])
-                start += len(ids)
-            flat = torch.cat(parts).tolist()
-            logits, start = [], 0
-            for ids in own:
-                logits.append(flat[start:start + len(ids)])
-                start += len(ids)
+        # Model.logits uploads its ids, a blocking copy, so the head rows are gathered with one upload. Each question
+        # then multiplies its own contiguous slice of them, at the shape Model.logits would use for it alone.
+        heads = self.model.embed[torch.tensor([t for ids in own for t in ids], device=hidden.device)]
+        parts, start = [], 0
+        for row, ids in zip(hidden, own):
+            parts.append(F.linear(row[None], heads[start:start + len(ids)]).float()[0])
+            start += len(ids)
+        flat = torch.cat(parts).tolist()
+        logits, start = [], 0
+        for ids in own:
+            logits.append(flat[start:start + len(ids)])
+            start += len(ids)
         return [[max(row[ids.index(t)] for t in forms) for forms in group]
                 for row, ids, group in zip(logits, own, groups)]
 

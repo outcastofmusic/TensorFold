@@ -203,24 +203,6 @@ def test_engine_answers_three_questions_in_one_forward(engine):
     assert out["usage"] == {"input_tokens": read, "output_tokens": 0}
 
 
-def test_a_request_s_questions_read_the_head_once(tiny, monkeypatch):
-    """Every question's options from one head matmul over the union of their tokens (TF_D1_HEAD=union)."""
-
-    engine = _head_engine(tiny, monkeypatch, "union")
-    calls: list[tuple[int, int]] = []
-    own = engine.model.logits
-
-    def counted(hidden, ids=None):
-        calls.append((hidden.shape[0], len(ids) if ids is not None else -1))
-        return own(hidden, ids)
-
-    monkeypatch.setattr(engine.model, "logits", counted)
-    engine.decide(STATE, {"refund": NOUL, "team": TEAM, "urgency": URGENCY})
-    f = engine.fmt
-    union = {t for q in (NOUL, TEAM, URGENCY) for forms in f.readout(question(q)) for t in forms}
-    assert calls == [(3, len(union))]
-
-
 def test_a_question_reads_the_same_alone_and_beside_others(engine, tiny):
     together = engine.decide(STATE, {"refund": NOUL, "team": TEAM, "urgency": URGENCY})["answers"]
     alone = engine.decide(STATE, {"team": TEAM})["answers"]["team"]
@@ -234,21 +216,7 @@ def test_a_question_reads_the_same_alone_and_beside_others(engine, tiny):
     assert abs(apart["refund"]["noul"] - together["refund"]["noul"]) < 2e-2
 
 
-def _head_engine(tiny, monkeypatch, head):
-    monkeypatch.setenv("TF_D1_HEAD", head)
-    return Engine(tiny, device="cpu")
-
-
-def test_head_choice_defaults_to_per_question_and_refuses_unknown_values(tiny, monkeypatch):
-    monkeypatch.delenv("TF_D1_HEAD", raising=False)
-    assert Engine(tiny, device="cpu").head == "per_question"
-    with pytest.raises(ValueError, match="TF_D1_HEAD: one of union, per_question, per_question_sync, not 'fused'"):
-        _head_engine(tiny, monkeypatch, "fused")
-
-
-@pytest.mark.parametrize("head,reads", [("union", 1), ("per_question", 1), ("per_question_sync", 3)])
-def test_each_head_choice_reads_back_as_named(tiny, monkeypatch, head, reads):
-    engine = _head_engine(tiny, monkeypatch, head)
+def test_a_request_s_questions_read_back_once(engine, monkeypatch):
     f = engine.fmt
     groups = [f.readout(question(q)) for q in (NOUL, TEAM, URGENCY)]
     hidden = engine._rows(f.encode(f.prefix(STATE)), [f.encode(f.suffix(question(q))) for q in (NOUL, TEAM, URGENCY)])
@@ -261,22 +229,21 @@ def test_each_head_choice_reads_back_as_named(tiny, monkeypatch, head, reads):
 
     monkeypatch.setattr(torch.Tensor, "tolist", counted)
     scores = engine._scores(hidden, groups)
-    assert len(calls) == reads and [len(s) for s in scores] == [len(g) for g in groups]
+    assert len(calls) == 1 and [len(s) for s in scores] == [len(g) for g in groups]
 
 
-def test_per_question_gives_per_question_sync_s_bits(tiny, monkeypatch):
-    f = Format(lfm2_tiny.tokenizer())
+def test_each_question_gets_the_bits_it_reads_alone(engine):
+    f = engine.fmt
     questions = [NOUL, TEAM, URGENCY, {"type": "choice", "instructions": "Which colour?",
                                        "criteria": {"red": None, "green": None, "blue": None, "grey": None}}]
     groups = [f.readout(question(q)) for q in questions]
-    got = {}
-    for head in ("union", "per_question", "per_question_sync"):
-        engine = _head_engine(tiny, monkeypatch, head)
-        hidden = engine._rows(f.encode(f.prefix(STATE)), [f.encode(f.suffix(question(q))) for q in questions])
-        got[head] = engine._scores(hidden, groups)
-    assert got["per_question"] == got["per_question_sync"]          # float equality, every logit
-    for a, b in zip(got["union"], got["per_question_sync"]):
-        assert all(math.isclose(x, y, abs_tol=5e-2) for x, y in zip(a, b))
+    hidden = engine._rows(f.encode(f.prefix(STATE)), [f.encode(f.suffix(question(q))) for q in questions])
+    alone = []
+    for row, group in zip(hidden, groups):
+        ids = sorted({t for forms in group for t in forms})
+        logits = engine.model.logits(row[None], ids)[0].tolist()
+        alone.append([max(logits[ids.index(t)] for t in forms) for forms in group])
+    assert engine._scores(hidden, groups) == alone                  # float equality, every logit
 
 
 def test_engine_answers_match_transformers_on_the_full_prompt(engine, tiny):

@@ -198,7 +198,7 @@ STACKS = {"attention": [("x3", 2560, 12288, 5), ("x3", 2560, 512, 5), ("x3", 256
 @pytest.mark.parametrize("which", list(STACKS))
 def test_a_stack_writes_the_same_bytes_in_place(which):
     g = torch.Generator().manual_seed(len(which))
-    sc = exl3_mm.Scratch(11, True)
+    sc = exl3_mm.Scratch(11)
     parts = [_x3(sc, k, n, b, g) if kind == "x3" else _f16(sc, n, k, g) for kind, k, n, b in STACKS[which]]
     _scratch(parts)
     st = exl3_mm.Stack(parts, sc)
@@ -222,7 +222,7 @@ F16_ROWS = (17, 33, 48, 129, 241, 256, 305, 753, 768, 1024, 2048, 2050, 2061)
 @pytest.mark.parametrize("n, k", F16_SHAPES)
 def test_the_in_program_sum_writes_the_split_sums_bytes(n, k):
     g = torch.Generator().manual_seed(n + k)
-    sc = exl3_mm.Scratch(11, True)
+    sc = exl3_mm.Scratch(11)
     q = _f16(sc, n, k, g)
     _scratch([q])
     used = 0
@@ -279,7 +279,7 @@ def test_an_fp16_hcs_fused_write_back_and_norm_keep_the_read_outs_bytes(mode, R)
     if forward._hc_fuser(torch.device("cuda")) is None:
         pytest.skip("the write-norm fusion's self-check did not pass on this GPU")
     g = torch.Generator().manual_seed(R + mode)
-    sc = exl3_mm.Scratch(11, True)
+    sc = exl3_mm.Scratch(11)
     down, up = _f16(sc, 324, 10240, g), _f16(sc, 10240, 320, g)
     _scratch([down, up])
     scale = (torch.rand((10240,), generator=g) + 0.5).float().cuda()

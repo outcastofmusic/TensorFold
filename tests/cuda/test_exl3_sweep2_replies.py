@@ -72,7 +72,7 @@ def flash_next():
         pytest.skip("the Flash Next EXL3 pack is not here")
     from tensorfold.families.qwen4_exp.cuda.weights import load
 
-    w = load(FN_PACK, mtp=True, draft_vocab=None, f16_narrow=True, hc_fuse=True)
+    w = load(FN_PACK, mtp=True, draft_vocab=None, hc_fuse=True)
     yield w
     del w
     _free()

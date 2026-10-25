@@ -446,7 +446,7 @@ def test_the_scratch_and_the_admission_take_the_window(monkeypatch, chunk):
     base = SimpleNamespace(bytes_at=lambda slots: 0, reserve=0, minimum_slots=1)
     exl3_pack.admission(lambda text: base)({})
     assert seen == [window]
-    sc = exl3_mm.Scratch(4, True)
+    sc = exl3_mm.Scratch(4)
     sc.allocate("cpu", experts=_layer(), rows=16, ple_words=0, ple_heads=0, ple_dim=0)
     assert sc.moe.rows == window
 
