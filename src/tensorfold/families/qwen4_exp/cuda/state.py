@@ -55,7 +55,7 @@ class Buffers:
         self.pa = torch.empty((rows, attn_width), dtype=bf, device=dev)
         self.q = torch.empty((rows, c.heads, c.head_dim), dtype=bf, device=dev)
         self.iq = torch.empty((rows, c.index_heads, c.index_dim), dtype=bf, device=dev)
-        # prompt chunks score on qsa_scores.cu unless TF_FLASHNEXT_QSA=torch (the same bits and lists either way)
+        # prompt chunks score on qsa_scores.cu (the Triton kernels' bits and lists)
         self.attn = attn_mod.AttnScratch(min(rows, ATT_ROWS) if prefill else rows, c.heads, c.head_dim, capacity,
                                          dev, budget=c.index_budget, ratio=c.index_ratio,
                                          fast=qsa.fast(prefill, c.index_heads, c.index_dim))

@@ -2,7 +2,7 @@
 
 - Routed experts at Flash Next EXL3's shapes (2560 <-> 640, 3-bit mul1 experts beside a 5-bit shared expert, 11
   slots), at 4 bits in each codebook, and at GLM-5.3's (4096 <-> 2048, mcg at 2.25 bits, whose 18-word tiles take
-  8-byte copies, and at 2.5 bits, 14-bit window, 8 slots): bf16 slots into a buffer (TF_FLASHNEXT_MOE_DIRECT's
+  8-byte copies, and at 2.5 bits, 14-bit window, 8 slots): bf16 slots into a buffer (the MoE buffer's
   call), fp32 slots and combined rows, windows of 65 to 2,048 rows, as ``routed`` serves them, with the epilogue
   kernels (no fusion, so they read the staged path's one total a matrix), on the spanned layout (no item list) and
   with PDL; each against the same launches unstaged (``tests.exl3_fakes.routed_with``). Uniform and skewed routing

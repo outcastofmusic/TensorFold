@@ -6,14 +6,14 @@
   prompt windows) on the item list alone and as ``routed`` serves them, against the launches of before
   (``tests.exl3_fakes.OLD``), eager and replayed from CUDA graphs; and group_kernel's item list against a Python
   model of it.
-- The down epilogue's bf16 slots (TF_FLASHNEXT_MOE_DIRECT) against a copy of its fp32 slots, at both models' shapes.
-- The EXL3 linear writing N columns of a wider output (TF_FLASHNEXT_STACK_DIRECT) at Flash Next's dense shapes and
-  GLM-5.3-sized ones, and Flash Next's two stacks (attention: q, k, v, indexer; DeltaNet: qkv, z, fp16 b/a) with the
-  switch on and off, 1 to 128 rows.
+- The down epilogue's bf16 slots (the MoE buffer's call) against a copy of its fp32 slots, at both models' shapes.
+- The EXL3 linear writing N columns of a wider output at Flash Next's dense shapes and GLM-5.3-sized ones, and Flash
+  Next's two stacks (attention: q, k, v, indexer; DeltaNet: qkv, z, fp16 b/a) writing in place against the scratch
+  copies an output off 16 bytes takes, 1 to 128 rows.
 - ``_f16_mm_ks`` (TF_FLASHNEXT_F16_INNER_K) against ``_f16_mm`` + ``_reduce`` at the pack's fp16 shapes and prompt
   row counts, into contiguous and stack-column outputs.
-- An fp16 hyper-connection's prompt read-out with the write-back and norm fused (TF_FLASHNEXT_HC_FUSE) against the
-  separate kernels, in the write-back modes the layers use.
+- An fp16 hyper-connection's prompt read-out with the write-back and norm fused against the separate kernels, in the
+  write-back modes the layers use.
 """
 
 from __future__ import annotations
@@ -192,7 +192,7 @@ STACKS = {"attention": [("x3", 2560, 12288, 5), ("x3", 2560, 512, 5), ("x3", 256
 
 
 @pytest.mark.parametrize("which", list(STACKS))
-def test_a_stack_writes_the_same_bytes_in_place(which):
+def test_a_stack_writes_the_same_bytes_in_place_as_through_the_copies(which):
     g = torch.Generator().manual_seed(len(which))
     sc = exl3_mm.Scratch(11)
     parts = [_x3(sc, k, n, b, g) if kind == "x3" else _f16(sc, n, k, g) for kind, k, n, b in STACKS[which]]
@@ -201,9 +201,9 @@ def test_a_stack_writes_the_same_bytes_in_place(which):
     for m in (1, 2, 3, 4, 5, 6, 7, 8, 16, 17, 28, 64, 128):
         x = torch.randn((m, 2560), generator=g).to(torch.bfloat16).cuda()
         got = []
-        for on in (False, True, False):
-            exl3_mm.use(exl3_mm.Switches(stack_direct=on, moe_chunk=False))
-            out = torch.full((m, st.n), float("nan"), dtype=torch.bfloat16, device="cuda")
+        for pad in (1, 0, 1):                        # a row stride 2 bytes off 16 takes the scratch copies
+            out = torch.full((m, st.n + pad), float("nan"), dtype=torch.bfloat16, device="cuda")[:, :st.n]
+            assert st.aligned(out) is (pad == 0)
             got.append(st(x, out).clone())
         torch.cuda.synchronize()
         assert torch.isfinite(got[0].float()).all(), (which, m)
@@ -227,7 +227,7 @@ def test_the_in_program_sum_writes_the_split_sums_bytes(n, k):
         for wide in (False, True):                                    # contiguous, and a stack's columns
             outs = []
             for on in (False, True):
-                exl3_mm.use(exl3_mm.Switches(inner_k=on, moe_chunk=False))
+                exl3_mm.use(exl3_mm.Switches(inner_k=on))
                 full = torch.full((m, n + (128 if wide else 0)), float("nan"), dtype=torch.bfloat16, device="cuda")
                 outs.append(q(x, full[:, :n]).clone())
             torch.cuda.synchronize()
@@ -279,12 +279,17 @@ def test_an_fp16_hcs_fused_write_back_and_norm_keep_the_read_outs_bytes(mode, R)
     down, up = _f16(sc, 324, 10240, g), _f16(sc, 10240, 320, g)
     _scratch([down, up])
     scale = (torch.rand((10240,), generator=g) + 0.5).float().cuda()
+    hc = HC(down, up, scale, True, down, up)
     got = []
     for fuse in (False, True, False):
-        hc = HC(down, up, scale, True, down, up, fuse=fuse)
         b, h, extra, inject_prev = _hc_inputs(R, torch.Generator().manual_seed(R + mode), mode)
         inject_out = torch.empty((R, 4), dtype=torch.bfloat16, device="cuda")
-        forward.hc_block(hc, b, R, 1e-6, 4, 320, mode, None if mode == 0 else inject_prev, inject_out, h, **extra)
+        prev = None if mode == 0 else inject_prev
+        if fuse:
+            forward.hc_block(hc, b, R, 1e-6, 4, 320, mode, prev, inject_out, h, **extra)
+        else:                                       # the separate kernels hc_block ran before the fusion
+            forward.glue.hc_writeback(h, h, b.pss, 4, mode, inject=prev, **extra)
+            forward._readout(hc, b, h, R, 1e-6, 4, 320, inject_out)
         torch.cuda.synchronize()
         got.append([t.clone() for t in (h, b.pss, b.normed, b.act, b.mixed, inject_out)])
     for a, c in zip(got[0], got[1]):

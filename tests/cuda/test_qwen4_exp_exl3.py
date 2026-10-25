@@ -118,7 +118,7 @@ def test_real_routed_experts_match_fp64_and_are_row_invariant():
     pk = exl3_pack.Pack(MODEL)
     name = "model.language_model.layers.5.mlp"
     ex = exl3.expert_table(pk, name + ".experts", 512, name + ".shared_expert", DEV)
-    s = Scratch(ex, exl3_mm.MOE_WINDOW, 11, device=DEV)
+    s = Scratch(ex, exl3_pack.MOE_WINDOW, 11, device=DEV)
     g = torch.Generator().manual_seed(2)
     rows = 64
     x = (torch.randn(rows, 2560, generator=g) * 0.5).to(torch.bfloat16).to(DEV)

@@ -13,7 +13,6 @@ GitHub has the full notes and the measurements behind them.
   add into the tensor-core dot and the bits change), run the up projection and the mix as one kernel, and take the
   checked write-back + norm kernel that the 4-bit HC already used. Each kernel makes the old kernels' roundings and adds
   in the same order. MiaAI-Lab's engine ran the same three steps in 31, 39 and 89 ms in that profile.
-  `TF_FLASHNEXT_HC_FUSE=1` (default) takes them, `0` restores the separate kernels, and any other value stops the start.
   Decode windows and the final read-out keep the separate kernels. The down-projection and up-mix kernels are ported
   from MiaAI-Lab's Qwen3.8 Flash Next recipe, patch 0008 (MIT licence), which builds on the TensorFold contributors'
   `bf16._b16mm` and `glue._hc_mix`.
@@ -37,8 +36,8 @@ GitHub has the full notes and the measurements behind them.
   instead (1.064x, replies change), and any other value than `prompt` or `qmmf` fails the load.
 - **Under `--parallel`, Qwen3.8 Flash Next sends a prompt's first token before its first drafts.** The copy index
   and up to six MTP draft steps ran first. Median time to first token at `--parallel 5` went from 2.32 to 2.09 s at
-  4k, 19.01 to 18.09 s at 32k and 82.47 to 82.53 s at 131k on 18 Oct 2026, with the same tokens.
-  `TF_FLASH_FIRST_EARLY=0` restores the old order. The done line's prefill now includes the prompt's last pass.
+  4k, 19.01 to 18.09 s at 32k and 82.47 to 82.53 s at 131k on 18 Oct 2026, with the same tokens. The done line's
+  prefill now includes the prompt's last pass.
 - **GLM-5.3 Flash runs 40% fewer device operations a decode window.** Packed projections read and write rows in
   place, and decode skips group sums no kernel reads: 2,712 operations fell to 1,613 a one-row window. Decode ran
   0.6-1.2% faster in 4 of 4 cells on 18 Oct 2026, and served replies stayed identical. `TF_GLM_PACKED_COPIES=1`
@@ -47,17 +46,15 @@ GitHub has the full notes and the measurements behind them.
   read every pooled block key once per row, so its cost grew 1.6 ms a 2,048-row chunk per 1k tokens of context: 50 ms
   at 30k and an estimated 215 ms at 131k. `qsa_scores.cu` stages 64 blocks' keys and 32 rows' queries in shared
   memory once and repeats the Triton kernel's fp32 instruction order, so each score is the same fp32 word. Rows of
-  8,192 blocks (32k keys) or more then select their blocks in tiles, with the same lists. `TF_FLASHNEXT_QSA=cuda`
-  (default) takes both, `torch` keeps the Triton kernels, and any other value stops the start. Decode windows keep
-  the Triton kernels. The kernel and the 8,192-block threshold are ported from MiaAI-Lab's Qwen3.8 Flash Next recipe,
+  8,192 blocks (32k keys) or more then select their blocks in tiles, with the same lists. Decode windows keep the
+  Triton kernels. The kernel and the 8,192-block threshold are ported from MiaAI-Lab's Qwen3.8 Flash Next recipe,
   patches 0002 and 0005 (MIT licence), which build on the TensorFold contributors' indexer kernels.
 - **Qwen3.8 Flash Next FP4-Local prompt chunks of 1,024+ rows run the routed experts in a shared-memory tile.** A
   CTA's four warps share an item's input rows through shared memory, and each decoded weight fragment serves up to
   four 16-row tiles on 64-pair items. The output bits equal the 16-pair kernel's, which decode and shorter chunks
-  keep. `TF_FLASHNEXT_PROMPT_EXPERT_TILE=2` (default) takes it for gate/up and down, `1` for gate/up only, `0` turns
-  it off, and any other value fails at load. MiaAI-Lab measured +13-15% cold prefill from this kernel in their Zig
-  engine. The kernel is ported from MiaAI-Lab's Qwen3.8 Flash Next recipe, patch 0014 (MIT licence), which builds on
-  the TensorFold contributors' expert kernels.
+  keep. MiaAI-Lab measured +13-15% cold prefill from this kernel in their Zig engine. The kernel is ported from
+  MiaAI-Lab's Qwen3.8 Flash Next recipe, patch 0014 (MIT licence), which builds on the TensorFold contributors' expert
+  kernels.
 - **`run.sh` and the swap endpoint serve three more models.** `qwen3.8-flash-next-fp4` loads NVIDIA's Qwen3.8 Flash Next
   FP4-Local and `nemotron-3.5-bolt` loads Nemotron 3.5 Bolt with LiLiCorr drafts; `prepare.sh` fetches both at pinned
   revisions. The default stays Qwen3.8 Flash Next's EXL3 pack. `lfm2.5-24b-a2b` loads Liquid's LFM2.5-24B-A2B in block FP8.

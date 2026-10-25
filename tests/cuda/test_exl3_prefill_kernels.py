@@ -7,11 +7,11 @@
   picks of -1 and of E, and PDL on and off.
 - The fused down and gate/up epilogues, each alone on the item list and as ``routed`` serves them: routed experts
   at Flash Next EXL3's shapes (2560 <-> 640, 3-bit mul1 experts beside a 5-bit shared expert, 11 slots) and
-  GLM-5.3's (4096 <-> 2048, mcg at 2.25 and 2.5 bits, 14-bit window, 8 slots): fp32 slots, bf16 slots into a buffer (TF_FLASHNEXT_MOE_DIRECT's call) and combined
-  rows, windows of 65 to 2,048 rows, PDL on and off, eager and replayed from a CUDA graph; the arrival counters are
-  zero after every launch. A planted control: counters that never reach the last arrival leave Xd unwritten and the
-  bytes differ.
-- TF_FLASHNEXT_MOE_CHUNK's call: one routed call of 2,048 rows equals two of 1,024, served and with the old launches.
+  GLM-5.3's (4096 <-> 2048, mcg at 2.25 and 2.5 bits, 14-bit window, 8 slots): fp32 slots, bf16 slots into a
+  buffer (the MoE buffer's call) and combined rows, windows of 65 to 2,048 rows, PDL on and off, eager and replayed
+  from a CUDA graph; the arrival counters are zero after every launch. A planted control: counters that never reach
+  the last arrival leave Xd unwritten and the bytes differ.
+- Flash Next's chunk-wide call: one routed call of 2,048 rows equals two of 1,024, served and with the old launches.
 """
 
 from __future__ import annotations

@@ -6,8 +6,6 @@ MIT); recorded router picks (her --plans replay) are not covered here."""
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 import torch
 
@@ -172,8 +170,8 @@ def _layer(e: int, d: int, ni: int):
 
 @pytest.mark.parametrize("rows", [2048, 1023])
 def test_a_prompt_chunk_through_moe_is_the_same_with_the_tile_off_or_on(monkeypatch, rows):
-    """moe() on a prompt chunk: TF_FLASHNEXT_PROMPT_EXPERT_TILE=0, 1 and 2 give the same activations and slots; at
-    2,048 rows the tile's 64-pair plan runs, at 1,023 the 16-pair one."""
+    """moe() on a prompt chunk gives the activations and slots of the 16-pair kernel at the same rows (``tiled``
+    patched off); at 2,048 rows the tile's 64-pair plan runs, at 1,023 the 16-pair one."""
 
     from types import SimpleNamespace
 
@@ -189,20 +187,19 @@ def test_a_prompt_chunk_through_moe_is_the_same_with_the_tile_off_or_on(monkeypa
     for name in ("gate_up", "down"):
         real = getattr(nvx, name)
         monkeypatch.setattr(nvx, name, lambda *a, _real=real, **kw: (tiles.append(kw["tile"]), _real(*a, **kw)))
+    served = nvfp4_moe.tiled
     got = {}
-    for mode in ("0", "1", "2"):
-        ex = replace(base, prompt_tile=nvfp4_moe.TILE_MODES[mode])  # the flag's value, as weights.load sets it
+    for label, choose in (("off", lambda rows, prompt: False), ("served", served)):
+        monkeypatch.setattr(nvfp4_moe, "tiled", choose)
         buf = moe_mod.MoEBuffers(rows, cfg, DEV, prefill=True)
         tiles.clear()
-        nvfp4_moe.moe(x, None, router, ex, buf, cfg)
-        got[mode] = (tuple(tiles), buf.plan.tile, buf.act[:rows].clone(), buf.y[:rows].clone())
+        nvfp4_moe.moe(x, None, router, base, buf, cfg)
+        got[label] = (tuple(tiles), buf.plan.tile, buf.act[:rows].clone(), buf.y[:rows].clone())
     tiled = rows >= nvx.TILE_ROWS
-    assert got["0"][:2] == ((False, False), 16)
-    assert got["1"][:2] == ((tiled, False), 16)                     # down regrouped in 16-pair items
-    assert got["2"][:2] == ((tiled, tiled), 64 if tiled else 16)
-    for mode in ("1", "2"):
-        assert torch.equal(got[mode][2].view(torch.int16), got["0"][2].view(torch.int16)), mode
-        assert torch.equal(got[mode][3].view(torch.int16), got["0"][3].view(torch.int16)), mode
+    assert got["off"][:2] == ((False, False), 16)
+    assert got["served"][:2] == ((tiled, tiled), 64 if tiled else 16)
+    assert torch.equal(got["served"][2].view(torch.int16), got["off"][2].view(torch.int16))
+    assert torch.equal(got["served"][3].view(torch.int16), got["off"][3].view(torch.int16))
 
 
 def test_decode_rows_never_take_the_tile(monkeypatch):
@@ -210,7 +207,6 @@ def test_decode_rows_never_take_the_tile(monkeypatch):
 
     from tensorfold.cuda import moe as moe_mod
 
-    monkeypatch.setenv(nvfp4_moe.TILE_ENV, "2")
     e, d, ni = 8, 256, 128
     ex = _layer(e, d, ni)
     cfg = SimpleNamespace(num_experts_per_tok=2, num_experts=e, moe_intermediate_size=ni, hidden_size=d)

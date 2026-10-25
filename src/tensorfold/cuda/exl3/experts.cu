@@ -287,7 +287,7 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
 }
 
 // Program (member row, 128-block of the model width): Y = (splits summed in order) @ H * svh_d, fp32, or rounded to
-// bf16 once as a copy of the fp32 Y into a bf16 tensor rounds it (a prompt's MoE buffer, TF_FLASHNEXT_MOE_DIRECT).
+// bf16 once as a copy of the fp32 Y into a bf16 tensor rounds it (a prompt's MoE buffer, forward._exl3_moe).
 template <typename TO>
 __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                      const half* __restrict__ svh_d, TO* __restrict__ y, int P, int D, int SK,

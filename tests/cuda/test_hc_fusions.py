@@ -1,11 +1,12 @@
-"""TF_FLASHNEXT_HC_FUSE on the GPU: the bf16 hyper-connection's prompt fusions write the old kernels' bytes.
+"""The bf16 hyper-connection's prompt fusions on the GPU: they write the old kernels' bytes.
 
 Each fusion against the kernels it replaces, on every HC shape FP4-Local's prompt chunks use (hidden 2560, 4 streams,
 low rank 320; the down projection with the inject rows, 324, and without, 320) at chunk rows 1, 128, 129, 2,047,
 2,048 and 4,096: the down projection with its K slices summed in each program (``bf16._b16mm_ks``), the up projection
-with the mix (``hc_b16.up_mix``), the write-back with the norm (``hc_check.fuser``), and ``forward.hc_block`` whole.
-The first three also run at the tiny checkpoint's shapes (hidden 512, low rank 64) at its chunk rows 188 and 512. Then a prompt and 48 greedy tokens, serial and drafted, with the switch off and on: on the tiny ModelOpt checkpoint
-in FP4-Local's layout, and on FP4-Local itself when TF_FP4_LOCAL names its directory."""
+with the mix (``hc_b16.up_mix``), the write-back with the norm (``hc_check.fuser``), and ``forward.hc_block`` whole
+against the separate kernels. The first three also run at the tiny checkpoint's shapes (hidden 512, low rank 64) at
+its chunk rows 188 and 512. Then a prompt and 48 greedy tokens as served, drafted equal serial: on the tiny ModelOpt
+checkpoint in FP4-Local's layout, and on FP4-Local itself when TF_FP4_LOCAL names its directory."""
 
 from __future__ import annotations
 
@@ -120,13 +121,13 @@ def test_the_write_back_and_norm_in_one_kernel_write_the_old_bytes(d, rows, mode
         assert _same(a, b), (d, rows, mode, i)
 
 
-def _hc(g, inject: bool, fuse: bool):
+def _hc(g, inject: bool):
     from tensorfold.families.qwen4_exp.cuda.bf16 import b16_from_rows
     from tensorfold.families.qwen4_exp.cuda.weight_types import HC
 
     down = b16_from_rows(_rand((LOW + (S if inject else 0), S * D), g, 0.02))
     up = b16_from_rows(_rand((S * D, LOW), g, 0.05))
-    return HC(down, up, 1.0 + _rand((S * D,), g, 0.1, torch.float32), inject, fuse=fuse)
+    return HC(down, up, 1.0 + _rand((S * D,), g, 0.1, torch.float32), inject)
 
 
 def _buffers(rows: int):
@@ -144,7 +145,7 @@ def _buffers(rows: int):
 @pytest.mark.parametrize("inject", [True, False])
 @pytest.mark.parametrize("mode", [0, 1, 2])
 @pytest.mark.parametrize("rows", ROWS)
-def test_a_hyper_connection_block_is_the_same_with_the_switch_off_or_on(rows, mode, inject):
+def test_a_hyper_connection_block_writes_the_separate_kernels_bytes(rows, mode, inject):
     g = torch.Generator(device=DEV).manual_seed(rows * 17 + mode + inject)
     h0 = _rand((rows, S * D), g)
     prev, branch = _rand((rows, S), g), _rand((rows, D), g)
@@ -152,10 +153,14 @@ def test_a_hyper_connection_block_is_the_same_with_the_switch_off_or_on(rows, mo
     seed = rows * 19 + inject
     got = {}
     for fuse in (False, True):
-        hc = _hc(torch.Generator(device=DEV).manual_seed(seed), inject, fuse)
+        hc = _hc(torch.Generator(device=DEV).manual_seed(seed), inject)
         b, h, inj = _buffers(rows), h0.clone(), torch.zeros((rows, S), dtype=torch.bfloat16, device=DEV)
         kw = {"y": y, "wts": wts} if mode == 2 else {"branch": branch} if mode == 1 else {}
-        forward.hc_block(hc, b, rows, 1e-6, S, LOW, mode, None if mode == 0 else prev, inj, h, **kw)
+        if fuse:
+            forward.hc_block(hc, b, rows, 1e-6, S, LOW, mode, None if mode == 0 else prev, inj, h, **kw)
+        else:                                            # the separate kernels hc_block ran before the fusions
+            glue.hc_writeback(h, h, b.pss, S, mode, inject=None if mode == 0 else prev, **kw)
+            forward._readout(hc, b, h, rows, 1e-6, S, LOW, inj if inject else None)
         got[fuse] = (h, b.normed, b.act, b.xs_act, b.mixed, inj)
     for i, (a, b) in enumerate(zip(got[False], got[True])):
         assert _same(a, b), (rows, mode, inject, i)
@@ -167,11 +172,6 @@ def test_a_hyper_connection_block_is_the_same_with_the_switch_off_or_on(rows, mo
 def _hcs(w):
     layers = list(w.layers) + ([w.mtp.layer] if w.mtp is not None else [])
     return [hc for layer in layers for hc in (layer.attn_hc, layer.mlp_hc)]
-
-
-def _set_fuse(w, on: bool) -> None:
-    for hc in _hcs(w):
-        hc.fuse = on
 
 
 def _reply(w, prompt, prefill_rows: int, capacity: int):
@@ -191,12 +191,6 @@ def _reply(w, prompt, prefill_rows: int, capacity: int):
     return out
 
 
-def _equal(a, b) -> None:
-    assert a[0] == b[0]
-    assert _same(a[1], b[1])
-    assert a[2:] == b[2:]
-
-
 @pytest.fixture(scope="module")
 def tiny(tmp_path_factory) -> Path:
     import json
@@ -209,36 +203,25 @@ def tiny(tmp_path_factory) -> Path:
     return path
 
 
-def test_the_tiny_checkpoint_replies_the_same_with_the_switch_off_or_on(tiny):
-    """One load with the switch flipped off, on, off: two loads of the tiny ModelOpt checkpoint already differ with the
-    switch off (18 Oct, a separate bug in TASKS.md), so comparing loads would test that, not the fusions."""
-
+def test_the_tiny_checkpoints_drafted_reply_equals_serial(tiny):
     from tensorfold.families.qwen4_exp.cuda.weights import load
 
     prompt = torch.randint(1, 256, (700,), generator=torch.Generator().manual_seed(3)).tolist()
-    w = load(tiny, mtp=True, draft_vocab=None, hc_fuse=True)
-    got = []
-    for on in (False, True, False):
-        _set_fuse(w, on)
-        got.append(_reply(w, prompt, 512, 1024))          # chunks of 512 and 188 rows
-    _equal(got[0], got[2])
-    _equal(got[0], got[1])
+    w = load(tiny, mtp=True, draft_vocab=None)
+    _, _, serial, drafted, rounds, _ = _reply(w, prompt, 512, 1024)          # chunks of 512 and 188 rows
+    assert drafted == serial and rounds > 0
 
 
 FP4_LOCAL = os.environ.get("TF_FP4_LOCAL")
 
 
 @pytest.mark.skipif(not FP4_LOCAL, reason="TF_FP4_LOCAL names FP4-Local's directory")
-def test_fp4_local_replies_the_same_with_the_switch_off_or_on():
+def test_fp4_locals_drafted_reply_equals_serial():
     from tensorfold.families.qwen4_exp.cuda.weights import load
 
-    w = load(Path(FP4_LOCAL), mtp=True, draft_vocab=None, hc_fuse=True)
+    w = load(Path(FP4_LOCAL), mtp=True, draft_vocab=None)
     hcs = _hcs(w)
-    assert len(hcs) == 98 and all(hc.fuse and hc.down.n == LOW + S and hc.up.n == S * D for hc in hcs)
+    assert len(hcs) == 98 and all(hc.down.n == LOW + S and hc.up.n == S * D for hc in hcs)
     prompt = torch.randint(10, 150_000, (4500,), generator=torch.Generator().manual_seed(8)).tolist()
-    got = []
-    for on in (False, True, False):                      # off twice: a difference is the switch's, not noise
-        _set_fuse(w, on)
-        got.append(_reply(w, prompt, 2048, 8192))           # chunks of 2,048, 2,048 and 404 rows
-    _equal(got[0], got[2])
-    _equal(got[0], got[1])
+    _, _, serial, drafted, rounds, _ = _reply(w, prompt, 2048, 8192)         # chunks of 2,048, 2,048 and 404 rows
+    assert drafted == serial and rounds > 0

@@ -1,8 +1,9 @@
-"""The EXL3 pack's matmul switches on the CPU: TF_FLASHNEXT_STACK_DIRECT, TF_FLASHNEXT_F16_INNER_K and
-TF_FLASHNEXT_MOE_DIRECT (their values, where the engine reads them, what each call launches with them on or off),
-TF_FLASHNEXT_HC_FUSE on the pack's fp16 hyper-connections, and (compiled for sm_121 without a GPU) that
-``_f16_mm_ks`` keeps ``_f16_mm``'s chain of MMA steps and adds its slices after their loops.
-tests/cuda/test_exl3_sweep2_kernels.py and test_exl3_sweep2_replies.py compare the bytes on the GPU."""
+"""The EXL3 pack's matmuls on the CPU: a stack's parts writing their columns in place (and the copies rows off 16
+bytes keep), TF_FLASHNEXT_F16_INNER_K (its values, where the engine reads it, what each call launches with it on or
+off), the write-back and norm fusion on the pack's fp16 hyper-connections, a prompt window's expert slots rounding
+straight into the MoE buffer, and (compiled for sm_121 without a GPU) that ``_f16_mm_ks`` keeps ``_f16_mm``'s chain
+of MMA steps and adds its slices after their loops. tests/cuda/test_exl3_sweep2_kernels.py compares the bytes on the
+GPU."""
 
 from __future__ import annotations
 
@@ -45,9 +46,9 @@ def _chain(ptx):
     return out
 
 
-ENVS = (exl3_mm.STACK_DIRECT_ENV, exl3_mm.INNER_K_ENV, exl3_mm.MOE_DIRECT_ENV)
-FIELDS = dict(zip(ENVS, ("stack_direct", "inner_k", "moe_direct")))
-DEFAULTS = dict(zip(ENVS, (True, False, True)))      # inner_k off: 0.994x prefill served (19 Oct)
+ENVS = (exl3_mm.INNER_K_ENV,)
+FIELDS = dict(zip(ENVS, ("inner_k",)))
+DEFAULTS = dict(zip(ENVS, (False,)))      # inner_k off: 0.994x prefill served (19 Oct)
 
 
 @pytest.fixture(autouse=True)
@@ -86,12 +87,11 @@ def test_the_engine_installs_what_it_reads(monkeypatch, tmp_path):
 
     for e in exl3_mm.ENVS:
         monkeypatch.delenv(e, raising=False)
-    monkeypatch.setenv(exl3_mm.STACK_DIRECT_ENV, "0")
-    monkeypatch.setenv(exl3_mm.MOE_DIRECT_ENV, "off")
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=False))
+    monkeypatch.setenv(exl3_mm.INNER_K_ENV, "1")
+    exl3_mm.use(exl3_mm.Switches())
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
-    assert exl3_mm.current() == exl3_mm.Switches(stack_direct=False, inner_k=False, moe_direct=False, moe_chunk=True)
+    assert exl3_mm.current() == exl3_mm.Switches(inner_k=True)
 
 
 # -- a stack's parts write their columns in place ------------------------------------------------------------------
@@ -116,10 +116,9 @@ def _stack(widths):
 
 @pytest.mark.parametrize("widths", [(12288, 512, 512, 640), (10240, 6144, 96)])   # attention, DeltaNet
 @pytest.mark.parametrize("m", [2, 3, 8, 16, 28, 129])
-def test_with_the_switch_each_part_writes_its_columns_in_place(widths, m):
+def test_each_part_writes_its_columns_in_place(widths, m):
     s, log = _stack(widths)
     out = torch.zeros((m, sum(widths)), dtype=torch.bfloat16)
-    exl3_mm.use(exl3_mm.Switches(stack_direct=True, moe_chunk=False))
     s(torch.zeros((m, 8)), out)
     at = 0
     for (ptr, shape, stride), n in zip(log, widths):
@@ -129,11 +128,10 @@ def test_with_the_switch_each_part_writes_its_columns_in_place(widths, m):
 
 
 @pytest.mark.parametrize("m", [2, 8, 28])
-def test_without_the_switch_rows_go_to_scratch_and_are_copied(m):
+def test_rows_off_16_bytes_go_to_scratch_and_are_copied(m):
     widths = (12288, 512, 512, 640)
     s, log = _stack(widths)
-    out = torch.zeros((m, sum(widths)), dtype=torch.bfloat16)
-    exl3_mm.use(exl3_mm.Switches(stack_direct=False, moe_chunk=False))
+    out = torch.zeros((m, sum(widths) + 1), dtype=torch.bfloat16)[:, :sum(widths)]      # a row stride off 16 bytes
     s(torch.zeros((m, 8)), out)
     assert {ptr for ptr, _, _ in log} == {s.sc.tmp.data_ptr()}
     at = 0
@@ -142,12 +140,11 @@ def test_without_the_switch_rows_go_to_scratch_and_are_copied(m):
         at += n
 
 
-def test_one_row_writes_in_place_either_way():
+def test_one_row_writes_in_place_at_any_row_stride():
     widths = (10240, 6144, 96)
-    for on in (True, False):
+    for pad in (0, 1):
         s, log = _stack(widths)
-        out = torch.zeros((1, sum(widths)), dtype=torch.bfloat16)
-        exl3_mm.use(exl3_mm.Switches(stack_direct=on, moe_chunk=False))
+        out = torch.zeros((1, sum(widths) + pad), dtype=torch.bfloat16)[:, :sum(widths)]
         s(torch.zeros((1, 8)), out)
         assert log[1][0] == out.data_ptr() + 10240 * 2
 
@@ -196,7 +193,7 @@ def test_a_call_launches_the_in_program_sum_where_it_fits(monkeypatch, n, k, m, 
     monkeypatch.setattr(exl3_mm, "_f16_mm", mm)
     monkeypatch.setattr(exl3_mm, "_f16_mm_ks", ks)
     monkeypatch.setattr(exl3_mm, "_reduce", red)
-    exl3_mm.use(exl3_mm.Switches(inner_k=on, moe_chunk=False))
+    exl3_mm.use(exl3_mm.Switches(inner_k=on))
     q = _f16(n, k)
     out = torch.empty((m, n + 64), dtype=torch.bfloat16)[:, :n]      # a stack's columns: any row stride
     q(torch.empty((m, k), dtype=torch.bfloat16), out)
@@ -217,7 +214,7 @@ def test_decode_partials_never_take_the_in_program_sum(monkeypatch):
     mm, ks = Spy(), Spy()
     monkeypatch.setattr(exl3_mm, "_f16_mm", mm)
     monkeypatch.setattr(exl3_mm, "_f16_mm_ks", ks)
-    exl3_mm.use(exl3_mm.Switches(inner_k=True, moe_chunk=False))
+    exl3_mm.use(exl3_mm.Switches(inner_k=True))
     _f16(324, 10240).partials(torch.empty((8, 10240), dtype=torch.bfloat16))
     assert ks.calls == [] and len(mm.calls) == 1
 
@@ -257,8 +254,8 @@ def test_the_in_program_sum_keeps_each_slices_mma_chain_and_adds_after_the_loop(
 ROWS = 2048
 
 
-def _x3_hc(fuse: bool):
-    return HC(SimpleNamespace(n=324), SimpleNamespace(n=10240), "scale", True, fuse=fuse)    # no kernel tag: fp16
+def _x3_hc():
+    return HC(SimpleNamespace(n=324), SimpleNamespace(n=10240), "scale", True)    # no kernel tag: fp16
 
 
 def _buffers(prefill: bool):
@@ -293,38 +290,29 @@ OLD = ["hc_writeback", "hc_normed", "down_act", "up", "hc_mix"]
 
 @pytest.mark.parametrize("rows", [17, 128, 2048])
 def test_a_prompt_chunk_writes_back_and_normalizes_in_one_kernel(launches, rows):
-    _block(_x3_hc(True), _buffers(True), rows)
+    _block(_x3_hc(), _buffers(True), rows)
     assert launches.calls == ["write_norm", "down_act", "up", "hc_mix"]
 
 
-@pytest.mark.parametrize("fuse, prefill, rows", [(False, True, ROWS), (True, True, 16), (True, False, 17),
-                                                 (True, False, 8)])
-def test_the_switch_off_decode_windows_and_short_chunks_keep_the_separate_kernels(launches, fuse, prefill, rows):
+@pytest.mark.parametrize("prefill, rows", [(True, 16), (False, 17), (False, 8)])
+def test_decode_windows_and_short_chunks_keep_the_separate_kernels(launches, prefill, rows):
     launches.fused = lambda *a, **k: pytest.fail("the write-norm fusion ran")
-    _block(_x3_hc(fuse), _buffers(prefill), rows)
+    _block(_x3_hc(), _buffers(prefill), rows)
     assert launches.calls == OLD
 
 
 def test_without_the_checked_fusion_the_separate_kernels_run(launches):
     launches.fused = None
-    _block(_x3_hc(True), _buffers(True), ROWS)
+    _block(_x3_hc(), _buffers(True), ROWS)
     assert launches.calls == OLD
 
 
-def test_the_loaders_hand_the_pack_the_hc_switch(monkeypatch, tmp_path):
-    from tensorfold.families.qwen4_exp.cuda import exl3, weights
-
-    got = {}
-    monkeypatch.setattr(exl3, "is_exl3", lambda path: True)
-    monkeypatch.setattr(exl3, "load", lambda *a, **kw: got.update(kw))
-    weights.load(tmp_path, "cpu", hc_fuse=False)
-    assert got["hc_fuse"] is False
-
-
 # -- a prompt window's expert slots round straight into the MoE buffer ---------------------------------------------
-@pytest.mark.parametrize("on", [True, False])
+@pytest.mark.parametrize("bf16", [True, False])
 @pytest.mark.parametrize("rows", [17, 1024, 1500, 2048])
-def test_a_prompt_windows_slots_go_straight_into_the_buffer(monkeypatch, on, rows):
+def test_a_prompt_windows_bf16_slots_go_straight_into_the_buffer(monkeypatch, bf16, rows):
+    """bf16 slots (a prompt's MoE buffer) round inside the down epilogue; fp32 ones take a copy."""
+
     from tensorfold.cuda.exl3 import experts
 
     slots, dims, window = 11, 8, 1024
@@ -339,10 +327,10 @@ def test_a_prompt_windows_slots_go_straight_into_the_buffer(monkeypatch, on, row
     monkeypatch.setattr(experts, "routed", routed)
     monkeypatch.setattr(forward.moe_mod, "router", lambda *a, **k: None)
     monkeypatch.setattr(forward.moe_mod, "select_rows", lambda *a, **k: None)
-    exl3_mm.use(exl3_mm.Switches(moe_direct=on, moe_chunk=False))
+    exl3_mm.use(exl3_mm.Switches(prompt_rows=window))
     buf = SimpleNamespace(logits=torch.zeros((rows, 1)), pick=torch.zeros((rows, slots), dtype=torch.int32),
                           wts=torch.zeros((rows, slots)), slots=slots,
-                          y=torch.zeros((rows, slots, dims), dtype=torch.bfloat16))
+                          y=torch.zeros((rows, slots, dims), dtype=torch.bfloat16 if bf16 else torch.float32))
     b = SimpleNamespace(prefill=True, moe=buf, mixed=torch.zeros((rows, dims)))
     w = SimpleNamespace(cfg=SimpleNamespace(top_k=10, experts=512), x3=SimpleNamespace(moe=None))
     mode, y, _ = forward._exl3_moe(SimpleNamespace(router=None, experts=None), w, b, rows)
@@ -350,7 +338,7 @@ def test_a_prompt_windows_slots_go_straight_into_the_buffer(monkeypatch, on, row
     assert torch.all(buf.y.float() == 0.5)
     starts = list(range(0, rows, window))
     assert [n for n, _ in calls] == [min(window, rows - r0) for r0 in starts]
-    if on:
+    if bf16:
         assert [p for _, p in calls] == [buf.y[r0].data_ptr() for r0 in starts]
     else:
         assert all(p is None for _, p in calls)

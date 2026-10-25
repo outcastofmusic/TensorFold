@@ -15,53 +15,33 @@ from tensorfold.cuda.exl3 import prefill as x3prefill
 from tensorfold.cuda.exl3.linear import Exl3Linear
 from tensorfold.env_flags import flag
 
-from .exl3_pack import MOE_WINDOW
-
 ROWS = 128               # most rows one call of the EXL3 linear or a split fp16 matmul takes
-STACK_DIRECT_ENV = "TF_FLASHNEXT_STACK_DIRECT"
 INNER_K_ENV = "TF_FLASHNEXT_F16_INNER_K"
-MOE_DIRECT_ENV = "TF_FLASHNEXT_MOE_DIRECT"
-MOE_CHUNK_ENV = "TF_FLASHNEXT_MOE_CHUNK"
 MOE_MOST_ROWS = 4096      # most rows one routed call takes: group_scan_kernel ranks 65,535 picks, 5,957 rows of 11 slots
 PROMPT_ROWS = 4096        # TENSORFOLD_PREFILL_ROWS unset: a prompt chunk's rows on an EXL3 pack
 
 
 @dataclass(frozen=True)
 class Switches:
-    """The pack's matmul switches (unset: stack and moe on, inner_k off; GPU 19 Oct, inner_k 0.994x prefill). The engine reads them once at startup (``read``) and installs them
-    (``use``); the matmuls consult ``current()`` at each call, so a CUDA graph keeps the setting it was captured with.
+    """The pack's matmul settings (unset: inner_k off; GPU 19 Oct, inner_k 0.994x prefill). The engine reads them once
+    at startup (``read``) and installs them (``use``); the matmuls consult ``current()`` at each call, so a CUDA graph
+    keeps the setting it was captured with.
 
-    TF_FLASHNEXT_STACK_DIRECT: a stack's parts write their columns of its output in place at every row count. Rows
-    past one went to scratch and were copied over: 156 copy kernels a 1,660-kernel verify graph (36 DeltaNet stacks of
-    3 parts, 12 attention stacks of 4), 253 us of its 41.4 ms (tf-runs/profile, exl3-mtp).
     TF_FLASHNEXT_F16_INNER_K: a prompt's fp16 matmul of several K slices (the HC and mixer down projections, DeltaNet's
     b/a, the PLE value) sums its slices inside each program in one launch over all rows (``_f16_mm_ks``), where it
     wrote fp32 slices and summed them in a second launch, 128 rows a pair of launches.
-    TF_FLASHNEXT_MOE_DIRECT: a prompt window's routed experts round their slots to bf16 straight into the MoE buffer
-    (``experts.routed(y=...)``), where they wrote fp32 slots that a copy then rounded: 1,024 rows x 11 slots x 2,560
-    is 115 MB of fp32 written and read again a window and layer.
-    TF_FLASHNEXT_MOE_CHUNK (unset: on; served 8k prefill 1.085x alone, 19 Oct): a prompt chunk's routed experts in one call of
-    all its rows, where two calls of MOE_WINDOW each read every expert's trellis. The 8,192-token profile
-    (19 Oct) read about 0.96 GB of expert trellis a window and layer and ran grouped_kernel at about 246 GB/s of DRAM
-    traffic. In one call an expert's member groups (about 44 rows, two groups of 32) run next to each other, so the
-    second group's weights can come from L2. Rows never depend on the window, so the bytes are the same. The routed
-    scratch doubles: 478 to 955 MB at Flash Next's shape.
     ``prompt_rows`` (TENSORFOLD_PREFILL_ROWS on an EXL3 pack, unset: PROMPT_ROWS; served cold prefill 1.04 to 1.09x
     at 4k to 131k, 21 Oct, decode within 0.995 to 1.005x; 2,048 restores the old chunks): a prompt chunk's rows. The routed scratch,
-    the prompt matmul workspace and the n-gram staging hold as many, and with moe_chunk one routed call takes up to
-    MOE_MOST_ROWS of them. Rows never depend on the chunk, so the bytes are the same. At 4,096 rows a layer's routed
+    the prompt matmul workspace and the n-gram staging hold as many, and one routed call takes up to MOE_MOST_ROWS of
+    them (``moe_window``). Rows never depend on the chunk, so the bytes are the same. At 4,096 rows a layer's routed
     call reads each expert's trellis once for twice the rows: 2 x 8.55 to 14.4 ms a layer (tf-runs/exl3-long-1021);
     the routed scratch grows from 1.4 to 2.8 GB."""
 
-    stack_direct: bool = True
     inner_k: bool = False
-    moe_direct: bool = True
-    moe_chunk: bool = True
     prompt_rows: int = PROMPT_ROWS
 
 
-ENVS = {STACK_DIRECT_ENV: "stack_direct", INNER_K_ENV: "inner_k", MOE_DIRECT_ENV: "moe_direct",
-        MOE_CHUNK_ENV: "moe_chunk"}
+ENVS = {INNER_K_ENV: "inner_k"}
 
 _current = Switches()          # each field's default is its served setting, the one ``read`` takes for an unset flag
 
@@ -90,10 +70,16 @@ def current() -> Switches:
 
 
 def moe_window() -> int:
-    """Most rows a prompt's routed-expert call takes: the chunk's (at most MOE_MOST_ROWS) with TF_FLASHNEXT_MOE_CHUNK,
-    else MOE_WINDOW."""
+    """Most rows a prompt's routed-expert call takes: the chunk's, at most MOE_MOST_ROWS.
 
-    return min(_current.prompt_rows, MOE_MOST_ROWS) if _current.moe_chunk else MOE_WINDOW
+    One call of all a chunk's rows, where calls of 1,024 rows (exl3_pack.MOE_WINDOW) each read every expert's
+    trellis (served 8k prefill 1.085x, 19 Oct; TF_FLASHNEXT_MOE_CHUNK turned it off until 25 Oct). The 8,192-token
+    profile (19 Oct) read about 0.96 GB of expert trellis a window and layer and ran grouped_kernel at about 246 GB/s
+    of DRAM traffic. In one call an expert's member groups (about 44 rows, two groups of 32) run next to each other,
+    so the second group's weights can come from L2. Rows never depend on the window, so the bytes are the same. The
+    routed scratch doubles: 478 to 955 MB at Flash Next's shape and 1,024-row windows."""
+
+    return min(_current.prompt_rows, MOE_MOST_ROWS)
 
 
 class Scratch:
@@ -373,9 +359,10 @@ class Stack:
             return self.parts[0](x, out)
         m = x.shape[0]
         # one row: a part's slice of ``out`` needs no copy (its row stride is unused); more rows write their columns at
-        # out's row stride (TF_FLASHNEXT_STACK_DIRECT) where every part's rows stay 16-byte aligned, or go to scratch
-        # and are copied over
-        if m == 1 or (current().stack_direct and self.aligned(out)):
+        # out's row stride where every part's rows stay 16-byte aligned, or go to scratch and are copied over. The
+        # copies were 156 kernels of a 1,660-kernel verify graph, 253 us of its 41.4 ms (tf-runs/profile, exl3-mtp;
+        # served 0.999-1.006x, 19 Oct; TF_FLASHNEXT_STACK_DIRECT turned the in-place writes off until 25 Oct)
+        if m == 1 or self.aligned(out):
             at = 0
             for p in self.parts:
                 p(x, out[:, at:at + p.n])

@@ -11,16 +11,6 @@ from tensorfold.env_flags import choice
 
 from . import nvfp4
 
-TILE_ENV = "TF_FLASHNEXT_PROMPT_EXPERT_TILE"
-TILE_MODES = {"0": 0, "1": 1, "2": 2}     # off; gate/up only; gate/up and down
-
-
-def tile_mode() -> int:
-    """TF_FLASHNEXT_PROMPT_EXPERT_TILE: which faces of prompt chunks run the shared-memory tile (unset: 2, both)."""
-
-    return TILE_MODES[choice(TILE_ENV, tuple(TILE_MODES), "2")]
-
-
 SHARED_DECODE_ENV = "TF_FP4_SHARED_DECODE"
 SHARED_DECODE_MODES = ("qmmf", "prompt")
 
@@ -36,11 +26,14 @@ def shared_decode() -> str:
     return choice(SHARED_DECODE_ENV, SHARED_DECODE_MODES, "prompt")      # lower case only: QMMF raises
 
 
-def tile_faces(mode: int, rows: int, prompt: bool) -> tuple[bool, bool]:
-    """(gate/up, down) on the tile kernel: prompt buffers of at least ``nvx.TILE_ROWS`` rows, as ``mode`` allows."""
+def tiled(rows: int, prompt: bool) -> bool:
+    """Whether gate/up and down run the shared-memory tile kernel: prompt buffers of at least ``nvx.TILE_ROWS`` rows.
 
-    on = prompt and rows >= nvx.TILE_ROWS
-    return on and mode >= 1, on and mode == 2
+    Prompt chunks of 1,024+ rows took 4k 1.125x, 16k 1.113x and 32k 1.111x prefill with replies identical
+    (tf-runs/gpu-tile); TF_FLASHNEXT_PROMPT_EXPERT_TILE turned it off, or on for gate/up alone, until 25 Oct. The
+    16-pair kernel keeps decode windows and shorter chunks, with the same bits."""
+
+    return prompt and rows >= nvx.TILE_ROWS
 
 
 @dataclass
@@ -58,8 +51,7 @@ class MoE4:
     routed_experts: nvx.Experts4
     shared: Expert4
     kernel: str = "nvfp4"
-    prompt_tile: int = 2           # tile_mode() and shared_decode(): ``weights.load`` sets the values the engine read
-    shared_decode: str = "prompt"
+    shared_decode: str = "prompt"  # shared_decode(): ``weights.load`` sets the value the engine read
 
     capturable = True     # the plan stays on the device
 
@@ -139,20 +131,17 @@ def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, 
 
     ``decode``: a decode window's rows, whose bf16 slots alone do not tell them from a prompt's."""
 
-    from tensorfold.cuda import experts as grouped
     from tensorfold.cuda import moe as moe_mod
 
     rows, top_k = x.shape[0], int(cfg.num_experts_per_tok)
     prompt = buf.y.dtype != torch.float32                  # a prompt's buffers keep bf16 slots
-    gu_tile, dn_tile = tile_faces(ex.prompt_tile, rows, prompt)
+    tile = tiled(rows, prompt)
     shared_prompt = prompt and not (decode and ex.shared_decode == "qmmf")
     moe_mod.router(x, router_rows, buf.logits[:rows])
-    moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, nvx.TILE_ITEM if gu_tile else nvx.PREFILL_TILE)
-    nvx.gate_up(x, ex.routed_experts, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed, tile=gu_tile)
+    moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, nvx.TILE_ITEM if tile else nvx.PREFILL_TILE)
+    nvx.gate_up(x, ex.routed_experts, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed, tile=tile)
     buf.act[:rows, top_k] = ex.shared_act(x, shared_prompt)
-    if dn_tile != gu_tile:                                 # mode 1: down regroups in its own kernel's items
-        grouped.route(buf.pick[:rows], buf.plan, nvx.TILE_ITEM if dn_tile else nvx.PREFILL_TILE)
     nvx.down(buf.act.view(-1, ex.width), ex.routed_experts, buf.plan, buf.y.view(-1, ex.dims), rows, skip=ex.routed,
-             tile=dn_tile)
+             tile=tile)
     buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], shared_prompt, not prompt)
     return buf

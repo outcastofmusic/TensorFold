@@ -73,7 +73,7 @@ def test_first_use_checks_real_bytes_and_falls_back_on_a_forced_difference(monke
             monkeypatch.setattr(hc_fused, "write_norm", lambda *a, **k: pytest.fail("disabled fusion ran"))
             h = torch.ones((17, 4 * 2560), dtype=torch.bfloat16, device=device)
             b = SimpleNamespace(prefill=True, pss=torch.empty((17, 10, 4), device=device))
-            hc = SimpleNamespace(down=object.__new__(qmm.Q4), inject=False, fuse=False)
+            hc = SimpleNamespace(down=object.__new__(qmm.Q4), inject=False)
             readouts = []
             monkeypatch.setattr(forward, "_readout", lambda *a, **k: readouts.append(True))
             forward.hc_block(hc, b, 17, 1e-6, 4, 320, 0, None, torch.empty(17, 4, device=device), h)

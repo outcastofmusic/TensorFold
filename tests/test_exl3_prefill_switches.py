@@ -1,4 +1,4 @@
-"""The EXL3 kernels' prompt windows on the CPU (Flash Next and GLM-5.3), with TF_FLASHNEXT_MOE_CHUNK (Flash Next):
+"""The EXL3 kernels' prompt windows on the CPU (Flash Next and GLM-5.3), with Flash Next's chunk-wide routed call:
 which launches ``routed`` makes at each shape, that ``tests.exl3_fakes.routed_with`` (the GPU byte tests' reference)
 makes the same launches at its defaults and the launches from before the fused kernels with ``OLD``, a Python model
 of ``group_scan_kernel``'s rounds against ``group_kernel``'s outputs (with a planted control that must fail), the
@@ -36,31 +36,6 @@ def restore():
 
 
 # -- the flags ------------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("value, on", [(None, True), ("1", True), ("off", False)])
-def test_the_chunk_window_flag(monkeypatch, value, on):
-    from tensorfold.families.qwen4_exp.cuda import exl3_mm
-
-    monkeypatch.delenv(exl3_mm.MOE_CHUNK_ENV, raising=False)
-    monkeypatch.delenv("TENSORFOLD_PREFILL_ROWS", raising=False)
-    if value is not None:
-        monkeypatch.setenv(exl3_mm.MOE_CHUNK_ENV, value)
-    got = exl3_mm.read()
-    assert got.moe_chunk is on
-    assert (got.stack_direct, got.inner_k, got.moe_direct) == (True, False, True)
-    exl3_mm.use(got)
-    assert exl3_mm.moe_window() == (exl3_mm.PROMPT_ROWS if on else 1024)
-
-
-@pytest.mark.parametrize("value", ["2", "chunk", "1.0"])
-def test_a_chunk_window_typo_stops_the_engine(monkeypatch, tmp_path, value):
-    from tensorfold.families.qwen4_exp.cuda import exl3_mm
-    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
-
-    monkeypatch.setenv(exl3_mm.MOE_CHUNK_ENV, value)
-    with pytest.raises(ValueError, match=exl3_mm.MOE_CHUNK_ENV):
-        FlashNextEngine(tmp_path / "missing")
-
-
 def test_the_engines_install_what_they_read(monkeypatch, tmp_path):
     from tensorfold.families.glm5_next.cuda.engine import GlmEngine
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
@@ -69,13 +44,13 @@ def test_the_engines_install_what_they_read(monkeypatch, tmp_path):
     for e in switches.ENVS:
         monkeypatch.delenv(e, raising=False)
     monkeypatch.setenv(switches.PDL_ENV, "1")
-    monkeypatch.setenv(exl3_mm.MOE_CHUNK_ENV, "1")
+    monkeypatch.setenv("TENSORFOLD_PREFILL_ROWS", "2048")
     switches.use(switches.Switches())
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=False))
+    exl3_mm.use(exl3_mm.Switches())
     with pytest.raises(Exception):
         FlashNextEngine(tmp_path / "missing")                      # fails at the checkpoint, after the switches
     assert switches.current() == switches.Switches(pdl=True)
-    assert exl3_mm.current().moe_chunk is True
+    assert exl3_mm.current().prompt_rows == 2048
     switches.use(switches.Switches())
     with pytest.raises(Exception):
         GlmEngine(tmp_path / "missing", rank=0, master="", port=0, world=1)
@@ -98,7 +73,7 @@ def test_an_unset_environment_reads_each_dataclass_default(monkeypatch):
             monkeypatch.delenv(e, raising=False)
         assert module.read() == module.Switches()
     assert switches.Switches() == switches.Switches(pdl=False)
-    assert exl3_mm.Switches() == exl3_mm.Switches(stack_direct=True, inner_k=False, moe_direct=True, moe_chunk=True)
+    assert exl3_mm.Switches() == exl3_mm.Switches(inner_k=False)
 
 
 # -- what routed launches -------------------------------------------------------------------------------------------
@@ -363,7 +338,7 @@ def _picks(rows: int, slots: int, E: int, seed: int, *, hot: bool = True) -> lis
 
 @pytest.mark.parametrize("rows, slots, E, tile, maxm", [
     (1024, 11, 513, 32, 1024),                                     # Flash Next's prompt window
-    (2048, 11, 513, 32, 2048),                                     # TF_FLASHNEXT_MOE_CHUNK
+    (2048, 11, 513, 32, 2048),                                     # a 2,048-row chunk in one routed call
     (1024, 9, 257, 32, 1024),                                      # GLM-5.3's shape
     (65, 11, 513, 32, 65), (100, 4, 9, 16, 100), (70, 8, 12, 32, 70), (130, 3, 5, 16, 130),
     (300, 11, 513, 32, 20),                                        # more picks of an expert than members fit
@@ -393,10 +368,9 @@ def test_the_control_without_the_zero_guard_fails():
     assert _group_scan(pick, 33, 300, 11, 32, threads=128, keep_zero=False) != want
 
 
-# -- TF_FLASHNEXT_MOE_CHUNK: a chunk in one routed call --------------------------------------------------------------
-@pytest.mark.parametrize("chunk", [True, False])
+# -- Flash Next: a chunk in one routed call ---------------------------------------------------------------------------
 @pytest.mark.parametrize("rows", [17, 1024, 1500, 2048, 3000])
-def test_a_chunk_takes_one_routed_call_of_its_rows(monkeypatch, chunk, rows):
+def test_a_chunk_takes_one_routed_call_of_its_rows(monkeypatch, rows):
     from tensorfold.families.qwen4_exp.cuda import exl3_mm, forward
 
     slots, dims = 11, 8
@@ -410,14 +384,14 @@ def test_a_chunk_takes_one_routed_call_of_its_rows(monkeypatch, chunk, rows):
     monkeypatch.setattr(experts, "routed", routed)
     monkeypatch.setattr(forward.moe_mod, "router", lambda *a, **k: None)
     monkeypatch.setattr(forward.moe_mod, "select_rows", lambda *a, **k: None)
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk, prompt_rows=2048))   # 2,048-row chunks
+    exl3_mm.use(exl3_mm.Switches(prompt_rows=2048))                # 2,048-row chunks
     buf = SimpleNamespace(logits=torch.zeros((rows, 1)), pick=torch.zeros((rows, slots), dtype=torch.int32),
                           wts=torch.zeros((rows, slots)), slots=slots,
                           y=torch.zeros((rows, slots, dims), dtype=torch.bfloat16))
     b = SimpleNamespace(prefill=True, moe=buf, mixed=torch.zeros((rows, dims)))
     w = SimpleNamespace(cfg=SimpleNamespace(top_k=10, experts=512), x3=SimpleNamespace(moe=None))
     forward._exl3_moe(SimpleNamespace(router=None, experts=None), w, b, rows)
-    window = 2048 if chunk else 1024
+    window = 2048
     starts = range(0, rows, window)
     assert [n for n, _, _ in calls] == [min(window, rows - r0) for r0 in starts]
     assert [p for _, p, _ in calls] == [b.mixed[r0].data_ptr() for r0 in starts]
@@ -425,21 +399,20 @@ def test_a_chunk_takes_one_routed_call_of_its_rows(monkeypatch, chunk, rows):
     assert torch.all(buf.y.float() == 0.5)
 
 
-@pytest.mark.parametrize("chunk", [True, False])
+@pytest.mark.parametrize("chunk", [1024, 2048, 4096])
 def test_the_scratch_and_the_admission_take_the_window(monkeypatch, chunk):
     from tensorfold.cuda import geometry
     from tensorfold.families.qwen4_exp.cuda import exl3_mm, exl3_pack
 
-    exl3_mm.use(exl3_mm.Switches(moe_chunk=chunk, prompt_rows=2048))   # 2,048-row chunks
-    window = 2048 if chunk else 1024
+    exl3_mm.use(exl3_mm.Switches(prompt_rows=chunk))
     seen = []
     monkeypatch.setattr(geometry, "exl3_indexed_scratch", lambda text, w, rows: seen.append(w) or 0)
     base = SimpleNamespace(bytes_at=lambda slots: 0, reserve=0, minimum_slots=1)
     exl3_pack.admission(lambda text: base)({})
-    assert seen == [window]
+    assert seen == [chunk]
     sc = exl3_mm.Scratch(4)
     sc.allocate("cpu", experts=_layer(), rows=16, ple_words=0, ple_heads=0, ple_dim=0)
-    assert sc.moe.rows == window
+    assert sc.moe.rows == chunk
 
 
 def test_the_window_doubles_the_routed_scratch_under_a_gib():
