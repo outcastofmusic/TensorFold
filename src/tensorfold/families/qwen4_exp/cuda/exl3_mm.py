@@ -18,12 +18,10 @@ from tensorfold.env_flags import flag
 from .exl3_pack import MOE_WINDOW
 
 ROWS = 128               # most rows one call of the EXL3 linear or a split fp16 matmul takes
-NARROW_ENV = "TF_FLASHNEXT_F16_NARROW"
 STACK_DIRECT_ENV = "TF_FLASHNEXT_STACK_DIRECT"
 INNER_K_ENV = "TF_FLASHNEXT_F16_INNER_K"
 MOE_DIRECT_ENV = "TF_FLASHNEXT_MOE_DIRECT"
 MOE_CHUNK_ENV = "TF_FLASHNEXT_MOE_CHUNK"
-MOE_CHUNK_WINDOW = 2048   # TF_FLASHNEXT_MOE_CHUNK: a prompt chunk's rows (geometry.PREFILL_ROWS) in one routed call
 MOE_MOST_ROWS = 4096      # most rows one routed call takes: group_scan_kernel ranks 65,535 picks, 5,957 rows of 11 slots
 PROMPT_ROWS = 4096        # TENSORFOLD_PREFILL_ROWS unset: a prompt chunk's rows on an EXL3 pack
 
@@ -43,7 +41,7 @@ class Switches:
     (``experts.routed(y=...)``), where they wrote fp32 slots that a copy then rounded: 1,024 rows x 11 slots x 2,560
     is 115 MB of fp32 written and read again a window and layer.
     TF_FLASHNEXT_MOE_CHUNK (unset: on; served 8k prefill 1.085x alone, 19 Oct): a prompt chunk's routed experts in one call of
-    MOE_CHUNK_WINDOW rows, where two calls of MOE_WINDOW each read every expert's trellis. The 8,192-token profile
+    all its rows, where two calls of MOE_WINDOW each read every expert's trellis. The 8,192-token profile
     (19 Oct) read about 0.96 GB of expert trellis a window and layer and ran grouped_kernel at about 246 GB/s of DRAM
     traffic. In one call an expert's member groups (about 44 rows, two groups of 32) run next to each other, so the
     second group's weights can come from L2. Rows never depend on the window, so the bytes are the same. The routed
@@ -98,20 +96,11 @@ def moe_window() -> int:
     return min(_current.prompt_rows, MOE_MOST_ROWS) if _current.moe_chunk else MOE_WINDOW
 
 
-def f16_narrow() -> bool:
-    """TF_FLASHNEXT_F16_NARROW (unset: off; served 1.00x on 19 Oct): decode rows of the fp16 matrices on narrow tiles (``narrow_tile``), the
-    old bytes. The engine reads it once at startup and the loader stores it on the shared ``Scratch``; a value outside
-    env_flags' set raises."""
-
-    return flag(NARROW_ENV, False)
-
-
 class Scratch:
     """Buffers for every EXL3 and fp16 matrix of the model (calls run one after another on one stream)."""
 
-    def __init__(self, slots: int, narrow: bool) -> None:
+    def __init__(self, slots: int) -> None:
         self.slots = slots                 # routed experts a row, plus the shared expert
-        self.narrow = narrow               # TF_FLASHNEXT_F16_NARROW: every F16 matrix's decode tiles
         self.users: list[Any] = []
         self.xh = self.z = self.tmp = self.part = None
         self.moe: x3experts.Scratch | None = None
@@ -219,24 +208,7 @@ def _reduce(P, OUT, M, N, o_stride, SK: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(OUT + r * o_stride + c, acc.to(OUT.dtype.element_ty), mask=ok)
 
 
-# Narrow tiles take calls of one m tile (decode and verify windows); a prompt's windows keep BN 64 on four warps.
-NARROW_ROWS = 16
-WIDE_TILE = (64, 4, 3)        # (BN, warps, stages)
-
-
-def narrow_tile(m: int, n: int, sk: int, target: int = 96) -> tuple[int, int, int]:
-    """(BN, warps, stages) for an [m, K] call on an [n, K] fp16 matrix of ``sk`` K slices with the narrow switch on.
-
-    Every tile gives each warp 16 columns (BN / warps), as BN 64 on four warps does, so the MMA layout, the K slices
-    and each output's chain of m16n8k16 steps in K order stay the old ones and a row keeps its bytes. In the serial
-    decode profile (GB10, tf-runs/profile/RESULTS.md) BN 64 ran HC up (n 10,240) on 160 programs and HC down (n 324,
-    16 slices) on 96, on 48 SMs at 190-200 GB/s. BN 32 doubles the programs; BN 16 on one warp takes a matrix that would still run fewer than ``target``."""
-
-    if m > NARROW_ROWS:
-        return WIDE_TILE
-    if -(-n // 32) * sk >= target:
-        return 32, 2, 4
-    return 16, 1, 4
+WIDE_TILE = (64, 4, 3)        # (BN, warps, stages) of every fp16 call
 
 
 INNER_K_PROGRAMS = 96    # tiles (16 rows x 64 columns) a call needs before its slices sum in-program: 2 an SM on GB10
@@ -247,13 +219,12 @@ BK = 64                  # _f16_mm's K block
 def inner_k_fits(m: int, n: int, k: int, sk: int) -> bool:
     """Whether an [m, k] call on an [n, k] matrix of ``sk`` slices takes ``_f16_mm_ks`` (TF_FLASHNEXT_F16_INNER_K).
 
-    Only rows past NARROW_ROWS, which ``_f16_mm`` runs on WIDE_TILE whatever the narrow switch says, so both kernels
-    have the same tile; only slices of two BK blocks or more (``_f16_mm_ks``); and only calls whose tiles fill the GPU
+    Only calls of more than one m tile (16 rows), as when ``_f16_mm`` also had narrow tiles for one; only slices of two BK blocks or more (``_f16_mm_ks``); and only calls whose tiles fill the GPU
     without the slices' programs: HC down (n 324) from 241 rows, the mixer's (n 320) from 305, DeltaNet's b/a (n 96)
     from 753, the PLE value (n 2,560) from 33. A row's bytes are the same either way, so the choice may follow the
     row count."""
 
-    return (sk > 1 and m > NARROW_ROWS and k // sk // BK >= INNER_K_BLOCKS
+    return (sk > 1 and m > 16 and k // sk // BK >= INNER_K_BLOCKS
             and -(-m // 16) * -(-n // WIDE_TILE[0]) >= INNER_K_PROGRAMS)
 
 
@@ -295,7 +266,7 @@ class F16:
         m = x.shape[0]
         if x.stride(1) != 1 or x.shape[1] != self.k:
             raise ValueError(f"F16: x {tuple(x.shape)} does not match K={self.k}")
-        bn, warps, stages = narrow_tile(m, self.n, self.sk) if self.sc.narrow else WIDE_TILE
+        bn, warps, stages = WIDE_TILE
         grid = (triton.cdiv(m, 16), triton.cdiv(self.n, bn), self.sk)
         _f16_mm[grid](x, self.w, out, m, self.n, x.stride(0), self.n if f32 else out.stride(0),
                       K=self.k, KS=self.k // self.sk, BM=16, BN=bn, BK=BK, F32=f32, num_warps=warps,

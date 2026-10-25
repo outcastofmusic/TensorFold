@@ -322,7 +322,9 @@ def run(args: argparse.Namespace) -> int:
     import os
 
     if args.dense:
-        os.environ["TF_FLASH_DENSE" if args.family == "flash" else "TF_GLM_DENSE"] = args.dense
+        if args.family != "flash":
+            raise SystemExit("--dense picks Flash Next's dense path (TF_FLASH_DENSE); GLM has no such switch")
+        os.environ["TF_FLASH_DENSE"] = args.dense
     model, tokenizer = load_family(args.family, args.model, args.ple_on_ssd, args.ssd_experts)
     wiki, code, chat = counts(args.sequences)
     rows = sequences(tokenizer, args.wikitext, args.length, wiki, code, chat)

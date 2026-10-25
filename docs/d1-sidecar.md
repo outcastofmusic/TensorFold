@@ -77,13 +77,10 @@ Requests run one at a time. A request reads its state once however many question
 not fit one forward's token budget (`TENSORFOLD_LFM2_TOKEN_BUDGET`, at most the context) continue in a second forward
 over the same state.
 
-`TF_D1_HEAD` picks how a request reads its option logits after the forward. `per_question`, the default, multiplies
-each question's row by its own options' head rows and reads every result back once: the bits of the code before
-b585b8fb, at the same speed. `union` multiplies every question's row by the head rows of all the request's options at
-once. `per_question_sync` reads each question back on its own. On the GPU (18 Oct, `tf-runs/gpu-d1/RESULTS.md`) the
-three ran within 1.7% of each other from 1 to 10 questions at 82 and 1,004 state tokens. `union` matched the old
-logits on 148 of 200 questions and changed 1 answer, and its head made a question's logits depend on the others in
-the request (37 of 50 equal); `per_question` matched on 200 of 200.
+After the forward, a request multiplies each question's row by its own options' head rows and reads every result
+back once, so a question's logits do not depend on the others in the request. On the GPU (18 Oct,
+`tf-runs/gpu-d1/RESULTS.md`) one head matmul over the union of a request's options ran within 1.7% of it from 1 to 10
+questions, and changed 1 of 200 answers. Its switch, `TF_D1_HEAD`, was removed on 25 Oct.
 
 ## Memory beside the big models
 

@@ -35,7 +35,7 @@ WINDOWS = (1, 2, 3, 16, 17, 64, 128)
 @pytest.mark.parametrize("n,k", [(324, 10240), (10240, 320), (96, 2560), (2560, 2560), (10240, 2560)])
 def test_f16_matches_fp64_and_is_row_invariant(n, k):
     g = torch.Generator().manual_seed(n + k)
-    sc = exl3_mm.Scratch(11, True)
+    sc = exl3_mm.Scratch(11)
     w = (torch.randn(n, k, generator=g) * 0.02).half()
     lin = exl3_mm.f16(sc, [w], DEV)
     sc.part = torch.empty((lin.sk * exl3_mm.ROWS * n,), dtype=torch.float32, device=DEV)

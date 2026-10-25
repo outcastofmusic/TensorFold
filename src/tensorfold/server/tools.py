@@ -95,11 +95,8 @@ _TOOL_FUNCTION_BLOCK_RE = re.compile(
     r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$",
     re.IGNORECASE | re.DOTALL,
 )
-# Remove only one framing newline per side; preserve value whitespace so resent history matches generated tokens.
-_TOOL_PARAMETER_BLOCK_RE = re.compile(
-    r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>",
-    re.IGNORECASE | re.DOTALL,
-)
+_PARAMETER_OPEN_RE = re.compile(r"<parameter=([^>\s]+)>", re.IGNORECASE)
+_PARAMETER_CLOSE_RE = re.compile(r"</parameter>", re.IGNORECASE)
 # Gemma 4: <|tool_call>call:NAME{key:value,...}<tool_call|>, and the 26B's bare :NAME{...}. Keys bare, strings between <|"|>.
 _GEMMA_OPEN_RE, _GEMMA_CLOSE_RE = re.compile(r"<\|tool_call>"), re.compile(r"<tool_call\|>")
 _GEMMA_CALL_RE = re.compile(r"^(?:call)?:([\w.-]+)\s*(\{.*\})$", re.DOTALL)
@@ -108,8 +105,9 @@ _GEMMA_KEY_RE = re.compile(r"(?<=[{,])\s*([A-Za-z_][\w-]*)\s*:")
 # DeepSeek-V4's DSML: one <｜DSML｜tool_calls> block holds invokes of named parameters, string="false" ones as JSON
 _DSML_BLOCK_RE = re.compile(r"<｜DSML｜tool_calls>(.*?)</｜DSML｜tool_calls>", re.DOTALL)
 _DSML_OPEN_RE, _DSML_CLOSE_RE = re.compile(r"<｜DSML｜tool_calls>"), re.compile(r"</｜DSML｜tool_calls>")
-_DSML_INVOKE_RE = re.compile(r'<｜DSML｜invoke name="([^"]*)">(.*?)</｜DSML｜invoke>', re.DOTALL)
-_DSML_PARAM_RE = re.compile(r'<｜DSML｜parameter name="([^"]*)" string="(true|false)">(.*?)</｜DSML｜parameter>', re.DOTALL)
+_DSML_INVOKE_OPEN_RE, _DSML_INVOKE_CLOSE_RE = re.compile(r'<｜DSML｜invoke name="([^"]*)">'), re.compile(r"</｜DSML｜invoke>")
+_DSML_PARAM_OPEN_RE = re.compile(r'<｜DSML｜parameter name="([^"]*)" string="(true|false)">')
+_DSML_PARAM_CLOSE_RE = re.compile(r"</｜DSML｜parameter>")
 _JSON_FENCE_RE = re.compile(
     r"^\s*```(?:json)?\s*(.*?)\s*```\s*$",
     re.IGNORECASE | re.DOTALL,
@@ -297,12 +295,12 @@ def _parse_tool_call_payload(block: str, schemas: dict[str, dict[str, Any]] | No
     name = match.group(1).strip()
     arguments: dict[str, Any] = {}
     body = match.group(2)
-    if complete and _TOOL_PARAMETER_BLOCK_RE.sub("", body).strip():
+    parameters, rest = tool_parameters(body)
+    if complete and rest.strip():
         return None
-    for param_match in _TOOL_PARAMETER_BLOCK_RE.finditer(body):
-        key = param_match.group(1).strip()
+    for key, value in parameters:
         schema = (schemas or {}).get(name.lower(), {}).get(key, {})
-        arguments[key] = decode_parameter(param_match.group(2), schema)
+        arguments[key] = decode_parameter(value, schema)
     if not name:
         raise ValueError("tool_call is missing a function name")
     return name, arguments
@@ -311,25 +309,25 @@ def _parse_tool_call_payload(block: str, schemas: dict[str, dict[str, Any]] | No
 def _parse_dsml_calls(block: str) -> list[tuple[str, dict[str, Any]]] | None:
     """Every invoke of a DSML block as (name, arguments), or None when anything in it is not a well-formed invoke."""
 
-    calls, at = [], 0
-    for invoke in _DSML_INVOKE_RE.finditer(block):
-        if block[at:invoke.start()].strip():
+    invokes, rest = _tagged(block, _DSML_INVOKE_OPEN_RE, _DSML_INVOKE_CLOSE_RE)
+    if not invokes or rest.strip():
+        return None
+    calls = []
+    for invoke, body in invokes:
+        params, rest = _tagged(body, _DSML_PARAM_OPEN_RE, _DSML_PARAM_CLOSE_RE)
+        if rest.strip():
             return None
-        at = invoke.end()
         arguments: dict[str, Any] = {}
-        body = invoke.group(2)
-        if _DSML_PARAM_RE.sub("", body).strip():
-            return None
-        for name, string, value in _DSML_PARAM_RE.findall(body):
-            if string == "true":
-                arguments[name] = value
+        for param, value in params:
+            if param.group(2) == "true":
+                arguments[param.group(1)] = value
                 continue
             try:
-                arguments[name] = json.loads(value)
+                arguments[param.group(1)] = json.loads(value)
             except json.JSONDecodeError:
                 return None
         calls.append((invoke.group(1).strip(), arguments))
-    return calls if calls and not block[at:].strip() else None
+    return calls
 
 
 def _strip_json_fence(text: str) -> str:
@@ -394,10 +392,10 @@ def _namespace(m: re.Match[str]) -> str:
     return "".join("i" if ch == "\u0130" else ch.lower() for ch in m.group(1))
 
 
-def _blocks(text: str, opener: re.Pattern[str], closer: re.Pattern[str],
-            key=lambda m: "") -> list[tuple[int, int, str]]:
-    """(start, end, body) of each block that runs from an ``opener`` match to the first ``closer`` match after it
-    with the same ``key``, in order; an opener inside an earlier block is part of it.
+def _pairs(text: str, opener: re.Pattern[str], closer: re.Pattern[str],
+           key=lambda m: "") -> list[tuple[re.Match[str], int, int]]:
+    """(opener match, closer start, closer end) of each block that runs from an ``opener`` match to the first
+    ``closer`` match after it with the same ``key``, in order; an opener inside an earlier block is part of it.
 
     This is what the lazy regex ``opener\\s*(.*?)\\s*closer`` found (upstream #913), but that regex searched the rest
     of the reply again from every opener without a closer: 2,000 of them in 1 MB took 10 s, holding the GIL. Here
@@ -407,7 +405,7 @@ def _blocks(text: str, opener: re.Pattern[str], closer: re.Pattern[str],
     for m in closer.finditer(text):
         closers.setdefault(key(m), []).append(m.span())
     passed: dict[str, int] = {}
-    found: list[tuple[int, int, str]] = []
+    found: list[tuple[re.Match[str], int, int]] = []
     at = 0
     for m in opener.finditer(text):
         if m.start() < at:
@@ -418,9 +416,39 @@ def _blocks(text: str, opener: re.Pattern[str], closer: re.Pattern[str],
             e += 1
         passed[name] = e
         if e < len(spans):
-            found.append((m.start(), spans[e][1], text[m.end():spans[e][0]]))
+            found.append((m, *spans[e]))
             at = spans[e][1]
     return found
+
+
+def _blocks(text: str, opener: re.Pattern[str], closer: re.Pattern[str],
+            key=lambda m: "") -> list[tuple[int, int, str]]:
+    """(start, end, body) of each block ``_pairs`` finds."""
+
+    return [(m.start(), end, text[m.end():start]) for m, start, end in _pairs(text, opener, closer, key)]
+
+
+def _tagged(text: str, opener: re.Pattern[str], closer: re.Pattern[str]) -> tuple[list[tuple[re.Match[str], str]], str]:
+    """(opener match, body) of each block ``_pairs`` finds, and the text outside them all."""
+
+    blocks, rest, at = [], [], 0
+    for m, start, end in _pairs(text, opener, closer):
+        blocks.append((m, text[m.end():start]))
+        rest.append(text[at:m.start()])
+        at = end
+    rest.append(text[at:])
+    return blocks, "".join(rest)
+
+
+def tool_parameters(body: str) -> tuple[list[tuple[str, str]], str]:
+    """Each ``<parameter=KEY>`` block of a call body as (key, value), and the text outside them. One framing newline
+    comes off each side of a value, and the rest of its whitespace stays, so resent history matches the tokens."""
+
+    blocks, rest = _tagged(body, _PARAMETER_OPEN_RE, _PARAMETER_CLOSE_RE)
+    parameters = []
+    for m, value in blocks:
+        parameters.append((m.group(1).strip(), value.removeprefix("\n").removesuffix("\n")))
+    return parameters, rest
 
 
 def tool_call_blocks(text: str) -> list[tuple[int, int, str]]:
@@ -468,8 +496,9 @@ def parse_tool_calls_from_content(
         if max_calls is not None and len(calls) >= max_calls:
             continue
         try:
-            if block.startswith("<｜DSML｜tool_calls>"):
-                parsed = _parse_dsml_calls(_DSML_BLOCK_RE.fullmatch(block).group(1))
+            dsml = _DSML_BLOCK_RE.fullmatch(block)
+            if dsml is not None:
+                parsed = _parse_dsml_calls(dsml.group(1))
             else:
                 one = _parse_tool_call_payload(block, schemas, complete=max_calls is not None)
                 parsed = None if one is None else [one]

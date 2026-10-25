@@ -17,7 +17,33 @@ pytest.importorskip("triton")
 from tensorfold.families.qwen4_exp.cuda import exl3_mm, forward  # noqa: E402
 from tensorfold.families.qwen4_exp.cuda.weight_types import HC  # noqa: E402
 
-from tests.test_flashnext_f16_narrow import SHAPES, Spy, _chain  # noqa: E402
+# Flash Next EXL3's fp16 matrices [n, k]: HC down with the inject rows, HC up, the mixer's down, DeltaNet's b/a, and
+# the PLE key and value projections
+SHAPES = [(324, 10240), (10240, 320), (320, 10240), (96, 2560), (10240, 2560), (2560, 2560)]
+MMA = re.compile(r"mma\.sync\.aligned\.(\S+) \{ ([^}]*) \}, \{ ([^}]*) \}, \{ ([^}]*) \}, \{ ([^}]*) \};")
+
+
+class Spy:
+    """A Triton kernel stand-in: ``kernel[grid](*args, **kw)`` records the launch."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getitem__(self, grid):
+        def call(*args, **kw):
+            self.calls.append((tuple(grid), kw))
+        return call
+
+
+def _chain(ptx):
+    """A warp's MMAs of one BK step as (accumulator, A fragment) in issue order, each accumulating in place."""
+
+    accs, frags, out = {}, {}, []
+    for kind, d, a, _b, c in MMA.findall(ptx):
+        assert kind == "m16n8k16.row.col.f32.f16.f16.f32" and d == c
+        out.append((accs.setdefault(d, len(accs)), frags.setdefault(a, len(frags))))
+    return out
+
 
 ENVS = (exl3_mm.STACK_DIRECT_ENV, exl3_mm.INNER_K_ENV, exl3_mm.MOE_DIRECT_ENV)
 FIELDS = dict(zip(ENVS, ("stack_direct", "inner_k", "moe_direct")))
@@ -83,7 +109,7 @@ class Part:
 
 def _stack(widths):
     log: list = []
-    sc = exl3_mm.Scratch(11, True)
+    sc = exl3_mm.Scratch(11)
     sc.tmp = torch.zeros((exl3_mm.ROWS * max(widths),), dtype=torch.bfloat16)
     return exl3_mm.Stack([Part(n, log) for n in widths], sc), log
 
@@ -157,7 +183,7 @@ def test_the_programs_each_matrix_needs():
 
 
 def _f16(n, k):
-    sc = exl3_mm.Scratch(11, True)
+    sc = exl3_mm.Scratch(11)
     sc.part = torch.empty((exl3_mm.f16_split(n, k) * exl3_mm.ROWS * n,), dtype=torch.float32)
     return exl3_mm.F16(torch.empty((n, k), dtype=torch.float16), n, k, exl3_mm.f16_split(n, k), sc)
 
@@ -291,8 +317,8 @@ def test_the_loaders_hand_the_pack_the_hc_switch(monkeypatch, tmp_path):
     got = {}
     monkeypatch.setattr(exl3, "is_exl3", lambda path: True)
     monkeypatch.setattr(exl3, "load", lambda *a, **kw: got.update(kw))
-    weights.load(tmp_path, "cpu", hc_fuse=False, f16_narrow=True)
-    assert got["hc_fuse"] is False and got["f16_narrow"] is True
+    weights.load(tmp_path, "cpu", hc_fuse=False)
+    assert got["hc_fuse"] is False
 
 
 # -- a prompt window's expert slots round straight into the MoE buffer ---------------------------------------------

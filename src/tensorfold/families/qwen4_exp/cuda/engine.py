@@ -96,7 +96,6 @@ class FlashNextEngine:
         import torch
 
         from .copy_drafts import enabled as copy_enabled, most_rows
-        from .exl3_mm import f16_narrow
         from . import exl3_mm
         from .hc_b16 import fuse as hc_fuse
         from tensorfold.cuda.exl3 import switches as exl3_switches
@@ -113,7 +112,6 @@ class FlashNextEngine:
         # TF_FLASHNEXT_PROMPT_EXPERT_TILE and TF_FP4_SHARED_DECODE: every NVFP4 layer's expert kernels
         self.prompt_tile, self.shared_decode = tile_mode(), shared_decode()
         self.hc_fuse = hc_fuse()                         # TF_FLASHNEXT_HC_FUSE: every HC's prompt fusions
-        self.f16_narrow = f16_narrow()                   # TF_FLASHNEXT_F16_NARROW: an EXL3 pack's fp16 decode tiles
         # every TF_EXL3_* switch of the EXL3 kernels (exl3.switches.ENVS)
         exl3_switches.use(exl3_switches.read())
         # TF_FLASHNEXT_STACK_DIRECT, _F16_INNER_K, _MOE_DIRECT, _MOE_CHUNK (before admission: it sizes the scratch)
@@ -186,7 +184,7 @@ class FlashNextEngine:
                                    vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), vision, rank),
                                    rank=rank, world=tp,
                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
-        self.prefill_rows, prompt_workspace = (chunk or PREFILL_ROWS, 0) if exl3 else (chunk, 0) if chunk else prompt_plan(
+        self.prefill_rows, prompt_workspace = (chunk, 0) if exl3 or chunk else prompt_plan(
             self.capacity_plan, config(model_dir), torch.cuda.get_device_capability(), world=tp, vision=vision,
             fp8=prompt_precision.fp8())
         if prompt_workspace:
@@ -210,7 +208,7 @@ class FlashNextEngine:
             w = load(model_dir, mtp=self.depth > 0, tp=(rank, 2) if tp == 2 else None,
                      draft_vocab=draft_vocab if self.depth > 0 else None, ple_on_ssd=ple_on_ssd,
                      table_reads=reads if prefetch and not ple_on_ssd else None, prompt_tile=self.prompt_tile,
-                     shared_decode=self.shared_decode, hc_fuse=self.hc_fuse, f16_narrow=self.f16_narrow)
+                     shared_decode=self.shared_decode, hc_fuse=self.hc_fuse)
         except BaseException:
             wait(reads)                               # a failed load leaves no table read behind it
             raise
@@ -432,7 +430,7 @@ class FlashNextEngine:
         most = max(self.depth + 1, getattr(self, "copy_rows", 0))
         widths, steps = range(2, most + 1), max(32, 2 * most)
         if self.multi is not None:
-            start, window, release = self_check.multi_windows(self.multi)
+            start, window, release = self_check.multi_windows(self.multi, steps=steps)
             try:
                 got = self_check.check_widths(start, window, widths=widths, steps=steps)
             finally:

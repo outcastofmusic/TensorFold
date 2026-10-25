@@ -33,9 +33,9 @@ class Graphs:
         self.warmed: set[str] = set()
         # TF_GLM_LAZY_SPARSE=1: a long-context shape is captured after its first step, which runs eagerly. At a
         # 98,304-token window start-up captures 72 of them in 7 s, and a reply uses the 12 of its own pool bucket.
-        import os
+        from tensorfold.env_flags import flag
 
-        self.lazy = os.environ.get("TF_GLM_LAZY_SPARSE", "0") == "1"
+        self.lazy = flag("TF_GLM_LAZY_SPARSE")
         self.rows = tuple(main_rows)
         with torch.no_grad():
             for R in main_rows:

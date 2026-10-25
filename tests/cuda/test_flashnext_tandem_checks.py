@@ -164,7 +164,7 @@ def _f16_downs(w):
 
     from tensorfold.families.qwen4_exp.cuda import exl3_mm
 
-    sc = exl3_mm.Scratch(11, False)
+    sc = exl3_mm.Scratch(11)
     g = torch.Generator().manual_seed(11)
     hcs = [hc for layer in [*w.layers, w.mtp.layer] for hc in (layer.attn_hc, layer.mlp_hc)] + [w.mixer, w.mtp.mixer]
     for hc in hcs:

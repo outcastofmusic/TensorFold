@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from tensorfold.cuda.request_text import RequestText
+from tensorfold.cuda.request_text import ESC, RequestText
 from tensorfold.server.messages import _normalize_tool_call_arguments, late_system_role, normalize_messages
 from tensorfold.server.request_options import effort_levels
 
@@ -77,6 +77,8 @@ class ChatTemplate:
         marked = request.seal(self.template.render(**dict(kwargs, messages=request.mark(messages),
                                                           tools=request.mark(tools) or None,
                                                           **request.mark(extra or {}))))
+        if ESC not in marked:
+            return marked               # the request spelt no added token, and no boundary stayed
         try:
             same = request.unmark(marked) == self.template.render(**kwargs)
         except jinja2.exceptions.TemplateError:

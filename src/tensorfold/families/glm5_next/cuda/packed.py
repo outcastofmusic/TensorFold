@@ -7,7 +7,6 @@ native dense arithmetic for serial and prompt rows. All calls run on one stream.
 from __future__ import annotations
 from dataclasses import dataclass
 import math
-import os
 import re
 import torch
 from tensorfold.cuda.affine6.affine6 import Affine6
@@ -19,10 +18,10 @@ from tensorfold.env_flags import flag
 # 256 283, 512 308, 1,024 314; replies keep their bits.
 MOE_WINDOW = 1024
 # experiment: a prompt chunk's trellis projections decode W once into the shared prompt GEMM (cuda/exl3/prefill.py)
-DENSE_PROMPT = os.environ.get('TF_GLM_DENSE_PROMPT', '0') == '1'
+DENSE_PROMPT = flag('TF_GLM_DENSE_PROMPT')
 # TF_GLM_PACKED_COPIES=1: every projection stages its rows in the scratch and copies its output back, and decode
 # computes the group sums packed projections never read (forward.group_sums): the old path, kept as the byte reference
-COPIES = os.environ.get('TF_GLM_PACKED_COPIES', '0') == '1'
+COPIES = flag('TF_GLM_PACKED_COPIES')
 PLAIN_NARROW_ENV = 'TF_GLM_PLAIN_NARROW'
 
 

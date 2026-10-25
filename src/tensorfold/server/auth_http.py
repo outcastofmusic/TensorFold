@@ -70,7 +70,7 @@ class Authenticated:
         return super().parse_request() and self._guard() and self._authenticate()
 
     def handle_expect_100(self):
-        return self._authenticate() and super().handle_expect_100()
+        return self._guard() and self._authenticate() and super().handle_expect_100()
 
     def send_response(self, code, message=None):
         counted = getattr(self, "_auth_counted", [False])

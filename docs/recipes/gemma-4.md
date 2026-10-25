@@ -47,7 +47,7 @@ one step ahead as the server's pipelined engine runs it):
 | plus the expert down loads issued before the reductions | 12.7 | 12.3-12.5 (80-81 tok/s) |
 | plus every load of `attn_tail` and `moe_tail` issued before their first reduction | | 11.7-11.9 (84-85 tok/s) |
 
-Through the server (`TF_GEMMA4_PIPELINE=1`, `tools/bench_openai.py`, 512 tokens, 5 reps, back to back on the
+Through the server (`TF_GEMMA4_PIPELINE=1` at the time; it and `TF_GEMMA4_FUSED` were removed since, `tools/bench_openai.py`, 512 tokens, 5 reps, back to back on the
 same machine), median tok/s:
 
 | Prompt | Temperature | mlx_lm forward (`TF_GEMMA4_FUSED=0`) | fused, first cut | fused, tails fixed |

@@ -160,7 +160,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
         prev = word != lane / (8 / K2);
     }
     // the warp's first two k steps into L2 before the wait (the weights are written once, at load); a register
-    // load here would stay live through the passes and spill
+    // load here would stay live through the passes and spill. It pays with PDL off too: 0.993x served without it
 #pragma unroll
     for (int s = 0; s < 2; ++s)
         if (s < per_warp)

@@ -87,9 +87,10 @@ def engine_windows(e, prompt: list[int] = PROMPT):
     return start, window
 
 
-def multi_windows(dec, prompt: list[int] = PROMPT):
+def multi_windows(dec, prompt: list[int] = PROMPT, steps: int = 128):
     """(start, window, release) over a ``MultiDecoder``'s shared-round path (``compute`` with the multi-stream
-    DeltaNet and attention steps, recurrent rows folded in the next round), on a free slot; ``release`` empties it."""
+    DeltaNet and attention steps, recurrent rows folded in the next round), on a free slot with room for a check of
+    ``steps``; ``release`` empties it."""
 
     from . import attn_multi, gdn_multi
     from .decode import prefill
@@ -100,7 +101,7 @@ def multi_windows(dec, prompt: list[int] = PROMPT):
     held: list[list[int]] = [[]]
 
     def start() -> int:
-        if not dec._grow(st, len(prompt) + 2 * 128, alone=True):      # a check of up to 64 steps and 64-row windows
+        if not dec._grow(st, len(prompt) + 2 * steps, alone=True):
             raise RuntimeError("no memory for the self-check's slot")
         held[0] = []
         e = _slot(dec.w, st, dec.buf, dec.mbuf, dec.pbuf, dec.capacity, dec.prefill_rows)
