@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from tensorfold.env_flags import flag
+
 DEFAULT_POLICY = "auto"
 DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 while their probability product holds 0.3
 EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
@@ -21,7 +23,7 @@ MAX_ROWS = 8                          # the widest verify window (a pending toke
 WARM_ROWS = 256                       # a background pass's chunk: a request asking for the GPU waits out one (0.7 s)
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
 # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
-DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
+DRAFT_RING = flag("TF_GLM_DRAFT_RING", True)
 
 
 def early_launch() -> bool:
@@ -29,27 +31,19 @@ def early_launch() -> bool:
     next round's block pass, before the host calls ``on_tokens``; the same tokens. Read once at startup into
     ``Weights.meta``; a value outside env_flags' set raises."""
 
-    from tensorfold.env_flags import flag
-
     return flag("TF_GLM_EARLY_LAUNCH", False)
 
 
 def kernel_switches() -> dict[str, bool]:
     """The decode kernels' switches, read once at startup into ``Weights.meta`` (``forward.Buffers`` takes them):
-    TF_GLM_PLAIN_NARROW (``packed.plain_narrow``), TF_GLM_HC_SPLIT (``glue.hc_split``), TF_GLM_MOE_IN_PLACE
-    (``forward.moe_in_place``) and TF_GLM_TOKEN_LIST (``sparse.token_list``), on when unset; TF_GLM_SHARED_STREAM
-    (``forward.shared_stream``), TF_GLM_KDA_WIDE (``kda.decode_wide``) and TF_GLM_EARLY_LAUNCH (``early_launch``, the
-    decode loops), off when unset. Either way a reply keeps its bytes; a value outside env_flags' set raises."""
+    TF_GLM_SHARED_STREAM (``forward.shared_stream``), TF_GLM_KDA_WIDE (``kda.decode_wide``) and TF_GLM_EARLY_LAUNCH
+    (``early_launch``, the decode loops), off when unset. Either way a reply keeps its bytes; a value outside
+    env_flags' set raises."""
 
-    from .forward import moe_in_place, shared_stream
-    from .glue import hc_split
+    from .forward import shared_stream
     from .kda import decode_wide
-    from .packed import plain_narrow
-    from .sparse import token_list
 
-    return {"plain_narrow": plain_narrow(), "hc_split": hc_split(), "moe_in_place": moe_in_place(),
-            "shared_stream": shared_stream(), "kda_wide": decode_wide(), "token_list": token_list(),
-            "early_launch": early_launch()}
+    return {"shared_stream": shared_stream(), "kda_wide": decode_wide(), "early_launch": early_launch()}
 
 
 def _token_id(model_dir: Path, text: str) -> int:
@@ -188,7 +182,8 @@ def calibrates(calibrate: bool, *, eager: bool, serial_only: bool) -> bool:
     """Whether startup times the drafters. TF_GLM_CALIBRATE=0 skips the 5 s of timing: `auto` on an EXL3 pack with a
     draft model is a fixed policy and reads no timings, and a request for the chooser (`auto:...`) is then refused."""
 
-    return bool(calibrate and not eager and not serial_only and os.environ.get("TF_GLM_CALIBRATE", "1") != "0")
+    timing = flag("TF_GLM_CALIBRATE", True)          # read first: a typo stops the start on every path
+    return bool(calibrate and not eager and not serial_only and timing)
 
 
 def _extended(c, others) -> bool:
@@ -259,18 +254,17 @@ class GlmEngine:
             raise ValueError(f"prefill_rows must be between 1 and {PREFILL_ROWS}; admission bounds this chunk size")
         # Without --context the window stays dense, attending every key without indexer work.
         explicit = context is not None if context_explicit is None else bool(context_explicit)
-        from . import LATENT
-
         transform = _weight_transform(rule, world, cfg.layers if not self.load_mtp else 0, self.load_mtp,
                                       self.load_mtp or drafter is not None)
-        from tensorfold.env_flags import flag
         from tensorfold.families.qwen4_exp.cuda.copy_drafts import BACK, most_rows
 
-        # TF_GLM_DFLASH_COPIES (unset: off): DFlash2 rounds verify a copy where the reply repeats earlier text; a
-        # copy's window widens from 6 rows up to TENSORFOLD_COPY_ROWS while copies land whole
-        self.dflash_copies = flag("TF_GLM_DFLASH_COPIES", False)
-        # TF_GLM_COPY_BACK=N: a copy only where its match runs N tokens before the 8 it needs (0: any match)
-        self.copy_back = int(os.environ.get("TF_GLM_COPY_BACK", "0").strip() or 0)
+        # TF_GLM_DFLASH_COPIES (unset: on): DFlash2 rounds verify a copy where the reply repeats earlier text; a
+        # copy's window widens from 6 rows up to TENSORFOLD_COPY_ROWS while copies land whole. With TF_GLM_COPY_BACK
+        # at 8: batch 48.6 to 54.5 tok/s, list copy 2.19x, rewrite 1.58x, json unchanged, the same replies
+        # (tf-runs/copy-longest, 2026-10-20)
+        self.dflash_copies = flag("TF_GLM_DFLASH_COPIES", True)
+        # TF_GLM_COPY_BACK=N (unset: 8): a copy only where its match runs N tokens before the 8 it needs (0: any match)
+        self.copy_back = int(os.environ.get("TF_GLM_COPY_BACK", "8").strip() or 8)
         if not 0 <= self.copy_back <= BACK:
             raise ValueError(f"TF_GLM_COPY_BACK: 0 to {BACK} (a match is scored {BACK} tokens back), not {self.copy_back}")
         from .drafter_choice import COPY_DRAFTS
@@ -292,7 +286,7 @@ class GlmEngine:
 
         def main_geometry(text):
             geometry = mla_geometry(_target_text(text, self.load_mtp), world, MAX_ROWS,
-                                    minimum_slots=DENSE_CAPACITY, latent=LATENT, mtp=self.load_mtp)
+                                    minimum_slots=DENSE_CAPACITY, mtp=self.load_mtp)
             if adapter_workspace:
                 from tensorfold.cuda.geometry import with_fixed
                 geometry = with_fixed(geometry, adapter_workspace)
@@ -308,7 +302,7 @@ class GlmEngine:
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
         # both ranks must run the same calls: refuse to start when they were given different settings
-        mine = [int(drafter is not None), capacity, int(long_context), int(self.serial_only), int(LATENT),
+        mine = [int(drafter is not None), capacity, int(long_context), int(self.serial_only),
                 prefill_rows, int(self.target_only), int(self.eager), int(self.calibrated), int(self.load_mtp),
                 int(DRAFT_RING), int(self.dflash_copies), self.copy_rows, self.copy_back, BACK]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
@@ -318,7 +312,7 @@ class GlmEngine:
         both = self._gather_ints(mine + [spare >> 20])
         if len(both) != world or any(row[:-1] != mine for row in both):
             raise RuntimeError("CUDA ranks were started with different settings (draft model, context, drafts, "
-                               "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, TF_GLM_DFLASH_COPIES, "
+                               "TF_GLM_MTP, TF_GLM_DRAFT_RING, TF_GLM_DFLASH_COPIES, "
                                "TENSORFOLD_COPY_ROWS, TF_GLM_COPY_BACK, TENSORFOLD_COPY_BACK): "
                                f"{both}; pull the draft model on both machines (or pass --drafter none to both) "
                                "and give both the same flags")

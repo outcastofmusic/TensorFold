@@ -29,10 +29,9 @@ def main():
     from tensorfold.cuda.geometry import mla_geometry, with_fixed
     from tensorfold.families.glm5_next.cuda.weights import Config, load, packed_residency, workspace_bytes
     from tensorfold.families.glm5_next.cuda.decode import Engine, prefill, serial_decode
-    from tensorfold.families.glm5_next.cuda import LATENT
     cfg=replace(Config.read(a.model_dir),mtp_layers=0)
-    if (cfg.layers,cfg.heads,cfg.lin_heads,cfg.vocab)!=(45,64,64,154880) or not LATENT:
-        ap.error('harness requires complete GLM-5.3 Flash geometry and latent cache')
+    if (cfg.layers,cfg.heads,cfg.lin_heads,cfg.vocab)!=(45,64,64,154880):
+        ap.error('harness requires complete GLM-5.3 Flash geometry')
     if not isinstance(tokens,list) or not tokens or any(type(v) is not int or not 0<=v<cfg.vocab for v in tokens):
         ap.error('tokens must be nonempty valid integer IDs')
     if len(tokens)+a.count>=cfg.dense_limit:
@@ -47,7 +46,7 @@ def main():
     extra=workspace_bytes(cfg,headers(a.model_dir),rows=1,prefill_rows=a.prefill_rows,load_mtp=False)
     def geometry(t):
         effective={**t,'num_nextn_predict_layers':0}
-        return with_fixed(mla_geometry(effective,1,1,minimum_slots=2560,latent=True),extra+additional_reserve+runtime_allowance)
+        return with_fixed(mla_geometry(effective,1,1,minimum_slots=2560),extra+additional_reserve+runtime_allowance)
     admission=admit(a.model_dir,len(tokens)+a.count,True,torch,geometry,packed_residency(cfg,load_mtp=False),rank=0,world=1)
     w=load(a.model_dir,rank=0,world=1,load_mtp=False)
     if len(w.layers)!=45 or not w.meta.get('packed_exl3') or w.mtp is not None:

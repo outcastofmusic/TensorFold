@@ -8,7 +8,7 @@ if not torch.cuda.is_available():
 
 from tensorfold.cuda.kernels.prefill_attention import attention, triton_attention  # noqa: E402
 
-# 27B, Qwen3.6-35B-A3B, Nemotron, GLM-5.3 per-head keys (TF_GLM_LATENT=0), a small group
+# 27B, Qwen3.6-35B-A3B, Nemotron, 32 heads of 256 (GLM-5.3's per-head shape before the latent cache), a small group
 SHAPES = [(24, 4, 256), (16, 2, 256), (32, 2, 128), (32, 32, 256), (12, 4, 128)]
 CHUNKS = [(0, 1), (0, 100), (0, 333), (17, 7), (64, 64), (1000, 129), (4133, 300)]
 

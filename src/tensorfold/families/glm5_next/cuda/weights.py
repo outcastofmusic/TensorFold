@@ -207,8 +207,6 @@ class DSAW:
     q_norm: torch.Tensor
     kv_norm: torch.Tensor
     q_b: Projection
-    kv_k: Projection                  # key rows of kv_b for the local heads
-    kv_v: Projection                  # value rows
     o: Projection
     heads: int
     index: IndexW | None = None
@@ -408,38 +406,26 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int =
         rows = torch.arange(HL * 512, device=dev).view(HL, 512)
         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
         if packed:
-            # Head-major K/V split AFTER ordinary plain matrix read. Keep F16
-            # blocks once, alias expanded projections to the same storage.
+            # Head-major K/V split AFTER ordinary plain matrix read, kept once in F16
             w = rows_of(PREFIX + p + "kv_b_proj").reshape(HL, cfg.qk_dim + cfg.v_dim, cfg.kv_lora)
-            wk = w[:, :cfg.qk_dim].contiguous()
-            wv = w[:, cfg.qk_dim:].contiguous()
-            kv_k = PlainLinear(wk.view(HL * cfg.qk_dim, cfg.kv_lora))
-            kv_v = PlainLinear(wv.view(HL * cfg.v_dim, cfg.kv_lora))
+            absorb = PlainAbsorb(w[:, :cfg.qk_dim].contiguous(), w[:, cfg.qk_dim:].contiguous())
         elif exl3:
             w = t(p + "kv_b_proj.weight")
-            kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
-            full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
+            absorb = latent.AbsorbW.from_rows(w[krows].float(), w[vrows].float(), HL)
         else:
             w, s, b = trip(p + "kv_b_proj")
-            kv_k = make_q4(w[krows], s[krows], b[krows])
-            kv_v = make_q4(w[vrows], s[vrows], b[vrows])
-        if not latent.ENABLED:
-            absorb = None
-        elif packed:
-            absorb = PlainAbsorb(wk, wv)
-        elif exl3:
-            absorb = latent.AbsorbW.from_rows(full_k(), full_v(), HL)
-        elif cfg.group_size == 64:        # the checkpoint's own 4-bit rows, read as they are stored
-            absorb = latent.AbsorbQ4((w[krows], s[krows], b[krows]), (w[vrows], s[vrows], b[vrows]), HL)
-        else:
-            absorb = latent.AbsorbW.from_rows(latent.dequant_mlx4(w[krows], s[krows], b[krows], cfg.group_size),
-                                              latent.dequant_mlx4(w[vrows], s[vrows], b[vrows], cfg.group_size), HL)
+            if cfg.group_size == 64:        # the checkpoint's own 4-bit rows, read as they are stored
+                absorb = latent.AbsorbQ4((w[krows], s[krows], b[krows]), (w[vrows], s[vrows], b[vrows]), HL)
+            else:
+                absorb = latent.AbsorbW.from_rows(latent.dequant_mlx4(w[krows], s[krows], b[krows], cfg.group_size),
+                                                  latent.dequant_mlx4(w[vrows], s[vrows], b[vrows], cfg.group_size),
+                                                  HL)
         ix = IndexW(stack([p + "indexer.wk", p + "indexer.weights_proj"]), q4(p + "indexer.wq_b"),
                     t(p + "indexer.k_norm.weight"), t(p + "indexer.k_norm.bias"),
                     t(p + "indexer.index_kpool_compress_gate", None if packed else torch.bfloat16).contiguous(),
                     t(p + "indexer.index_kpool_compress_ape", None if packed else torch.bfloat16).contiguous())
         return DSAW(proj, t(p + "q_a_layernorm.weight"), t(p + "kv_a_layernorm.weight"), q4(p + "q_b_proj"),
-                    kv_k, kv_v, q4(p + "o_proj"), HL, ix, absorb)
+                    q4(p + "o_proj"), HL, ix, absorb)
 
     def mlp(p: str) -> MLPW:
         gu = stack([p + "gate_proj", p + "up_proj"])

@@ -1,4 +1,4 @@
-"""Sparse DSA keeps lower-index pools on score ties and visits selected tokens and chunks in position order so window rows preserve serial bits."""
+"""Sparse DSA's selection keeps lower-index pools on score ties and lists selected tokens in position order so window rows preserve serial bits."""
 
 from __future__ import annotations
 
@@ -6,21 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorfold.env_flags import flag
-
 from tensorfold.cuda.geometry import MLA_SELECT_ROWS as SELECT_ROWS   # a prompt chunk's rows scored at once
 
 POOL = 4
 TOPK_POOLS = 512
-TOKEN_LIST_ENV = "TF_GLM_TOKEN_LIST"
-
-
-def token_list() -> bool:
-    """TF_GLM_TOKEN_LIST (unset: on): ``select_tokens`` builds each row's token list and count in one kernel
-    (``_token_list``) instead of about 13 torch ops, the same integers. The engine reads it once at startup into
-    ``Weights.meta``; a value outside env_flags' set raises."""
-
-    return flag(TOKEN_LIST_ENV, True)
 BR = 16
 
 
@@ -222,11 +211,10 @@ def token_rows(pools: torch.Tensor, pos_dev: torch.Tensor) -> tuple[torch.Tensor
 
 
 def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int | None, R: int, np_max: int,
-                  pos_dev: torch.Tensor, *, bucket: int | None = None,
-                  fused: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+                  pos_dev: torch.Tensor, *, bucket: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Each row's attended tokens [R, 2051] ascending (-1 padded) and their count past the dense limit; ``bucket`` fixes the pool count for graphs.
 
-    ``fused`` (TF_GLM_TOKEN_LIST): the list and counts from ``token_rows``' one kernel, the same integers."""
+    The list and counts come from ``token_rows``' one kernel, the integers of ``token_rows_ops``' 13 torch ops."""
 
     if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
         raise ValueError("select_tokens: index queries must be contiguous rows, weights unit-stride columns")
@@ -249,11 +237,11 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
         blocks.append(top_pools(scores[:n], TOPK_POOLS, at))                           # ascending pool index
     del scores
     pools = blocks[0] if len(blocks) == 1 else torch.cat(blocks)
-    return token_rows(pools, pos_dev) if fused else token_rows_ops(pools, pos_dev)
+    return token_rows(pools, pos_dev)
 
 
 def token_rows_ops(pools: torch.Tensor, pos_dev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``token_rows`` in torch ops, the reference (TF_GLM_TOKEN_LIST=0)."""
+    """``token_rows`` in torch ops, the reference the tests compare the kernel against."""
 
     R = pools.shape[0]
     dev = pools.device
@@ -268,94 +256,3 @@ def token_rows_ops(pools: torch.Tensor, pos_dev: torch.Tensor) -> tuple[torch.Te
     tokens[:, TOPK_POOLS * POOL:] = torch.where(tail_ok, tail, -1)
     counts = torch.where(npool > TOPK_POOLS, TOPK_POOLS * POOL + tail_ok.sum(1), 0).to(torch.int32)
     return tokens, counts
-
-
-@triton.jit
-def _gtile(q, k, v, m, l, o, valid, SCALE: tl.constexpr):
-    scores = tl.dot(q, tl.trans(k)).to(tl.float32) * SCALE
-    scores = tl.where(valid[None, :], scores, float("-inf"))
-    tile_m = tl.max(scores, 1)
-    active = tile_m != float("-inf")
-    next_m = tl.where(active, tl.maximum(m, tile_m), m)
-    alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
-    p = tl.where(valid[None, :] & active[:, None], tl.exp(scores - next_m[:, None]), 0.0)
-    o = o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
-    l = l * alpha + tl.sum(p, 1)
-    return next_m, l, o
-
-
-@triton.jit
-def _sparse_chunks(Q, KC, VC, TOK, CNT, PO, PM, PL, W: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
-                   CH: tl.constexpr, SCALE: tl.constexpr):
-    """Attend selected tokens in list order with the query in row 0 of a 16-row tile and the other tile rows idle."""
-
-    r = tl.program_id(0)
-    h = tl.program_id(1)
-    c = tl.program_id(2)
-    n = tl.load(CNT + r)
-    d = tl.arange(0, D)
-    g = tl.arange(0, 16)
-    q = tl.load(Q + (r * H + h) * D + d[None, :] + g[:, None] * 0, mask=(g == 0)[:, None], other=0).to(tl.bfloat16)
-    m = tl.full((16,), float("-inf"), tl.float32)
-    l = tl.zeros((16,), tl.float32)
-    o = tl.zeros((16, D), tl.float32)
-    for t in range(CH // 64):
-        idx = c * CH + t * 64 + tl.arange(0, 64)
-        ok = idx < n
-        tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
-        kk = tl.load(KC + (tok[:, None] * H + h) * D + d[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
-        vv = tl.load(VC + (tok[:, None] * H + h) * D + d[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
-        m, l, o = _gtile(q, kk, vv, m, l, o, ok, SCALE)
-    base = (c * 128 + r) * H + h
-    tl.store(PO + base * D + d[None, :] + g[:, None] * 0, o, mask=(g == 0)[:, None])
-    tl.store(PM + base + g * 0, m, mask=g == 0)
-    tl.store(PL + base + g * 0, l, mask=g == 0)
-
-
-@triton.jit
-def _sparse_merge(PO, PM, PL, OUT, CNT, H: tl.constexpr, D: tl.constexpr, NCH: tl.constexpr, CH: tl.constexpr):
-    r = tl.program_id(0)
-    h = tl.program_id(1)
-    n = tl.load(CNT + r)
-    if n == 0:
-        return
-    d = tl.arange(0, D)
-    m = float("-inf")
-    l = 0.0
-    o = tl.zeros((D,), tl.float32)
-    for c in range(NCH):
-        if c * CH < n:
-            base = (c * 128 + r) * H + h
-            cm = tl.load(PM + base)
-            cl = tl.load(PL + base)
-            co = tl.load(PO + base * D + d)
-            active = cl > 0.0
-            next_m = tl.where(active, tl.maximum(m, cm), m)
-            a = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
-            b = tl.where(active, tl.exp(cm - next_m), 0.0)
-            o = o * a + co * b
-            l = l * a + cl * b
-            m = next_m
-    tl.store(OUT + (r * H + h) * D + d, (o / l).to(tl.bfloat16))
-
-
-PART_ROWS = 128          # rows of one launch: the kernels keep a row's chunk partials at c * 128 + r
-
-
-def sparse_attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
-                     out: torch.Tensor, scale: float) -> None:
-    """Write attention for rows with positive counts into out [R, H, D] in launches of up to 128 rows, leaving other rows untouched."""
-
-    R, H, D = q.shape
-    W = tokens.shape[1]
-    CH = 512
-    nch = triton.cdiv(W, CH)
-    po = torch.empty((nch * PART_ROWS * H * D,), dtype=torch.float32, device=q.device)
-    pm = torch.empty((nch * PART_ROWS * H,), dtype=torch.float32, device=q.device)
-    pl = torch.empty((nch * PART_ROWS * H,), dtype=torch.float32, device=q.device)
-    for r0 in range(0, R, PART_ROWS):
-        n = min(PART_ROWS, R - r0)
-        rows = slice(r0, r0 + n)
-        _sparse_chunks[(n, H, nch)](q[rows], kc, vc, tokens[rows], counts[rows], po, pm, pl, W=W, H=H, D=D, CH=CH,
-                                    SCALE=scale, num_warps=4, num_stages=1)
-        _sparse_merge[(n, H)](po, pm, pl, out[rows], counts[rows], H=H, D=D, NCH=nch, CH=CH, num_warps=4)

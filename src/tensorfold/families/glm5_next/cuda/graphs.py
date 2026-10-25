@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from . import latent, prof
+from . import prof
 from .forward import compute
 from .mtp import mtp_compute
 
@@ -31,11 +31,12 @@ class Graphs:
         saved = list(st.cur)
         parities = (0, 1) if st.cur else (0,)
         self.warmed: set[str] = set()
-        # TF_GLM_LAZY_SPARSE=1: a long-context shape is captured after its first step, which runs eagerly. At a
-        # 98,304-token window start-up captures 72 of them in 7 s, and a reply uses the 12 of its own pool bucket.
+        # TF_GLM_LAZY_SPARSE (unset: on): a long-context shape is captured after its first step, which runs eagerly
+        # (0.1 s a graph). At a 98,304-token window start-up captured 72 of them in 7 s, and a reply uses the 12 of its
+        # own pool bucket; 0 captures them all at start-up.
         from tensorfold.env_flags import flag
 
-        self.lazy = flag("TF_GLM_LAZY_SPARSE")
+        self.lazy = flag("TF_GLM_LAZY_SPARSE", True)
         self.rows = tuple(main_rows)
         with torch.no_grad():
             for R in main_rows:
@@ -59,7 +60,7 @@ class Graphs:
                     with torch.cuda.graph(g, pool=self.pool):
                         mtp_compute(w, st, e.mbuf, n)
                     self.mtp[n] = g
-            if st.index is not None and latent.ENABLED:
+            if st.index is not None:
                 self._capture_sparse(e, main_rows, mtp_rows, parities)
         torch.cuda.synchronize()
 

@@ -330,13 +330,16 @@ glm() {
     local try
     for try in 1 2 3 4; do
         docker rm -f tensorfold-glm >/dev/null 2>&1 || true
-        # TF_GLM_DENSE_PROMPT=1: prompt rows through the dense matmul, 310 -> 362 tok/s on a 20,500-token prompt
-        # TF_GLM_CALIBRATE=0: no 5 s of draft timing at start; only the `auto:...` chooser reads it (TIMING=1 keeps it)
-        # TF_GLM_LAZY_SPARSE=1: the 72 long-context graphs are captured at first use (0.1 s each) where start-up took 7 s
-        # TF_GLM_DFLASH_COPIES=1 TF_GLM_COPY_BACK=8: DFlash2 rounds verify copies of earlier text, widening to 32 rows,
-        # where the match runs 8 tokens further back: batch 48.6 -> 54.5 tok/s, list copy 2.19x, rewrite 1.58x, json
-        # unchanged, same replies (tf-runs/copy-longest, 2026-10-20). COPIES=0 serves without them
-        serve tensorfold-glm -e TF_GLM_DENSE_PROMPT=1 -e TF_GLM_CALIBRATE="${TIMING:-0}" -e TF_GLM_LAZY_SPARSE=1 -e TENSORFOLD_MEMORY_RESERVE_GIB=11 -e TF_GLM_DFLASH_COPIES="${COPIES:-1}" -e TF_GLM_COPY_BACK=8 "${states[@]}" -- "$model" --tp 1 --host 127.0.0.1 --port "$PORT" --name glm-5.3-flash \
+        # Two GLM switches serve off their code defaults. TF_GLM_DENSE_PROMPT=1: prompt rows through the dense matmul,
+        # 310 -> 362 tok/s on a 20,500-token prompt; replies change (TrueScore -0.7 [-4.0, +2.6]), and the default 0 is
+        # the only path where a resumed reply's end is exact. TF_GLM_CALIBRATE=0: no 5 s of draft timing at start; only
+        # the `auto:...` chooser reads it (TIMING=1 keeps it).
+        # The code defaults already serve TF_GLM_LAZY_SPARSE=1 (long-context graphs captured at first use),
+        # TF_GLM_DFLASH_COPIES=1 and TF_GLM_COPY_BACK=8 (DFlash2 rounds verify copies of earlier text); COPIES=0
+        # serves without the copies
+        local copies=()
+        [ -z "${COPIES:-}" ] || copies=(-e "TF_GLM_DFLASH_COPIES=$COPIES")
+        serve tensorfold-glm -e TF_GLM_DENSE_PROMPT=1 -e TF_GLM_CALIBRATE="${TIMING:-0}" -e TENSORFOLD_MEMORY_RESERVE_GIB=11 "${copies[@]}" "${states[@]}" -- "$model" --tp 1 --host 127.0.0.1 --port "$PORT" --name glm-5.3-flash \
             --context "${CONTEXT:-$context}" --max-tokens "${CONTEXT:-$context}" "${drafter[@]}" "${budget[@]}" ${EXTRA:-}
         # no d1 beside GLM: GLM leaves 17 GiB, and d1's load took it under 8 GiB (2026-10-17)
         wait_ready tensorfold-glm "$PORT" && return 0

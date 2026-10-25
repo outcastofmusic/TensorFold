@@ -98,7 +98,7 @@ def test_routed_native_activation_boundary(monkeypatch):
     monkeypatch.setattr(experts,'routed',stop)
     with pytest.raises(BoundaryReached):
         routed_micro_windows(torch.ones(2,128),torch.zeros(2,2,dtype=torch.int32),
-                             object(),SimpleNamespace(rows=2),torch.empty(2,2,128),2,10)
+                             SimpleNamespace(dims=128),SimpleNamespace(rows=2,slots=2),torch.empty(2,2,128),2,10)
 
 
 def test_mtp_omission_fails_before_device_work():

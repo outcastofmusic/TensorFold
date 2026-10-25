@@ -59,13 +59,13 @@ def narrow_blocks(m,k,dtype):
     return next(u for u in (8,4,2,1) if nk%u==0)
 
 
-def plain_matmul(weight,x,out,narrow=False):
-    """out = x @ weight.T in fp32; ``narrow`` (TF_GLM_PLAIN_NARROW) sends decode rows to _plain_narrow, same bytes."""
+def plain_matmul(weight,x,out):
+    """out = x @ weight.T in fp32; decode rows ``narrow_blocks`` takes run on _plain_narrow, _plain's bytes."""
     m,k=x.shape
     n=weight.shape[0]
     if weight.shape[1]!=k or out.shape!=(m,n) or not weight.is_contiguous():
         raise ValueError('plain matmul shape/contiguity mismatch')
-    u=narrow_blocks(m,k,weight.dtype) if narrow else 0
+    u=narrow_blocks(m,k,weight.dtype)
     if u:
         # GB10, one decode row, K 4096: _plain runs 2-18 programs of 16 outputs, 4 KB in flight each, at 66 GB/s
         _plain_narrow[(m,triton.cdiv(n,2))](x,weight,out,m,x.stride(0),out.stride(0),N=n,K=k,BK=128,BN=2,U=u,
@@ -75,23 +75,18 @@ def plain_matmul(weight,x,out,narrow=False):
     return out
 
 
-def routed_micro_windows(x,pick,ex,scratch,out,rows,limit,in_place=False):
-    """Native generic compressed routed experts, copied per-slot before combine.
+def routed_micro_windows(x,pick,ex,scratch,out,rows,limit):
+    """Native generic compressed routed experts in windows of ``scratch.rows``.
 
-    Scratch slots include the shared slot (pick==E); native leaves that slot to
-    caller. Shared output is installed afterward by the normal GLM combine.
-    ``in_place`` (TF_GLM_MOE_IN_PLACE): each window's down epilogue writes its
-    rows of ``out`` (contiguous fp32 [rows, slots, D], routed's ``y``) instead
-    of the scratch's y, which then needs no copy.
+    Each window's down epilogue writes its rows of ``out`` (contiguous fp32
+    [rows, slots, D], routed's ``y``) in place of the scratch's y. Slots include
+    the shared slot (pick==E), which native leaves to the caller.
     """
     from tensorfold.cuda.exl3.experts import routed, ACT_BF16
-    if in_place and not (out.is_contiguous() and out.dtype==torch.float32):
-        raise ValueError('in-place routed windows need contiguous fp32 rows')
+    if not (out.is_contiguous() and out.dtype==torch.float32):
+        raise ValueError('routed windows write contiguous fp32 rows')
     for start in range(0,rows,scratch.rows):
         r=min(scratch.rows,rows-start)
-        into=out[start:start+r].view(r*scratch.slots,ex.dims) if in_place else None
-        y=routed(x[start:start+r],pick[start:start+r],None,ex,scratch,None,r,
-                 limit=limit,act_mode=ACT_BF16,y=into)
-        if not in_place:
-            out[start:start+r].copy_(y.view(r,scratch.slots,ex.dims))
+        routed(x[start:start+r],pick[start:start+r],None,ex,scratch,None,r,
+               limit=limit,act_mode=ACT_BF16,y=out[start:start+r].view(r*scratch.slots,ex.dims))
     return out

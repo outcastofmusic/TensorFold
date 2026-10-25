@@ -166,9 +166,9 @@ def live_caches(seed=0):
     t = lambda *shape: torch.randn(*shape, generator=g).to(torch.bfloat16)    # noqa: E731
     from types import SimpleNamespace
 
-    return SimpleNamespace(kc=[t(CAP, 8)], vc=[None], index=[(t(CAP, 4), t(CAP, 2), t(CAP // 4 + 1, 4)),
-                                                              (t(CAP, 4), t(CAP, 2), t(CAP // 4 + 1, 4))],
-                           mtp_kc=t(CAP, 8), mtp_vc=None, rec=t(2, 4, 4))
+    return SimpleNamespace(kc=[t(CAP, 8)], index=[(t(CAP, 4), t(CAP, 2), t(CAP // 4 + 1, 4)),
+                                                  (t(CAP, 4), t(CAP, 2), t(CAP // 4 + 1, 4))],
+                           mtp_kc=t(CAP, 8), rec=t(2, 4, 4))
 
 
 def glm(store, st):

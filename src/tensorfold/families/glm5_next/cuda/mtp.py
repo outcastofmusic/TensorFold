@@ -47,7 +47,7 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool = 
     mm(b, b.mcat[:n], m.eh, None if b.prefill else group_sums(m.eh, b.mcat[:n], b.mxs[:n]), b.mx[:n])
     layer = m.layer
     glue.rmsnorm(b.mx[:n], layer.in_norm, c.eps, b.normed[:n], b.xs[:n])
-    g = dsa_block(layer, w, st.mtp_kc, st.mtp_vc, st.mtp_pos_dev, b, n, nch,
+    g = dsa_block(layer, w, st.mtp_kc, st.mtp_pos_dev, b, n, nch,
                   st.index[-1] if st.index is not None else None, host_pos, sparse_np)
     glue.residual_add(b.mx[:n], b.mx[:n], g)
     glue.rmsnorm(b.mx[:n], layer.post_norm, c.eps, b.normed[:n], b.xs[:n])
@@ -66,6 +66,6 @@ def mtp_forward(w: Weights, st: State, b: Buffers, next_tokens: Sequence[int], h
     """Write hidden/token rows into cache slots mtp_len onward and expose logits and b.mx; the caller advances st.mtp_len."""
 
     n = mtp_stage(w, st, b, next_tokens, hidden)
-    from .attention import CHUNK
+    from .latent import CHUNK
 
     return mtp_compute(w, st, b, n, last_only=last_only, nch=-(-(st.mtp_len + n) // CHUNK), host_pos=st.mtp_len)

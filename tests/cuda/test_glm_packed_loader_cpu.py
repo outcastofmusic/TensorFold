@@ -91,8 +91,6 @@ def test_actual_target_only_loader(checkpoint):
     assert w.layers[0].mlp.gu.parts[0].bits==3
     d=w.layers[1].dsa
     assert d.absorb.wk.dtype==torch.float16
-    assert d.absorb.wk.data_ptr()==d.kv_k.weight.data_ptr()
-    assert d.absorb.wv.data_ptr()==d.kv_v.weight.data_ptr()
     assert torch.equal(d.absorb.wk,t[weights.PREFIX+'layers.1.self_attn.kv_b_proj.weight'][:128].view(1,128,128))
     # Actual storage traversal includes aliasing and generic native objects.
     assert w.nbytes()>0

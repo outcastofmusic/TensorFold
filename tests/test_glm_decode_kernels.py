@@ -1,11 +1,11 @@
-"""TF_GLM_PLAIN_NARROW and TF_GLM_HC_SPLIT: the switches, which calls each kernel takes, and the thread layouts that
-keep the old bytes. CPU only: the kernels are spies that record their launches, and the layout checks compile the
-Triton kernels for sm_121 without a GPU (tests/cuda/test_glm_decode_shapes.py compares the bytes on the GPU)."""
+"""GLM's decode kernels for plain projections (``prefill._plain_narrow``) and hyper-connection partials
+(``glue._hc_partial_split``): which calls each kernel takes, and the thread layouts that keep the old kernels' bytes.
+CPU only: the kernels are spies that record their launches, and the layout checks compile the Triton kernels for
+sm_121 without a GPU (tests/cuda/test_glm_decode_shapes.py compares the bytes on the GPU)."""
 
 from __future__ import annotations
 
 import re
-from types import SimpleNamespace as NS
 
 import pytest
 
@@ -13,7 +13,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
 pytestmark = pytest.mark.torch
 
-from tensorfold.families.glm5_next.cuda import engine, forward, glue, packed, prefill
+from tensorfold.families.glm5_next.cuda import glue, packed, prefill
 
 
 class Spy:
@@ -28,63 +28,21 @@ class Spy:
         return call
 
 
-# -- the switches -------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("env,read", [("TF_GLM_PLAIN_NARROW", packed.plain_narrow), ("TF_GLM_HC_SPLIT", glue.hc_split)])
-def test_each_switch_is_on_unless_set_off_and_a_typo_raises(monkeypatch, env, read):
-    monkeypatch.delenv(env, raising=False)
-    assert read() is True
-    for value, want in (("0", False), ("off", False), ("1", True), ("on", True), ("", True)):
-        monkeypatch.setenv(env, value)
-        assert read() is want, value
-    monkeypatch.setenv(env, "maybe")
-    with pytest.raises(ValueError, match=env):
-        read()
-
-
-def test_the_engine_reads_both_switches_into_the_weights_meta(monkeypatch):
-    monkeypatch.setenv("TF_GLM_PLAIN_NARROW", "0")
-    monkeypatch.delenv("TF_GLM_HC_SPLIT", raising=False)
-    assert {k: v for k, v in engine.kernel_switches().items() if k in ("plain_narrow", "hc_split")} == \
-        {"plain_narrow": False, "hc_split": True}
-    monkeypatch.setenv("TF_GLM_HC_SPLIT", "no")
-    assert {k: v for k, v in engine.kernel_switches().items() if k in ("plain_narrow", "hc_split")} == \
-        {"plain_narrow": False, "hc_split": False}
-
-
-def _weights(meta):
-    c = NS(hidden=128, streams=4, heads=2, lin_heads=2, kv_lora=128, q_lora=128, qk_dim=128, v_dim=128,
-           index_dim=128, index_heads=2, dense_width=256, top_k=1, moe_width=128, shared_width=128, experts=2,
-           quant="exl3", mtp_layers=0)
-    head = packed.PlainLinear(torch.ones(256, 128, dtype=torch.float16))
-    return NS(cfg=c, device="cpu", world=1, meta={"packed_exl3": True, **meta}, layers=[], head=head, mtp=None)
-
-
-@pytest.mark.parametrize("meta,narrow,split", [({}, True, True), ({"plain_narrow": False, "hc_split": True}, False, True),
-                                               ({"plain_narrow": True, "hc_split": False}, True, False)])
-def test_buffers_take_the_switches_from_the_meta_and_default_on(monkeypatch, meta, narrow, split):
-    monkeypatch.setattr(packed, "projections", lambda w: [w.head])
-    monkeypatch.setattr(forward.latent, "ENABLED", False)
-    for prefill_rows in (False, True):
-        b = forward.Buffers(_weights(meta), 4, capacity=16, prefill=prefill_rows)
-        assert b.projection_scratch.narrow is narrow and b.hc_split is split
-
-
 # -- plain projections ---------------------------------------------------------------------------------------------
 # GLM-5.3 Flash's plain fp16 projections [N, K]: f_a and g_a, b_proj, the router gate, the indexer's wk, weights_proj
-# and kpool gate, f_b and g_b, and kv_b's key and value blocks (TF_GLM_LATENT=0)
+# and kpool gate, f_b and g_b, and a 512-wide K
 PLAIN = [(128, 4096), (64, 4096), (288, 4096), (32, 4096), (8192, 128), (16384, 512)]
 
 
 @pytest.mark.parametrize("n,k", PLAIN)
 @pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 8, 9, 128])
-@pytest.mark.parametrize("on", [True, False])
-def test_decode_rows_of_a_multi_block_k_take_the_narrow_kernel(monkeypatch, n, k, rows, on):
+def test_decode_rows_of_a_multi_block_k_take_the_narrow_kernel(monkeypatch, n, k, rows):
     old, new = Spy(), Spy()
     monkeypatch.setattr(prefill, "_plain", old)
     monkeypatch.setattr(prefill, "_plain_narrow", new)
     w = torch.empty((n, k), dtype=torch.float16)
-    prefill.plain_matmul(w, torch.empty((rows, k), dtype=torch.bfloat16), torch.empty((rows, n)), on)
-    narrow = on and rows <= 8 and k >= 256
+    prefill.plain_matmul(w, torch.empty((rows, k), dtype=torch.bfloat16), torch.empty((rows, n)))
+    narrow = rows <= 8 and k >= 256
     assert (len(new.calls), len(old.calls)) == ((1, 0) if narrow else (0, 1))
     if narrow:
         grid, kw = new.calls[0]
@@ -104,14 +62,15 @@ def test_k_blocks_a_trip_divide_the_k_blocks_and_other_weights_stay_on_the_old_k
     assert prefill.narrow_blocks(prefill.NARROW_ROWS + 1, 4096, torch.float16) == 0
 
 
-@pytest.mark.parametrize("narrow", [True, False])
-def test_a_projection_passes_the_scratch_switch_to_the_kernel(monkeypatch, narrow):
-    seen = []
-    monkeypatch.setattr(packed, "_plain_cuda", lambda q, x, out, n: seen.append(n))
+@pytest.mark.parametrize("rows,narrow", [(2, True), (9, False)])
+def test_a_plain_projection_of_decode_rows_reaches_the_narrow_kernel(monkeypatch, rows, narrow):
+    old, new = Spy(), Spy()
+    monkeypatch.setattr(prefill, "_plain", old)
+    monkeypatch.setattr(prefill, "_plain_narrow", new)
     q = packed.PlainLinear(torch.zeros(64, 256, dtype=torch.float16))
-    s = packed.ProjectionScratch([q], 4, "cpu", narrow=narrow)
-    packed.matmul(q, _Cudaish(torch.zeros((2, 256), dtype=torch.bfloat16)), torch.empty((2, 64)), s)
-    assert seen == [narrow]
+    s = packed.ProjectionScratch([q], 16, "cpu")
+    packed.matmul(q, _Cudaish(torch.zeros((rows, 256), dtype=torch.bfloat16)), torch.empty((rows, 64)), s)
+    assert (len(new.calls), len(old.calls)) == ((1, 0) if narrow else (0, 1))
 
 
 class _Cudaish(torch.Tensor):
@@ -137,19 +96,15 @@ def _hc(rows, fn_dtype=torch.float32, wide=16384, d=4096):
 
 @pytest.mark.parametrize("rows", [1, 6, 2048])
 @pytest.mark.parametrize("wide,d", [(16384, 4096), (2048, 512)])
-@pytest.mark.parametrize("split", [True, False])
-def test_hc_pre_takes_the_split_partials_with_the_switch_on(monkeypatch, rows, wide, d, split):
+def test_hc_pre_takes_the_split_partials(monkeypatch, rows, wide, d):
     old, new, finish = Spy(), Spy(), Spy()
     monkeypatch.setattr(glue, "_hc_partial", old)
     monkeypatch.setattr(glue, "_hc_partial_split", new)
     monkeypatch.setattr(glue, "_hc_finish", finish)
-    glue.hc_pre(*_hc(rows, wide=wide, d=d), split=split)
+    glue.hc_pre(*_hc(rows, wide=wide, d=d))
     assert len(finish.calls) == 1 and finish.calls[0][0] == (rows,)
-    if split:
-        assert not old.calls and new.calls[0][0] == (rows, glue.HC_BLOCKS, 3)
-        assert new.calls[0][1]["MG"] == 8 and new.calls[0][1]["SUB"] == 128 and new.calls[0][1]["num_warps"] == 4
-    else:
-        assert not new.calls and old.calls[0][0] == (rows, glue.HC_BLOCKS)
+    assert not old.calls and new.calls[0][0] == (rows, glue.HC_BLOCKS, 3)
+    assert new.calls[0][1]["MG"] == 8 and new.calls[0][1]["SUB"] == 128 and new.calls[0][1]["num_warps"] == 4
 
 
 def test_a_two_byte_mixing_matrix_stays_on_the_old_partials(monkeypatch):
@@ -157,7 +112,7 @@ def test_a_two_byte_mixing_matrix_stays_on_the_old_partials(monkeypatch):
     monkeypatch.setattr(glue, "_hc_partial", old)
     monkeypatch.setattr(glue, "_hc_partial_split", new)
     monkeypatch.setattr(glue, "_hc_finish", Spy())
-    glue.hc_pre(*_hc(1, fn_dtype=torch.bfloat16), split=True)
+    glue.hc_pre(*_hc(1, fn_dtype=torch.bfloat16))
     assert len(old.calls) == 1 and not new.calls
 
 

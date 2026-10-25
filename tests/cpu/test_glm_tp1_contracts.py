@@ -66,7 +66,6 @@ class ConstructorHarness:
             self.modules[name] = ModuleType(name)
         torch = self.modules["torch"]
         torch.cuda = NS(set_device=lambda n: self.calls.append(("device", n)))
-        self.modules["tensorfold.families.glm5_next.cuda"].LATENT = True
         self.comm = NS(barrier=lambda: self.calls.append(("barrier",)), all_gather=lambda *_: None,
                        ready=lambda *_, **__: None)
         def nccl(rank, world, master, port):
@@ -208,6 +207,7 @@ class EngineContracts(unittest.TestCase):
         self.assertEqual(h.estimates["model.visual.blocks.0.weight"], 0)
         self.assertEqual(e.cache_bytes, 0)
         self.assertEqual(e.policy, "0")
+        self.assertEqual((e.dflash_copies, e.copy_back), (True, 8))     # the served copies
 
     def test_tp2_constructor_preserves_communication_and_mtp(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as folder:
@@ -485,18 +485,22 @@ class GraphContracts(unittest.TestCase):
     def test_target_only_graphs_skip_mtp_and_keep_recurrence_parities(self):
         calls = []
         cuda = NS(graph_pool_handle=lambda: 1, synchronize=lambda: None, CUDAGraph=lambda: object(), graph=lambda *a, **k: nullcontext())
-        env = {"torch": NS(cuda=cuda, no_grad=nullcontext), "prof": NS(active=True), "latent": NS(ENABLED=True),
+        env = {"torch": NS(cuda=cuda, no_grad=nullcontext), "prof": NS(active=True),
                "compute": lambda w, st, b, r, **k: calls.append(tuple(st.cur)),
                "mtp_compute": lambda *a, **k: self.fail("MTP capture in target-only"),
                "pool_buckets": lambda n: [n]}
         Graphs = definitions(BASE / "cuda/graphs.py", {"Graphs"}, env)["Graphs"]
-        e = NS(w=NS(mtp=object(), meta={"target_only": True}), st=NS(cur=[1, 0], index=[(None, None, NS(shape=(2050,)))]), buf=object(), mbuf=NS())
-        graphs = Graphs(e, main_rows=(1,), mtp_rows=(1,))
-        self.assertEqual(set(graphs.main), {(1, 0), (1, 1)})
-        self.assertEqual(set(graphs.sparse), {(1, 0, 2048), (1, 1, 2048)})
-        self.assertEqual(graphs.mtp, {})
-        self.assertEqual(graphs.sparse_mtp, {})
-        self.assertEqual(e.st.cur, [1, 0])
+        # served default: long-context shapes wait for their first step; TF_GLM_LAZY_SPARSE=0 captures them at start
+        for lazy, sparse in ((None, set()), ("0", {(1, 0, 2048), (1, 1, 2048)})):
+            e = NS(w=NS(mtp=object(), meta={"target_only": True}), st=NS(cur=[1, 0], index=[(None, None, NS(shape=(2050,)))]), buf=object(), mbuf=NS())
+            env = {k: v for k, v in os.environ.items() if k != "TF_GLM_LAZY_SPARSE"}
+            with patch.dict(os.environ, env if lazy is None else {**env, "TF_GLM_LAZY_SPARSE": lazy}, clear=True):
+                graphs = Graphs(e, main_rows=(1,), mtp_rows=(1,))
+            self.assertEqual(set(graphs.main), {(1, 0), (1, 1)})
+            self.assertEqual(set(graphs.sparse), sparse)
+            self.assertEqual(graphs.mtp, {})
+            self.assertEqual(graphs.sparse_mtp, {})
+            self.assertEqual(e.st.cur, [1, 0])
 
 
 if __name__ == "__main__":

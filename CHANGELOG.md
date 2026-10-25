@@ -5,6 +5,22 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **A typo in seven more switches stops the start.** `TF_GLM_DRAFT_RING`, `TF_GLM_CALIBRATE`, `TF_GLM_TREE_PROBE`,
+  `TF_GLM_PROFILE`, `TF_GLM_SKIP_RENORM`, `TF_LFM2_GRAPHS` and `TF_FLASH_STAGE_AHEAD` compared the raw string to `0` or
+  `1`, so `TF_GLM_DRAFT_RING=off` kept the ring on and `TF_GLM_PROFILE=on` left profiling off. They now take 0, off,
+  false or no and 1, on, true or yes in any case, and any other value fails at start. 0 and 1 keep their meaning.
+  Flash Next reads `TF_FLASH_STAGE_AHEAD` once per buffer set, where it read it on every prompt pass and decode step.
+- **A direct `tensorfold serve` of GLM-5.3 on CUDA runs what `run.sh` serves.** `TF_GLM_LAZY_SPARSE`,
+  `TF_GLM_DFLASH_COPIES` and `TF_GLM_COPY_BACK` now default to 1, 1 and 8, the values `run.sh` passed, and `run.sh`
+  no longer passes them. Before, a direct serve, the tests and the tools captured every long-context graph at start
+  (7 s at 98,304 tokens) and verified no copies in DFlash2 rounds. `TF_GLM_LAZY_SPARSE=0`, `TF_GLM_DFLASH_COPIES=0`
+  (`COPIES=0` in `run.sh`) and `TF_GLM_COPY_BACK=0` restore the old behaviour. `TF_GLM_DENSE_PROMPT` and
+  `TF_GLM_CALIBRATE` keep their defaults of 0 and 1, and `run.sh` still sets 1 and 0.
+- **GLM-5.3 on CUDA drops five switches whose other branch production never ran.** `TF_GLM_LATENT=0` (per-head
+  keys and values, 0.3.6's attention), `TF_GLM_PLAIN_NARROW=0`, `TF_GLM_HC_SPLIT=0`, `TF_GLM_MOE_IN_PLACE=0` and
+  `TF_GLM_TOKEN_LIST=0` (the decode kernels before the 1.078x serial speed-up of tf-runs/gpu-glmdec and gpu-glm2) are
+  gone with the per-head attention and sparse-attention kernels. The engine no longer reads the five names, so
+  setting one does nothing. Served replies and speed stay the same: production ran the remaining branch of each.
 - **Qwen3.8 Flash Next FP4-Local prompt chunks run the bf16 hyper-connections in fewer kernels, with the same bytes.**
   In a 32,768-token prefill on 18 Oct 2026, the 98 HC read-outs of a 2,048-row chunk took 102 ms for the down projection
   and its split-K reduce, 72 ms for the up projection and the stream mix, and 105 ms for the write-back and the norm.

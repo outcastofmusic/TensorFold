@@ -245,15 +245,17 @@ def test_latent_attention_skips_the_out_projection_group_sums(monkeypatch):
     monkeypatch.setattr(forward.latent, "absorb_q", lambda q, absorb, out: out)
     monkeypatch.setattr(forward, "dense_attention", lambda *a, **kw: None)
     monkeypatch.setattr(forward.latent, "expand_v", lambda ol, absorb, out: out)
+    monkeypatch.setattr(forward.glue, "rmsnorm", lambda *a: None)
     R, o = 2, PlainLinear(torch.zeros(64, 128))
-    a = NS(heads=2, o=o, absorb=None)
-    w = NS(cfg=NS(dense_limit=2048, qk_dim=64, v_dim=64), comm=None)
+    a = NS(heads=2, o=o, absorb=None, proj=object(), q_b=object(), q_norm=None, kv_norm=None)
+    w = NS(cfg=NS(dense_limit=2048, qk_dim=64, v_dim=64, q_lora=32, eps=1e-5), comm=None)
     b = NS(lat=torch.zeros(R, 32), lat_s=NS(qa=torch.zeros(R, 2, 32), ol=torch.zeros(R, 2, 32), nch=1),
            q=torch.zeros(R, 2, 64), vn=torch.zeros(R, 2, 64), xs_ao=torch.zeros(R, 2), part=torch.zeros(R, 64),
-           world=1, prefill=False)
-    forward._dsa_latent(a, w, None, None, b, R, 1, None, 0)
+           normed=torch.zeros(R, 64), xs=torch.zeros(R, 1), dp=torch.zeros(R, 64), qr=torch.zeros(R, 32),
+           xs_qr=torch.zeros(R, 1), xs_lat=torch.zeros(R, 1), world=1, prefill=False)
+    forward.dsa_block(NS(dsa=a), w, None, None, b, R, 1, None, 0)
     assert sums.calls == 0
-    assert handed == [(o, None)]
+    assert handed[-1] == (o, None)
 
 
 def test_unpacked_projections_keep_their_group_sums(monkeypatch):

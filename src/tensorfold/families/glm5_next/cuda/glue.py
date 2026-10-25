@@ -8,19 +8,9 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorfold.env_flags import flag
-
 # fixed K split of the mixing dots (a function of the shape only; changing it changes bits for every row alike)
 HC_BLOCKS = 16
-HC_SPLIT_ENV = "TF_GLM_HC_SPLIT"
 HC_GROUP = 8                  # mixing rows a program of _hc_partial_split: the 24 in three programs
-
-
-def hc_split() -> bool:
-    """TF_GLM_HC_SPLIT (unset: on): hc_pre's mixing dots on ``_hc_partial_split``, the old bytes. The engine reads it
-    once at startup into ``Weights.meta``; a value outside env_flags' set raises."""
-
-    return flag(HC_SPLIT_ENV, True)
 
 
 # -- embedding ----------------------------------------------------------------------------------------------
@@ -212,14 +202,14 @@ def splits(fn: torch.Tensor) -> bool:
 
 def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
            out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor,
-           eps: float, hc_eps: float, iters: int, split: bool = False) -> None:
-    """BF16 or packed-TP1 FP32 streams -> unchanged BF16 normed rows + xs, post and comb; ``split``
-    (TF_GLM_HC_SPLIT) takes the mixing dots on _hc_partial_split, the same bytes."""
+           eps: float, hc_eps: float, iters: int) -> None:
+    """BF16 or packed-TP1 FP32 streams -> unchanged BF16 normed rows + xs, post and comb; a mixing matrix that
+    ``splits`` takes the mixing dots on _hc_partial_split, _hc_partial's bytes."""
 
     rows, wide = x.shape
     d = norm_w.shape[0]
     s = wide // d
-    if split and splits(fn):
+    if splits(fn):
         # GB10, one decode row: _hc_partial's 16 programs took 12.3 µs a call, 1.1 ms a token over 90 calls
         _hc_partial_split[(rows, HC_BLOCKS, 24 // HC_GROUP)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128,
                                                             MG=HC_GROUP, num_warps=4)

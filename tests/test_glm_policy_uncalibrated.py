@@ -45,3 +45,12 @@ def test_calibrate_off_in_the_environment_counts_as_uncalibrated(monkeypatch):
     monkeypatch.delenv("TF_GLM_CALIBRATE")
     assert module.calibrates(True, eager=False, serial_only=False) is True
     assert module.calibrates(True, eager=True, serial_only=False) is False
+
+
+@pytest.mark.parametrize("eager", [False, True])
+def test_a_calibrate_typo_stops_the_start(monkeypatch, eager):
+    from tensorfold.families.glm5_next.cuda import engine as module
+
+    monkeypatch.setenv("TF_GLM_CALIBRATE", "of")
+    with pytest.raises(ValueError, match="TF_GLM_CALIBRATE"):
+        module.calibrates(True, eager=eager, serial_only=False)

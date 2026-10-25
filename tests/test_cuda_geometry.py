@@ -129,7 +129,7 @@ def test_mla_latent_estimate_grows_by_the_cache_and_counts_one_prompt_chunk_scra
     for block in (256, 512):                     # rows of the dense pass's partials
         monkeypatch.setattr(geometry, "MLA_PROMPT_ATT_ROWS", block)
         for mtp in (0, 1):
-            g = geometry.mla_geometry({**text, "num_nextn_predict_layers": mtp}, 2, 8, latent=True)
+            g = geometry.mla_geometry({**text, "num_nextn_predict_layers": mtp}, 2, 8)
             count = 2 + mtp
             slope = count * lw * 2 + count * index * 2 * 9 // 4 + min(rows, 512)
             assert g.bytes_at(b) - g.bytes_at(a) == (b - a) * slope
@@ -141,9 +141,8 @@ def test_mla_latent_estimate_grows_by_the_cache_and_counts_one_prompt_chunk_scra
 
 
 @pytest.mark.torch
-@pytest.mark.parametrize("latent", [True, False], ids=["latent", "per-head"])
 @pytest.mark.parametrize("mtp", [False, True])
-def test_mla_actual_cache_and_replay_state_are_budgeted(monkeypatch, allocations, mtp, latent):
+def test_mla_actual_cache_and_replay_state_are_budgeted(monkeypatch, allocations, mtp):
     arrays, fake = allocations
     mod = importlib.import_module("tensorfold.families.glm5_next.cuda.forward")
     kda = importlib.import_module("tensorfold.families.glm5_next.cuda.kda")
@@ -151,7 +150,6 @@ def test_mla_actual_cache_and_replay_state_are_budgeted(monkeypatch, allocations
     monkeypatch.setattr(mod, "torch", fake)
     monkeypatch.setattr(kda, "torch", fake)
     monkeypatch.setattr(cache, "torch", fake)
-    monkeypatch.setattr(cache, "ENABLED", latent)
     text = {"hidden_size": 512, "num_attention_heads": 8, "num_hidden_layers": 4,
             "layer_types": ["linear_attention", "full_attention"] * 2, "linear_num_heads": 8,
             "qk_nope_head_dim": 256, "v_head_dim": 256, "vocab_size": 1024,
@@ -165,14 +163,12 @@ def test_mla_actual_cache_and_replay_state_are_budgeted(monkeypatch, allocations
     weights = SimpleNamespace(cfg=cfg, world=2, device="cpu", layers=layers, meta={"long_context": True},
                               mtp=SimpleNamespace() if mtp else None, head=SimpleNamespace(n=512))
     slots = 65536
-    attention = importlib.import_module("tensorfold.families.glm5_next.cuda.attention")
-    monkeypatch.setattr(attention, "torch", fake)
     mod.Buffers(weights, 64, slots)
     if mtp:
         mod.Buffers(weights, 64, slots)
     mod.Buffers(weights, 2048, slots, prefill=True)     # the prompt chunks' buffers, as ``decode.Engine`` makes them
     mod.State(weights, slots, 64)
-    estimated = geometry.mla_geometry(text, 2, 8, latent=latent).bytes_at(slots)
+    estimated = geometry.mla_geometry(text, 2, 8).bytes_at(slots)
     assert any(slots in t.shape for t in arrays)             # the constructors ran on the fake allocator
     assert bytes_in(arrays) <= estimated
 
@@ -184,11 +180,9 @@ def test_mla_prompt_chunk_latent_partials_hold_one_row_block(monkeypatch, alloca
     mod = importlib.import_module("tensorfold.families.glm5_next.cuda.forward")
     kda = importlib.import_module("tensorfold.families.glm5_next.cuda.kda")
     cache = importlib.import_module("tensorfold.families.glm5_next.cuda.latent")
-    attention = importlib.import_module("tensorfold.families.glm5_next.cuda.attention")
     sparse = importlib.import_module("tensorfold.families.glm5_next.cuda.sparse")
-    for m in (mod, kda, cache, attention):
+    for m in (mod, kda, cache):
         monkeypatch.setattr(m, "torch", fake)
-    monkeypatch.setattr(cache, "ENABLED", True)
     cfg = SimpleNamespace(heads=64, lin_heads=8, conv=4, qk_dim=256, v_dim=256, index_dim=128, hidden=512, streams=4,
                           q_lora=512, kv_lora=512, index_heads=32, dense_width=1024, top_k=2, moe_width=512, experts=8,
                           quant="mlx")
@@ -209,7 +203,7 @@ def test_mla_chunk_scratch_counts_one_block_of_pool_scores():
     text = {"num_attention_heads": 64, "kv_lora_rank": 512, "index_topk": 2048, "qk_nope_head_dim": 256}
     for cap in (4096, 262152, 1 << 20):
         partials = 5 * 2048 * 32 * 514 * 4                            # sparse attention's 5 chunk partials a row
-        assert geometry.mla_chunk_scratch(text, 2, cap, latent=True) == \
+        assert geometry.mla_chunk_scratch(text, 2, cap) == \
             512 * 4 * ((cap + 3) // 4) + 2048 * 16 * 2051 + partials
 
 
@@ -241,12 +235,11 @@ def test_mla_exl3_scratch_and_buffers_are_budgeted(monkeypatch, allocations, mtp
     """GLM-5.3-Flash EXL3 at one rank's shapes: the scratch and buffers allocated stay within mla_geometry."""
     arrays, fake = allocations
     mod = importlib.import_module("tensorfold.families.glm5_next.cuda.forward")
-    names = ("kda", "latent", "attention", "exl3_mm")
+    names = ("kda", "latent", "exl3_mm")
     mods = [mod] + [importlib.import_module(f"tensorfold.families.glm5_next.cuda.{n}") for n in names]
     for m in mods + [importlib.import_module("tensorfold.cuda.experts"),
                      importlib.import_module("tensorfold.cuda.exl3.experts")]:
         monkeypatch.setattr(m, "torch", fake)
-    monkeypatch.setattr(mods[2], "ENABLED", True)
     exl3_mm = mods[-1]
     text = {"hidden_size": 4096, "num_attention_heads": 64, "num_hidden_layers": 4,
             "layer_types": ["linear_attention", "full_attention"] * 2, "linear_attn_config": {"num_heads": 64},
@@ -274,8 +267,8 @@ def test_mla_exl3_scratch_and_buffers_are_budgeted(monkeypatch, allocations, mtp
     pbuf = mod.Buffers(weights, geometry.PREFILL_ROWS, cap, prefill=True)
     assert pbuf.sk.numel() == 8 * geometry.PREFILL_ROWS * 16384          # BF16 prompt projections' partials
     mod.State(weights, cap, 64)
-    estimated = geometry.mla_geometry(text, 2, 16, latent=True).bytes_at(cap)
-    assert bytes_in(arrays) <= estimated - geometry.mla_chunk_scratch(text, 2, cap, latent=True)
+    estimated = geometry.mla_geometry(text, 2, 16).bytes_at(cap)
+    assert bytes_in(arrays) <= estimated - geometry.mla_chunk_scratch(text, 2, cap)
 
 
 @pytest.mark.torch

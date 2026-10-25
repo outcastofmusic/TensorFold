@@ -1,6 +1,6 @@
-"""TF_GLM_MOE_IN_PLACE, TF_GLM_SHARED_STREAM, TF_GLM_KDA_WIDE, TF_GLM_TOKEN_LIST and TF_GLM_EARLY_LAUNCH: the switches,
-which buffers, kernels and launch order each path takes, and the token list's integers. CPU only: the MoE kernels and
-the engine are stand-ins, the token-list kernel runs in Triton's interpreter, and tests/cuda/test_glm_sweep_switches.py
+"""TF_GLM_SHARED_STREAM, TF_GLM_KDA_WIDE and TF_GLM_EARLY_LAUNCH: the switches, which buffers, kernels and launch
+order each path takes; and the served MoE slots and token list, which have no switch. CPU only: the MoE kernels and the
+engine are stand-ins, the token-list kernel runs in Triton's interpreter, and tests/cuda/test_glm_sweep_switches.py
 compares the bytes on the GPU."""
 
 from __future__ import annotations
@@ -16,8 +16,7 @@ pytestmark = pytest.mark.torch
 
 from tensorfold.families.glm5_next.cuda import decode, engine, forward, kda, packed, prefill, sparse
 
-SWITCHES = [("TF_GLM_MOE_IN_PLACE", forward.moe_in_place, True), ("TF_GLM_SHARED_STREAM", forward.shared_stream, False),
-            ("TF_GLM_KDA_WIDE", kda.decode_wide, False), ("TF_GLM_TOKEN_LIST", sparse.token_list, True),
+SWITCHES = [("TF_GLM_SHARED_STREAM", forward.shared_stream, False), ("TF_GLM_KDA_WIDE", kda.decode_wide, False),
             ("TF_GLM_EARLY_LAUNCH", engine.early_launch, False)]
 
 
@@ -36,19 +35,13 @@ def test_each_switch_has_its_default_and_a_typo_raises(monkeypatch, env, read, d
 def test_the_engine_reads_every_switch_into_the_weights_meta(monkeypatch):
     for env, _, _ in SWITCHES:
         monkeypatch.delenv(env, raising=False)
-    monkeypatch.delenv("TF_GLM_PLAIN_NARROW", raising=False)
-    monkeypatch.delenv("TF_GLM_HC_SPLIT", raising=False)
-    assert engine.kernel_switches() == {"plain_narrow": True, "hc_split": True, "moe_in_place": True,
-                                        "shared_stream": False, "kda_wide": False, "token_list": True,
-                                        "early_launch": False}
+    assert engine.kernel_switches() == {"shared_stream": False, "kda_wide": False, "early_launch": False}
     for env, _, default in SWITCHES:
         monkeypatch.setenv(env, "0" if default else "1")
-    assert engine.kernel_switches() == {"plain_narrow": True, "hc_split": True, "moe_in_place": False,
-                                        "shared_stream": True, "kda_wide": True, "token_list": False,
-                                        "early_launch": True}
+    assert engine.kernel_switches() == {"shared_stream": True, "kda_wide": True, "early_launch": True}
 
 
-@pytest.mark.parametrize("env", ["TF_GLM_PLAIN_NARROW", "TF_GLM_HC_SPLIT"] + [env for env, _, _ in SWITCHES])
+@pytest.mark.parametrize("env", [env for env, _, _ in SWITCHES])
 def test_a_switch_typo_stops_the_engine_before_any_read(monkeypatch, tmp_path, env):
     """No checkpoint is there, so the flag must fail first: a typo costs no weight load."""
 
@@ -78,15 +71,12 @@ def _weights(meta):
 
 def _buffers(monkeypatch, meta, rows=4, prefill=False):
     monkeypatch.setattr(packed, "projections", lambda w: [w.head])
-    monkeypatch.setattr(forward.latent, "ENABLED", False)
     return forward.Buffers(_weights(meta), rows, capacity=16, prefill=prefill)
 
 
-@pytest.mark.parametrize("meta,on", [({}, True), ({"moe_in_place": True}, True), ({"moe_in_place": False}, False)])
 @pytest.mark.parametrize("prefill_rows", [False, True])
-def test_the_buffers_take_the_in_place_switch_and_start_ey_at_zero(monkeypatch, meta, on, prefill_rows):
-    b = _buffers(monkeypatch, meta, prefill=prefill_rows)
-    assert b.moe_in_place is on
+def test_the_packed_buffers_start_ey_at_zero(monkeypatch, prefill_rows):
+    b = _buffers(monkeypatch, {}, prefill=prefill_rows)
     assert b.ey.shape == (4, TOP + 1, D) and b.ey.dtype == torch.float32 and not b.ey.any()
 
 
@@ -107,38 +97,34 @@ def _fake_routed(calls):
 
 
 @pytest.mark.parametrize("rows,window", [(3, 4), (4, 4), (10, 4), (9, 3)])
-def test_in_place_windows_write_out_and_give_the_copies_values(monkeypatch, rows, window):
+def test_routed_windows_write_out_in_place_and_leave_the_shared_slot(monkeypatch, rows, window):
     from tensorfold.cuda.exl3 import experts as gx
 
     ex = NS(dims=D, width=I, count=E)
     pick = torch.tensor([[r % E, (r + 1) % E, E] for r in range(rows)], dtype=torch.int32)
     x = torch.arange(1, rows + 1, dtype=torch.float32)[:, None].expand(rows, D)
-    got = []
-    for in_place in (False, True):
-        calls = []
-        monkeypatch.setattr(gx, "routed", _fake_routed(calls))
-        s = gx.Scratch(ex, window, TOP + 1, device="cpu")
-        own = s.y
-        out = torch.zeros((rows, TOP + 1, D))
-        out[:, TOP] = 7.0                                    # the caller's shared slot
-        prefill.routed_micro_windows(x, pick, ex, s, out, rows, 10.0, in_place=in_place)
-        assert s.y is own                                    # the scratch's y is never swapped
-        assert len(calls) == -(-rows // window)
-        if in_place:
-            assert all(t.data_ptr() == out[i * window].data_ptr() for i, t in enumerate(calls))
-            assert torch.equal(out[:, TOP], torch.full((rows, D), 7.0))
-        got.append(out[:, :TOP].clone())
-    assert torch.equal(got[0], got[1])
+    calls = []
+    monkeypatch.setattr(gx, "routed", _fake_routed(calls))
+    s = gx.Scratch(ex, window, TOP + 1, device="cpu")
+    own = s.y
+    out = torch.zeros((rows, TOP + 1, D))
+    out[:, TOP] = 7.0                                        # the caller's shared slot
+    prefill.routed_micro_windows(x, pick, ex, s, out, rows, 10.0)
+    assert s.y is own                                        # the scratch's y is never swapped
+    assert len(calls) == -(-rows // window)
+    assert all(t.data_ptr() == out[i * window].data_ptr() for i, t in enumerate(calls))
+    assert torch.equal(out[:, TOP], torch.full((rows, D), 7.0))
+    assert torch.equal(out[:, :TOP], torch.arange(1, rows + 1, dtype=torch.float32)[:, None, None].expand(rows, TOP, D))
 
 
-def test_in_place_windows_refuse_rows_they_cannot_write(monkeypatch):
+def test_routed_windows_refuse_rows_they_cannot_write(monkeypatch):
     from tensorfold.cuda.exl3 import experts as gx
 
     s = gx.Scratch(NS(dims=D, width=I, count=E), 4, TOP + 1, device="cpu")
     out = torch.zeros((4, TOP + 1, D), dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="contiguous fp32"):
         prefill.routed_micro_windows(torch.zeros(4, D), torch.zeros(4, 3, dtype=torch.int32), NS(dims=D), s, out, 4,
-                                     10.0, in_place=True)
+                                     10.0)
 
 
 def test_the_kda_read_out_rows_are_the_buffers_own_only_for_decode_with_the_switch_on(monkeypatch):
@@ -148,11 +134,6 @@ def test_the_kda_read_out_rows_are_the_buffers_own_only_for_decode_with_the_swit
     assert q.shape == (4, 2, kda.DK) and q.dtype == torch.float32 and y.shape == (4, 2, kda.DV)
     assert y.dtype == torch.bfloat16
     assert _buffers(monkeypatch, {"kda_wide": True}, prefill=True).kda_tmp is None
-
-
-def test_the_token_list_switch_reaches_the_buffers(monkeypatch):
-    assert _buffers(monkeypatch, {}).token_list is True
-    assert _buffers(monkeypatch, {"token_list": False}).token_list is False
 
 
 # -- the MoE block ------------------------------------------------------------------------------------------------
@@ -166,12 +147,9 @@ class Log:
         def rec(name, t):
             log.append((self.stream, name, t))
 
-        def routed(x, pick, ex, scratch, out, rows, limit, in_place=False):
+        def routed(x, pick, ex, scratch, out, rows, limit):
             rec("routed", out)
-            y = out if in_place else scratch.y[:rows * scratch.slots].view(rows, scratch.slots, D)
-            y[:, :TOP] = 1.0                            # the routed kernels skip the shared slot
-            if not in_place:
-                out.copy_(y)
+            out[:, :TOP] = 1.0                          # the routed kernels skip the shared slot
             return out
 
         def mm(b_, x, q, xs, out, f32=False):
@@ -195,10 +173,9 @@ class Log:
         monkeypatch.setattr(forward.route_log, "note", lambda *a: None)
 
 
-@pytest.mark.parametrize("in_place", [True, False])
-def test_the_shared_expert_lands_in_its_slot_before_the_combine(monkeypatch, in_place):
-    w = _weights({"moe_in_place": in_place})
-    b = _buffers(monkeypatch, {"moe_in_place": in_place})
+def test_the_shared_expert_lands_in_its_slot_before_the_combine(monkeypatch):
+    w = _weights({})
+    b = _buffers(monkeypatch, {})
     b.ey.fill_(-1.0)
     log = Log(monkeypatch, b)
     m = w.layers[0].moe
@@ -207,10 +184,8 @@ def test_the_shared_expert_lands_in_its_slot_before_the_combine(monkeypatch, in_
     names = [e[1] for e in log.events]
     assert names == ["mm", "select", "routed", "mm", "swiglu", "mm", "combine", "gather"]
     down = log.events[5][2]
-    if in_place:            # the shared expert writes the slot itself: no copy through sy
-        assert down.data_ptr() == b.ey[0, TOP].data_ptr() and down.stride(0) == (TOP + 1) * D
-    else:
-        assert down.data_ptr() == b.sy.data_ptr()
+    # the shared expert writes the slot itself: no copy through sy
+    assert down.data_ptr() == b.ey[0, TOP].data_ptr() and down.stride(0) == (TOP + 1) * D
     combined = log.events[6][2]
     assert torch.equal(combined[:, :TOP], torch.ones(3, TOP, D)) and torch.equal(combined[:, TOP], torch.full((3, D), 2.0))
 
@@ -223,10 +198,9 @@ class _Stream:
         self.log.events.append((self.name, f"wait {other.name}", None))
 
 
-@pytest.mark.parametrize("in_place", [True, False])
-def test_the_shared_stream_forks_after_the_router_and_joins_before_the_combine(monkeypatch, in_place):
-    w = _weights({"moe_in_place": in_place})
-    b = _buffers(monkeypatch, {"moe_in_place": in_place})
+def test_the_shared_stream_forks_after_the_router_and_joins_before_the_combine(monkeypatch):
+    w = _weights({})
+    b = _buffers(monkeypatch, {})
     log = Log(monkeypatch, b)
     log.bind(w.layers[0].moe)
     main, side = _Stream(log, "main"), _Stream(log, "side")
@@ -326,16 +300,15 @@ def test_the_token_list_kernel_writes_the_torch_ops_integers():
     assert len(counts) == len(TOKEN_CASES) and max(counts) == sparse.TOPK_POOLS * sparse.POOL + 3
 
 
-@pytest.mark.parametrize("fused", [False, True])
-def test_select_tokens_takes_the_kernel_with_the_switch_on(monkeypatch, fused):
+def test_select_tokens_takes_the_kernel(monkeypatch):
     calls = []
     monkeypatch.setattr(sparse, "_scores", type("S", (), {"__getitem__": lambda self, g: lambda *a, **k: None})())
     monkeypatch.setattr(sparse, "top_pools", lambda s, k, at: torch.zeros((s.shape[0], k), dtype=torch.int64))
     monkeypatch.setattr(sparse, "token_rows", lambda p, pos: calls.append("kernel") or (p, p))
     monkeypatch.setattr(sparse, "token_rows_ops", lambda p, pos: calls.append("ops") or (p, p))
     qi, wts = torch.zeros(2, 64), torch.zeros(2, 2)
-    sparse.select_tokens(qi, wts, torch.zeros(1), 4096, 2, 4096, torch.zeros(1, dtype=torch.int32), fused=fused)
-    assert calls == (["kernel"] if fused else ["ops"])
+    sparse.select_tokens(qi, wts, torch.zeros(1), 4096, 2, 4096, torch.zeros(1, dtype=torch.int32))
+    assert calls == ["kernel"]
 
 
 # -- early launches --------------------------------------------------------------------------------------------------
