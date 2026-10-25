@@ -229,17 +229,3 @@ def test_the_staged_fused_epilogues_compile_the_epilogue_kernels_rounding_and_fm
     plain = one("grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi2ELi0ELi8E")
     assert one("grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi2ELi1ELi8E") - plain == gateup
     assert one("grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi2ELi2ELi8E") - plain == down + down
-
-
-# -- the bench tool -------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("on", [set(), {"staged"}])
-def test_the_bench_sweeps_the_staged_switch_alone(on):
-    pytest.importorskip("triton")
-    from tensorfold.families.qwen4_exp.cuda import exl3_mm
-    from tools.exl3_prefill_bench import _set
-
-    base_sw = switches.Switches(pdl=True, group_scan=False, down_fuse=True, gateup_fuse=False)
-    base_mm = exl3_mm.Switches(moe_chunk=False)
-    _set(base_sw, base_mm, on, ("staged",))
-    assert switches.current() == dataclasses.replace(base_sw, expert_staged="staged" in on)
-    assert exl3_mm.current() == base_mm

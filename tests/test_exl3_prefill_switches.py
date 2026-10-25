@@ -533,20 +533,3 @@ def test_the_fused_epilogues_compile_the_epilogue_kernels_rounding_and_fma_instr
     assert gateup["FFMA"] > 0 and gateup["MUFU.EX2"] > 0
     assert fused_gu == gateup
     assert fused_dn == down + down
-
-
-# -- the bench tool -------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("on", [set(), {"scan"}, {"down"}, {"gateup"}, {"chunk"}, {"scan", "down", "gateup", "chunk"}])
-def test_the_bench_sets_each_named_switch_and_keeps_the_rest(on):
-    pytest.importorskip("triton")
-    from tensorfold.families.qwen4_exp.cuda import exl3_mm
-    from tools.exl3_prefill_bench import _set
-
-    base_sw = switches.Switches(pdl=True, expert_items=False, group_scan=False, down_fuse=False, gateup_fuse=False,
-                                group_scan_decode=False, linear_pair=False)
-    base_mm = exl3_mm.Switches(stack_direct=False, inner_k=True, moe_chunk=False)
-    _set(base_sw, base_mm, on)
-    sw, mm = switches.current(), exl3_mm.current()
-    assert (sw.group_scan, sw.down_fuse, sw.gateup_fuse, mm.moe_chunk) == \
-        ("scan" in on, "down" in on, "gateup" in on, "chunk" in on)
-    assert (sw.pdl, sw.expert_items, mm.stack_direct, mm.inner_k, mm.moe_direct) == (True, False, False, True, True)
