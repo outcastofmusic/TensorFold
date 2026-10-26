@@ -401,7 +401,7 @@ class GlmEngine:
                  "states": [list(st.rec.shape[1:]), str(st.rec.dtype), list(st.conv.shape), str(st.conv.dtype)]}
         return disk_states.from_env("GLM", parts)
 
-    def _live(self, snap) -> bool:
+    def _rows_live(self, snap) -> bool:
         """Whether ``snap``'s rows are the live caches' (``_take_over`` saves or drops a state before they change)."""
         return snap.rows is None and self.live[:len(snap.ids)] == snap.ids
 
@@ -432,8 +432,8 @@ class GlmEngine:
                     return snap.rows
                 return _row_views(self.e.st, n, m) if self.live[:n] == snap.ids else None
 
-            known = max((c.blocks for c in self.cache if c.blocks and self._live(c)), key=lambda b: sum(map(len, b)),
-                        default=[]) if self._live(snap) else []
+            known = max((c.blocks for c in self.cache if c.blocks and self._rows_live(c)),
+                        key=lambda b: sum(map(len, b)), default=[]) if self._rows_live(snap) else []
             # a flat drafter's rows are in no snapshot: such a state resumes without DFlash2 drafts (save_rows)
             end = snap.drafter_end if snap.drafter_rows is not None else -1
             if self.disk.write(snap.ids, views, {"rec": snap.rec, "conv": snap.conv, "pending": snap.pending},
