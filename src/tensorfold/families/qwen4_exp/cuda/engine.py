@@ -14,7 +14,26 @@ from . import CONFIDENCE, DEPTH
 
 MAX_DEPTH = 15           # a verify window of at most 16 rows
 KEEP_SERIAL = 4          # prompt states the serial engine keeps (they share its attention rows)
-KEEP = 8                 # prompt states (one token before each end) a concurrent decoder keeps to resume from
+KEEP = 8                 # the fewest prompt states (one token before each end) a concurrent decoder keeps
+KEEP_PER_STREAM = 4      # a turn keeps its message start, prompt end and reply end, and the chain's shortest stays
+
+
+def kept_states(streams: int) -> int:
+    """TENSORFOLD_KEPT_STATES (unset or empty: 4 a stream, at least ``KEEP``): the prompt states a concurrent decoder
+    keeps to resume from, 115 MB each on Flash Next. With 8 a turn of one agent session pushed out another's prompt
+    end: eight 6-turn sessions on 8 streams reused 50% of their prompts and put out 46 tok/s; at 24, 81% and 75 tok/s,
+    and 64 did no better (tf-runs/agents-1026, EXL3, 2026-10-26). 4 a stream keeps every session's latest prompt end
+    in test_flash_next_kept_chain, where 3 loses one in eight. A value that is not a whole number above 0 stops the
+    start."""
+
+    import os
+
+    value = os.environ.get("TENSORFOLD_KEPT_STATES", "").strip()
+    if not value:
+        return max(KEEP, KEEP_PER_STREAM * streams)
+    if not value.isdecimal() or int(value) < 1:
+        raise ValueError(f"TENSORFOLD_KEPT_STATES: a whole number above 0, not {value!r}")
+    return int(value)
 # Reserve bounded tower workspace separately from its weights; override for measured deployments.
 VISION_WORKSPACE = 4 * 2**30
 
@@ -146,10 +165,11 @@ class FlashNextEngine:
             self.comm.barrier()
         gather = (lambda values: gather_ints(torch, self.comm.all_gather, values)) if tp == 2 else None
         each, mtp, bits = self.copy_rows, self.depth > 0, BITS_OF[self.kv_dtype]
+        keep = kept_states(streams)
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
         rows0 = chunk or PREFILL_ROWS
         lone = bool(graphs and mtp and (tp == 2 or lone_graphs()))     # two ranks plan their lone rounds: left as is
-        geometry = ((lambda text: indexed_stream_geometry(text, streams + int(lone), each, KEEP, mtp=mtp,
+        geometry = ((lambda text: indexed_stream_geometry(text, streams + int(lone), each, keep, mtp=mtp,
                                                           kv_bits=bits, world=tp, prefill_rows=rows0))
                     if streams > 1 else
                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits,
@@ -253,7 +273,7 @@ class FlashNextEngine:
 
                 self.e = None
                 self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
-                                          confidence=self.confidence, keep=KEEP, points=self.points,
+                                          confidence=self.confidence, keep=keep, points=self.points,
                                           copy=getattr(self, "copy_drafts", False),
                                           kv_dtype=self.kv_dtype, share=share, vision=self.vision,
                                           prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=lone,

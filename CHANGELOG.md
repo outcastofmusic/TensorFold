@@ -5,6 +5,15 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **Qwen3.8 Flash Next on CUDA keeps 4 prompt states a stream, where it kept 8 in all, and `run.sh` serves the EXL3
+  pack with 8 streams.** Each turn of a conversation keeps its message start, its prompt end and its reply end, so 8
+  states held about two conversations' latest turns: with eight agent sessions on 8 streams, a turn pushed out
+  another session's prompt end and the next turn of that session prefilled its whole history again. In the Flare
+  recipe's agent benchmark (eight 6-turn code-review sessions, 26 Oct 2026), 24 states lifted the reused share of
+  prompt tokens from 50% to 81% and the total output from 46 to 75 tok/s; 64 did no better. Each state is 115 MB, so
+  8 streams keep 32 for 2.8 GiB more than before, and the window stays 262,144 tokens. `TENSORFOLD_KEPT_STATES=N`
+  sets the count. On the EXL3 pack, 8 streams put out 51.6 tok/s against 31.6 at 4 in the same benchmark with one
+  session unchanged; FP4-Local stays at 4 streams, where 8 left 1.5 GiB spare.
 - **Qwen3.8 Flash Next FP4-Local fills long prompts in 4,096-row pieces while 8,192 or more prompt rows remain.**
   Pieces narrow to 2,048 rows once fewer remain. In the 25 Oct 2026 sweep, a threshold of 8,192 ran cold prefill
   1.08-1.13x as fast at 32k tokens, 1.05-1.06x at 131k and 0.99x at 4k (geometric mean 1.060); thresholds of 16,384
