@@ -7,18 +7,19 @@ from tensorfold.cuda.geometry import PREFILL_ROWS, indexed_prompt_bytes
 
 IDLE_ROWS = 4096
 LONG_PIECE_ENV = "TENSORFOLD_LONG_PIECE_TOKENS"
+LONG_PIECE_TOKENS = 8192   # the threshold the 25 Oct sweep picked
 _long_from = 0          # the installed threshold (use): 0 keeps every idle piece at its buffers' rows
 
 
 def long_piece_tokens() -> int:
-    """TENSORFOLD_LONG_PIECE_TOKENS (unset or empty: 0): an NVFP4 checkpoint's idle pieces take 4,096 rows while at
-    least this many prompt rows remain to fill, else 2,048. 0 keeps 2,048 rows, the released width. On 18 Oct 2026
-    4,096-row pieces ran 131k-token prompts 1.03-1.09x faster and 4k-token prompts 0.72-0.97x as fast (tf-runs/
-    gpu-chunks); a sweep picks the threshold. A value that is not a whole number stops the start."""
+    """TENSORFOLD_LONG_PIECE_TOKENS (unset or empty: ``LONG_PIECE_TOKENS``): an NVFP4 checkpoint's idle pieces take
+    4,096 rows while at least this many prompt rows remain to fill, else 2,048. 0 keeps 2,048 rows, the width before
+    the sweep. On 25 Oct 2026 8,192 ran cold prefill 1.05-1.13x as fast at 32k-131k tokens and 0.99x at 4k; 16,384
+    and 32,768 gained less (tf-runs/nvfp4-long-pieces). A value that is not a whole number stops the start."""
 
     value = os.environ.get(LONG_PIECE_ENV, "").strip()
     if not value:
-        return 0
+        return LONG_PIECE_TOKENS
     if not value.isdecimal():
         raise ValueError(f"{LONG_PIECE_ENV}: a token count of 0 or more, not {value!r}")
     return int(value)

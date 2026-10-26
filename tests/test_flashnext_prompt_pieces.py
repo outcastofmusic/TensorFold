@@ -237,8 +237,8 @@ def test_the_threshold_comes_from_the_environment(monkeypatch):
     from tensorfold.families.qwen4_exp.cuda.prompt_plan import long_piece_tokens
 
     monkeypatch.delenv("TENSORFOLD_LONG_PIECE_TOKENS", raising=False)
-    assert long_piece_tokens() == 0
-    for value, tokens in [(" ", 0), ("0", 0), ("8192", 8192), (" 32768 ", 32768)]:
+    assert long_piece_tokens() == 8192
+    for value, tokens in [(" ", 8192), ("0", 0), ("8192", 8192), (" 32768 ", 32768)]:
         monkeypatch.setenv("TENSORFOLD_LONG_PIECE_TOKENS", value)
         assert long_piece_tokens() == tokens
     for value in ["-1", "8k", "8192.0", "off"]:
