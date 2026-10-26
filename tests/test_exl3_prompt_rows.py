@@ -25,7 +25,6 @@ TEXT = {"hidden_size": 2560, "moe_intermediate_size": 640, "num_experts_per_tok"
 @pytest.fixture(autouse=True)
 def restore(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
-    monkeypatch.delenv(exl3_mm.MOE_CHUNK_ENV, raising=False)
     before = exl3_mm.current()
     yield
     exl3_mm.use(before)
@@ -41,8 +40,6 @@ def test_the_prompt_rows_and_their_routed_window(monkeypatch, value, rows, windo
     assert dataclasses.replace(got, prompt_rows=4096) == exl3_mm.Switches()    # the other switches keep their defaults
     exl3_mm.use(got)
     assert exl3_mm.moe_window() == window
-    exl3_mm.use(dataclasses.replace(got, moe_chunk=False))
-    assert exl3_mm.moe_window() == 1024                                        # MOE_WINDOW, whatever the chunk
 
 
 def test_unset_is_the_served_chunk():

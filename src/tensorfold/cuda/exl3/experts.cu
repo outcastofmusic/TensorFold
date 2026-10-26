@@ -121,7 +121,7 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
 }
 
 // group_kernel's outputs (the same uids, ucount, members, items and icount) by a count, a scan and a stable scatter
-// (TF_EXL3_GROUP_SCAN). group_kernel's threads each scan every pick once an expert they hold: on a 1,024-row window
+// (experts.scan_fits). group_kernel's threads each scan every pick once an expert they hold: on a 1,024-row window
 // of Flash Next (11,264 picks, 513 experts) 129 threads of one block ran 2.3 ms. Here every block counts all picks
 // (warps merge equal experts with match_any) and scans the counts to the places in id order; block b then owns
 // experts [b * per, (b + 1) * per): their ids, items and members. Members come out in pick order because the picks
@@ -287,7 +287,7 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
 }
 
 // Program (member row, 128-block of the model width): Y = (splits summed in order) @ H * svh_d, fp32, or rounded to
-// bf16 once as a copy of the fp32 Y into a bf16 tensor rounds it (a prompt's MoE buffer, TF_FLASHNEXT_MOE_DIRECT).
+// bf16 once as a copy of the fp32 Y into a bf16 tensor rounds it (a prompt's MoE buffer, forward._exl3_moe).
 template <typename TO>
 __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                      const half* __restrict__ svh_d, TO* __restrict__ y, int P, int D, int SK,

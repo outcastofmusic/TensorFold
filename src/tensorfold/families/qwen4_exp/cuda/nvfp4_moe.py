@@ -7,40 +7,17 @@ from dataclasses import dataclass
 import torch
 
 from tensorfold.cuda.nvfp4 import experts as nvx
-from tensorfold.env_flags import choice
 
 from . import nvfp4
 
-TILE_ENV = "TF_FLASHNEXT_PROMPT_EXPERT_TILE"
-TILE_MODES = {"0": 0, "1": 1, "2": 2}     # off; gate/up only; gate/up and down
+def tiled(rows: int, prompt: bool) -> bool:
+    """Whether gate/up and down run the shared-memory tile kernel: prompt buffers of at least ``nvx.TILE_ROWS`` rows.
 
+    Prompt chunks of 1,024+ rows took 4k 1.125x, 16k 1.113x and 32k 1.111x prefill with replies identical
+    (tf-runs/gpu-tile); TF_FLASHNEXT_PROMPT_EXPERT_TILE turned it off, or on for gate/up alone, until 25 Oct. The
+    16-pair kernel keeps decode windows and shorter chunks, with the same bits."""
 
-def tile_mode() -> int:
-    """TF_FLASHNEXT_PROMPT_EXPERT_TILE: which faces of prompt chunks run the shared-memory tile (unset: 2, both)."""
-
-    return TILE_MODES[choice(TILE_ENV, tuple(TILE_MODES), "2")]
-
-
-SHARED_DECODE_ENV = "TF_FP4_SHARED_DECODE"
-SHARED_DECODE_MODES = ("qmmf", "prompt")
-
-
-def shared_decode() -> str:
-    """TF_FP4_SHARED_DECODE: the kernel of a decode window's MXFP8 shared expert (unset: prompt).
-
-    Decode windows keep bf16 slots (``moe_prefill``), which once sent their shared expert to the prompt GEMM. ``qmmf``
-    runs it on the lane matmul like every other decode linear; ``prompt`` keeps the prompt GEMM's bits. Prompt rows
-    take the prompt GEMM either way. ``prompt`` is the default: on FP4-Local (GB10, 18 Oct) its 16-row tile gave
-    1.059x decode with the old replies' bytes, against 1.064x for ``qmmf``, whose replies differ."""
-
-    return choice(SHARED_DECODE_ENV, SHARED_DECODE_MODES, "prompt")      # lower case only: QMMF raises
-
-
-def tile_faces(mode: int, rows: int, prompt: bool) -> tuple[bool, bool]:
-    """(gate/up, down) on the tile kernel: prompt buffers of at least ``nvx.TILE_ROWS`` rows, as ``mode`` allows."""
-
-    on = prompt and rows >= nvx.TILE_ROWS
-    return on and mode >= 1, on and mode == 2
+    return prompt and rows >= nvx.TILE_ROWS
 
 
 @dataclass
@@ -58,8 +35,6 @@ class MoE4:
     routed_experts: nvx.Experts4
     shared: Expert4
     kernel: str = "nvfp4"
-    prompt_tile: int = 2           # tile_mode() and shared_decode(): ``weights.load`` sets the values the engine read
-    shared_decode: str = "prompt"
 
     capturable = True     # the plan stays on the device
 
@@ -133,26 +108,23 @@ def moe4_from_experts(gate: list, up: list, down: list, shared: tuple) -> MoE4:
     return moe4_from_checkpoint(stack(gate), stack(up), stack(down), shared)
 
 
-def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, buf, cfg, *,
-        decode: bool = False) -> None:
+def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, buf, cfg) -> None:
     """Route rows x [R, D] and run their experts into buf (the shared ``moe`` contract); ``xs`` unused: no biases.
 
-    ``decode``: a decode window's rows, whose bf16 slots alone do not tell them from a prompt's."""
+    Buffers of bf16 slots, a prompt's and a decode window's (``moe_prefill``), run the shared expert on the prompt
+    GEMM. On FP4-Local (GB10, 18 Oct) its 16-row tile gave decode windows 1.059x with the old replies' bytes. The
+    lane matmul gave 1.064x with replies that differ, and TF_FP4_SHARED_DECODE=qmmf chose it until 25 Oct."""
 
-    from tensorfold.cuda import experts as grouped
     from tensorfold.cuda import moe as moe_mod
 
     rows, top_k = x.shape[0], int(cfg.num_experts_per_tok)
     prompt = buf.y.dtype != torch.float32                  # a prompt's buffers keep bf16 slots
-    gu_tile, dn_tile = tile_faces(ex.prompt_tile, rows, prompt)
-    shared_prompt = prompt and not (decode and ex.shared_decode == "qmmf")
+    tile = tiled(rows, prompt)
     moe_mod.router(x, router_rows, buf.logits[:rows])
-    moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, nvx.TILE_ITEM if gu_tile else nvx.PREFILL_TILE)
-    nvx.gate_up(x, ex.routed_experts, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed, tile=gu_tile)
-    buf.act[:rows, top_k] = ex.shared_act(x, shared_prompt)
-    if dn_tile != gu_tile:                                 # mode 1: down regroups in its own kernel's items
-        grouped.route(buf.pick[:rows], buf.plan, nvx.TILE_ITEM if dn_tile else nvx.PREFILL_TILE)
+    moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, nvx.TILE_ITEM if tile else nvx.PREFILL_TILE)
+    nvx.gate_up(x, ex.routed_experts, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed, tile=tile)
+    buf.act[:rows, top_k] = ex.shared_act(x, prompt)
     nvx.down(buf.act.view(-1, ex.width), ex.routed_experts, buf.plan, buf.y.view(-1, ex.dims), rows, skip=ex.routed,
-             tile=dn_tile)
-    buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], shared_prompt, not prompt)
+             tile=tile)
+    buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], prompt, not prompt)
     return buf

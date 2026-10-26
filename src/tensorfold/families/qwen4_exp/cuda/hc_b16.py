@@ -1,10 +1,10 @@
-"""The bf16 hyper-connection's prompt fusions (an NVFP4 checkpoint such as FP4-Local) and their switch.
+"""The bf16 hyper-connection's prompt fusions (an NVFP4 checkpoint such as FP4-Local).
 
-TF_FLASHNEXT_HC_FUSE (default on) sends prompt chunks of more than ``forward.FUSED_ROWS`` rows through three fusions
-with the old kernels' bytes: the write-back and the norm in one kernel (``hc_check.fuser``, self-checked), the down
-projection's K slices summed inside each program (``bf16.matmul(inner_k=True)``), and the up projection with the
-stream mix (``up_mix``). An EXL3 pack's fp16 HC takes the first of them, which reads no matrix. ``0`` restores the
-separate kernels. The engine reads the flag once at startup and the loader stores it on each ``HC`` (``HC.fuse``).
+Prompt chunks of more than ``forward.FUSED_ROWS`` rows run three fusions with the old kernels' bytes: the write-back
+and the norm in one kernel (``hc_check.fuser``, self-checked), the down projection's K slices summed inside each
+program (``bf16.matmul(inner_k=True)``), and the up projection with the stream mix (``up_mix``). An EXL3 pack's fp16
+HC takes the first of them, which reads no matrix. FP4-Local 12k prefill went from 1,856 to 2,228 tok/s (1.14-1.20x)
+and 32k 1.08-1.17x with replies identical 4/4 (tf-runs/gpu-hc); TF_FLASHNEXT_HC_FUSE turned them off until 25 Oct.
 
 ``_hc_up_mix`` is ported from MiaAI-Lab's Qwen3.8 Flash Next recipe, patch 0008 ``prompt_mm._hc_up_mix`` (MIT
 licence), which builds on the TensorFold contributors' ``bf16._b16mm`` and ``glue._hc_mix``.
@@ -13,17 +13,6 @@ licence), which builds on the TensorFold contributors' ``bf16._b16mm`` and ``glu
 from __future__ import annotations
 
 import torch
-
-from tensorfold.env_flags import flag
-
-FUSE_ENV = "TF_FLASHNEXT_HC_FUSE"
-
-
-def fuse() -> bool:
-    """TF_FLASHNEXT_HC_FUSE: the bf16 HC's prompt fusions (unset: on); a value outside env_flags' set raises."""
-
-    return flag(FUSE_ENV, True)
-
 
 HAS_TRITON = True
 try:

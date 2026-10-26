@@ -121,7 +121,7 @@ that change them. Three choices need a word:
 | Copy drafts at 6 drafts a round | A 2,252-token prompt's first 128 tokens: 36.5 to 89.0 tok/s; rewrite 108 to 124 |
 | Copy windows widen to 32 rows (`TENSORFOLD_COPY_ROWS`, 20 Oct) | Copy text 119 to 244 tok/s, rewrite 147 to 237; 1.25x one stream and 1.23x four over 12 cells, same replies |
 | Copies follow the occurrence that matches furthest back (`TENSORFOLD_COPY_BACK`, 20 Oct) | Qwen, four in flight: copy 110 to 172 tok/s, batch +4.5%; a list's lines no longer copy the previous line |
-| GLM copies in DFlash2 rounds (`TF_GLM_DFLASH_COPIES`, `TF_GLM_COPY_BACK`, on in `run.sh`) | Batch 48.6 to 54.5 tok/s, list copy 66.8 to 146.4, rewrite 63.1 to 99.6, json unchanged, same replies |
+| GLM copies in DFlash2 rounds (`TF_GLM_DFLASH_COPIES`, `TF_GLM_COPY_BACK`, on by default) | Batch 48.6 to 54.5 tok/s, list copy 66.8 to 146.4, rewrite 63.1 to 99.6, json unchanged, same replies |
 | EXL3 prompt experts read once for 32 rows | Prefill 780 to 828 tok/s, bit-identical output |
 | EXL3 image tower converted from the pack | `tensorfold.vision.exl3_convert` reads a tower stored inside the pack's shards |
 

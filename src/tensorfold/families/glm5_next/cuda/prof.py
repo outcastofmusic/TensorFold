@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import os
 import time
 from contextlib import contextmanager
 
 import torch
 
-ENABLED = os.environ.get("TF_GLM_PROFILE", "0") == "1"
+from tensorfold.env_flags import flag
+
+ENABLED = flag("TF_GLM_PROFILE")
 active = False                     # set only around prefill chunks
 totals: dict[str, float] = {}
 peaks: dict[str, int] = {}         # the most memory a block allocated on top of what was live before it

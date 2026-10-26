@@ -189,36 +189,6 @@ def test_kda_chain_serial_window_and_reference():
 
 
 @cuda
-def test_chain_attention_serial_window_and_reference():
-    from tensorfold.families.glm5_next.cuda.attention import AttnScratch, attention, kv_write
-
-    gen = torch.Generator().manual_seed(4)
-    H, D, cap = 4, 256, 1200
-    P, R = 700, 6
-    kc = torch.zeros((cap, H, D), dtype=torch.bfloat16, device="cuda")
-    vc = torch.zeros_like(kc)
-    kc[:P] = torch.randn((P, H, D), generator=gen).to(torch.bfloat16).cuda()
-    vc[:P] = torch.randn((P, H, D), generator=gen).to(torch.bfloat16).cuda()
-    q = torch.randn((R, H, D), generator=gen).to(torch.bfloat16).cuda()
-    kn = torch.randn((R, H, D), generator=gen).to(torch.bfloat16).cuda()
-    vn = torch.randn((R, H, D), generator=gen).to(torch.bfloat16).cuda()
-    scr = AttnScratch(8, H, D, cap, "cuda")
-    pos = torch.tensor([P], dtype=torch.int32, device="cuda")
-    kv_write(kn, vn, kc, vc, pos)
-    win = attention(q, kc, vc, pos, scr, scale=D ** -0.5).clone()
-    full = attention(q, kc, vc, pos, scr, scale=D ** -0.5, nch=None).clone()
-    assert torch.equal(win, full)
-    for r in range(R):
-        one = attention(q[r:r + 1].contiguous(), kc, vc, torch.tensor([P + r], dtype=torch.int32, device="cuda"), scr,
-                        scale=D ** -0.5, nch=-(-(P + r + 1) // 512))
-        assert torch.equal(one[0], win[r]), r
-        keys = kc[:P + r + 1].double()
-        s = torch.einsum("hd,thd->ht", q[r].double(), keys) * D ** -0.5
-        ref = torch.einsum("ht,thd->hd", torch.softmax(s, dim=-1), vc[:P + r + 1].double())
-        assert (one[0].double() - ref).abs().max() < 0.02
-
-
-@cuda
 def test_commit_kernels_match_per_layer_updates():
     from tensorfold.families.glm5_next.cuda import kda
 
@@ -239,63 +209,23 @@ def test_commit_kernels_match_per_layer_updates():
 
 
 @cuda
-def test_sparse_selection_and_attention_rows_invariant():
+def test_sparse_selection_rows_invariant():
     from tensorfold.families.glm5_next.cuda import sparse
 
     gen = torch.Generator().manual_seed(6)
-    cap, pos, R, H, D = 2600, 2200, 5, 4, 256
+    cap, pos, R = 2600, 2200, 5
     npmax = cap // 4
     pk = torch.randn((npmax + 2, 128), generator=gen).to(torch.bfloat16).cuda()
     qi = torch.randn((R, 32 * 128), generator=gen).to(torch.bfloat16).cuda()
     wts = torch.randn((R, 160), generator=gen).to(torch.bfloat16).cuda()[:, 128:]
-    kc = torch.randn((cap, H, D), generator=gen).to(torch.bfloat16).cuda()
-    vc = torch.randn((cap, H, D), generator=gen).to(torch.bfloat16).cuda()
-    q = torch.randn((R, H, D), generator=gen).to(torch.bfloat16).cuda()
     pos_dev = torch.tensor([pos], dtype=torch.int32, device="cuda")
     tokens, counts = sparse.select_tokens(qi, wts, pk, pos, R, npmax, pos_dev)
-    out = torch.zeros((R, H, D), dtype=torch.bfloat16, device="cuda")
-    sparse.sparse_attention(q, kc, vc, tokens, counts, out, D ** -0.5)
     for r in range(R):
         p1 = torch.tensor([pos + r], dtype=torch.int32, device="cuda")
         t1, c1 = sparse.select_tokens(qi[r:r + 1].contiguous(), wts[r:r + 1], pk, pos + r, 1, npmax, p1)
         assert torch.equal(t1[0], tokens[r]) and int(c1[0]) == int(counts[r]) == 2048 + (pos + r + 1) % 4
-        o1 = torch.zeros((1, H, D), dtype=torch.bfloat16, device="cuda")
-        sparse.sparse_attention(q[r:r + 1].contiguous(), kc, vc, t1, c1, o1, D ** -0.5)
-        assert torch.equal(o1[0], out[r]), r
         sel = t1[0, :int(c1[0])].long()
         assert bool((sel[1:] > sel[:-1]).all()) and int(sel[-1]) == pos + r
-        s = torch.einsum("hd,thd->ht", q[r].double(), kc[sel].double()) * D ** -0.5
-        ref = torch.einsum("ht,thd->hd", torch.softmax(s, dim=-1), vc[sel].double())
-        assert (o1[0].double() - ref).abs().max() < 0.02
-
-
-@cuda
-def test_sparse_attention_of_a_prompt_chunk_keeps_each_rows_bits():
-    """A prompt chunk's rows past the dense limit (hundreds, not a decode window's few) each get their serial step's
-    bits; 0.3.5.1 aliased the chunk partials of rows 128 and up, and GLM answered "!!!!" past 2,051 tokens (#53)."""
-
-    from tensorfold.families.glm5_next.cuda import sparse
-
-    gen = torch.Generator().manual_seed(53)
-    pos, R, H, D = 2048, 300, 4, 256
-    cap = pos + R + 4
-    npmax = cap // 4
-    pk = torch.randn((npmax + 2, 128), generator=gen).to(torch.bfloat16).cuda()
-    qi = torch.randn((R, 32 * 128), generator=gen).to(torch.bfloat16).cuda()
-    wts = torch.randn((R, 32), generator=gen).to(torch.bfloat16).cuda()
-    kc = torch.randn((cap, H, D), generator=gen).to(torch.bfloat16).cuda()
-    vc = torch.randn((cap, H, D), generator=gen).to(torch.bfloat16).cuda()
-    q = torch.randn((R, H, D), generator=gen).to(torch.bfloat16).cuda()
-    pos_dev = torch.tensor([pos], dtype=torch.int32, device="cuda")
-    tokens, counts = sparse.select_tokens(qi, wts, pk, pos, R, npmax, pos_dev)
-    assert int((counts > 0).sum()) == R - 3                  # positions 2048-2050 stay dense
-    out = torch.zeros((R, H, D), dtype=torch.bfloat16, device="cuda")
-    sparse.sparse_attention(q, kc, vc, tokens, counts, out, D ** -0.5)
-    for r in (0, 3, 127, 128, 129, 255, 256, R - 1):
-        one = torch.zeros((1, H, D), dtype=torch.bfloat16, device="cuda")
-        sparse.sparse_attention(q[r:r + 1].contiguous(), kc, vc, tokens[r:r + 1].contiguous(),
-                                counts[r:r + 1].contiguous(), one, D ** -0.5)
-        assert torch.equal(one[0], out[r]), r
 
 
 @cuda

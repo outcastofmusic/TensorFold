@@ -72,6 +72,15 @@ def test_mac_metrics_is_prometheus_and_health_stays_json():
         thread.join(5)
 
 
+def test_a_glm_engine_scrapes_with_no_lane_streams():
+    # GlmEngine once named a snapshot check _live, the attribute the lane engines keep their live streams in
+    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
+
+    app = SimpleNamespace(served_name="glm", model_ids=["glm"], max_batch_size=1, engine=object.__new__(GlmEngine))
+    body = metrics.render(app)
+    assert sample(body, f"{metrics.PREFIX}requests_running") == "0"
+
+
 def test_the_footprint_gauge_is_served_where_the_platform_counts_it():
     """A live process reading, so two scrapes can differ; each route must carry the family once."""
 

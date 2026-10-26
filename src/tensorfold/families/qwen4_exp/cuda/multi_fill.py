@@ -211,7 +211,6 @@ class PromptPasses:
             waited = time.perf_counter()
             torch.cuda.synchronize()
             spent += (time.perf_counter() - waited) / len(pieces)
-        early = self.first_early
         joined, head = [], 0
         for (s, a, n), last in zip(pieces, lasts):
             s.prefill_s += spent
@@ -250,12 +249,11 @@ class PromptPasses:
                 s.drafters = {}
             s.started = time.perf_counter()
             self.streams[s.sid] = s
-            if early:                                    # the client has it while the first drafts are made
-                self._take_first(s, first)
+            # the client has the first token while the first drafts are made (median TTFT at --parallel 5: 4k 2.32 to
+            # 2.09 s, 32k 19.01 to 18.09 s, 131k 82.47 to 82.53 s, the same tokens; tf-runs/gpu-ttft, 18 Oct)
+            self._take_first(s, first)
             # every rank drafts, a stream that ended at its first token too: two ranks' MTP steps stay in step
             self._first_drafts(s, e, mtp, last, first)
-            if not early:
-                self._take_first(s, first)
             if s.done:
                 joined.append(s)
         self._joined_ranks()

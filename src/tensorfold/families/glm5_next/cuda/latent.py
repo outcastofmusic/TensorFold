@@ -6,7 +6,6 @@ import torch
 import triton
 import triton.language as tl
 
-from . import LATENT as ENABLED     # off (TF_GLM_LATENT=0): per-head keys and values, 0.3.5's path, for A/B
 
 L = 512            # GLM-5.3-Flash's latent width (kv_lora_rank); the kernels take the width from the tensors
 CHUNK = 512        # keys per chunk program, merged in absolute order

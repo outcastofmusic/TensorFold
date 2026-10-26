@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,13 +15,14 @@ import triton.language as tl
 
 from tensorfold.cuda.direct_read import SafeTensors
 from tensorfold.engine.exact_sampling import Sampling, uniform_rows
+from tensorfold.env_flags import flag
 
 from . import glue, qmm
 from . import packed as packed_mod
 from .weights import Weights
 
 # TF_GLM_TREE_PROBE=1: count how often a draft's runner-up is the token the target wanted (no change to replies)
-TREE_PROBE = os.environ.get("TF_GLM_TREE_PROBE", "0") == "1"
+TREE_PROBE = flag("TF_GLM_TREE_PROBE")
 TREE: dict[str, float] = {}
 EDGE = 0.6        # the selector's edge score weight in a chain pick
 NOISE = 0.7       # the target's keyed noise weight when sampling

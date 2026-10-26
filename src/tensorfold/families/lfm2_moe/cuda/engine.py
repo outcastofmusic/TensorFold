@@ -97,7 +97,7 @@ class Engine:
         self.sampled = torch.zeros(1, dtype=torch.int32, device=dev)
         self.offsets = torch.arange(max(prefill_rows, DECODE_ROWS), dtype=torch.int32, device=dev)
         self.tok = torch.zeros(1, dtype=torch.int32, device=dev)       # a graphed step's input token
-        self.graphs = self.cuda and os.environ.get("TF_LFM2_GRAPHS", "1").strip() != "0"
+        self.graphs = flag("TF_LFM2_GRAPHS", True) and self.cuda
         self.graph = None
         self.graph_out: torch.Tensor | None = None
         self.sampling = None

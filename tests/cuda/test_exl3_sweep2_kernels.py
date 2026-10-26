@@ -1,21 +1,22 @@
 """The sweep's kernel switches on the GPU: the same bytes with each switch on or off.
 
-- TF_EXL3_EXPERT_ITEMS: routed experts at Flash Next EXL3's shapes (2560 <-> 640, 3-bit mul1 experts beside a 5-bit
+- The item list: routed experts at Flash Next EXL3's shapes (2560 <-> 640, 3-bit mul1 experts beside a 5-bit
   shared expert, 11 slots) and GLM-5.3's (4096 <-> 2048, mcg at 2.25 and 2.5 bits, 14-bit window, 8 slots): per-slot
   outputs and combined rows of windows from 1 to 1,024 rows (decode windows, multi-stream windows of 17-28 rows,
-  prompt windows), eager and replayed from CUDA graphs; and group_kernel's item list against a Python model of it.
-- The down epilogue's bf16 slots (TF_FLASHNEXT_MOE_DIRECT) against a copy of its fp32 slots, at both models' shapes.
-- The EXL3 linear writing N columns of a wider output (TF_FLASHNEXT_STACK_DIRECT) at Flash Next's dense shapes and
-  GLM-5.3-sized ones, and Flash Next's two stacks (attention: q, k, v, indexer; DeltaNet: qkv, z, fp16 b/a) with the
-  switch on and off, 1 to 128 rows.
-- ``_f16_mm_ks`` (TF_FLASHNEXT_F16_INNER_K) against ``_f16_mm`` + ``_reduce`` at the pack's fp16 shapes and prompt
-  row counts, into contiguous and stack-column outputs.
-- An fp16 hyper-connection's prompt read-out with the write-back and norm fused (TF_FLASHNEXT_HC_FUSE) against the
-  separate kernels, in the write-back modes the layers use.
+  prompt windows) on the item list alone and as ``routed`` serves them, against the launches of before
+  (``tests.exl3_fakes.OLD``), eager and replayed from CUDA graphs; and group_kernel's item list against a Python
+  model of it.
+- The down epilogue's bf16 slots (the MoE buffer's call) against a copy of its fp32 slots, at both models' shapes.
+- The EXL3 linear writing N columns of a wider output at Flash Next's dense shapes and GLM-5.3-sized ones, and Flash
+  Next's two stacks (attention: q, k, v, indexer; DeltaNet: qkv, z, fp16 b/a) writing in place against the scratch
+  copies an output off 16 bytes takes, 1 to 128 rows.
+- An fp16 hyper-connection's prompt read-out with the write-back and norm fused against the separate kernels, in the
+  write-back modes the layers use.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import pytest
@@ -27,14 +28,12 @@ from tensorfold.cuda.exl3 import experts, linear, switches  # noqa: E402
 from tensorfold.families.qwen4_exp.cuda import exl3_mm  # noqa: E402
 
 from tests.cuda.exl3_layers import LAYERS, LINEAR, _inputs, _layer, _same, _scale, _trellis  # noqa: E402
+from tests.exl3_fakes import OLD, route
 from tests.test_exl3_expert_items import _listing  # noqa: E402
 
-OFF = switches.Switches(pdl=False, expert_items=False, group_scan=False, down_fuse=False, gateup_fuse=False,
-                        group_scan_decode=False, linear_pair=False)
-EXPERT_SETTINGS = [switches.Switches(pdl=False, expert_items=True, group_scan=False, down_fuse=False,
-                                     gateup_fuse=False, group_scan_decode=False, linear_pair=False),
-                   switches.Switches(pdl=True, expert_items=True, group_scan=False, down_fuse=False,
-                                     gateup_fuse=False, group_scan_decode=False, linear_pair=False)]
+ITEMS = dataclasses.replace(OLD, expert_items=True)
+# (launches, PDL): the item list alone, and routed's own launches (None)
+EXPERT_SETTINGS = [(ITEMS, False), (ITEMS, True), (None, False), (None, True)]
 ROWS = (1, 8, 16, 17, 24, 28, 64, 65, 128, 1024)
 
 
@@ -46,11 +45,11 @@ def restore():
     exl3_mm.use(before_mm)
 
 
-def _run(name, R, x, sel, w, scratch):
+def _run(k, name, R, x, sel, w, scratch):
     ex, slots, E, act = _layer(name)
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
-    y = experts.routed(x, sel, None, ex, scratch, None, R, limit, act).clone()
-    out = experts.routed(x, sel, w, ex, scratch, None, R, limit, act).clone()
+    y = route(k, x, sel, None, ex, scratch, None, R, limit, act).clone()
+    out = route(k, x, sel, w, ex, scratch, None, R, limit, act).clone()
     return y, out
 
 
@@ -61,16 +60,15 @@ def test_routed_experts_keep_their_bytes_on_the_item_list(name, R):
     ex, slots, E, _ = _layer(name)
     scratch = experts.Scratch(ex, max(ROWS), slots)
     x, sel, w = _inputs(name, R, 3000 + R)
-    switches.use(OFF)
-    want = _run(name, R, x, sel, w, scratch)
+    want = _run(OLD, name, R, x, sel, w, scratch)
     torch.cuda.synchronize()
     assert torch.isfinite(want[1]).all()
-    for sw in EXPERT_SETTINGS:
-        switches.use(sw)
-        y, out = _run(name, R, x, sel, w, scratch)
+    for k, pdl in EXPERT_SETTINGS:
+        switches.use(switches.Switches(pdl=pdl))
+        y, out = _run(k, name, R, x, sel, w, scratch)
         torch.cuda.synchronize()
-        assert _same(y, want[0]), (name, R, sw)
-        assert _same(out, want[1]), (name, R, sw)
+        assert _same(y, want[0]), (name, R, k, pdl)
+        assert _same(out, want[1]), (name, R, k, pdl)
 
 
 @pytest.mark.parametrize("name", list(LAYERS))
@@ -102,8 +100,7 @@ def test_graphs_captured_on_the_item_list_replay_the_old_bytes(name):
     scratch = experts.Scratch(ex, max(rows), slots)
     limit = 7.0 if act == experts.ACT_BF16 else math.inf
     bufs, graphs = {}, {}
-    switches.use(switches.Switches(pdl=True, expert_items=True, group_scan=False, down_fuse=False, gateup_fuse=False,
-                                   group_scan_decode=False, linear_pair=False))
+    switches.use(switches.Switches(pdl=True))
     for R in rows:
         x, sel, w = _inputs(name, R, 60 + R)
         out = torch.empty((R, ex.dims), dtype=torch.float32, device="cuda")
@@ -113,12 +110,12 @@ def test_graphs_captured_on_the_item_list_replay_the_old_bytes(name):
         with torch.cuda.graph(graph):
             experts.routed(x, sel, w, ex, scratch, out, R, limit, act)
         bufs[R], graphs[R] = (x, sel, w, out), graph
-    switches.use(OFF)
+    switches.use(switches.Switches())
     for R in rows:
         x, sel, w, out = bufs[R]
         nx, nsel, nw = _inputs(name, R, 95 + R)                   # new picks: the list is the replay's own
         x.copy_(nx), sel.copy_(nsel), w.copy_(nw)
-        eager = experts.routed(x, sel, w, ex, scratch, None, R, limit, act).clone()
+        eager = route(OLD, x, sel, w, ex, scratch, None, R, limit, act).clone()
         out.fill_(float("nan"))
         graphs[R].replay()
         torch.cuda.synchronize()
@@ -193,7 +190,7 @@ STACKS = {"attention": [("x3", 2560, 12288, 5), ("x3", 2560, 512, 5), ("x3", 256
 
 
 @pytest.mark.parametrize("which", list(STACKS))
-def test_a_stack_writes_the_same_bytes_in_place(which):
+def test_a_stack_writes_the_same_bytes_in_place_as_through_the_copies(which):
     g = torch.Generator().manual_seed(len(which))
     sc = exl3_mm.Scratch(11)
     parts = [_x3(sc, k, n, b, g) if kind == "x3" else _f16(sc, n, k, g) for kind, k, n, b in STACKS[which]]
@@ -202,40 +199,13 @@ def test_a_stack_writes_the_same_bytes_in_place(which):
     for m in (1, 2, 3, 4, 5, 6, 7, 8, 16, 17, 28, 64, 128):
         x = torch.randn((m, 2560), generator=g).to(torch.bfloat16).cuda()
         got = []
-        for on in (False, True, False):
-            exl3_mm.use(exl3_mm.Switches(stack_direct=on, moe_chunk=False))
-            out = torch.full((m, st.n), float("nan"), dtype=torch.bfloat16, device="cuda")
+        for pad in (1, 0, 1):                        # a row stride 2 bytes off 16 takes the scratch copies
+            out = torch.full((m, st.n + pad), float("nan"), dtype=torch.bfloat16, device="cuda")[:, :st.n]
+            assert st.aligned(out) is (pad == 0)
             got.append(st(x, out).clone())
         torch.cuda.synchronize()
         assert torch.isfinite(got[0].float()).all(), (which, m)
         assert _same(got[0].float(), got[1].float()) and _same(got[0].float(), got[2].float()), (which, m)
-
-
-# -- the prompt's fp16 matmuls with their K slices summed in-program ----------------------------------------------
-F16_SHAPES = [(324, 10240), (320, 10240), (96, 2560), (2560, 2560)]          # HC down, mixer down, b/a, PLE value
-F16_ROWS = (17, 33, 48, 129, 241, 256, 305, 753, 768, 1024, 2048, 2050, 2061)
-
-
-@pytest.mark.parametrize("n, k", F16_SHAPES)
-def test_the_in_program_sum_writes_the_split_sums_bytes(n, k):
-    g = torch.Generator().manual_seed(n + k)
-    sc = exl3_mm.Scratch(11)
-    q = _f16(sc, n, k, g)
-    _scratch([q])
-    used = 0
-    for m in F16_ROWS:
-        x = (torch.randn((m, k), generator=g) * 0.3).to(torch.bfloat16).cuda()
-        for wide in (False, True):                                    # contiguous, and a stack's columns
-            outs = []
-            for on in (False, True):
-                exl3_mm.use(exl3_mm.Switches(inner_k=on, moe_chunk=False))
-                full = torch.full((m, n + (128 if wide else 0)), float("nan"), dtype=torch.bfloat16, device="cuda")
-                outs.append(q(x, full[:, :n]).clone())
-            torch.cuda.synchronize()
-            assert torch.isfinite(outs[0].float()).all(), (n, k, m)
-            assert _same(outs[0].float(), outs[1].float()), (n, k, m, wide)
-        used += exl3_mm.inner_k_fits(m, n, k, q.sk)
-    assert used > 0                                                    # some row counts took _f16_mm_ks
 
 
 # -- an fp16 hyper-connection's prompt write-back and norm in one kernel -------------------------------------------
@@ -280,12 +250,17 @@ def test_an_fp16_hcs_fused_write_back_and_norm_keep_the_read_outs_bytes(mode, R)
     down, up = _f16(sc, 324, 10240, g), _f16(sc, 10240, 320, g)
     _scratch([down, up])
     scale = (torch.rand((10240,), generator=g) + 0.5).float().cuda()
+    hc = HC(down, up, scale, True, down, up)
     got = []
     for fuse in (False, True, False):
-        hc = HC(down, up, scale, True, down, up, fuse=fuse)
         b, h, extra, inject_prev = _hc_inputs(R, torch.Generator().manual_seed(R + mode), mode)
         inject_out = torch.empty((R, 4), dtype=torch.bfloat16, device="cuda")
-        forward.hc_block(hc, b, R, 1e-6, 4, 320, mode, None if mode == 0 else inject_prev, inject_out, h, **extra)
+        prev = None if mode == 0 else inject_prev
+        if fuse:
+            forward.hc_block(hc, b, R, 1e-6, 4, 320, mode, prev, inject_out, h, **extra)
+        else:                                       # the separate kernels hc_block ran before the fusion
+            forward.glue.hc_writeback(h, h, b.pss, 4, mode, inject=prev, **extra)
+            forward._readout(hc, b, h, R, 1e-6, 4, 320, inject_out)
         torch.cuda.synchronize()
         got.append([t.clone() for t in (h, b.pss, b.normed, b.act, b.mixed, inject_out)])
     for a, c in zip(got[0], got[1]):

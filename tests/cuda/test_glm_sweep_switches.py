@@ -1,5 +1,5 @@
-"""TF_GLM_MOE_IN_PLACE, TF_GLM_SHARED_STREAM, TF_GLM_KDA_WIDE, TF_GLM_TOKEN_LIST and TF_GLM_EARLY_LAUNCH on the GPU:
-every switch keeps the bytes.
+"""TF_GLM_SHARED_STREAM, TF_GLM_KDA_WIDE and TF_GLM_EARLY_LAUNCH on the GPU: every switch keeps the bytes, and the
+served token-list kernel writes its torch reference's integers.
 
 Kernels first: ``sparse.token_rows`` (one kernel) against ``sparse.token_rows_ops`` (the torch ops) at decode rows 1 to
 8 and a prompt chunk's 2,048, around the dense limit and deep in a 98,304-token window; the KDA chain on the
@@ -80,8 +80,7 @@ real = pytest.mark.skipif(not (MODEL / "config.json").exists() or not (DRAFTER /
                           reason="the packed GLM checkpoint or its drafter is not here")
 CONTEXT = 8192            # past the dense limit: sparse steps run the indexer and the token list
 SAMPLINGS = [None, Sampling(1234, 1.0, 20, 0.95)]
-SWITCHES = ("TF_GLM_MOE_IN_PLACE", "TF_GLM_SHARED_STREAM", "TF_GLM_KDA_WIDE", "TF_GLM_TOKEN_LIST",
-            "TF_GLM_EARLY_LAUNCH")
+SWITCHES = ("TF_GLM_SHARED_STREAM", "TF_GLM_KDA_WIDE", "TF_GLM_EARLY_LAUNCH")
 _held: dict[str, object] = {}
 
 
@@ -115,11 +114,7 @@ def _switch(engine, on: bool) -> None:
 
     engine.w.meta["early_launch"] = on
     for b in (engine.e.buf, engine.e.pbuf, engine.e.mbuf):
-        if b is None:
-            continue
-        b.moe_in_place = on and b.exl3 is not None
-        b.token_list = on
-        if b.prefill:
+        if b is None or b.prefill:
             continue
         b.side = torch.cuda.Stream() if on else None
         LL = engine.w.cfg.lin_heads // engine.w.world
@@ -152,8 +147,7 @@ PROMPTS = {"short": _prompt(40, 11), "past the dense limit": _prompt(2100, 13), 
 def test_eager_replies_are_the_same_with_the_switches_off_on_off_and_drafted_equal_serial(sampling):
     engine = _engine("eager")
     meta = engine.w.meta
-    assert meta["moe_in_place"] and meta["shared_stream"] and meta["kda_wide"] and meta["token_list"]
-    assert meta["early_launch"]
+    assert meta["shared_stream"] and meta["kda_wide"] and meta["early_launch"]
     for name, prompt in PROMPTS.items():
         got = []
         for on in (False, True, False):        # off twice: a difference is the switches', not the engine's
@@ -194,7 +188,7 @@ def test_graph_replies(kind):
     on = kind == "graphs-on"
     meta = engine.w.meta
     assert engine.e.graphs is not None
-    assert [meta[k] for k in ("moe_in_place", "shared_stream", "kda_wide", "token_list", "early_launch")] == [on] * 5
+    assert [meta[k] for k in ("shared_stream", "kda_wide", "early_launch")] == [on] * 3
     assert (engine.e.buf.side is not None) is on and (engine.e.buf.kda_tmp is not None) is on
     got = {}
     for name, prompt in PROMPTS.items():

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from tensorfold.cuda import moe as moe_mod
+from tensorfold.env_flags import flag
 
 from . import attention as attn_mod
 from . import gdn as gdn_mod
@@ -37,6 +38,8 @@ class Buffers:
         self.last = torch.zeros((rows,), dtype=torch.int32, device=dev)          # each stream's last row
         self.last_host = torch.zeros((rows,), dtype=torch.int32, pin_memory=torch.cuda.is_available())
         self.staged = torch.cuda.Event() if torch.cuda.is_available() else None
+        # TF_FLASH_STAGE_AHEAD (unset: on): ``forward.stage`` reads the n-gram rows before its wait; 0 after it
+        self.stage_ahead = flag("TF_FLASH_STAGE_AHEAD", True)
         self.h = torch.empty((rows, wide), dtype=bf, device=dev)
         self.pss = torch.empty((rows, c.hidden // 256, c.streams), dtype=f32, device=dev)
         self.normed = torch.empty((rows, wide), dtype=bf, device=dev)
@@ -55,7 +58,7 @@ class Buffers:
         self.pa = torch.empty((rows, attn_width), dtype=bf, device=dev)
         self.q = torch.empty((rows, c.heads, c.head_dim), dtype=bf, device=dev)
         self.iq = torch.empty((rows, c.index_heads, c.index_dim), dtype=bf, device=dev)
-        # prompt chunks score on qsa_scores.cu unless TF_FLASHNEXT_QSA=torch (the same bits and lists either way)
+        # prompt chunks score on qsa_scores.cu (the Triton kernels' bits and lists)
         self.attn = attn_mod.AttnScratch(min(rows, ATT_ROWS) if prefill else rows, c.heads, c.head_dim, capacity,
                                          dev, budget=c.index_budget, ratio=c.index_ratio,
                                          fast=qsa.fast(prefill, c.index_heads, c.index_dim))

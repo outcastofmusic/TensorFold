@@ -5,16 +5,33 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
-- **`TENSORFOLD_LONG_PIECE_TOKENS=N` gives Qwen3.8 Flash Next FP4-Local 4,096-row idle prompt pieces while N or
-  more prompt rows remain to fill.** Pieces narrow to 2,048 rows once fewer remain. On 18 Oct 2026, 4,096-row pieces
-  everywhere ran 131k-token prompts 1.03-1.09x faster and 4k-token prompts 0.72-0.97x as fast, so a sweep will pick
-  N. Unset or 0 keeps 2,048 rows, the served width, and any other value than a whole number stops the start. At any
-  N above 0 the start budgets the 4,096-row piece: the wider buffers plus the fp32 K-slice partials of the bf16
-  linears, 2.50 GiB of workspace with MTP drafts and 2.04 GiB without. A window that leaves no room keeps 2,048 rows.
-  Each expert then gets 80 routed rows a weight read instead of 40. Pieces beside live replies stay at 2,048 rows or
-  fewer, and one GPU on the GB10 is required, with NVFP4 experts and MXFP8 for every other quantized linear. A
-  row's bits do not depend on its piece, so replies and kept states stay the same. The MLX checkpoint keeps its
-  4,096-row idle pieces, and a set `TENSORFOLD_PREFILL_ROWS` keeps its one width.
+- **Qwen3.8 Flash Next FP4-Local fills long prompts in 4,096-row pieces while 8,192 or more prompt rows remain.**
+  Pieces narrow to 2,048 rows once fewer remain. In the 25 Oct 2026 sweep, a threshold of 8,192 ran cold prefill
+  1.08-1.13x as fast at 32k tokens, 1.05-1.06x at 131k and 0.99x at 4k (geometric mean 1.060); thresholds of 16,384
+  and 32,768 reached 1.038 and 1.000. `TENSORFOLD_LONG_PIECE_TOKENS=N` moves the threshold, 0 keeps every piece at
+  2,048 rows, and any other value than a whole number stops the start. The start budgets the 4,096-row piece from
+  the memory left after the window: the wider buffers plus the fp32 K-slice partials of the bf16 linears, 2.50 GiB
+  of workspace with MTP drafts and 2.04 GiB without. The window stays 262,144 tokens on one Spark, and a window that
+  leaves no room keeps 2,048 rows. Each expert then gets 80 routed rows a weight read instead of 40. Pieces beside
+  live replies stay at 2,048 rows or fewer, and one GPU on the GB10 is required, with NVFP4 experts and MXFP8 for
+  every other quantized linear. A row's bits do not depend on its piece, so replies and kept states stay the same.
+  The MLX checkpoint keeps its 4,096-row idle pieces, and a set `TENSORFOLD_PREFILL_ROWS` keeps its one width.
+- **A typo in seven more switches stops the start.** `TF_GLM_DRAFT_RING`, `TF_GLM_CALIBRATE`, `TF_GLM_TREE_PROBE`,
+  `TF_GLM_PROFILE`, `TF_GLM_SKIP_RENORM`, `TF_LFM2_GRAPHS` and `TF_FLASH_STAGE_AHEAD` compared the raw string to `0` or
+  `1`, so `TF_GLM_DRAFT_RING=off` kept the ring on and `TF_GLM_PROFILE=on` left profiling off. They now take 0, off,
+  false or no and 1, on, true or yes in any case, and any other value fails at start. 0 and 1 keep their meaning.
+  Flash Next reads `TF_FLASH_STAGE_AHEAD` once per buffer set, where it read it on every prompt pass and decode step.
+- **A direct `tensorfold serve` of GLM-5.3 on CUDA runs what `run.sh` serves.** `TF_GLM_LAZY_SPARSE`,
+  `TF_GLM_DFLASH_COPIES` and `TF_GLM_COPY_BACK` now default to 1, 1 and 8, the values `run.sh` passed, and `run.sh`
+  no longer passes them. Before, a direct serve, the tests and the tools captured every long-context graph at start
+  (7 s at 98,304 tokens) and verified no copies in DFlash2 rounds. `TF_GLM_LAZY_SPARSE=0`, `TF_GLM_DFLASH_COPIES=0`
+  (`COPIES=0` in `run.sh`) and `TF_GLM_COPY_BACK=0` restore the old behaviour. `TF_GLM_DENSE_PROMPT` and
+  `TF_GLM_CALIBRATE` keep their defaults of 0 and 1, and `run.sh` still sets 1 and 0.
+- **GLM-5.3 on CUDA drops five switches whose other branch production never ran.** `TF_GLM_LATENT=0` (per-head
+  keys and values, 0.3.6's attention), `TF_GLM_PLAIN_NARROW=0`, `TF_GLM_HC_SPLIT=0`, `TF_GLM_MOE_IN_PLACE=0` and
+  `TF_GLM_TOKEN_LIST=0` (the decode kernels before the 1.078x serial speed-up of tf-runs/gpu-glmdec and gpu-glm2) are
+  gone with the per-head attention and sparse-attention kernels. The engine no longer reads the five names, so
+  setting one does nothing. Served replies and speed stay the same: production ran the remaining branch of each.
 - **Qwen3.8 Flash Next FP4-Local prompt chunks run the bf16 hyper-connections in fewer kernels, with the same bytes.**
   In a 32,768-token prefill on 18 Oct 2026, the 98 HC read-outs of a 2,048-row chunk took 102 ms for the down projection
   and its split-K reduce, 72 ms for the up projection and the stream mix, and 105 ms for the write-back and the norm.
@@ -23,7 +40,6 @@ GitHub has the full notes and the measurements behind them.
   add into the tensor-core dot and the bits change), run the up projection and the mix as one kernel, and take the
   checked write-back + norm kernel that the 4-bit HC already used. Each kernel makes the old kernels' roundings and adds
   in the same order. MiaAI-Lab's engine ran the same three steps in 31, 39 and 89 ms in that profile.
-  `TF_FLASHNEXT_HC_FUSE=1` (default) takes them, `0` restores the separate kernels, and any other value stops the start.
   Decode windows and the final read-out keep the separate kernels. The down-projection and up-mix kernels are ported
   from MiaAI-Lab's Qwen3.8 Flash Next recipe, patch 0008 (MIT licence), which builds on the TensorFold contributors'
   `bf16._b16mm` and `glue._hc_mix`.
@@ -43,12 +59,11 @@ GitHub has the full notes and the measurements behind them.
 - **Qwen3.8 Flash Next FP4-Local decodes 1.059x faster with the same replies.** Decode rows of the shared expert ran
   the prompt GEMM on 128x128 blocks, 3.9 ms a serial token. They now take a 16x64 tile with six stages, whose bits
   equal the other tiles'. On 18 Oct 2026 at `--parallel 4 --kv-dtype int8`, decode ran 1.042-1.071x faster on code
-  and 1.048-1.074x on chat, and greedy replies stayed byte-equal. `TF_FP4_SHARED_DECODE=qmmf` takes the lane matmul
-  instead (1.064x, replies change), and any other value than `prompt` or `qmmf` fails the load.
+  and 1.048-1.074x on chat, and greedy replies stayed byte-equal.
 - **Under `--parallel`, Qwen3.8 Flash Next sends a prompt's first token before its first drafts.** The copy index
   and up to six MTP draft steps ran first. Median time to first token at `--parallel 5` went from 2.32 to 2.09 s at
-  4k, 19.01 to 18.09 s at 32k and 82.47 to 82.53 s at 131k on 18 Oct 2026, with the same tokens.
-  `TF_FLASH_FIRST_EARLY=0` restores the old order. The done line's prefill now includes the prompt's last pass.
+  4k, 19.01 to 18.09 s at 32k and 82.47 to 82.53 s at 131k on 18 Oct 2026, with the same tokens. The done line's
+  prefill now includes the prompt's last pass.
 - **GLM-5.3 Flash runs 40% fewer device operations a decode window.** Packed projections read and write rows in
   place, and decode skips group sums no kernel reads: 2,712 operations fell to 1,613 a one-row window. Decode ran
   0.6-1.2% faster in 4 of 4 cells on 18 Oct 2026, and served replies stayed identical. `TF_GLM_PACKED_COPIES=1`
@@ -57,17 +72,15 @@ GitHub has the full notes and the measurements behind them.
   read every pooled block key once per row, so its cost grew 1.6 ms a 2,048-row chunk per 1k tokens of context: 50 ms
   at 30k and an estimated 215 ms at 131k. `qsa_scores.cu` stages 64 blocks' keys and 32 rows' queries in shared
   memory once and repeats the Triton kernel's fp32 instruction order, so each score is the same fp32 word. Rows of
-  8,192 blocks (32k keys) or more then select their blocks in tiles, with the same lists. `TF_FLASHNEXT_QSA=cuda`
-  (default) takes both, `torch` keeps the Triton kernels, and any other value stops the start. Decode windows keep
-  the Triton kernels. The kernel and the 8,192-block threshold are ported from MiaAI-Lab's Qwen3.8 Flash Next recipe,
+  8,192 blocks (32k keys) or more then select their blocks in tiles, with the same lists. Decode windows keep the
+  Triton kernels. The kernel and the 8,192-block threshold are ported from MiaAI-Lab's Qwen3.8 Flash Next recipe,
   patches 0002 and 0005 (MIT licence), which build on the TensorFold contributors' indexer kernels.
 - **Qwen3.8 Flash Next FP4-Local prompt chunks of 1,024+ rows run the routed experts in a shared-memory tile.** A
   CTA's four warps share an item's input rows through shared memory, and each decoded weight fragment serves up to
   four 16-row tiles on 64-pair items. The output bits equal the 16-pair kernel's, which decode and shorter chunks
-  keep. `TF_FLASHNEXT_PROMPT_EXPERT_TILE=2` (default) takes it for gate/up and down, `1` for gate/up only, `0` turns
-  it off, and any other value fails at load. MiaAI-Lab measured +13-15% cold prefill from this kernel in their Zig
-  engine. The kernel is ported from MiaAI-Lab's Qwen3.8 Flash Next recipe, patch 0014 (MIT licence), which builds on
-  the TensorFold contributors' expert kernels.
+  keep. MiaAI-Lab measured +13-15% cold prefill from this kernel in their Zig engine. The kernel is ported from
+  MiaAI-Lab's Qwen3.8 Flash Next recipe, patch 0014 (MIT licence), which builds on the TensorFold contributors' expert
+  kernels.
 - **`run.sh` and the swap endpoint serve three more models.** `qwen3.8-flash-next-fp4` loads NVIDIA's Qwen3.8 Flash Next
   FP4-Local and `nemotron-3.5-bolt` loads Nemotron 3.5 Bolt with LiLiCorr drafts; `prepare.sh` fetches both at pinned
   revisions. The default stays Qwen3.8 Flash Next's EXL3 pack. `lfm2.5-24b-a2b` loads Liquid's LFM2.5-24B-A2B in block FP8.

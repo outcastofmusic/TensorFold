@@ -324,7 +324,7 @@ def test_a_deep_prompt_chunk_stays_within_the_estimates_chunk_scratch():
     torch.cuda.synchronize()
     used = torch.cuda.max_memory_allocated() - base
     assert bool((counts > 0).all())
-    assert used <= mla_chunk_scratch(text, 2, cap, latent=True), used
+    assert used <= mla_chunk_scratch(text, 2, cap), used
 
 
 @cuda

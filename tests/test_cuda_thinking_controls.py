@@ -336,3 +336,16 @@ def test_the_budget_matches_the_lane_engine(tmp_path):
             prepared = server.PreparedRequest(list(prompt), count, [], True, None, think_budget=budget)
             result = app.run({"return_token_ids": True}, True, lambda delta: True, prepared=prepared)
             assert result["stats"]["token_ids"] == want, (budget, width)
+
+
+@pytest.mark.parametrize("fields, want", [
+    ({"chat_template_kwargs": {"enable_thinking": False}}, 5),                    # thinking off, no max_tokens: 5
+    ({"chat_template_kwargs": {"enable_thinking": False}, "max_tokens": 9}, 9),   # an asked max_tokens stands
+    ({"chat_template_kwargs": {"enable_thinking": False}, "max_completion_tokens": 9}, 9),
+    ({}, 24)])                                                                    # thinking on: --max-tokens
+def test_the_answer_budget_caps_a_thinking_off_reply_that_names_no_limit(tmp_path, fields, want):
+    app = app_for(tmp_path, ChainEngine())
+    app.answer_budget = 5
+    status, body = ask(app, **fields)
+    assert status == 200 and len(body["tensorfold"]["token_ids"]) == want
+    assert body["choices"][0]["finish_reason"] == "length"

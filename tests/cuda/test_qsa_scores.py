@@ -1,5 +1,6 @@
-"""TF_FLASHNEXT_QSA=cuda against torch: qsa_scores.cu writes `_scores`' bytes at the same positions, the tiled select
-from 8,192 blocks lists `_select`'s blocks (lower ids first among equal scores), and prompts prefill to the same bits.
+"""qsa_scores.cu against the Triton kernels: qsa_scores.cu writes `_scores`' bytes at the same positions, the tiled
+select from 8,192 blocks lists `_select`'s blocks (lower ids first among equal scores), and prompts prefill to the same
+bits as on the Triton kernels (``qsa.fast`` patched off, as TF_FLASHNEXT_QSA=torch served until 25 Oct).
 
 Shapes are the FP4-Local and EXL3 3.05bpw indexer's (4 heads of 128 dims, 4-key blocks, a 2,048-key budget) at the
 262,144-key window `--context 262144` admits; prompt blocks are ATT_ROWS (256) rows, as forward.py launches them."""
@@ -142,16 +143,21 @@ def w():
     return _model()
 
 
+SERVED_FAST = qsa.fast
+
+
 def _engine(w, monkeypatch, flag: str, capacity: int) -> Engine:
-    monkeypatch.setenv(qsa.ENV, flag)
+    """``flag`` torch: the prompt buffers on the Triton kernels, else as served."""
+
+    monkeypatch.setattr(qsa, "fast", (lambda *a: False) if flag == "torch" else SERVED_FAST)
     e = Engine(w, capacity=capacity, max_rows=8, prefill_rows=2048)
     assert e.pbuf.attn.fast is (flag == "cuda") and not e.buf.attn.fast
     return e
 
 
-def test_a_32k_prompt_prefills_and_decodes_the_same_with_either_flag(w, monkeypatch):
+def test_a_32k_prompt_prefills_and_decodes_the_same_on_either_kernel(w, monkeypatch):
     """33,000 tokens (8,250 blocks at the end: the fast scratch's tiled select runs) and 24 greedy tokens: the same
-    first token, state bits and replies with the flag torch and cuda."""
+    first token, state bits and replies on the Triton kernels and qsa_scores.cu."""
 
     prompt = _prompt(33_000, seed=32)
     runs = {}

@@ -42,21 +42,7 @@ def lone_graphs() -> bool:
     return os.environ.get("TENSORFOLD_LONE_GRAPHS", "0").strip().lower() in ("1", "on", "true", "yes")
 
 
-FIRST_EARLY = "TF_FLASH_FIRST_EARLY"
-
-
-def first_early() -> bool:
-    """Whether a prompt's first token goes out before its first drafts are made (TF_FLASH_FIRST_EARLY=0: after them,
-    as before). The drafts and the copy index over the prompt depend only on the token, so the reply is the same.
-    Read once at startup and kept by the concurrent decoder (``MultiDecoder.first_early``)."""
-
-    from tensorfold.env_flags import flag
-
-    return flag(FIRST_EARLY, True)
-
-
-def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True, qsa_cuda: bool = True,
-                  indexer: tuple[int, int]) -> None:
+def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True, indexer: tuple[int, int]) -> None:
     """Load each applicable extension after admission and before resident weights consume the pool. ``indexer``: the
     checkpoint's (index heads, index head dim); qsa_scores.cu builds only for a shape it covers (``qsa.fits``)."""
 
@@ -67,7 +53,7 @@ def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True,
     from . import gdn, gdn_io, qsa
 
     loaders = [experts._ext, shared_gdn._ext, qmm._ext, gdn_io._ext]
-    if qsa_cuda and qsa.fits(*indexer):
+    if qsa.fits(*indexer):
         loaders.append(qsa._ext)
     if solo:                                     # serial windows, including a concurrent decoder's lone graph slot
         loaders.append(gdn._ext)
@@ -97,24 +83,16 @@ class FlashNextEngine:
 
         from .copy_drafts import enabled as copy_enabled, most_rows
         from . import exl3_mm
-        from .hc_b16 import fuse as hc_fuse
         from tensorfold.cuda.exl3 import switches as exl3_switches
-        from .nvfp4_moe import shared_decode, tile_mode
-        from .qsa import mode as qsa_mode
 
         from .exl3_pack import admission, extra_files, is_exl3
 
         from tensorfold.families import quant_method, read_config
 
         # the kernel flags, read once here: an unknown value stops the start before any read
-        qsa_cuda = qsa_mode() == "cuda"                  # TF_FLASHNEXT_QSA
-        self.first_early = first_early()                 # TF_FLASH_FIRST_EARLY
-        # TF_FLASHNEXT_PROMPT_EXPERT_TILE and TF_FP4_SHARED_DECODE: every NVFP4 layer's expert kernels
-        self.prompt_tile, self.shared_decode = tile_mode(), shared_decode()
-        self.hc_fuse = hc_fuse()                         # TF_FLASHNEXT_HC_FUSE: every HC's prompt fusions
-        # every TF_EXL3_* switch of the EXL3 kernels (exl3.switches.ENVS)
+        # TF_EXL3_PDL, the EXL3 kernels' one switch (exl3.switches.ENVS)
         exl3_switches.use(exl3_switches.read())
-        # TF_FLASHNEXT_STACK_DIRECT, _F16_INNER_K, _MOE_DIRECT, _MOE_CHUNK (before admission: it sizes the scratch)
+        # TENSORFOLD_PREFILL_ROWS (before admission: the rows size the scratch)
         exl3_mm.use(exl3_mm.read())
         exl3 = is_exl3(model_dir)
         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
@@ -204,7 +182,7 @@ class FlashNextEngine:
 
         raw = read_config(model_dir)
         build_kernels(exl3=exl3, nvfp4=not exl3 and quant_method(raw) == "modelopt", solo=streams == 1 or lone,
-                      qsa_cuda=qsa_cuda, indexer=indexer_shape(raw.get("text_config") or raw))
+                      indexer=indexer_shape(raw.get("text_config") or raw))
         from concurrent.futures import wait
 
         from tensorfold.cuda.direct_read import wait_all
@@ -213,8 +191,7 @@ class FlashNextEngine:
         try:
             w = load(model_dir, mtp=self.depth > 0, tp=(rank, 2) if tp == 2 else None,
                      draft_vocab=draft_vocab if self.depth > 0 else None, ple_on_ssd=ple_on_ssd,
-                     table_reads=reads if prefetch and not ple_on_ssd else None, prompt_tile=self.prompt_tile,
-                     shared_decode=self.shared_decode, hc_fuse=self.hc_fuse)
+                     table_reads=reads if prefetch and not ple_on_ssd else None)
         except BaseException:
             wait(reads)                               # a failed load leaves no table read behind it
             raise
@@ -281,8 +258,7 @@ class FlashNextEngine:
                                           kv_dtype=self.kv_dtype, share=share, vision=self.vision,
                                           prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=lone,
                                           spec=self.spec, count_drafters=self.count_drafters,
-                                          end_anchor=self.end_anchor, first_early=self.first_early,
-                                          copy_rows=self.copy_rows)
+                                          end_anchor=self.end_anchor, copy_rows=self.copy_rows)
                 self.scheduler = Scheduler(self.multi, max_streams=streams)
             else:
                 self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.copy_rows), graphs=graphs,
