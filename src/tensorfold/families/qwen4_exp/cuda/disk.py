@@ -25,7 +25,7 @@ from tensorfold.cuda import disk_states
 from tensorfold.env_flags import flag
 
 # the environment the prompt kernels read: a state written under other values may not be the bits this run computes
-KERNEL_FLAGS = ("TENSORFOLD_PREFILL_ROWS", "TF_QMMF_FUSED_ROWS", "TF_FLASH_STAGE_AHEAD")
+KERNEL_FLAGS = ("TENSORFOLD_PREFILL_ROWS", "TENSORFOLD_LONG_PIECE_TOKENS", "TF_QMMF_FUSED_ROWS", "TF_FLASH_STAGE_AHEAD")
 BLOCKS = "disk_blocks"           # a kept snapshot's key: its rows' full blocks on disk (disk_states.blocks)
 
 

@@ -20,6 +20,7 @@ from .forward import Cut, commit, cut_snapshot, forward
 from . import image_rows
 from .state import CAND, Buffers, State
 from .mtp import mtp_forward
+from .prompt_plan import piece_rows, pieces_of, warm_widths
 from .weights import Weights
 
 
@@ -342,15 +343,16 @@ def prefill_begin(e: Engine, prompt: Sequence[int], *, mtp: bool = True, resume:
 
 
 def chunk_plan(start: int, n: int, rows: int, points, marks: int = 1) -> list[tuple[int, int, list[int]]]:
-    """(start, end, kept points in (start, end]) for chunks of up to ``rows`` over prompt rows [start, n). A chunk
-    keeps up to ``marks`` (at most MARKS) new states, its chain leaving those inside it as it passes, so a further
-    point ends it there. Admission counts one new state a chunk on the serial engine: ``marks`` 1."""
+    """(start, end, kept points in (start, end]) for chunks of up to ``rows`` over prompt rows [start, n), each
+    narrowed by ``piece_rows`` once the rows left fall under TENSORFOLD_LONG_PIECE_TOKENS. A chunk keeps up to
+    ``marks`` (at most MARKS) new states, its chain leaving those inside it as it passes, so a further point ends it
+    there. Admission counts one new state a chunk on the serial engine: ``marks`` 1."""
 
     if not 1 <= marks <= MARKS:
         raise ValueError(f"a chunk keeps 1 to {MARKS} states, not {marks}")
     points, plan = sorted(p for p in set(points) if start < p <= n), []
     while start < n:
-        end, here = cap_points(start, min(start + rows, n), points, marks)
+        end, here = cap_points(start, min(start + piece_rows(rows, n - start), n), points, marks)
         plan.append((start, end, here))
         start = end
     return plan
@@ -458,12 +460,16 @@ WARM_TAIL = 18      # a partial chunk after a full one: neither its rows nor the
 
 @torch.no_grad()
 def warm(e: Engine) -> None:
-    """Prefill a synthetic prompt (a full chunk, then a partial one cut at the kept point a row before its end) and empty the state, so no request compiles or loads a prompt kernel."""
+    """Prefill a synthetic prompt (a full chunk, then a partial one cut at the kept point a row before its end) and empty the state, so no request compiles or loads a prompt kernel.
 
-    prompt = [0] * min(e.prefill_rows + WARM_TAIL + 1, e.capacity)
-    prefill(e, prompt, None, keep_at=entry_end(prompt))
-    e.kept = None
-    e.reset()
+    While TENSORFOLD_LONG_PIECE_TOKENS switches piece widths, a prompt of each width (``warm_widths``)."""
+
+    for width in warm_widths(e.prefill_rows):
+        with pieces_of(width, e.prefill_rows):
+            prompt = [0] * min(width + WARM_TAIL + 1, e.capacity)
+            prefill(e, prompt, None, keep_at=entry_end(prompt))
+            e.kept = None
+            e.reset()
 
 
 @dataclass

@@ -5,6 +5,17 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **Qwen3.8 Flash Next FP4-Local fills long prompts in 4,096-row pieces while 8,192 or more prompt rows remain.**
+  Pieces narrow to 2,048 rows once fewer remain. In the 25 Oct 2026 sweep, a threshold of 8,192 ran cold prefill
+  1.08-1.13x as fast at 32k tokens, 1.05-1.06x at 131k and 0.99x at 4k (geometric mean 1.060); thresholds of 16,384
+  and 32,768 reached 1.038 and 1.000. `TENSORFOLD_LONG_PIECE_TOKENS=N` moves the threshold, 0 keeps every piece at
+  2,048 rows, and any other value than a whole number stops the start. The start budgets the 4,096-row piece from
+  the memory left after the window: the wider buffers plus the fp32 K-slice partials of the bf16 linears, 2.50 GiB
+  of workspace with MTP drafts and 2.04 GiB without. The window stays 262,144 tokens on one Spark, and a window that
+  leaves no room keeps 2,048 rows. Each expert then gets 80 routed rows a weight read instead of 40. Pieces beside
+  live replies stay at 2,048 rows or fewer, and one GPU on the GB10 is required, with NVFP4 experts and MXFP8 for
+  every other quantized linear. A row's bits do not depend on its piece, so replies and kept states stay the same.
+  The MLX checkpoint keeps its 4,096-row idle pieces, and a set `TENSORFOLD_PREFILL_ROWS` keeps its one width.
 - **A typo in seven more switches stops the start.** `TF_GLM_DRAFT_RING`, `TF_GLM_CALIBRATE`, `TF_GLM_TREE_PROBE`,
   `TF_GLM_PROFILE`, `TF_GLM_SKIP_RENORM`, `TF_LFM2_GRAPHS` and `TF_FLASH_STAGE_AHEAD` compared the raw string to `0` or
   `1`, so `TF_GLM_DRAFT_RING=off` kept the ring on and `TF_GLM_PROFILE=on` left profiling off. They now take 0, off,

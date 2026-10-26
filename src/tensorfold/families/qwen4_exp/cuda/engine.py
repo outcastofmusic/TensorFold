@@ -102,7 +102,7 @@ class FlashNextEngine:
             raise ValueError("--ple-on-ssd reads the MLX checkpoint's n-gram tables; an EXL3 pack maps its own table "
                              "from its file, so drop --ple-on-ssd")
         from .decode import Engine
-        from .prompt_plan import choose as prompt_plan
+        from .prompt_plan import choose as prompt_plan, long_piece_tokens, storage, use as use_long_pieces
         from .kvcache import BITS_OF, check as check_kv
         from .weights import draft_token_ids, load
         from tensorfold.cuda.capacity import admit, config, gather_ints
@@ -112,6 +112,8 @@ class FlashNextEngine:
         # TENSORFOLD_PREFILL_ROWS: prompt pieces of that many rows, admitted with the window (not the idle plan); an
         # EXL3 pack's pieces and scratch take exl3_mm.Switches.prompt_rows (installed above), set or not
         chunk = exl3_mm.current().prompt_rows if exl3 else indexed_prefill_rows()
+        # TENSORFOLD_LONG_PIECE_TOKENS: an NVFP4 checkpoint's 4,096-row idle pieces, while that many rows remain
+        long_from = long_piece_tokens()
 
         if tp not in (1, 2) or rank not in range(tp):
             raise ValueError(f"rank {rank} of {tp}: Flash Next runs on one GPU or two")
@@ -162,9 +164,13 @@ class FlashNextEngine:
                                    vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), vision, rank),
                                    rank=rank, world=tp,
                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
+        text = config(model_dir)
         self.prefill_rows, prompt_workspace = (chunk, 0) if exl3 or chunk else prompt_plan(
-            self.capacity_plan, config(model_dir), torch.cuda.get_device_capability(), world=tp, vision=vision,
-            fp8=prompt_precision.fp8())
+            self.capacity_plan, text, torch.cuda.get_device_capability(), world=tp, vision=vision,
+            fp8=prompt_precision.fp8(), mtp=mtp, long_from=long_from)
+        # the MLX checkpoint's wide pieces and a set TENSORFOLD_PREFILL_ROWS keep one width
+        self.long_from = long_from if prompt_workspace and storage(text.get("_quantization") or {}) == "nvfp4" else 0
+        use_long_pieces(self.long_from)
         if prompt_workspace:
             peak = self.capacity_plan["total_bytes_estimate"] / 2**30
             print(f"[tensorfold] {self.prefill_rows}-row idle prompt workspace {prompt_workspace / 2**30:.2f} GiB; "
@@ -356,7 +362,8 @@ class FlashNextEngine:
             how += f", read again after warm-up in {reread_s:.1f}s ({pinned / 2**30:.2f} GiB of pages locked)"
         kv = "" if self.kv_dtype == "bf16" else f"; {self.kv_dtype} KV cache (fp16 scale per 32 values)"
         print(f"[tensorfold] Flash Next on CUDA: {rule}; {where}{kv}; n-gram tables {how}; {captured} "
-              f"decode graphs captured; idle prompt pieces {self.prefill_rows} rows; "
+              f"decode graphs captured; idle prompt pieces {self.prefill_rows} rows"
+              f"{f' while {self.long_from}+ prompt rows remain, else {PREFILL_ROWS}' if self.long_from else ''}; "
               f"prompt kernels warmed in {warm_s:.1f}s", flush=True)
 
     def _idle_work(self):
