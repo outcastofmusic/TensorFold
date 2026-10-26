@@ -26,7 +26,7 @@
 #   EXTRA="..."                more `tensorfold serve` flags
 #   QWEN_MODEL, QWEN_FP4_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL, SUPER_MODEL, D1_MODEL   another checkpoint folder under $MODELS
 # Qwen, Qwen FP4, GLM:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused;  Qwen: STATES_ALL=0: each slot's shortest and longest state go to disk (1: every kept state)
-# Qwen:  CONTEXT=262144  PARALLEL=4  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
+# Qwen:  CONTEXT=262144  PARALLEL=8 (FP4-Local: 4)  KEPT=4 a stream (TENSORFOLD_KEPT_STATES)  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   ANSWER_BUDGET=24576 (thinking off, no max_tokens asked; 0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)   COPIES=1 (0: no copy drafts in DFlash2 rounds)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
 # Qwen FP4-Local: Qwen's settings, VISION=0 by default (the image tower run.sh converts belongs to the EXL3 pack)
@@ -229,9 +229,12 @@ qwen() {  # [served name] [clef_first: 1 starts Clef before Qwen]
         serve clef-serve -- "$clef" --host 127.0.0.1 --port "$CLEF_PORT" --name clef --context 16384
         wait_ready clef-serve "$CLEF_PORT" || failed clef-serve
     fi
+    [ -z "${KEPT:-}" ] || flags+=(-e "TENSORFOLD_KEPT_STATES=$KEPT")
     [ "${STATES:-1}" = 0 ] || flags+=(-v tensorfold-states:/states -e TENSORFOLD_QWEN_STATES=/states/qwen -e "TENSORFOLD_QWEN_STATES_GIB=${STATES_GIB:-64}" -e "TENSORFOLD_QWEN_STATES_TTL_H=${STATES_TTL_H:-72}" -e "TENSORFOLD_QWEN_STATES_ALL=${STATES_ALL:-0}")
+    # 8 streams: eight 6-turn agent sessions put out 51.6 tok/s against 31.6 at 4, and one session the same (tf-runs/
+    # agents-1026, EXL3, 2026-10-26)
     serve tensorfold-serve "${flags[@]}" -- "$model" --host 127.0.0.1 --port "$PORT" --name "$name" \
-        --context "${CONTEXT:-262144}" --max-tokens "${CONTEXT:-262144}" --parallel "${PARALLEL:-4}" --kv-dtype "${KV:-int8}" \
+        --context "${CONTEXT:-262144}" --max-tokens "${CONTEXT:-262144}" --parallel "${PARALLEL:-8}" --kv-dtype "${KV:-int8}" \
         "${vision[@]}" "${guard[@]}" "${budget[@]}" ${EXTRA:-}
     # Clef starts second: it is ready 17 s before Qwen either way, and Qwen's start is the one a switch waits for
     if [ "${GUARD:-1}" != 0 ] && [ "$clef_first" != 1 ]; then
@@ -245,7 +248,9 @@ qwen() {  # [served name] [clef_first: 1 starts Clef before Qwen]
 # NVIDIA's QAD FP4-Local checkpoint through the same path: decode 0.71-0.82x the EXL3 pack's, TrueScore 91.0 against
 # 87.8 (paired +2.3 [-1.1, +6.4]) and planning +1.5 [-0.4, +3.5], 2026-10-17
 qwen_fp4() {
-    QWEN_MODEL="${QWEN_FP4_MODEL:-$MODELS/Qwen3.8-Flash-Next-FP4-Local}" VISION="${VISION:-0}" qwen qwen3.8-flash-next-fp4 1
+    # FP4-Local keeps 4 streams: at 8 its startup estimate left 1.5 GiB of 85.6 (2026-10-26)
+    QWEN_MODEL="${QWEN_FP4_MODEL:-$MODELS/Qwen3.8-Flash-Next-FP4-Local}" VISION="${VISION:-0}" PARALLEL="${PARALLEL:-4}" \
+        qwen qwen3.8-flash-next-fp4 1
 }
 
 bolt() {

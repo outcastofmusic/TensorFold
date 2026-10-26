@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from tensorfold.families.qwen4_exp.cuda import prefixes
 
 
@@ -59,3 +61,46 @@ def test_a_history_every_continuation_forks_from_is_never_the_entry_given_up():
         prefixes.remember(owner, history, st, resume["state"], resume["tail"])     # as multi_plan keeps a resume
         prefixes.remember(owner, history + [7, step], st, {"mtp_len": 0}, None)
         assert history in [k[0] for k in owner.kept], step
+
+
+def _agents(keep: int) -> list[int]:
+    """Eight interleaved six-turn sessions, as the Flare recipe's agent benchmark sends them: each turn keeps its
+    message start, its prompt end and its reply end, and the next turn replaces the reply. The rows each later turn
+    resumes from beyond the shared system block."""
+
+    owner = _owner(keep)
+    system = list(range(400))
+    prefixes.remember(owner, system, object(), {}, None)
+    slots, prompts, reused = [object() for _ in range(8)], [list(system) for _ in range(8)], []
+    for turn in range(6):
+        for sid, slot in enumerate(slots):
+            if turn:
+                best = prefixes.longest(owner.kept, prompts[sid] + [8, 8])
+                reused.append(len(best[0]) - len(system) if best else 0)
+            start = prompts[sid] + [8, 8] if turn else prompts[sid]
+            prompts[sid] = start + [1000 * sid + turn] * 50
+            prefixes.remember(owner, list(start), slot, {}, None)
+            prefixes.remember(owner, prompts[sid][:-1], slot, {}, None)
+            prefixes.remember(owner, prompts[sid] + [5, 5], slot, {}, None)
+    return reused
+
+
+def test_eight_agent_sessions_resume_their_latest_prompt_ends_with_four_states_a_stream():
+    from tensorfold.families.qwen4_exp.cuda.engine import KEEP, kept_states
+
+    reused = _agents(kept_states(8))
+    assert reused == [52 * (n // 8) + 49 for n in range(40)]   # each turn resumes from the one before
+    assert _agents(KEEP).count(0) > 20               # the old cap: most turns resumed from the system block alone
+
+
+def test_the_kept_state_count_comes_from_the_environment(monkeypatch):
+    from tensorfold.families.qwen4_exp.cuda.engine import kept_states
+
+    monkeypatch.delenv("TENSORFOLD_KEPT_STATES", raising=False)
+    assert [kept_states(n) for n in (1, 2, 4, 8)] == [8, 8, 16, 32]
+    monkeypatch.setenv("TENSORFOLD_KEPT_STATES", " 64 ")
+    assert kept_states(8) == 64
+    for value in ["0", "-1", "8.0", "lots"]:
+        monkeypatch.setenv("TENSORFOLD_KEPT_STATES", value)
+        with pytest.raises(ValueError, match="TENSORFOLD_KEPT_STATES"):
+            kept_states(8)
