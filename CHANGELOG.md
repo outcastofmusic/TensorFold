@@ -5,6 +5,13 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **Dense Llama checkpoints serve on CUDA, written for Nanbeige4.3-33B.** The new `llama_dense` family takes
+  model_type `llama` on one GPU and one stream, from bf16 as released, an EXL3 pack or a ModelOpt or compressed-tensors
+  NVFP4 / FP8 export. Decode drafts copies from the context and verifies each as a chain of up to 128 rows; every
+  drafted token is the serial decode's. Prompts resume from message starts and from each prompt's end less one token.
+  config.json refusals come before any load: rope_scaling, biases, a non-SiLU MLP, a tied head, head_dim other than
+  128 or 256, and more than 16 query heads a KV head. `--tp 2`, `--parallel` and `--drafter` are refused too. The tests
+  ran on a tiny random Llama only (2026-10-27): no measurement on the real weights exists yet.
 - **Qwen3.8 Flash Next on CUDA keeps 4 prompt states a stream, where it kept 8 in all, and `run.sh` serves the EXL3
   pack with 8 streams.** Each turn of a conversation keeps its message start, its prompt end and its reply end, so 8
   states held about two conversations' latest turns: with eight agent sessions on 8 streams, a turn pushed out
