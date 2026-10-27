@@ -17,6 +17,8 @@ from .weights import Weights
 
 # TF_Q27_COPY_TREE=1: a round with a copy also verifies the DFlash2 tree, hung beside the copy (TandemLLM T4)
 COPY_TREE = os.environ.get("TF_Q27_COPY_TREE", "0") == "1"
+# ...only while the copy window is at most this wide: wide windows are copies that keep landing whole (edits, rewrites)
+COPY_TREE_ROWS = int(os.environ.get("TF_Q27_COPY_TREE_ROWS", "32"))
 
 
 def clone_state(st: State) -> State:
@@ -246,7 +248,7 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
         stage = time.perf_counter()
         copied = copies.propose(context, copy_rows - 1) if copies is not None else []
         chain = len(copied)
-        if copied and draft is not None and COPY_TREE:
+        if copied and draft is not None and COPY_TREE and copy_rows <= COPY_TREE_ROWS:
             copied = copied[:max_rows - tree_rows]
             tree, tree_of = draft.propose_tree(out[-1], len(context), tree_rows - 1, sampling)
             guesses, parents, chain = hang_tree(copied, tree, tree_of)
