@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import time
 from typing import Callable, Sequence
 
@@ -13,6 +14,9 @@ from tensorfold.engine.exact_sampling import Sampling
 from .forward import State, _paths, commit, tree_forward
 from tensorfold.cuda.sampling import sample_rows
 from .weights import Weights
+
+# TF_Q27_COPY_TREE=1: a round with a copy also verifies the DFlash2 tree, hung beside the copy (TandemLLM T4)
+COPY_TREE = os.environ.get("TF_Q27_COPY_TREE", "0") == "1"
 
 
 def clone_state(st: State) -> State:
@@ -166,6 +170,23 @@ def copy_chain(context: Sequence[int], max_nodes: int = 127,
     return best if len(best) >= min_match else []
 
 
+def hang_tree(copied: list[int], tree: list[int], tree_parents: list[int]) -> tuple[list[int], list[int], int]:
+    """A copy chain with a draft tree beside it: tree nodes that repeat the chain's next token merge into it.
+    Returns the guesses, their parents (-1: the round's root) and the chain's length."""
+
+    guesses, parents = list(copied), list(range(-1, len(copied) - 1))
+    at: list[int] = []                       # each tree node's guess index
+    for token, p in zip(tree, tree_parents):
+        parent = -1 if p < 0 else at[p]
+        if parent + 1 < len(copied) and copied[parent + 1] == token:
+            at.append(parent + 1)           # the parent is the root or on the chain, and this is the chain's next
+            continue
+        at.append(len(guesses))
+        guesses.append(token)
+        parents.append(parent)
+    return guesses, parents, len(copied)
+
+
 def next_copy_rows(rows: int, landed_whole: bool, tree_rows: int, max_rows: int) -> int:
     """A copy's next window: twice as wide after a whole copy, half after a broken one."""
 
@@ -224,7 +245,12 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
     while len(out) < count and (not stop_eos or out[-1] not in w.config.eos) and not stopped:
         stage = time.perf_counter()
         copied = copies.propose(context, copy_rows - 1) if copies is not None else []
-        if copied:
+        chain = len(copied)
+        if copied and draft is not None and COPY_TREE:
+            copied = copied[:max_rows - tree_rows]
+            tree, tree_of = draft.propose_tree(out[-1], len(context), tree_rows - 1, sampling)
+            guesses, parents, chain = hang_tree(copied, tree, tree_of)
+        elif copied:
             guesses = copied
             parents = list(range(-1, len(guesses) - 1))
         elif draft is not None:
@@ -288,7 +314,8 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
         if trace is not None:
             trace[-1]["commit_ms"] = round(1000 * (time.perf_counter() - stage), 3)
         if copied:                           # the verified window's rows: a grammar may have dropped some
-            copy_rows = next_copy_rows(copy_rows, len(path) == len(tokens), tree_rows, max_rows)
+            whole = len(path) == len(tokens) if chain == len(tokens) - 1 else path[1:] == list(range(1, chain + 1))
+            copy_rows = next_copy_rows(copy_rows, whole, tree_rows, max_rows)
         rounds += 1
         drafted_rows += len(tokens) - 1
         accepted_drafts += len(path) - 1

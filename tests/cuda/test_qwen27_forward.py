@@ -185,3 +185,44 @@ def test_wide_copy_windows_keep_serial_tokens():
         if t["source"] == "copy":
             assert t["rows"] <= rows
             rows = next_copy_rows(rows, t["accepted"] == t["rows"] - 1, 8, 64)
+
+
+def test_copies_with_a_tree_beside_them_keep_serial_tokens(monkeypatch):
+    """TF_Q27_COPY_TREE: copy rounds also verify the draft tree; tokens stay the serial decode's."""
+
+    import dataclasses
+
+    from tensorfold.families.qwen3_5.cuda import decode
+    from tensorfold.families.qwen3_5.cuda.decode import prefill
+
+    base = _model()
+    w = Weights(dataclasses.replace(base.config, layers=64), base.embed, [base.layers[0]] * 64, base.norm,
+                base.head, base.inv_freq)
+    prompt = [3, 1, 4, 1, 5, 9, 2, 6] * 6
+    st, pending = prefill(w, prompt, None)
+    ref = list(prompt) + serial_decode(w, st, pending, 120, None, stop_eos=False).tokens
+
+    class Drafter:
+        """Right for two tokens, then wrong; a wrong sibling at depth one."""
+
+        calls = 0
+
+        def propose_tree(self, pending, context_length, max_nodes, sampling):
+            self.calls += 1
+            k = context_length
+            right = [ref[k + j] if k + j < len(ref) else 1 for j in range(2)]
+            guesses = right + [(right[1] + 1) % 256, (right[0] + 3) % 256]
+            return guesses[:max_nodes], [-1, 0, 1, -1][:max_nodes]
+
+        def add_taps(self, taps):
+            pass
+
+    monkeypatch.setattr(decode, "COPY_TREE", True)
+    drafter = Drafter()
+    st, pending = prefill(w, prompt, None)
+    trace: list[dict] = []
+    mixed = draft_decode(w, st, prompt, pending, 120, None, drafter, max_rows=64, tree_rows=8, allow_copy=True,
+                         stop_eos=False, trace=trace)
+    assert mixed.tokens == ref[len(prompt):]
+    copy_rounds = [t for t in trace if t["source"] == "copy"]
+    assert copy_rounds and drafter.calls == len(trace)

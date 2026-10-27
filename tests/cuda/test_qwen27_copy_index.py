@@ -28,3 +28,16 @@ def test_copy_windows_start_at_the_tree_width_double_while_copies_land_whole_and
     assert seen == [16, 32, 64, 128, 128, 64, 32, 16, 16]
     assert next_copy_rows(8, False, 8, 128) == 16          # a backed copy needs 8 matching tokens and room past them
     assert next_copy_rows(12, True, 12, 12) == 12          # two ranks and concurrent streams: the old fixed width
+
+
+def test_a_draft_tree_hangs_beside_a_copy_and_merges_where_it_repeats_the_chain():
+    from tensorfold.families.qwen3_5.cuda.decode import hang_tree
+
+    # tree: 7 (root), 8 under 7, 5 (root), 9 under 5; the copy chain is 7 8 6
+    guesses, parents, chain = hang_tree([7, 8, 6], [7, 8, 5, 9], [-1, 0, -1, 2])
+    assert chain == 3
+    assert guesses == [7, 8, 6, 5, 9] and parents == [-1, 0, 1, -1, 3]
+    # a tree node off the chain keeps its own subtree even when a later token matches the chain
+    guesses, parents, _ = hang_tree([7, 8], [4, 8], [-1, 0])
+    assert guesses == [7, 8, 4, 8] and parents == [-1, 0, -1, 2]
+    assert hang_tree([], [3, 4], [-1, 0]) == ([3, 4], [-1, 0], 0)
