@@ -6,6 +6,7 @@
 #   ./prepare.sh glm-5.3-flash    GLM-5.3 Flash hybrid (Sushi experts on Mosaic 12L's dense part, 182 GB of downloads)
 #                                 and its draft model (2.3 GB)
 #   ./prepare.sh qwen-flash-next-fp4   NVIDIA's Qwen3.8 Flash Next FP4-Local (96 GB) and Clef-Flash
+#   ./prepare.sh qwen-27b         Qwen3.8-27B dense, EXL3 3.00bpw (13 GB), and z-lab's DFlash2 draft model (3.6 GB)
 #   ./prepare.sh nemotron-bolt    Nemotron 3.5 Bolt 74B-A9B 24 GB (23 GB) and its LiLiCorr draft model (0.9 GB)
 #   ./prepare.sh d1               d1-3B, Liquid AI's decision model (6.3 GB), the sidecar run.sh starts beside each model;
 #                                 LFM Open License v1.0: commercial use only below US$10M annual revenue
@@ -42,6 +43,8 @@ GLM=(0xSero/GLM-5.3-Flash-EXL3-Spark 2642851741fc833764e77d03039117be559dc83e gl
 SUSHI=(beamster/GLM-5.3-Flash-Sushi-2.4bpw 0bc3bf157723d2bb7723e31118addf48b22101b0 glm53-flash-sushi-2.4bpw)
 HYBRID=glm53-flash-sushi-experts-mosaic-dense
 QWEN_FP4=(nvidia/Qwen3.8-Flash-Next-FP4-Local b9ce18a6887e18c089fdea8509a33e63429a3300 Qwen3.8-Flash-Next-FP4-Local)
+QWEN27=(turboderp/Qwen3.8-27B-exl3 6fe61ad620abfe97c5b49f9722c2bceeea4ccc28 Qwen3.8-27B-exl3-3.00bpw)   # branch 3.00bpw
+QWEN27_DRAFT=(z-lab/Qwen3.8-27B-DFlash2 50307d4c4cde6860d4eee73e2547cd786fe8e8a4 Qwen3.8-27B-DFlash2)
 BOLT=(nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB c6cc2e8ffa353403213d6b9b18aaf8eb684d705a Nemotron-3.5-Bolt-74B-A9B-24GB)
 BOLT_DRAFT=(nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr abd478065678ee83a93821c4b3f512da24e4cecb Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr)
 D1=(LiquidAI/d1-3B 051bcc464b01b9f92942b364d9586b0ef5912432 d1-3B)
@@ -153,12 +156,13 @@ case "$what" in
     qwen-flash-next) need=100 ;;
     glm-5.3-flash)   need=$glm_need ;;
     qwen-flash-next-fp4) need=115 ;;
+    qwen-27b)        need=17 ;;
     nemotron-bolt)   need=25 ;;
     d1)              need=7 ;;
     lfm2-24b)        need=26 ;;
     nemotron-3.5-super) need=76 ;;
     all)             need=$((100 + glm_need)) ;;
-    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, nemotron-bolt, lfm2-24b, nemotron-3.5-super, d1, or nothing for the first two)" ;;
+    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, qwen-27b, nemotron-bolt, lfm2-24b, nemotron-3.5-super, d1, or nothing for the first two)" ;;
 esac
 free=$(df -BG --output=avail "$MODELS" | tail -1 | tr -dc 0-9)
 [ "$free" -ge "$need" ] || echo "prepare: $MODELS has $free GB free and a first download needs $need GB" >&2
@@ -167,6 +171,7 @@ case "$what" in
     qwen-flash-next) qwen ;;
     glm-5.3-flash)   glm ;;
     qwen-flash-next-fp4) qwen_fp4 ;;
+    qwen-27b)        fetch "${QWEN27[@]}"; fetch "${QWEN27_DRAFT[@]}" ;;
     nemotron-bolt)   bolt ;;
     d1)              fetch "${D1[@]}" ;;
     lfm2-24b)        lfm2 ;;

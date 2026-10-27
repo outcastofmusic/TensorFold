@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))   # the checkou
 from tensorfold.server import request_guard  # noqa: E402
 
 TARGET = {"qwen3.8-flash-next": "qwen-flash-next", "glm-5.3-flash": "glm-5.3-flash",    # served name: run.sh target
-          "qwen3.8-flash-next-fp4": "qwen-flash-next-fp4", "nemotron-3.5-bolt": "nemotron-bolt",
+          "qwen3.8-flash-next-fp4": "qwen-flash-next-fp4", "qwen3.8-27b": "qwen-27b", "nemotron-3.5-bolt": "nemotron-bolt",
           "lfm2.5-24b-a2b": "lfm2-24b", "nemotron-3.5-super": "nemotron-3.5-super"}
 ALIAS = {target: name for name, target in TARGET.items()}
 PORT = int(os.environ.get("PORT", "30000"))
