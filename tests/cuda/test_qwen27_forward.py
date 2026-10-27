@@ -188,7 +188,7 @@ def test_wide_copy_windows_keep_serial_tokens():
 
 
 def test_copies_with_a_tree_beside_them_keep_serial_tokens(monkeypatch):
-    """TF_Q27_COPY_TREE: copy rounds also verify the draft tree; tokens stay the serial decode's."""
+    """TF_Q27_COPY_TREE: copy rounds after a missed copy also verify the draft tree; tokens stay the serial decode's."""
 
     import dataclasses
 
@@ -225,4 +225,4 @@ def test_copies_with_a_tree_beside_them_keep_serial_tokens(monkeypatch):
                          stop_eos=False, trace=trace)
     assert mixed.tokens == ref[len(prompt):]
     copy_rounds = [t for t in trace if t["source"] == "copy"]
-    assert copy_rounds and drafter.calls == len(trace)
+    assert copy_rounds and len(trace) - len(copy_rounds) < drafter.calls <= len(trace)

@@ -17,8 +17,8 @@ from .weights import Weights
 
 # TF_Q27_COPY_TREE=1: a round with a copy also verifies the DFlash2 tree, hung beside the copy (TandemLLM T4)
 COPY_TREE = os.environ.get("TF_Q27_COPY_TREE", "0") == "1"
-# ...only while the copy window is at most this wide: wide windows are copies that keep landing whole (edits, rewrites)
-COPY_TREE_ROWS = int(os.environ.get("TF_Q27_COPY_TREE_ROWS", "32"))
+# ...only after a copy round whose first copied token missed: gated on windows of at most 32 rows instead, edits still
+# lost 10-12%, since their copies land and the drafter's pass is spent for nothing (tf-runs/qwen27-t4b-1027)
 
 
 def clone_state(st: State) -> State:
@@ -239,6 +239,7 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
     context = list(prompt) + out
     copies = CopyIndex() if allow_copy else None
     copy_rows = next_copy_rows(tree_rows, False, tree_rows, max_rows)
+    copy_missed = False                      # the last copy round rejected its first copied token
     stages = dict(draft=0.0, verify=0.0, sample=0.0, commit=0.0)
     rounds = drafted_rows = accepted_drafts = 0
     widths: list[int] = []
@@ -248,7 +249,7 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
         stage = time.perf_counter()
         copied = copies.propose(context, copy_rows - 1) if copies is not None else []
         chain = len(copied)
-        if copied and draft is not None and COPY_TREE and copy_rows <= COPY_TREE_ROWS:
+        if copied and draft is not None and COPY_TREE and copy_missed:
             copied = copied[:max_rows - tree_rows]
             tree, tree_of = draft.propose_tree(out[-1], len(context), tree_rows - 1, sampling)
             guesses, parents, chain = hang_tree(copied, tree, tree_of)
@@ -318,6 +319,7 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
         if copied:                           # the verified window's rows: a grammar may have dropped some
             whole = len(path) == len(tokens) if chain == len(tokens) - 1 else path[1:] == list(range(1, chain + 1))
             copy_rows = next_copy_rows(copy_rows, whole, tree_rows, max_rows)
+            copy_missed = path[1:2] != [1]
         rounds += 1
         drafted_rows += len(tokens) - 1
         accepted_drafts += len(path) - 1
