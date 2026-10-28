@@ -350,10 +350,12 @@ class ReadAhead:
 
     depth = 2                           # lookups read ahead at most (the next prompt chunk, and the one after)
 
-    def __init__(self, table: Any) -> None:
+    def __init__(self, table: Any, depth: int | None = None) -> None:
         from concurrent.futures import ThreadPoolExecutor
 
         self.table = table
+        if depth is not None:
+            self.depth = depth
         self._pool = ThreadPoolExecutor(1, thread_name_prefix="ngram-read-ahead")
         self._ahead: dict[bytes, Any] = {}
 

@@ -12,6 +12,7 @@ import torch
 from tensorfold.cuda.exl3 import experts as x3experts
 from tensorfold.cuda.exl3 import format as fmt
 
+from ..host_table import ReadAhead
 from .exl3_mm import Scratch, current, f16, stack, x3
 from .exl3_pack import _DT, EXTRA_FILES, NgramTable, Pack, is_exl3
 
@@ -202,7 +203,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         if table_reads is not None:                   # its pages come in while the weights load
             in_background(table.prefetch, table_reads)    # the caller waits for it (``wait_all``)
         conv = plain(name + ".conv1d.weight").reshape(cfg.streams * cfg.hidden, cfg.ple_kernel).to(torch.bfloat16)
-        return PLEW(table, f16(sc, [pk.get(name + ".key_proj.weight")], device),
+        return PLEW(ReadAhead(table, depth=8), f16(sc, [pk.get(name + ".key_proj.weight")], device),
                     f16(sc, [pk.get(name + ".value_proj.weight")], device), centred(name + ".norm_key.weight"),
                     centred(name + ".norm_query.weight"), centred(name + ".norm_conv.weight"), conv.contiguous(), ngram)
 

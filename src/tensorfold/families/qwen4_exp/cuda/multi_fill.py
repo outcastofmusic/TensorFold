@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import copy
 import time
 
+import numpy as np
 import torch
 
 from tensorfold.cuda.kernels.gdn import MARKS
 from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.streams import Stream
+from tensorfold.env_flags import flag
 
 from . import image_rows
 from .copy_drafts import CopyIndex
 from .decode import (_gathered_fits, absorb, cap_points, choose_gathered, entry_end, draft, draft_cut,
                      tp_sample_rows)
-from .forward import Cut, commit, compute, cut_snapshot, stage
+from .forward import Cut, commit, compute, cut_snapshot, read_ahead, stage
 from .mtp import mtp_compute, mtp_stage
 from .state import CAND, ENDS
 from .multi_tp import OutOfStep
@@ -22,6 +25,8 @@ from .prompt_plan import pass_limit, piece_rows
 
 PASS_MIN = 512
 FILL_GUARD = 8
+AHEAD = 2               # idle prompt passes whose n-gram rows are read while the current one runs
+# (TF_NGRAM_READ_AHEAD=0: none, each pass reads its rows at ``stage``)
 
 
 class PromptPasses:
@@ -118,6 +123,7 @@ class PromptPasses:
             segs = stage(self.w, self.pbuf, [(s.st, s.prompt[a:a + n]) for s, a, n in pieces])
             ends, cuts = self._end_rows(pieces, segs), self._cuts(pieces, segs)
             logits = compute(self.w, segs, self.pbuf, logits=bool(ends), ends=ends, cuts=cuts)
+            self._read_ahead(pieces)                     # after the launches, before commit clears ple_last
             heads = logits[:len(ends)].clone() if ends else None
             candidates = self._prompt_candidates(len(ends))
             lasts = self._absorb(pieces, segs, cuts)
@@ -128,6 +134,55 @@ class PromptPasses:
             extra = max(0.0, time.perf_counter() - t0) / max(1, rows)
             self.row_s = extra if self.row_s is None else 0.7 * self.row_s + 0.3 * extra
         return self._joined(pieces, heads, lasts, (time.perf_counter() - t0) / len(pieces), candidates)
+
+    def _coming(self, pieces) -> list[list[tuple[Stream, int, int]]]:
+        """The AHEAD idle passes after ``pieces``: the agreed plan's (two ranks), else ``_pieces`` run on a copy
+        whose prompts have advanced. A pass with decode rounds live depends on their timing, so none is predicted."""
+
+        if self.pass_plan is not None:
+            by_sid = {s.sid: s for s in self.filling}
+            ahead = self.pass_plan[self.pass_index:self.pass_index + AHEAD]
+            return [[(by_sid[sid], a, n) for sid, a, n in plan] for plan in ahead if all(x[0] in by_sid for x in plan)]
+        if any(not s.done for s in self.streams.values()):
+            return []
+        p = copy.copy(self)
+        p.fills, p.filling, p.passed = {sid: list(f) for sid, f in self.fills.items()}, list(self.filling), dict(self.passed)
+        coming = []
+        for _ in range(AHEAD):                       # as _pass then _joined would: the copy's prompts move on
+            for s, a, n in pieces:
+                p.fills[s.sid][2] = a + n
+                if a + n == len(s.prompt):
+                    p.filling.remove(s)
+            pieces = p._pieces() if p.filling else []
+            if not pieces:
+                break
+            p._note_passed(pieces)
+            coming.append(pieces)
+        return coming
+
+    def _read_ahead(self, pieces) -> None:
+        """Read the n-gram rows of the coming idle passes on a thread while the GPU runs this one (no host sync).
+
+        Called after ``stage``: a prompt in this pass has its rows' history in ``ple_last``, another its
+        ``ple_history`` at its fill start. A wrong guess only reads rows no lookup takes."""
+
+        if not flag("TF_NGRAM_READ_AHEAD", True) or not any(layer.ple is not None for layer in self.w.layers):
+            return
+        ctx, at = self.w.cfg.ngram_size - 1, {}
+        for s, a, n in pieces:
+            history, tokens = s.st.ple_last
+            at[s.sid] = (a + n, np.concatenate([history, tokens])[-ctx:])
+        for plan in self._coming(pieces):
+            windows = []
+            for s, a, n in plan:
+                pos, history = at.get(s.sid) or (self.fills[s.sid][2], s.st.ple_history)
+                if a < pos:
+                    return
+                tokens = np.asarray(s.prompt[a:a + n], dtype=np.int64)
+                history = np.concatenate([history, np.asarray(s.prompt[pos:a], dtype=np.int64)])[-ctx:]
+                windows.append((history, tokens))
+                at[s.sid] = (a + n, np.concatenate([history, tokens])[-ctx:])
+            read_ahead(self.w, windows)
 
     @staticmethod
     def _end_rows(pieces, segs) -> list[int]:
