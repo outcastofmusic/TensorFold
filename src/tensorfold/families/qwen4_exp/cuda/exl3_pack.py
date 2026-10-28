@@ -195,7 +195,10 @@ class NgramTable:
         self.multipliers = pk.get(base + "layer_multipliers").cpu().numpy()
         from tensorfold.cuda.ngram_pages import Pins
 
+        from ..ssd_table import row_reader
+
         self._pins = Pins()
+        self._reader = row_reader([self.words])
 
     def gather(self, ids: np.ndarray) -> np.ndarray:
         """Rows ``ids`` (global) -> int16 [n, words]."""
@@ -203,6 +206,8 @@ class NgramTable:
         flat = np.asarray(ids, dtype=np.int64).reshape(-1)
         if np.any(flat < 0) or np.any(flat >= self.rows):
             raise IndexError(f"n-gram row outside [0, {self.rows})")
+        if self._reader is not None:                 # threaded reads: the faults of the copy below run one at a time
+            return self._reader.read(flat)[0].view(np.int16)
         shard = np.searchsorted(self.starts, flat, side="right") - 1
         at = self.offsets[shard] + (flat - self.starts[shard]) * self.row_bytes
         where = self.fidx[shard]
