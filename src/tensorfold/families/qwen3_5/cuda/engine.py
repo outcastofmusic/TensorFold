@@ -9,8 +9,16 @@ from typing import Any, Callable, Sequence
 
 from tensorfold.cuda import prompt_precision
 
-KEEP = 3             # prompt states a concurrent decoder keeps to resume from (each holds a DeltaNet copy)
+KEEP = 3             # the fewest prompt states a concurrent decoder keeps to resume from (each holds a DeltaNet copy)
+KEEP_PER_STREAM = 4  # a turn keeps its message start and prompt end, and the chain's shortest stays
 KEEP_ONE = 4         # prompt states one stream keeps (they share its attention buffers)
+
+
+def kept_states(streams: int) -> int:
+    """The prompt states ``streams`` concurrent streams keep by default: 3 for 8 agent sessions on 8 streams reused 38% of
+    their prompts, 32 reused 77% (tf-runs/qwen27-t4b-1027, 2026-10-27)."""
+
+    return max(KEEP, KEEP_PER_STREAM * streams)
 
 
 def entry_end(prompt: Sequence[int]) -> int:
@@ -74,7 +82,7 @@ class Qwen27Engine:
         torch.cuda.set_device(0)
         if streams > 1 and tp == 1:          # streams' caches of many sizes come and go: growable segments, less slack
             torch.cuda.memory._set_allocator_settings("expandable_segments:True")
-        keep = KEEP if keep is None else int(keep)         # --checkpoint-slots: each kept state is in the estimate
+        keep = kept_states(streams) if keep is None else int(keep)         # --checkpoint-slots: each kept state is in the estimate
         if tp == 2:
             import torch.distributed as dist
 

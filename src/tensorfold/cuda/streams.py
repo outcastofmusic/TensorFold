@@ -166,7 +166,7 @@ class PrefixCache:
         return entry
 
     def add(self, ids: list[int], state: Any, snap: Any) -> None:
-        """Newest last; past ``keep``, the oldest entry never resumed from goes first, else the oldest."""
+        """Newest last; past ``keep``, the oldest entry not resumed from since an eviction passed it goes first."""
 
         self.entries = [e for e in self.entries if e[0] != ids] + [(ids, state, snap)]
         while len(self.entries) > self.keep:
@@ -182,8 +182,14 @@ class PrefixCache:
         return True
 
     def _drop(self, among: list) -> None:
-        cold = [e for e in among if tuple(e[0]) not in self.hit]
-        gone = cold[0] if cold else among[0]
+        # second chance: a resumed entry this eviction passes over loses its mark, so states that served one
+        # conversation do not hold the slots forever (8 agents' second run reused 48% of prompt tokens, the first 77%)
+        cold = next((i for i, e in enumerate(among) if tuple(e[0]) not in self.hit), None)
+        if cold is None:
+            gone = among[0]
+        else:
+            gone = among[cold]
+            self.hit -= {tuple(e[0]) for e in among[:cold]}
         self.entries = [e for e in self.entries if e is not gone]
         self.hit &= {tuple(e[0]) for e in self.entries}
 
