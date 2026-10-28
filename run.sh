@@ -232,6 +232,9 @@ qwen() {  # [served name] [clef_first: 1 starts Clef before Qwen]
         wait_ready clef-serve "$CLEF_PORT" || failed clef-serve
     fi
     [ -z "${KEPT:-}" ] || flags+=(-e "TENSORFOLD_KEPT_STATES=$KEPT")
+    # the prompt-tail A/B (tf-runs/prefill-gap-1028 M3): TAIL=1 evens the last two pieces, TILE_ROWS=256 the expert tile
+    [ -z "${TAIL:-}" ] || flags+=(-e "TENSORFOLD_PROMPT_TAIL=$TAIL")
+    [ -z "${TILE_ROWS:-}" ] || flags+=(-e "TENSORFOLD_EXPERT_TILE_ROWS=$TILE_ROWS")
     [ "${STATES:-1}" = 0 ] || flags+=(-v tensorfold-states:/states -e TENSORFOLD_QWEN_STATES=/states/qwen -e "TENSORFOLD_QWEN_STATES_GIB=${STATES_GIB:-64}" -e "TENSORFOLD_QWEN_STATES_TTL_H=${STATES_TTL_H:-72}" -e "TENSORFOLD_QWEN_STATES_ALL=${STATES_ALL:-0}")
     # 8 streams: eight 6-turn agent sessions put out 51.6 tok/s against 31.6 at 4, and one session the same (tf-runs/
     # agents-1026, EXL3, 2026-10-26)

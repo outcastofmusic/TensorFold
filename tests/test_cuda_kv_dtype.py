@@ -110,7 +110,7 @@ def test_two_ranks_with_different_caches_refuse_to_start(fake_runtime, peer):  #
     def rank(kv_dtype, comm):
         obj = FlashNextEngine.__new__(FlashNextEngine)
         obj.depth, obj.confidence, obj.max_len, obj.kv_dtype, obj.comm = 6, 0.3, 8192, kv_dtype, comm
-        obj.prefill_rows = 2048                            # constructor-resolved prompt rows must agree too
+        obj.prefill_rows, obj.even_tail = 2048, False       # constructor-resolved prompt rows must agree too
         obj.streams, obj.graphs_enabled = 1, True
         return obj
 
@@ -135,7 +135,7 @@ def test_two_ranks_with_different_prompt_precision_refuse_to_start(fake_runtime)
     def rank(comm):
         obj = FlashNextEngine.__new__(FlashNextEngine)
         obj.depth, obj.confidence, obj.max_len, obj.kv_dtype, obj.comm = 6, 0.3, 8192, "bf16", comm
-        obj.prefill_rows = 2048                            # isolate the precision mismatch, not a missing setting
+        obj.prefill_rows, obj.even_tail = 2048, False       # isolate the precision mismatch, not a missing setting
         obj.streams, obj.graphs_enabled = 1, True
         return obj
 

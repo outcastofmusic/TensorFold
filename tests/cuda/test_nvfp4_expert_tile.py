@@ -1,7 +1,7 @@
 """The shared-memory NVFP4 expert tile (64-pair items) against nvfp4_expert_kernel (16-pair items): byte-equal outputs
 for gate/up, fp32 down and bf16 down, on Flash Next's shapes (512 experts, top 10, D 2560, NI 640 or 320 at two ranks),
 under uniform, skewed and one-hot-expert routing, special values (NaN, -0, denormal and huge scales, every e4m3 byte),
-chunks of 1,024 to 4,096 rows and item tails of every size. Mirrors MiaAI-Lab's experts-tile-check (recipe patch 0014,
+chunks of 129 to 4,096 rows and item tails of every size. Mirrors MiaAI-Lab's experts-tile-check (recipe patch 0014,
 MIT); recorded router picks (her --plans replay) are not covered here."""
 
 from __future__ import annotations
@@ -115,7 +115,8 @@ def _same_bytes(face, a: torch.Tensor, b: torch.Tensor) -> None:
         pytest.fail(f"{face}: {differ} of {ia.numel()} values differ between the tile and nvfp4_expert_kernel")
 
 
-@pytest.mark.parametrize("rows", [129, 974, 1024, 2048, 2049, 4096])
+# 256-1,047: the tile from 256 rows (TENSORFOLD_EXPERT_TILE_ROWS) and the even prompt tail's pieces
+@pytest.mark.parametrize("rows", [129, 256, 512, 974, 1000, 1024, 1040, 1047, 2048, 2049, 4096])
 @pytest.mark.parametrize("routing", ["uniform", "skewed", "hot"])
 def test_the_tile_writes_the_old_kernels_bytes(experts, routing, rows):
     ex, special = experts

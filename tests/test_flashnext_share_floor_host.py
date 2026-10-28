@@ -22,7 +22,7 @@ def _decoder():
     owner = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "PromptPasses")
     body = [node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name in methods]
     nodes.append(ast.ClassDef(name="Decoder", bases=[], keywords=[], body=body, decorator_list=[], type_params=[]))
-    namespace = {"PREFILL_ROWS": 2048, "_long_from": 0, "ENDS": 16, "MARKS": 4, "entry_end": lambda prompt: max(1, len(prompt) - 1)}
+    namespace = {"PREFILL_ROWS": 2048, "_long_from": 0, "_even_tail": False, "ENDS": 16, "MARKS": 4, "entry_end": lambda prompt: max(1, len(prompt) - 1)}
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(root / "multi_fill.py"), "exec"), namespace)
     dec = namespace["Decoder"]()
     dec.streams, dec.filling, dec.fills = {0: SimpleNamespace(done=False)}, [], {}
