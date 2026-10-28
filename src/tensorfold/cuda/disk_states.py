@@ -93,6 +93,15 @@ def _readers() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(READERS, thread_name_prefix="tensorfold-states")
 
 
+def _uncache(fd: int) -> None:
+    """Drop a written piece's pages from the page cache, so state writes do not push out what serving reads through
+    it (Flash Next's 27-30 GiB n-gram table is never pinned). DONTNEED drops only clean pages: write them first."""
+
+    if hasattr(os, "posix_fadvise"):              # Linux; elsewhere the pieces stay cached as before
+        os.fdatasync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+
+
 def _key(ids: Sequence[int]) -> str:
     """A state's name: the SHA-256 of its ids as JSON, which ``_keys`` reads at every length of a prompt at once."""
 
@@ -224,7 +233,10 @@ class DiskStates:
         path = self.pieces / name
         if not path.exists():
             tmp = path.with_suffix(f".tmp{os.getpid()}")
-            tmp.write_bytes(data)
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                _uncache(f.fileno())
             tmp.replace(path)
         self.sizes[name] = len(data)
         return name

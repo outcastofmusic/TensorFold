@@ -223,3 +223,20 @@ def test_a_prompts_prefix_keys_are_the_states_names(disk, tmp_path):
     assert store.find(prompt, 0, lambda e: len(e.ids) < 100).ids == prompt[:50]
     store.forget(store.entries[-1])
     assert not store.has(prompt[:200]) and store.find(prompt, 0, lambda e: True).ids == prompt[:50]
+
+
+def test_every_written_piece_leaves_the_page_cache(disk, tmp_path, monkeypatch):
+    """State writes sync each piece and advise DONTNEED, so they do not evict the pages serving reads."""
+
+    if not hasattr(os, "posix_fadvise"):
+        pytest.skip("no posix_fadvise here")
+    synced, advised = [], []
+    real_sync, real_advise = os.fdatasync, os.posix_fadvise
+    monkeypatch.setattr(os, "fdatasync", lambda fd: synced.append(fd) or real_sync(fd))
+    monkeypatch.setattr(os, "posix_fadvise", lambda fd, at, n, how: advised.append((fd, at, n, how))
+                        or real_advise(fd, at, n, how))
+    store = folder_with_state(disk, tmp_path, "e" * 16)
+    pieces = list((tmp_path / ("e" * 16)).rglob("pieces/*"))
+    assert pieces and len(advised) == len(synced) == len(pieces)
+    assert all(how == os.POSIX_FADV_DONTNEED and (at, n) == (0, 0) for _, at, n, how in advised)
+    assert store.entries
