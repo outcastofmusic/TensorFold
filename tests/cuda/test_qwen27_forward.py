@@ -217,7 +217,18 @@ def test_copies_with_a_tree_beside_them_keep_serial_tokens(monkeypatch):
         def add_taps(self, taps):
             pass
 
+    class MissingCopies(decode.CopyIndex):
+        """Every other copy starts with a wrong token, so the round after it hangs the tree beside its copy."""
+
+        proposals = 0
+
+        def propose(self, context, max_nodes):
+            copied = super().propose(context, max_nodes)
+            MissingCopies.proposals += 1
+            return [(copied[0] + 1) % 256, *copied[1:]] if copied and MissingCopies.proposals % 2 else copied
+
     monkeypatch.setattr(decode, "COPY_TREE", True)
+    monkeypatch.setattr(decode, "CopyIndex", MissingCopies)
     drafter = Drafter()
     st, pending = prefill(w, prompt, None)
     trace: list[dict] = []
