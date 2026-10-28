@@ -16,7 +16,7 @@ from tensorfold.families.qwen3_5.cuda.decode import prefill, serial_decode  # no
 from tensorfold.families.qwen3_5.cuda.forward import (State, commit, commit_streams, multi_tree_forward,  # noqa: E402
                                                         tree_forward)
 from tensorfold.families.qwen3_5.cuda.draft_tree import allocate  # noqa: E402
-from tensorfold.families.qwen3_5.cuda.multi import TREE, MultiDecoder, private, viewed  # noqa: E402
+from tensorfold.families.qwen3_5.cuda.multi import BESIDE, TREE, MultiDecoder, private, viewed  # noqa: E402
 from tensorfold.families.qwen3_5.cuda.weights import Attention, Config, GDN, Layer, QLinear, Weights  # noqa: E402
 
 V = 256
@@ -103,7 +103,7 @@ class _Oracle(MultiDecoder):
     def _trees(self, plan, blocks):
         out = {}
         for sid, mode, _, _ in plan:
-            if mode != TREE:
+            if mode not in (TREE, BESIDE):
                 continue
             s = self.streams[sid]
             ref, n = self.truth[tuple(s.prompt)], len(s.out)
@@ -220,6 +220,80 @@ def test_a_failed_prompt_end_copy_fails_only_its_request(monkeypatch):
         assert isinstance(stats, dict) and got == refs[tuple(prompt)], (i, stats)
     assert sched.thread.is_alive() and not dec.streams
     assert all(entry[0] != doomed for entry in dec.cache.entries)
+
+
+def test_a_wide_copy_window_beside_trees_keeps_each_streams_bits():
+    w = _model()
+    prompts = [[5, 6, 7], [9, 10, 11, 12, 13, 14, 15]]
+    wide = list(range(20, 148))                                   # a 128-row copy chain
+    trees = [(wide, list(range(-1, 127))), ([30, 31, 32], [-1, 0, 0])]
+    paths = [list(range(100)), [0, 2]]
+    states = [_prefilled(w, p) for p in prompts]
+    logits, record, _, starts = multi_tree_forward(w, [(t, p, st) for (t, p), st in zip(trees, states)])
+    for s, ((tokens, parents), st) in enumerate(zip(trees, states)):
+        ref = private(st, st.pos + 128)
+        single, rec = tree_forward(w, _tok(tokens), parents, ref)
+        assert torch.equal(logits[starts[s]:starts[s + 1]], single), s
+        commit(ref, rec, paths[s])
+        mine = private(st, st.pos + 128)
+        commit(mine, record, [starts[s] + r for r in paths[s]])
+        _same_state(mine, ref)
+
+
+class _TruthCopies:
+    """Copies of a stream's serial reply, some with a wrong token, some unsure: windows widen past 16 rows."""
+
+    n = 8
+
+    def __init__(self, prompt, reply, rng):
+        self.prompt, self.reply, self.rng = prompt, reply, rng
+        self.unsure, self.reach = False, 0
+
+    def propose(self, context, max_nodes):
+        k = len(context) - len(self.prompt)
+        copied = list(self.reply[k:k + max_nodes])
+        if len(copied) < self.n:
+            return []
+        if self.rng.random() < 0.3:
+            copied[self.rng.randrange(len(copied))] = self.rng.randrange(1, V)
+        self.unsure = self.rng.random() < 0.5
+        return copied
+
+
+class _Copier(_Oracle):
+    """The oracle's trees, with copies of the serial replies up to 128 rows and the tree beside unsure ones."""
+
+    def __init__(self, w, truth, seed=0, **kw):
+        super().__init__(w, truth, seed, copy_rows=128, **kw)
+        self.draft = object()                           # a drafter for _mode (the oracle writes the trees)
+        self.widest, self.modes = 0, set()
+
+    def _copy_start(self, s):
+        super()._copy_start(s)
+        if s.copies is not None:
+            s.copies = _TruthCopies(s.prompt, self.truth[tuple(s.prompt)], self.rng)
+
+    def _windows(self, plan, copied, blocks):
+        wins = super()._windows(plan, copied, blocks)
+        self.widest = max(self.widest, *(len(t) for t, _ in wins))
+        self.modes |= {mode for _, mode, _, _ in plan}
+        return wins
+
+
+@pytest.mark.parametrize("streams", [1, 4])
+def test_wide_copies_equal_serial(streams):
+    w = _model()
+    refs = {tuple(p): _serial(w, p, smp, 300) for p, smp in zip(PROMPTS[:streams], SAMPLINGS)}
+    dec = _Copier(w, refs, seed=streams)
+    got = {}
+    for prompt, sampling in zip(PROMPTS[:streams], SAMPLINGS):
+        out: list[int] = []
+        dec.admit(Stream(prompt, 300, sampling, draft=True, emit=lambda new, out=out: out.extend(new)))
+        got[tuple(prompt)] = out
+    while dec.live():
+        dec.finish(dec.round())
+    assert got == refs
+    assert dec.widest > (64 if streams == 1 else 16) and BESIDE in dec.modes, (dec.widest, dec.modes)
 
 
 def test_allocate_prices_drafts_against_the_curve():

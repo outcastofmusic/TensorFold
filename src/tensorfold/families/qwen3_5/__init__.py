@@ -311,6 +311,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
 
     from .cuda.engine import Qwen27Engine
     from .cuda.exl3_load import quant_config
+    from .cuda.multi import COPY_ROWS
 
     if quant_config(Path(model_dir)) is not None:
         print("[tensorfold] EXL3 packs are experimental: replies are exact; on a DGX Spark decode runs 0.8-1.2x the MLX "
@@ -328,7 +329,10 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     streams = max(1, int(options.get("parallel") or 1))
     # one stream on one GB10 takes the width it affords (16-row trees, widening to 128); other shapes keep 12 rows
     wide = tp == 1 and streams == 1 and gb10()
+    # several streams on one GB10: a copy widens to COPY_ROWS (TF_Q27_MULTI_COPY_ROWS) alone, 32 beside others
+    copy_rows = COPY_ROWS if tp == 1 and streams > 1 and gb10() else 16
     return Qwen27Engine(Path(model_dir), draft, max_rows=128 if wide else 12, tree_rows=16 if wide else None,
+                        copy_rows=copy_rows,
                         tp=tp, rank=rank, master=master, port=master_port,
                         split_head=tp == 2, tp_draft=tp == 2 and draft is not None, allow_copy=not no_drafts,
                         streams=streams, context=options.get("context"),
