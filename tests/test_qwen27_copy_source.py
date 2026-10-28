@@ -62,3 +62,9 @@ def test_a_unique_continuation_is_sure(decode):
     context = list(range(20, 60)) + list(range(20, 30))
     index = decode.CopyIndex()
     assert index.propose(context, 8) == list(range(30, 38)) and not index.unsure and index.reach == 2
+
+
+def test_repeating_text_copies_a_whole_window_rather_than_the_latest_short_one(decode, monkeypatch):
+    monkeypatch.setattr(decode, "COPY_SOURCE", "longest")
+    context = [3, 1, 4, 1, 5, 9, 2, 6] * 12
+    assert decode.CopyIndex().propose(context, 32) == ([3, 1, 4, 1, 5, 9, 2, 6] * 4)

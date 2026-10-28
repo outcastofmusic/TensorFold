@@ -134,6 +134,7 @@ def serial_decode(w: Weights, st: State, pending: int, count: int,
 COPY_SOURCE = os.environ.get("TF_COPY_SOURCE", "longest")
 SOURCES = 64                 # the latest occurrences a "longest" copy compares
 REACH = 1024                 # how far back it compares them
+SURE = 32                    # a match this far back is as good as any longer one
 
 
 class CopyIndex:
@@ -168,8 +169,13 @@ class CopyIndex:
         self.unsure, self.reach = len({context[start + n] for start in recent}) > 1, max(reach.values())
         best: list[int] = []
         if COPY_SOURCE == "longest":
-            start = max(reversed(recent), key=lambda s: (reach[s], min(len(context) - s - n, max_nodes)))
-            best = list(context[start + n:start + n + max_nodes])
+            # of the sources with a gram's worth to copy, the one matching furthest back; past SURE tokens every
+            # match is as good, and the longer window wins (in repeating text the latest source matches furthest and
+            # has the least left to copy)
+            room = [s for s in reversed(recent) if len(context) - s - n >= n]
+            if room:
+                start = max(room, key=lambda s: (min(reach[s], SURE), min(len(context) - s - n, max_nodes)))
+                best = list(context[start + n:start + n + max_nodes])
         else:
             for start in reversed(starts):
                 continuation = list(context[start + n:start + n + max_nodes])
