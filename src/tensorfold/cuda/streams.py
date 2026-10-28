@@ -184,12 +184,12 @@ class PrefixCache:
     def _drop(self, among: list) -> None:
         # second chance: a resumed entry this eviction passes over loses its mark, so states that served one
         # conversation do not hold the slots forever (8 agents' second run reused 48% of prompt tokens, the first 77%)
-        gone = among[0]
-        for e in among:
-            if tuple(e[0]) not in self.hit:
-                gone = e
-                break
-            self.hit.discard(tuple(e[0]))
+        cold = next((i for i, e in enumerate(among) if tuple(e[0]) not in self.hit), None)
+        if cold is None:
+            gone = among[0]
+        else:
+            gone = among[cold]
+            self.hit -= {tuple(e[0]) for e in among[:cold]}
         self.entries = [e for e in self.entries if e is not gone]
         self.hit &= {tuple(e[0]) for e in self.entries}
 
