@@ -304,6 +304,25 @@ class NVFP4Table(BF16Table):
     def lock(self) -> bool:
         return False
 
+    def lock_runs(self, budget: int) -> int:
+        """TF_NGRAM_LOCK_SCALES=1: pin the block scales alone (10 of a row's 90 bytes, 3.0 GiB on FP4-Local, whose
+        misses double each row's), within ``budget`` bytes; bytes newly pinned. The container's memlock limit must
+        allow them (``--ulimit memlock``), else mlock refuses and nothing more is pinned. Unset: nothing."""
+
+        from tensorfold.env_flags import flag
+
+        if not flag("TF_NGRAM_LOCK_SCALES"):
+            return 0
+        if not hasattr(self, "_pins"):
+            from tensorfold.cuda.ngram_pages import Pins
+
+            self._pins = Pins()
+        return self._pins.runs(self.scales, max(0, int(budget)))
+
+    @property
+    def pinned_bytes(self) -> int:
+        return self._pins.nbytes if hasattr(self, "_pins") else 0
+
     def prefetch(self, workers: int = 16) -> float:
         return _prefetch(self.values + self.scales, workers)
 

@@ -154,3 +154,31 @@ def test_an_unknown_gather_mode_stops_the_load_and_unset_copies_from_the_map(tmp
     monkeypatch.setenv("TF_NGRAM_GATHER", "mlock")
     with pytest.raises(ValueError, match="TF_NGRAM_GATHER"):
         HostTable(files)
+
+
+def test_nvfp4_scales_pin_only_when_asked_and_within_the_budget(tmp_path, monkeypatch):
+    from tensorfold.cuda import ngram_pages
+
+    files = _nvfp4(tmp_path)
+    locked = []
+
+    class Api:
+        def mlock(self, at, n):
+            locked.append((at, n))
+            return 0
+
+        def munlock(self, at, n):
+            return 0
+
+    monkeypatch.setattr(ngram_pages, "libc", lambda: Api())
+    monkeypatch.delenv("TF_NGRAM_LOCK_SCALES", raising=False)
+    table = NVFP4Table(files, 1.0)
+    assert table.lock_runs(1 << 30) == 0 and table.pinned_bytes == 0 and not locked
+    monkeypatch.setenv("TF_NGRAM_LOCK_SCALES", "1")
+    scales = sum(ngram_pages.lock_bytes(SimpleNamespace(values=[a])) for a in table.scales)
+    assert table.lock_runs(0) == 0 and not locked
+    got = table.lock_runs(1 << 30)
+    assert got == table.pinned_bytes == scales == sum(n for _, n in locked)
+    codes = [ngram_pages.span(int(a.ctypes.data), int(a.nbytes)) for a in table.values]
+    assert all(not (lo < c1 and c0 < lo + n) for lo, n in locked for c0, c1 in codes)       # codes stay unpinned
+    assert table.lock_runs(1 << 30) == 0                                                    # nothing new to pin
