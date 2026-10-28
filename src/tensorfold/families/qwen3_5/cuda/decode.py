@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import time
 from typing import Callable, Sequence
 
@@ -13,6 +14,19 @@ from tensorfold.engine.exact_sampling import Sampling
 from .forward import State, _paths, commit, tree_forward
 from tensorfold.cuda.sampling import sample_rows
 from .weights import Weights
+
+# a round with a copy also verifies the DFlash2 tree, hung beside the copy (TandemLLM T4; TF_Q27_COPY_TREE=0 turns it
+# off): 1.010x over 12 prompt kinds, json +5-9%, copy -3%, texts identical 72/72 (tf-runs/round3-1027)
+COPY_TREE = os.environ.get("TF_Q27_COPY_TREE", "1") == "1"
+# ...beside which copies (TF_Q27_COPY_TREE_GATE): "miss", after a copy round whose first copied token missed;
+# "broken", after one that did not land whole; "unsure" (the default), beside a copy whose sources disagree on its
+# next token (CopyIndex.unsure); "short", beside an unsure one or one matching fewer than ``min_match`` tokens before its gram;
+# "none", every one. Ungated, copy prompts gained 31% and edits lost 10-12%: their copies land and the drafter's pass is
+# spent for nothing (tf-runs/qwen27-t4-1027, qwen27-t4b-1027). On the saved outputs an unsure copy missed its first
+# token in 19 of 19 rounds, a sure one in 7 of 121 (tf-runs/copy-tree-1028). Served A/B, 12 boots, texts identical
+# 264/264, against copies from "latest" with no tree: "longest" alone 1.080x; with the tree beside every copy 1.064x,
+# beside short ones 1.088x, beside unsure ones 1.095x (copy +64%, json +10%, edit and rewrite level)
+COPY_TREE_GATE = os.environ.get("TF_Q27_COPY_TREE_GATE", "unsure")
 
 
 def clone_state(st: State) -> State:
@@ -113,13 +127,26 @@ def serial_decode(w: Weights, st: State, pending: int, count: int,
     return DecodeResult(out, seconds, rounds, 0, 0, widths=[1] * rounds)
 
 
+# TF_COPY_SOURCE: which earlier occurrence of the last ``min_match`` tokens a copy continues. "latest": the latest with
+# a whole window after it. "longest" (the default): the one whose tokens before the gram also match the context's
+# furthest, then the latest. On the 27B's saved outputs a 40-line list took 10 copy rounds of 90 tokens against 19 of 47, since lines
+# ending alike (" EUR and ships in 4 days") sent "latest" to the wrong line (tf-runs/copy-tree-1028)
+COPY_SOURCE = os.environ.get("TF_COPY_SOURCE", "longest")
+SOURCES = 64                 # the latest occurrences a "longest" copy compares
+REACH = 1024                 # how far back it compares them
+SURE = 32                    # a match this far back is as good as any longer one
+
+
 class CopyIndex:
-    """Index earlier suffix matches and propose the longest continuation, breaking ties by latest occurrence and requiring ``min_match`` tokens."""
+    """Index earlier suffix matches and propose a continuation of ``min_match`` or more tokens (``COPY_SOURCE``).
+    After a proposal, ``unsure``: the latest occurrences disagree on the next token; ``reach``: how many tokens before
+    the gram the best of them matches."""
 
     def __init__(self, min_match: int = 8):
         self.n = min_match
         self.positions: dict[tuple[int, ...], list[int]] = {}
         self.indexed = 0            # grams starting before this position are in the index
+        self.unsure, self.reach = False, 0
 
     def update(self, context: Sequence[int]) -> None:
         n = self.n
@@ -137,14 +164,36 @@ class CopyIndex:
         starts = self.positions.get(tuple(context[-n:]))
         if not starts:
             return []
+        recent = starts[-SOURCES:]
+        reach = {start: self._reach(context, start) for start in recent}
+        self.unsure, self.reach = len({context[start + n] for start in recent}) > 1, max(reach.values())
         best: list[int] = []
-        for start in reversed(starts):
-            continuation = list(context[start + n:start + n + max_nodes])
-            if len(continuation) > len(best):
-                best = continuation
-                if len(best) == max_nodes:
-                    break
+        if COPY_SOURCE == "longest":
+            # of the sources with a gram's worth to copy, the one matching furthest back; past SURE tokens every
+            # match is as good, and the longer window wins (in repeating text the latest source matches furthest and
+            # has the least left to copy)
+            room = [s for s in reversed(recent) if len(context) - s - n >= n]
+            if room:
+                start = max(room, key=lambda s: (min(reach[s], SURE), min(len(context) - s - n, max_nodes)))
+                best = list(context[start + n:start + n + max_nodes])
+        else:
+            for start in reversed(starts):
+                continuation = list(context[start + n:start + n + max_nodes])
+                if len(continuation) > len(best):
+                    best = continuation
+                    if len(best) == max_nodes:
+                        break
         return best if len(best) >= n else []
+
+    def _reach(self, context: Sequence[int], start: int) -> int:
+        """How many tokens before the gram at ``start`` match the tokens before the context's last gram."""
+
+        k, here, most = 0, len(context) - self.n, min(REACH, start)
+        while k + 32 <= most and context[start - k - 32:start - k] == context[here - k - 32:here - k]:
+            k += 32                                  # whole slices compare in C; the last one token by token
+        while k < most and context[start - 1 - k] == context[here - 1 - k]:
+            k += 1
+        return k
 
 
 def copy_chain(context: Sequence[int], max_nodes: int = 127,
@@ -164,6 +213,33 @@ def copy_chain(context: Sequence[int], max_nodes: int = 127,
             if len(best) == max_nodes:
                 break
     return best if len(best) >= min_match else []
+
+
+def hang_tree(copied: list[int], tree: list[int], tree_parents: list[int]) -> tuple[list[int], list[int], int]:
+    """A copy chain with a draft tree beside it: tree nodes that repeat the chain's next token merge into it.
+    Returns the guesses, their parents (-1: the round's root) and the chain's length."""
+
+    guesses, parents = list(copied), list(range(-1, len(copied) - 1))
+    at: list[int] = []                       # each tree node's guess index
+    for token, p in zip(tree, tree_parents):
+        parent = -1 if p < 0 else at[p]
+        if parent + 1 < len(copied) and copied[parent + 1] == token:
+            at.append(parent + 1)           # the parent is the root or on the chain, and this is the chain's next
+            continue
+        at.append(len(guesses))
+        guesses.append(token)
+        parents.append(parent)
+    return guesses, parents, len(copied)
+
+
+def _tree_beside(copies: CopyIndex, missed: bool) -> bool:
+    """Whether this round's copy gets the draft tree beside it (``COPY_TREE_GATE``)."""
+
+    if COPY_TREE_GATE == "unsure":
+        return copies.unsure
+    if COPY_TREE_GATE == "short":
+        return copies.unsure or copies.reach < copies.n
+    return missed
 
 
 def next_copy_rows(rows: int, landed_whole: bool, tree_rows: int, max_rows: int) -> int:
@@ -216,6 +292,7 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
     context = list(prompt) + out
     copies = CopyIndex() if allow_copy else None
     copy_rows = next_copy_rows(tree_rows, False, tree_rows, max_rows)
+    copy_missed = COPY_TREE_GATE == "none"   # the last copy round failed the gate's test (see COPY_TREE_GATE)
     stages = dict(draft=0.0, verify=0.0, sample=0.0, commit=0.0)
     rounds = drafted_rows = accepted_drafts = 0
     widths: list[int] = []
@@ -224,7 +301,13 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
     while len(out) < count and (not stop_eos or out[-1] not in w.config.eos) and not stopped:
         stage = time.perf_counter()
         copied = copies.propose(context, copy_rows - 1) if copies is not None else []
-        if copied:
+        chain, beside = len(copied), False
+        if copied and draft is not None and COPY_TREE and _tree_beside(copies, copy_missed):
+            beside = True
+            copied = copied[:max_rows - tree_rows]
+            tree, tree_of = draft.propose_tree(out[-1], len(context), tree_rows - 1, sampling)
+            guesses, parents, chain = hang_tree(copied, tree, tree_of)
+        elif copied:
             guesses = copied
             parents = list(range(-1, len(guesses) - 1))
         elif draft is not None:
@@ -275,6 +358,9 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
         if trace is not None:
             trace.append(_round_record(tokens, tree_parents, depths, path, terminal, stop,
                                        "copy" if copied else "tree", draft, spent))
+            if copied:                       # how far the copy held, and what the tree beside it added
+                held = sum(1 for row in path[1:] if row <= chain)
+                trace[-1].update(chain=chain, held=held, beside=beside, unsure=copies.unsure, reach=copies.reach)
         stage = time.perf_counter()
         commit(st, record, path)
         if draft is not None:
@@ -288,7 +374,10 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
         if trace is not None:
             trace[-1]["commit_ms"] = round(1000 * (time.perf_counter() - stage), 3)
         if copied:                           # the verified window's rows: a grammar may have dropped some
-            copy_rows = next_copy_rows(copy_rows, len(path) == len(tokens), tree_rows, max_rows)
+            whole = len(path) == len(tokens) if chain == len(tokens) - 1 else path[1:] == list(range(1, chain + 1))
+            copy_rows = next_copy_rows(copy_rows, whole, tree_rows, max_rows)
+            copy_missed = (COPY_TREE_GATE == "none" or (COPY_TREE_GATE == "broken" and not whole)
+                           or path[1:2] != [1])
         rounds += 1
         drafted_rows += len(tokens) - 1
         accepted_drafts += len(path) - 1

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,8 @@ from tensorfold.cuda import prompt_precision
 
 KEEP = 3             # the fewest prompt states a concurrent decoder keeps to resume from (each holds a DeltaNet copy)
 KEEP_PER_STREAM = 4  # a turn keeps its message start and prompt end, and the chain's shortest stays
+# TF_Q27_TRACE=<dir>: one GPU, one stream: every request's rounds (draft_decode's trace) appended to <dir>/rounds.jsonl
+TRACE = os.environ.get("TF_Q27_TRACE", "")
 KEEP_ONE = 4         # prompt states one stream keeps (they share its attention buffers)
 
 
@@ -337,10 +340,16 @@ class Qwen27Engine:
         if on_tokens([pending]):
             return {"prefill_s": prefill_s, "cached": hit[1].pos if hit else 0}
         # the cache holds the state before the last prompt token, not ``st``: the decode may commit into it
+        trace = [] if TRACE else None
         result = draft_decode(self.w, st, prompt, pending, max_tokens, sampling, drafter,
                               max_rows=self.max_rows, tree_rows=self.tree_rows,
                               allow_copy=self.allow_copy and draft, stop_eos=stop_eos,
-                              on_tokens=on_tokens, inplace=True, **grammar)
+                              on_tokens=on_tokens, inplace=True, **grammar, **({} if trace is None else {"trace": trace}))
+        if trace is not None:
+            import json
+
+            with open(Path(TRACE) / "rounds.jsonl", "a") as out:
+                out.write(json.dumps({"prompt": len(prompt), "tokens": len(result.tokens), "rounds": trace}) + "\n")
         return {"prefill_s": prefill_s, "decode_s": result.seconds, "rounds": result.rounds,
                 "cached": hit[1].pos if hit else 0, "drafts": draft, "min_rows": min(result.widths, default=0),
                 "drafted": result.drafted_rows, "accepted": result.accepted_drafts}
