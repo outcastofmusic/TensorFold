@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from tensorfold.families.qwen4_exp import ssd_table
+from tensorfold.families.qwen4_exp import host_table, ssd_table
 from tensorfold.families.qwen4_exp.host_table import HostTable, NVFP4Table, read_header
 from tests.test_ngram_table_threads import _tables
 from tests.test_ple_ssd import _checkpoint, _same
@@ -96,6 +96,7 @@ def test_exl3_rows_read_with_pread_equal_the_maps(tmp_path, monkeypatch, consoli
     tensors = {"t.head_bias": torch.zeros(4), "t.head_offsets": torch.zeros(2, dtype=torch.int64),
                "t.head_vocab_sizes": torch.ones(2, dtype=torch.int64), "t.layer_multipliers": torch.ones(2)}
     pk = SimpleNamespace(dir=tmp_path, entry=entries.__getitem__, get=tensors.__getitem__)
+    monkeypatch.setattr(host_table, "GATHER_SPLIT", 8)       # the map's copy on threads from 16 rows
     mapped, read = _both(lambda: exl3_pack.NgramTable(pk, "t.", 2, "cpu"), monkeypatch)
     for ids in _asks(read.rows):
         got = read.gather(ids)

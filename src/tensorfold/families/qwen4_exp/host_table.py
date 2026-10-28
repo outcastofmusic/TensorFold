@@ -14,8 +14,10 @@ import numpy as np
 from tensorfold.families.qwen4_exp.ssd_table import SSDTable, row_reader
 
 _PARTS = ("weight", "scales", "biases")
-# a prompt chunk's gather copies big row runs on worker threads (GIL released); bytes stay the same as single-threaded
-GATHER_THREADS = 16
+# a prompt chunk's gather copies big row runs on worker threads (GIL released); bytes stay the same as single-threaded.
+# 64: each worker waits on one page fault at a time, so the threads are the reads in flight on a cold table (8,192
+# cold NVFP4 rows took 57-104 ms on 64 against 207-282 on 16, 28 Oct CPU bench); resident rows cost the same
+GATHER_THREADS = 64
 GATHER_SPLIT = 512
 
 

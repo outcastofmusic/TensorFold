@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -195,10 +196,12 @@ class NgramTable:
         self.multipliers = pk.get(base + "layer_multipliers").cpu().numpy()
         from tensorfold.cuda.ngram_pages import Pins
 
+        from ..host_table import GATHER_THREADS
         from ..ssd_table import row_reader
 
         self._pins = Pins()
         self._reader = row_reader([self.words])
+        self._pool = ThreadPoolExecutor(GATHER_THREADS, thread_name_prefix="ngram-gather")
 
     def gather(self, ids: np.ndarray) -> np.ndarray:
         """Rows ``ids`` (global) -> int16 [n, words]."""
@@ -213,9 +216,13 @@ class NgramTable:
         where = self.fidx[shard]
         out = np.empty((len(flat), self.row_bytes), dtype=np.uint8)
         cols = np.arange(self.row_bytes)
-        for f in np.unique(where):
-            sel = np.nonzero(where == f)[0]
+
+        def copy(f: int, sel: np.ndarray) -> None:
             out[sel] = self.maps[f][at[sel, None] + cols]
+
+        from ..host_table import _copy_rows
+
+        _copy_rows(self._pool, where, copy)          # a prompt chunk's faults on threads, as the other tables'
         return out.view(np.int16)
 
     def lock(self) -> bool:
