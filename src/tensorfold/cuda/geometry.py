@@ -383,12 +383,14 @@ def _gdn_dims(t: dict, world: int) -> tuple:
             nk, nv, dk, dv, 2 * nk * dk + 2 * nv * dv + 2 * nv)
 
 
-def stream_geometry(t: dict, world: int, streams: int, keep: int, *, first: int | None = None) -> Geometry:
-    """The 27B's concurrent decoder: live streams, ``keep`` kept prompt ends, windows; ``first``: growth on one GPU."""
+def stream_geometry(t: dict, world: int, streams: int, keep: int, *, first: int | None = None,
+                    copy_rows: int = 16) -> Geometry:
+    """The 27B's concurrent decoder: live streams, ``keep`` kept prompt ends, windows (a 16-row tree each, or a lone
+    stream's ``copy_rows``-row copy); ``first``: growth on one GPU."""
 
     linear, attention = layer_counts(t)
     d, h, hk, hd, nk, nv, dk, dv, width = _gdn_dims(t, world)
-    rows = 16 * streams
+    rows = max(16 * streams, copy_rows)              # multi.stream_rows
     state = linear * (nv * dk * dv * 4 + (int(t["linear_conv_kernel_dim"]) - 1) * (2 * nk * dk + nv * dv) * 2)
     # a commit writes a stream's new states before its old ones go; a cached end is added before the oldest leaves
     fixed = (2 * streams + keep + 2) * state + linear * rows * (width * 2 + nk * dk * 4 + nv * dv * 4 + nv * 8)

@@ -55,7 +55,7 @@ class Qwen27Engine:
                  tp_draft: bool = False, allow_copy: bool = True, streams: int = 1,
                  context: int | None = None, context_explicit: bool | None = None, vision: bool = False,
                  vision_urls: bool = False, vision_offload: bool = False, tree_rows: int | None = None,
-                 keep: int | None = None):
+                 keep: int | None = None, copy_rows: int = 16):
         import torch
 
         from tensorfold.cuda.nvfp4.format import is_quantized
@@ -112,7 +112,8 @@ class Qwen27Engine:
         many = streams > 1
         # prompt chunks sized to the card (4096 rows from 80 GB), the verify scratch to the rows a round takes
         chunk = prompt_rows(total_bytes(torch), prompt_row_bytes(config(model_dir), tp))
-        geometry = ((lambda text: stream_geometry(text, tp, streams, keep, first=256 if tp == 1 else None)) if many
+        geometry = ((lambda text: stream_geometry(text, tp, streams, keep, first=256 if tp == 1 else None,
+                                                     copy_rows=copy_rows)) if many
                     else (lambda text: gdn_geometry(text, tp, max_rows, rows=max_rows, prompt=chunk, evicts=tp == 1)))
         # an affine checkpoint's packed words at their stored precision; an EXL3 pack's by its own format
         tensor_bytes = weight_transform(model_dir, one_gpu=tp == 1)
@@ -177,7 +178,7 @@ class Qwen27Engine:
 
             self.multi = MultiDecoder(self.w, self.draft, allow_copy=allow_copy, rank=rank, world=tp,
                                       context=self.capacity_plan["cache_slots"], keep=keep, points=self.points,
-                                      vision=self.vision)
+                                      vision=self.vision, copy_rows=copy_rows, streams=streams)
             self.multi.model_dir = self.model_dir             # rank 1 compiles a request's grammar from it
             self.multi.calibrate(streams)
             if rank == 0:

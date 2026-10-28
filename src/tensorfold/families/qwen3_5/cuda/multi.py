@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 import torch
@@ -13,7 +14,7 @@ from tensorfold.cuda.sampling import sample_streams
 from tensorfold.cuda.streams import PrefixCache, Stream, accept, next_fill
 from tensorfold.engine.grammar import GrammarError, pack
 
-from .decode import CopyIndex, clone_state
+from .decode import COPY_TREE, COPY_TREE_GATE, CopyIndex, _tree_beside, clone_state, hang_tree, next_copy_rows
 from .decode_tp import SAMPLING_WORDS as W, _sample_split, _share, first_token, pack_sampling, unpack_sampling
 from .draft_tree import allocate
 from .engine import entry_end
@@ -22,21 +23,38 @@ from .prefill import CHUNK, Piece, prefill_batch, prefill_state
 from .weights import Weights
 
 ADMIT, ROUND, DONE, FILL, FILLS = 1, 2, 3, 4, 5   # rank 0's messages
-COPY, TREE, ONE = 0, 1, 2               # a stream's window this round
+COPY, TREE, ONE, BESIDE = 0, 1, 2, 3     # a stream's window this round (BESIDE: a copy with the tree beside it)
 STEP = 1024                             # prompt rows a prefill step takes while other streams decode
 GROW = 8192                             # rows a stream's attention caches grow by at a time (one GPU)
 GIB = 1024**3
 TIMED = 16                              # the last rounds whose time beside the forward sets a stream count's overhead
 DEPTH_CHIPS = ((12, 0),)                # tuned planning (measured overhead, curve steps, the block); else 0.6.0's
 BATCH = True                            # queued foreground prompts' steps share one prefill forward
+# TF_Q27_MULTI_COPY_ROWS: the widest copy window a stream verifies alone (one GB10; the engine passes 16 elsewhere).
+# Copies start at 16 rows and double while they land whole, as the one-stream decode's (next_copy_rows), and an unsure
+# copy gets the DFlash2 tree beside it (COPY_TREE_GATE). 16 keeps every window at 16 rows, the rule before 2026-10-28,
+# under which one request at --parallel 8 against one stream lost 48% on copy and 35% on rewrite (tf-runs/q27-next-1028)
+COPY_ROWS = int(os.environ.get("TF_Q27_MULTI_COPY_ROWS", "128"))
+# the widest copy while other streams share the round, whose rows every stream waits for: on the 27B 32-39 rows
+# verify in 70 ms against 63 at 16-23, 64-71 in 120 (one stream); Flash Next's shared copies stop at 32 too
+# (copy_drafts.COPY_ROWS)
+SHARED_COPY_ROWS = 32
 
 
-def calibration_rows(streams: int, steps: bool = True) -> list[int]:
-    """Row counts the startup curve times: ``streams`` full windows and (``steps``) a point past each tile step."""
+def calibration_rows(streams: int, steps: bool = True, most: int = 0) -> list[int]:
+    """Row counts the startup curve times: ``streams`` full windows, or ``most`` rows if more (a lone stream's widest
+    copy), and (``steps``) a point past each tile step."""
 
+    top = max(16 * streams, most)
     grid = [r for r in (1, 2, 4, 8, 12, 16, 17, 24, 32, 33, 48, 64, 65, 96, 128, 129, 192, 256, 257, 384, 512)
             if steps or r not in (17, 33, 65, 129, 257)]
-    return sorted({r for r in grid if r <= 16 * streams} | {16 * streams})
+    return sorted({r for r in grid if r <= top} | {top})
+
+
+def stream_rows(streams: int, copy_rows: int = 16) -> int:
+    """The most rows a round of up to ``streams`` streams verifies: a 16-row tree each, or a lone stream's copy."""
+
+    return max(16 * streams, copy_rows)
 
 
 def private(st: State, rows: int) -> State:
@@ -87,19 +105,29 @@ def _unflatten(flat: list[int], pairs: bool) -> list:
 
 
 class MultiDecoder:
-    """The ``Scheduler``'s decoder on one GPU or as ``rank`` of two; a stream's window holds at most 16 rows."""
+    """The ``Scheduler``'s decoder on one GPU or as ``rank`` of two; a stream's tree holds at most 16 rows, its copy
+    ``copy_rows`` alone and SHARED_COPY_ROWS beside other streams, the round at most ``budget`` rows."""
 
     memory_gate: MemoryGate | None = None     # one GPU: streams' caches grow by use (two ranks reserve up front)
     block: int = 16                           # rows of the drafter's next block with several streams (pending, masks)
     depth: bool = True                        # whether the block follows the trees here (DEPTH_CHIPS)
     spent: dict | None = None                 # streams -> the last rounds' ms beside the forward
     last: tuple | None = None                 # (start, streams, rows) of the round before
+    copy_rows: int = 16                       # the widest copy window (a lone stream's)
+    budget: int = 16                          # the most rows a round verifies (the memory estimate's)
+    copy_cap: int = 16                        # this round's widest copy window
 
     def __init__(self, w: Weights, draft=None, *, max_rows: int = 16, allow_copy: bool = True, stop_eos: bool = True,
-                 keep: int = 8, rank: int = 0, world: int = 1, context: int = 0, points=None, vision=None) -> None:
+                 keep: int = 8, rank: int = 0, world: int = 1, context: int = 0, points=None, vision=None,
+                 copy_rows: int | None = None, streams: int = 1) -> None:
         if not 1 <= max_rows <= 16:
-            raise ValueError("a stream's window is 1 to 16 rows (the multi-stream GDN tree kernel's limit)")
+            raise ValueError("a stream's tree is 1 to 16 rows")
+        copy_rows = max_rows if copy_rows is None else copy_rows
+        if not max_rows <= copy_rows <= 128:
+            raise ValueError("a copy window is max_rows to 128 rows (the tree attention's limit)")
         self.w, self.draft, self.max_rows, self.allow_copy = w, draft, max_rows, allow_copy
+        self.copy_rows = self.copy_cap = copy_rows
+        self.budget = stream_rows(streams, copy_rows)
         self.vision = vision
         self.context = context                                # prompt plus reply tokens a stream holds (0: no bound)
         self.eos = tuple(w.config.eos) if stop_eos else ()
@@ -187,7 +215,7 @@ class MultiDecoder:
     def _first(self, s: Stream) -> int:
         """The rows a stream's caches start with (one GPU): its prompt and a window, a step at a time."""
 
-        return min(self._most(s), -(-(len(s.prompt) + self.max_rows + 2) // GROW) * GROW)
+        return min(self._most(s), -(-(len(s.prompt) + self.copy_rows + 2) // GROW) * GROW)
 
     def _room(self, s: Stream) -> None:
         """A new prompt's rows fit beside the live streams, cached prompt ends going first; else it waits (NoRoom)."""
@@ -220,7 +248,7 @@ class MultiDecoder:
         live = sorted(live, key=lambda x: x.sid)
         blocked = False
         for s in live:
-            rows = min(s.st.pos + self.max_rows + 2, self._most(s))   # a stream never commits past its prompt and reply
+            rows = min(s.st.pos + self.copy_rows + 2, self._most(s))  # a stream never commits past its prompt and reply
             have = next((kv[0].shape[0] for kv in s.st.kv if kv is not None), rows)
             if rows <= have:
                 s.waiting = False
@@ -345,6 +373,7 @@ class MultiDecoder:
         for (s, _), first in zip(batch, firsts):
             if first is not None:
                 s.copies = CopyIndex() if self.allow_copy and s.draft and self.rank == 0 else None
+                self._copy_start(s)
                 s.context = list(s.prompt)
                 s.started = time.perf_counter()
                 self.filling = [x for x in self.filling if x is not s]
@@ -384,6 +413,7 @@ class MultiDecoder:
         if first is None:
             return None
         s.copies = CopyIndex() if self.allow_copy and s.draft and self.rank == 0 else None
+        self._copy_start(s)
         s.context = list(s.prompt)
         s.started = time.perf_counter()
         self.filling = [x for x in self.filling if x is not s]
@@ -406,6 +436,7 @@ class MultiDecoder:
             self.last = None
             return done
         copied: dict[int, list[int]] = {}
+        self.copy_cap = self._copy_cap(len(live))
         plan = [(s.sid, self._mode(s, copied), s.out[-1], len(s.context)) for s in live]
         self._send([ROUND, len(plan), *[x for item in plan for x in item]])
         wins, record, taps, starts, sampled = self._verify(plan, copied)
@@ -415,6 +446,9 @@ class MultiDecoder:
             paths.append(path)
             ends.append(end)
         self._send([x for path in paths for x in (len(path), *path)])
+        for s, (sid, mode, _, _), (tokens, _), path in zip(live, plan, wins, paths):
+            if mode in (COPY, BESIDE):
+                self._landed(s, tokens, path, self.chains[sid])
         self._commit(plan, wins, record, taps, starts, paths)
         self.last = (start, len(plan), sum(len(t) for t, _ in wins)) if self.costs is not None else None
         for s, (tokens, _), path, end in zip(live, wins, paths, ends):
@@ -458,17 +492,48 @@ class MultiDecoder:
 
         return self.eos if s.stop_eos else ()
 
+    def _copy_start(self, s: Stream) -> None:
+        """A decoding stream's first copy window (rank 0's), and the copy-tree gate's state, as draft_decode starts."""
+
+        s.copy_rows = next_copy_rows(self.max_rows, False, self.max_rows, self.copy_rows)
+        s.copy_missed = COPY_TREE_GATE == "none"
+
+    def _copy_cap(self, n: int) -> int:
+        """The widest copy window in a round of ``n`` streams: a lone stream's widest; beside others SHARED_COPY_ROWS,
+        within the rows the other streams' trees leave in the budget."""
+
+        if n == 1:
+            return self.copy_rows
+        return max(self.max_rows, min(self.copy_rows, SHARED_COPY_ROWS, self.budget - self.max_rows * (n - 1)))
+
     def _mode(self, s: Stream, copied: dict[int, list[int]]) -> int:
         if not s.draft:
             return ONE
-        copied[s.sid] = s.copies.propose(s.context, self.max_rows - 1) if s.copies is not None else []
-        return COPY if copied[s.sid] else (TREE if self.draft is not None else ONE)
+        copies = s.copies
+        rows = min(s.copy_rows, self.copy_cap) if copies is not None else 0
+        copied[s.sid] = copies.propose(s.context, rows - 1) if copies is not None else []
+        if not copied[s.sid]:
+            return TREE if self.draft is not None else ONE
+        # as draft_decode: an unsure copy shares its window with the tree, if the copy keeps a gram's worth of rows
+        if (self.draft is not None and COPY_TREE and rows - self.max_rows >= copies.n
+                and _tree_beside(copies, s.copy_missed)):
+            copied[s.sid] = copied[s.sid][:rows - self.max_rows]
+            return BESIDE
+        return COPY
+
+    def _landed(self, s: Stream, tokens: list[int], path: list[int], chain: int) -> None:
+        """Rank 0, after a copy round: the stream's next copy window and gate state (draft_decode's rule)."""
+
+        whole = len(path) == len(tokens) if chain == len(tokens) - 1 else path[1:] == list(range(1, chain + 1))
+        s.copy_rows = next_copy_rows(min(s.copy_rows, self.copy_cap), whole, self.max_rows, self.copy_rows)
+        s.copy_missed = (COPY_TREE_GATE == "none" or (COPY_TREE_GATE == "broken" and not whole)
+                         or path[1:2] != [1])
 
     def _trees(self, plan, blocks) -> dict[int, tuple[list[int], list[int], list[float]]]:
         """Rank 0: each tree stream's nodes, parents and path scores, in the policy's pop order."""
 
         return {sid: self.draft.finish_tree(blocks[sid], length, self.max_rows - 1, self.streams[sid].sampling)
-                for sid, mode, _, length in plan if mode == TREE and blocks.get(sid) is not None}
+                for sid, mode, _, length in plan if mode in (TREE, BESIDE) and blocks.get(sid) is not None}
 
     def _cost(self, rows: int) -> float:
         pts = self.costs
@@ -484,15 +549,20 @@ class MultiDecoder:
         keep = {sid: len(t[0]) for sid, t in trees.items()}
         if self.costs is not None and trees:
             sids = list(trees)
-            fixed = sum(1 + (len(copied[sid]) if mode == COPY else 0) for sid, mode, _, _ in plan)
+            fixed = sum(1 + (len(copied[sid]) if mode in (COPY, BESIDE) else 0) for sid, mode, _, _ in plan)
             counts = allocate([trees[sid][2] for sid in sids], fixed, float(len(plan)), self._cost,
                               self._overhead(len(plan)))
             keep = dict(zip(sids, counts))
         wins = []
+        self.chains = {}                              # each copy's rows after the root, for _landed
         for sid, mode, pending, _ in plan:
             guesses, parents = [], []
-            if mode == COPY:
+            if mode in (COPY, BESIDE):
                 guesses, parents = copied[sid], list(range(-1, len(copied[sid]) - 1))
+                self.chains[sid] = len(guesses)
+                if mode == BESIDE and sid in trees:
+                    guesses, parents, self.chains[sid] = hang_tree(copied[sid], trees[sid][0][:keep[sid]],
+                                                                   trees[sid][1][:keep[sid]])
             elif sid in trees:
                 guesses, parents = trees[sid][0][:keep[sid]], trees[sid][1][:keep[sid]]
             wins.append(([pending] + list(guesses), [-1] + [0 if p < 0 else p + 1 for p in parents]))
@@ -503,7 +573,7 @@ class MultiDecoder:
         """Time the forward at the row counts ``streams`` windows bring; every rank runs the same forwards."""
 
         st, points = State(self.w), []
-        for r in calibration_rows(streams, self.depth):
+        for r in calibration_rows(streams, self.depth, self.copy_rows):
             n = -(-r // 16)
             sizes = [r // n + (i < r % n) for i in range(n)]
             wins = [([0] * k, list(range(-1, k - 1)), st) for k in sizes]
@@ -523,7 +593,7 @@ class MultiDecoder:
         """Both ranks: drafter blocks, rank 0's windows, the forward and each stream's samples."""
 
         blocks = {}
-        tree = [(sid, pending) for sid, mode, pending, _ in plan if mode == TREE] if self.drafts else []
+        tree = [(sid, pending) for sid, mode, pending, _ in plan if mode in (TREE, BESIDE)] if self.drafts else []
         block = self.block if self.depth else self.max_rows    # one stream too: DFlash2 drafts best near 8 rows
         if tree:                                      # every stream's block in one drafter pass
             launched = self.draft.launch_blocks([self.streams[sid].snap for sid, _ in tree],
