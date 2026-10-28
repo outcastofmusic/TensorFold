@@ -229,6 +229,7 @@ def test_copies_with_a_tree_beside_them_keep_serial_tokens(monkeypatch):
 
     monkeypatch.setattr(decode, "COPY_TREE", True)
     monkeypatch.setattr(decode, "CopyIndex", MissingCopies)
+    monkeypatch.setattr(decode, "COPY_TREE_GATE", "miss")     # the misses above are what open the tree
     drafter = Drafter()
     st, pending = prefill(w, prompt, None)
     trace: list[dict] = []
