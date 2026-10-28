@@ -19,14 +19,16 @@ from .weights import Weights
 # off): 1.010x over 12 prompt kinds, json +5-9%, copy -3%, texts identical 72/72 (tf-runs/round3-1027)
 COPY_TREE = os.environ.get("TF_Q27_COPY_TREE", "1") == "1"
 # ...beside which copies (TF_Q27_COPY_TREE_GATE): "miss", after a copy round whose first copied token missed;
-# "broken", after one that did not land whole; "unsure" (the default), beside a copy whose sources disagree on its
-# next token (CopyIndex.unsure); "short", beside an unsure one or one matching fewer than ``min_match`` tokens before its gram;
+# "broken", after one that did not land whole; "unsure", beside a copy whose sources disagree on its next token
+# (CopyIndex.unsure); "short" (the default), beside an unsure one or one matching fewer than ``min_match`` tokens before its gram;
 # "none", every one. Ungated, copy prompts gained 31% and edits lost 10-12%: their copies land and the drafter's pass is
 # spent for nothing (tf-runs/qwen27-t4-1027, qwen27-t4b-1027). On the saved outputs an unsure copy missed its first
 # token in 19 of 19 rounds, a sure one in 7 of 121 (tf-runs/copy-tree-1028). Served A/B, 12 boots, texts identical
 # 264/264, against copies from "latest" with no tree: "longest" alone 1.080x; with the tree beside every copy 1.064x,
-# beside short ones 1.088x, beside unsure ones 1.095x (copy +64%, json +10%, edit and rewrite level)
-COPY_TREE_GATE = os.environ.get("TF_Q27_COPY_TREE_GATE", "unsure")
+# beside short ones 1.088x, beside unsure ones 1.095x (copy +64%, json +10%, edit and rewrite level). After the fix
+# that gives "longest" room to copy, "short" beat "unsure" 1.010x, code and json +4%, texts identical 120/120
+# (tf-runs/q27-next-1028, gates rerun)
+COPY_TREE_GATE = os.environ.get("TF_Q27_COPY_TREE_GATE", "short")
 
 
 def clone_state(st: State) -> State:
