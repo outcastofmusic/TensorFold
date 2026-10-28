@@ -8,7 +8,7 @@ import torch
 
 from tensorfold.cuda.nvfp4 import experts as nvx
 
-from . import nvfp4
+from . import nvfp4, shared_stream
 
 def tiled(rows: int, prompt: bool) -> bool:
     """Whether gate/up and down run the shared-memory tile kernel: prompt buffers of at least ``nvx.TILE_ROWS`` rows.
@@ -108,23 +108,36 @@ def moe4_from_experts(gate: list, up: list, down: list, shared: tuple) -> MoE4:
     return moe4_from_checkpoint(stack(gate), stack(up), stack(down), shared)
 
 
-def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, buf, cfg) -> None:
+def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, buf, cfg, *,
+        prompt_pass: bool = False) -> None:
     """Route rows x [R, D] and run their experts into buf (the shared ``moe`` contract); ``xs`` unused: no biases.
 
     Buffers of bf16 slots, a prompt's and a decode window's (``moe_prefill``), run the shared expert on the prompt
     GEMM. On FP4-Local (GB10, 18 Oct) its 16-row tile gave decode windows 1.059x with the old replies' bytes. The
-    lane matmul gave 1.064x with replies that differ, and TF_FP4_SHARED_DECODE=qmmf chose it until 25 Oct."""
+    lane matmul gave 1.064x with replies that differ, and TF_FP4_SHARED_DECODE=qmmf chose it until 25 Oct.
+
+    With TF_FLASHNEXT_SHARED_STREAM the shared expert runs on a second stream beside the router and the routed
+    experts (``shared_stream``; ``prompt_pass``: a prompt chunk's buffers, which mode 1 keeps on one stream)."""
 
     from tensorfold.cuda import moe as moe_mod
 
     rows, top_k = x.shape[0], int(cfg.num_experts_per_tok)
-    prompt = buf.y.dtype != torch.float32                  # a prompt's buffers keep bf16 slots
+    prompt = buf.y.dtype != torch.float32                  # bf16 slots: a prompt's, or a decode window's moe_prefill
     tile = tiled(rows, prompt)
+    side = shared_stream.side(x.device, prompt_pass)
+    if side is not None:            # slot top_k of act and y, which the routed kernels skip, written on the side
+        with torch.cuda.stream(side.fork()):
+            buf.act[:rows, top_k] = ex.shared_act(x, prompt)
+            buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], prompt, not prompt)
     moe_mod.router(x, router_rows, buf.logits[:rows])
     moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, nvx.TILE_ITEM if tile else nvx.PREFILL_TILE)
     nvx.gate_up(x, ex.routed_experts, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed, tile=tile)
-    buf.act[:rows, top_k] = ex.shared_act(x, prompt)
+    if side is None:
+        buf.act[:rows, top_k] = ex.shared_act(x, prompt)
     nvx.down(buf.act.view(-1, ex.width), ex.routed_experts, buf.plan, buf.y.view(-1, ex.dims), rows, skip=ex.routed,
              tile=tile)
-    buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], prompt, not prompt)
+    if side is None:
+        buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], prompt, not prompt)
+    else:
+        side.join()                                        # buf.y whole before the write-back reads it
     return buf
