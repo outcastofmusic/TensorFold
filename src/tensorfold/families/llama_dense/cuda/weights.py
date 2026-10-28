@@ -41,8 +41,16 @@ class Config:
                    layers=int(t["num_hidden_layers"]), heads=heads,
                    kv_heads=int(t.get("num_key_value_heads") or heads),
                    head_dim=int(t.get("head_dim") or int(t["hidden_size"]) // heads), vocab=int(t["vocab_size"]),
-                   eps=float(t.get("rms_norm_eps", 1e-6)), rope_theta=float(t.get("rope_theta", 10000.0)),
+                   eps=float(t.get("rms_norm_eps", 1e-6)), rope_theta=rope_theta(t),
                    eos=tuple(dict.fromkeys(found)))
+
+
+def rope_theta(t: dict[str, Any]) -> float:
+    """The rotation base: top-level ``rope_theta``, or under ``rope_parameters`` where transformers 5 writes it (the
+    ModelOpt export of Nanbeige4.3-33B); read as 10,000 there, its long replies turned to junk (tf-runs/round3-1027)."""
+
+    value = t.get("rope_theta", (t.get("rope_parameters") or {}).get("rope_theta"))
+    return 10000.0 if value is None else float(value)
 
 
 @dataclass

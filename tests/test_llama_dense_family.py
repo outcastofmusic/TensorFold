@@ -30,6 +30,7 @@ def test_nanbeige_config_is_accepted():
 
 @pytest.mark.parametrize(("change", "why"), [
     ({"rope_scaling": {"rope_type": "llama3", "factor": 8.0}}, "rope_scaling"),
+    ({"rope_parameters": {"rope_type": "yarn", "rope_theta": 1e6, "factor": 4.0}}, "rope_parameters"),
     ({"attention_bias": True}, "biases"),
     ({"mlp_bias": True}, "biases"),
     ({"hidden_act": "gelu"}, "hidden_act"),
@@ -167,3 +168,14 @@ def test_the_reference_equals_transformers_llama():
                rope_theta=1.2e8, eos=(2,))
     got = forward(stored, c, ids)
     assert torch.allclose(got, want, atol=1e-4, rtol=1e-4), (got - want).abs().max()
+
+
+def test_rope_theta_is_read_from_rope_parameters_too(tmp_path):
+    """transformers 5 (the ModelOpt NVFP4 export) writes the base under rope_parameters only."""
+    from tensorfold.families.llama_dense import refusal
+    from tensorfold.families.llama_dense.cuda.weights import Config
+
+    exported = {k: v for k, v in NANBEIGE.items() if k not in ("rope_theta", "rope_scaling")}
+    exported["rope_parameters"] = {"rope_theta": 120000000, "rope_type": "default"}
+    (tmp_path / "config.json").write_text(json.dumps(exported))
+    assert refusal(exported) is None and Config.read(tmp_path).rope_theta == 1.2e8

@@ -27,6 +27,8 @@ def refusal(config: dict[str, Any]) -> str | None:
         return f"architectures {arch}: the engine runs LlamaForCausalLM"
     if t.get("rope_scaling"):
         return f"rope_scaling {t['rope_scaling']}: the engine rotates by plain rope_theta only"
+    if (t.get("rope_parameters") or {}).get("rope_type", "default") != "default":
+        return f"rope_parameters {t['rope_parameters']}: the engine rotates by plain rope_theta only"
     if t.get("attention_bias") or t.get("mlp_bias"):
         return "attention or MLP biases: the engine's projections have none"
     if str(t.get("hidden_act", "silu")) != "silu":
