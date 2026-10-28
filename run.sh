@@ -31,7 +31,7 @@
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   ANSWER_BUDGET=24576 (thinking off, no max_tokens asked; 0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)   COPIES=1 (0: no copy drafts in DFlash2 rounds)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
 # Qwen FP4-Local: Qwen's settings, VISION=0 by default (the image tower run.sh converts belongs to the EXL3 pack)
-# Qwen 27B: CONTEXT=262144 (KV 64 KiB a token)  PARALLEL=1  THINK_BUDGET=8000 (0: none); no Clef, no disk states
+# Qwen 27B: CONTEXT=262144 (KV 64 KiB a token)  PARALLEL=8 (1: one stream)  THINK_BUDGET=8000 (0: none); no Clef, no disk states
 # Bolt:  CONTEXT=131072 (a stream's KV is 8 KiB a token)  THINK_BUDGET=8000 (0: none); no disk states, one stream
 # LFM2:  CONTEXT=131072 (KV 20 KiB a token)  THINK_BUDGET=8000 (0: none); one stream, no drafts, no disk states.
 #        LFM Open License v1.0: commercial use is licensed only under US$10M annual revenue
@@ -263,7 +263,7 @@ qwen27() {
     [ -e "$drafter/config.json" ] || die "no draft model at $drafter (run ./prepare.sh qwen-27b)"
     local budget=() parallel=()
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
-    [ "${PARALLEL:-1}" = 1 ] || parallel=(--parallel "$PARALLEL")
+    [ "${PARALLEL:-8}" = 1 ] || parallel=(--parallel "${PARALLEL:-8}")   # one user at 8 ties 1 but json -4 to -7%; 8 users 234 tok/s (tf-runs/q27-multi-1028)
     IMAGE=$(image)
     stop_all
     serve tensorfold-q27 -- "$model" --host 127.0.0.1 --port "$PORT" --name qwen3.8-27b --drafter "$drafter" \
