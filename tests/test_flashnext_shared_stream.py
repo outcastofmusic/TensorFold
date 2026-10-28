@@ -28,10 +28,12 @@ def mode(monkeypatch):
     shared_stream.mode.cache_clear()
 
 
-def test_the_switch_is_off_unless_set(mode):
+def test_the_switch_is_on_for_decode_unless_set(mode):
     mode(None)
-    assert shared_stream.mode() == shared_stream.OFF
+    assert shared_stream.mode() == shared_stream.DECODE
     mode("")
+    assert shared_stream.mode() == shared_stream.DECODE
+    mode("0")
     assert shared_stream.mode() == shared_stream.OFF
     mode("1")
     assert shared_stream.mode() == shared_stream.DECODE

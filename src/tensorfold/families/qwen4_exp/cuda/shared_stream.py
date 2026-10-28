@@ -31,10 +31,12 @@ OFF, DECODE, ALL = 0, 1, 2          # 1: decode windows and head passes; 2: prom
 
 @lru_cache(maxsize=1)
 def mode() -> int:
-    """TF_FLASHNEXT_SHARED_STREAM: 0 (default) one stream, 1 decode windows and head passes, 2 every pass. Read
-    once a process: captured graphs keep the schedule they were captured with (tests clear the cache)."""
+    """TF_FLASHNEXT_SHARED_STREAM: 0 one stream, 1 (default) decode windows and head passes, 2 every pass. Read
+    once a process: captured graphs keep the schedule they were captured with (tests clear the cache). FP4-Local,
+    mode 1 against 0: 1.033x at one request and 1.038x at four, replies identical 280/280; mode 2 added nothing
+    (tf-runs/shared-1028, 2026-10-28)."""
 
-    return int(choice(ENV, ("0", "1", "2"), "0"))
+    return int(choice(ENV, ("0", "1", "2"), "1"))
 
 
 def applies(prompt_pass: bool, m: int | None = None) -> bool:
