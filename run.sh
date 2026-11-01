@@ -91,7 +91,7 @@ image() {
         docker rm -f tensorfold-build >/dev/null 2>&1 || true
         # a failed install must not be committed under the source's hash, nor prune the images that still work
         docker run --name tensorfold-build -v "$SRC:/tf:ro" "$BASE" \
-            bash -c "cp -r /tf /tmp/tf && pip install -q -c /tmp/tf/run-constraints.txt '/tmp/tf[vision]' && rm -rf /tmp/tf" >/dev/null \
+            bash -c "cp -r /tf /tmp/tf && pip install -q -c /tmp/tf/run-constraints.txt '/tmp/tf[vision,grammar]' && rm -rf /tmp/tf" >/dev/null \
             || { docker rm -f tensorfold-build >/dev/null 2>&1; die "installing the checkout into $tag failed"; }
         docker commit --change "LABEL tensorfold.src=$SRC" tensorfold-build "$tag" >/dev/null || die "committing $tag failed"
         docker rm tensorfold-build >/dev/null

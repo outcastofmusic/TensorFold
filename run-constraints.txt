@@ -6,3 +6,5 @@ huggingface_hub==1.33.0
 shellingham==1.5.4
 transformers==5.19.0
 typer==0.27.3
+# Since 2026-11-01, for response_format and guided_*: without it every structured request gets HTTP 400.
+xgrammar==0.2.8

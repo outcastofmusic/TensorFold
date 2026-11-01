@@ -5,6 +5,8 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **`run.sh` serving images include xgrammar, so `response_format` and `guided_*` work there.** The image installed
+  only the vision extra, and every structured request got HTTP 400 asking for `pip install 'tensorfold[grammar]'`.
 - **Qwen3.8 Flash Next on CUDA keeps 4 prompt states a stream, where it kept 8 in all, and `run.sh` serves the EXL3
   pack with 8 streams.** Each turn of a conversation keeps its message start, its prompt end and its reply end, so 8
   states held about two conversations' latest turns: with eight agent sessions on 8 streams, a turn pushed out
