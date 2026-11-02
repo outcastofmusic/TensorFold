@@ -94,8 +94,10 @@ def make_handler(app: App):
                 return metrics.send(self, app)
             if self.path.rstrip("/") in ("/v1/models", "/models"):
                 reasoning = app.reasoning_info() if hasattr(app, "reasoning_info") else None
+                window = app.max_model_len() if hasattr(app, "max_model_len") else None
                 self._json(200, {"object": "list", "data": [
                     {"id": model_id, "object": "model", "owned_by": "tensorfold",
+                     **({"max_model_len": window} if window is not None else {}),
                      **({"reasoning": reasoning} if reasoning is not None else {})} for model_id in app.model_ids]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
                 self._json(200, {"status": "ok"} if getattr(getattr(app, "auth", None), "enabled", False)

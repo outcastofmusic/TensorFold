@@ -7,7 +7,9 @@ clients that time out on a silent connection stay connected. Python's standard l
 
     GET  /v1/models      every model, "loaded" on the one in memory and a "state": ready, loading, unloading,
                          unloaded or failed (with the "error" of its last load, kept until a load of it succeeds),
-                         and the "backend" the loaded one is forwarded to ("127.0.0.1:30002", null on the others)
+                         and the "backend" the loaded one is forwarded to ("127.0.0.1:30002", null on the others);
+                         "max_model_len" (vLLM's name) is the window the model served on its last load, kept in
+                         SWAP_WINDOWS across restarts, and missing for a model whose server has never reported one
     GET  /swap           {"loaded": ..., "loading": ..., "running": n, "backend": "127.0.0.1:30002" or null}
     POST /swap/<model>   load a model now and answer when it is ready
 
@@ -16,7 +18,8 @@ SWAP_DRAIN=600 (seconds a swap waits for running requests before it cuts them of
 stays loaded before a request for the other one may replace it: with two clients on two models, each then gets a turn
 of that length where otherwise every request would pay a swap), SWAP_TIMEOUT=3600 (seconds the backend may stay
 silent before a request is given up; a non-streamed reply is silent until it is whole), SWAP_PERSIST=120 (seconds the
-outgoing model may take to write its kept prompt states to disk before run.sh stops it).
+outgoing model may take to write its kept prompt states to disk before run.sh stops it), SWAP_WINDOWS (a JSON file of
+each model's last window; run.sh sets it, and without it the windows last until this process ends).
 """
 
 from __future__ import annotations
@@ -48,6 +51,7 @@ DRAIN = float(os.environ.get("SWAP_DRAIN", "600"))
 HOLD = float(os.environ.get("SWAP_HOLD", "0"))
 TIMEOUT = float(os.environ.get("SWAP_TIMEOUT", "3600"))
 PERSIST = float(os.environ.get("SWAP_PERSIST", "120"))
+WINDOWS = os.environ.get("SWAP_WINDOWS")
 MAX_BODY = 64 << 20                     # bytes: a request with images inlined fits
 RUN = str(Path(__file__).resolve().parent / "run.sh")
 # Origin too: this endpoint checks it, and the server behind listens on another port, so it would refuse it
@@ -65,16 +69,57 @@ def backend() -> str:
     return f"127.0.0.1:{BACKEND}"
 
 
-def loaded() -> str | None:
-    """The model the backend port serves now, or None."""
+def served() -> list:
+    """The backend's /v1/models entries, or [] when nothing answers."""
 
     try:
         conn = http.client.HTTPConnection("127.0.0.1", BACKEND, timeout=3)
         conn.request("GET", "/v1/models")
-        name = json.loads(conn.getresponse().read())["data"][0]["id"]
-    except (OSError, ValueError, KeyError, IndexError, http.client.HTTPException):
-        return None
+        data = json.loads(conn.getresponse().read())["data"]
+    except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
+        return []
+    return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
+
+
+def loaded() -> str | None:
+    """The model the backend port serves now, or None."""
+
+    name = next(iter(served()), {}).get("id")
     return name if name in TARGET else None
+
+
+def window(model: str) -> int | None:
+    """The max_model_len the backend gives ``model``, or None (upstream's native server, Super's, gives none)."""
+
+    for entry in served():
+        value = entry.get("max_model_len")
+        if entry.get("id") == model and isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def saved_windows() -> dict[str, int]:
+    """SWAP_WINDOWS' windows; none when the file is missing or unreadable, as each load writes it afresh."""
+
+    try:
+        got = json.loads(Path(WINDOWS).read_text()) if WINDOWS else {}
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(got, dict):
+        return {}
+    return {k: v for k, v in got.items() if k in TARGET and isinstance(v, int) and not isinstance(v, bool)}
+
+
+def save_windows(windows: dict[str, int]) -> None:
+    if not WINDOWS:
+        return
+    path = Path(WINDOWS)
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(windows, sort_keys=True))
+        tmp.replace(path)                       # a reader never sees half a file
+    except OSError as exc:                      # the windows still serve from memory
+        say(f"could not write {path}: {exc}")
 
 
 def persist(model: str) -> None:
@@ -115,6 +160,18 @@ class Swapper:
         self.since = 0.0                 # when the loaded model became ready
         self.waiting: Counter[str | None] = Counter()   # requests in enter(), by the model they name
         self.failed: dict[str, str] = {}                # model: why its last load failed
+        self.windows = saved_windows()                  # model: the max_model_len it served on its last load
+        if self.current is not None:
+            self.note_window(self.current, window(self.current))
+
+    def note_window(self, model: str, value: int | None) -> None:
+        """Keep ``model``'s window from the load that just finished. None (a probe that timed out, or a server that
+        reports none) keeps the last one."""
+
+        if value is None or self.windows.get(model) == value:
+            return
+        self.windows[model] = value
+        save_windows(dict(self.windows))
 
     def models(self) -> list[dict]:
         """The /v1/models entries, each with the model's state."""
@@ -132,6 +189,8 @@ class Swapper:
                     entry["state"], entry["error"] = "failed", self.failed[name]
                 else:
                     entry["state"] = "unloaded"
+                if name in self.windows:
+                    entry["max_model_len"] = self.windows[name]
                 out.append(entry)
             return out
 
@@ -178,7 +237,8 @@ class Swapper:
         except OSError as exc:                       # run.sh missing or not executable, or no memory to fork it
             code, why = None, f"run.sh did not start: {exc}"
         say(f"{want} {'ready' if code == 0 else 'FAILED'} after {time.monotonic() - start:.0f} s")
-        now = want if code == 0 else loaded()        # an HTTP probe, kept out of the lock
+        now = want if code == 0 else loaded()        # HTTP probes, kept out of the lock
+        served_window = window(want) if code == 0 else None
         with self.cond:
             self.current = now
             self.since = time.monotonic()
@@ -188,6 +248,7 @@ class Swapper:
                 self.failed[want] = why
                 raise RuntimeError(f"{want} did not load ({why}); see the swap log")
             self.failed.pop(want, None)
+            self.note_window(want, served_window)
             self.running += 1
             return want
 
