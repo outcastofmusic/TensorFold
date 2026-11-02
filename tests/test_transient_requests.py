@@ -60,6 +60,19 @@ def test_the_request_field_reaches_a_concurrent_engine(tmp_path, field, expected
     assert status == 200 and app.engine.calls == [expected]
 
 
+TITLE = [{"role": "system", "content": "Write a short title for this conversation."},
+         {"role": "user", "content": "How do I free a stream slot?"}]
+
+
+@pytest.mark.parametrize("field, expected", [({}, True), ({"transient": False}, False), ({"transient": True}, True)])
+def test_a_title_request_is_transient_unless_it_says_otherwise(tmp_path, field, expected):
+    app = app_for(tmp_path)
+    app.engine = Recording()
+    with http_server(app) as port:
+        status, _ = _post(port, {"model": "fake-cuda", "messages": TITLE, "max_tokens": 4, **field})
+    assert status == 200 and app.engine.calls == [expected]
+
+
 @pytest.mark.parametrize("value", ["yes", 1, None, {}])
 def test_a_transient_that_is_not_a_bool_is_refused(tmp_path, value):
     app = app_for(tmp_path)
