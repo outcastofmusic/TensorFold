@@ -444,3 +444,94 @@ def test_the_endpoint_refuses_a_rebound_host_or_a_foreign_origin_and_never_forwa
         server.shutdown()
         server.server_close()
     assert "origin" in swap.HOP                  # the server behind listens on another port and would refuse it
+
+
+class _Windowed(BaseHTTPRequestHandler):
+    """A backend whose /v1/models gives each model the window in ``served``; no persist route."""
+    protocol_version = "HTTP/1.1"
+    served: dict[str, int | None]
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def _send(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        self._send(200, {"object": "list", "data": [
+            {"id": name, "object": "model", **({"max_model_len": w} if w is not None else {})}
+            for name, w in _Windowed.served.items()]})
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self._send(404, {"error": {"message": "unknown path"}})
+
+
+def _windows(swapper):
+    return {m["id"]: m["max_model_len"] for m in swapper.models() if "max_model_len" in m}
+
+
+def test_models_keep_each_model_s_last_window_across_swaps_and_restarts(swap, tmp_path):
+    run = tmp_path / "run.sh"
+    run.write_text("#!/bin/sh\n")
+    run.chmod(0o755)
+    swap.RUN = str(run)
+    swap.WINDOWS = str(tmp_path / "windows.json")
+    backend = _serve(_Windowed)
+    swap.BACKEND = backend.server_address[1]
+    try:
+        swapper = swap.Swapper()
+        assert _windows(swapper) == {}                              # nothing loaded yet: no window to report
+        _Windowed.served = {"glm-5.3-flash": 98304}
+        swapper.enter("glm-5.3-flash")
+        swapper.leave()
+        _Windowed.served = {"qwen3.8-flash-next": 262144}
+        swapper.enter("qwen3.8-flash-next")
+        swapper.leave()
+    finally:
+        backend.shutdown()
+    expected = {"glm-5.3-flash": 98304, "qwen3.8-flash-next": 262144}
+    assert _windows(swapper) == expected                            # glm is unloaded and still reports its window
+    assert _windows(swap.Swapper()) == expected                     # a restarted endpoint reads them back
+
+
+def test_a_load_whose_server_reports_no_window_keeps_the_saved_one(swap, tmp_path):
+    run = tmp_path / "run.sh"
+    run.write_text("#!/bin/sh\n")
+    run.chmod(0o755)
+    swap.RUN = str(run)
+    swap.WINDOWS = str(tmp_path / "windows.json")
+    Path(swap.WINDOWS).write_text(json.dumps({"nemotron-3.5-super": 131072, "glm-5.3-flash": 98304}))
+    _Windowed.served = {"nemotron-3.5-super": None}               # upstream's native server gives no window
+    backend = _serve(_Windowed)
+    swap.BACKEND = backend.server_address[1]
+    try:
+        swapper = swap.Swapper()
+        swapper.enter("nemotron-3.5-super")
+    finally:
+        backend.shutdown()
+    saved = {"nemotron-3.5-super": 131072, "glm-5.3-flash": 98304}    # a probe that timed out loses nothing
+    assert _windows(swapper) == saved
+    assert json.loads(Path(swap.WINDOWS).read_text()) == saved
+
+
+@pytest.mark.parametrize("text", ["not json", "[1, 2]", '{"glm-5.3-flash": "big", "unknown-model": 5, "qwen3.8-27b": true}'])
+def test_an_unreadable_windows_file_reports_no_windows(swap, tmp_path, text):
+    swap.WINDOWS = str(tmp_path / "windows.json")
+    Path(swap.WINDOWS).write_text(text)
+    assert _windows(swap.Swapper()) == {}
+
+
+def test_the_endpoint_reads_the_window_of_a_model_already_loaded_at_start(swap, tmp_path, monkeypatch):
+    _Windowed.served = {"qwen3.8-27b": 262144}
+    backend = _serve(_Windowed)
+    swap.BACKEND = backend.server_address[1]
+    monkeypatch.setattr(swap, "loaded", lambda: "qwen3.8-27b")
+    try:
+        assert _windows(swap.Swapper()) == {"qwen3.8-27b": 262144}
+    finally:
+        backend.shutdown()

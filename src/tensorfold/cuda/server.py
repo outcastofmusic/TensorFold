@@ -154,6 +154,14 @@ class App:
             info["supported_efforts"] = [e for e in _EFFORT_ORDER if e in levels] + (["none"] if switch else [])
         return info
 
+    def max_model_len(self) -> int | None:
+        """vLLM's ``max_model_len``, which ``/v1/models`` and ``/tokenize`` report: the prompt-plus-reply window this
+        server admits, else the model's own, so a client can size its context without a probe. None when neither is
+        known (no ``max_position_embeddings`` and no ``--context``)."""
+
+        limit = self._context_limit()
+        return limit if limit is not None else (self.native_context_window or None)
+
     def reply_model(self, body: Any) -> str:
         """The id a reply names: the one the request asked for when this endpoint answers to it, else ``--name``."""
 
@@ -452,9 +460,7 @@ class App:
             if not isinstance(text, str):
                 raise RequestError("prompt must be a string (or send messages)")
             ids = self.tok.encode(text, add_special_tokens=flag(body, "add_special_tokens", True)).ids
-        limit = self._context_limit()
-        reply: dict[str, Any] = {"count": len(ids), "tokens": [int(t) for t in ids],
-                                 "max_model_len": limit if limit is not None else self.native_context_window}
+        reply: dict[str, Any] = {"count": len(ids), "tokens": [int(t) for t in ids], "max_model_len": self.max_model_len()}
         if strings:
             reply["token_strs"] = [self.tok.id_to_token(t) for t in reply["tokens"]]
         return reply

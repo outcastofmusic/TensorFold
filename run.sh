@@ -172,7 +172,7 @@ swap() {
     stop_all
     mkdir -p "$STATE"
     rm -f "$STATE/swap.pid"
-    PORT=$PORT BACKEND_PORT="${BACKEND_PORT:-30002}" SWAP_PIDFILE="$STATE/swap.pid" \
+    PORT=$PORT BACKEND_PORT="${BACKEND_PORT:-30002}" SWAP_PIDFILE="$STATE/swap.pid" SWAP_WINDOWS="$STATE/windows.json" \
         setsid nohup python3 "$SRC/swap.py" >>"$STATE/swap.log" 2>&1 </dev/null &
     local i
     for i in $(seq 30); do                       # up to 15 s for the pidfile and the port

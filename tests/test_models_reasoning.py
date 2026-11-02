@@ -55,3 +55,20 @@ def test_the_models_route_carries_it(tmp_path):
     entry = json.loads(raw)["data"][0]
     assert status == 200 and entry["id"] == "fake-cuda"
     assert entry["reasoning"] == {"default_enabled": False}
+
+
+def test_the_models_route_gives_the_served_window_as_vllm_s_max_model_len(tmp_path):
+    """A client sizes its context from /v1/models at startup instead of probing with an oversized request."""
+    from tests.test_cuda_admission import http_server
+    from tests.test_cuda_tool_choice import Engine, app_for
+    from tests.test_responses_api import call
+
+    served = app_for(tmp_path, Engine())
+    served.native_context_window, served.context_window = 262144, 98304     # --context below the model's own
+    with http_server(served) as port:
+        entry = json.loads(call(port, "GET", "/v1/models")[1])["data"][0]
+        assert entry["max_model_len"] == 98304
+        served.context_window = 0                                           # no --context: the model's own window
+        assert json.loads(call(port, "GET", "/v1/models")[1])["data"][0]["max_model_len"] == 262144
+        served.native_context_window = 0                                    # neither known: the field is left out
+        assert "max_model_len" not in json.loads(call(port, "GET", "/v1/models")[1])["data"][0]
