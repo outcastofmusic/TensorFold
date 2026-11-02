@@ -638,6 +638,12 @@ class App:
         turns = None if concurrent else self._turns()
         if concurrent and background and "background" in inspect.signature(self.engine.generate).parameters:
             options["background"] = True            # the engine's scheduler orders its lanes and prompts
+        transient = body.get("transient", False)
+        if not isinstance(transient, bool):
+            raise RequestError("transient must be true or false")
+        # a one-off (a tool's extraction call) keeps no prompt state; an engine without kept slots ignores it
+        if concurrent and transient and "transient" in inspect.signature(self.engine.generate).parameters:
+            options["transient"] = True
         # one engine at a time: a background reply yields between rounds (not on two ranks, which decode to the end)
         yielding = background and turns is not None and getattr(self.engine, "tp", 1) == 1
         guard = self._thinking_guard(prepared, body)

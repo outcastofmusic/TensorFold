@@ -144,7 +144,7 @@ class PromptPasses:
     def _points(self, s: Stream, start: int, n: int) -> list[int]:
         """The message-start and prompt-end snapshots the prompt piece of ``n`` rows from ``start`` reaches."""
 
-        if not s.draft or s.st.image_positions is not None:
+        if not s.draft or s.transient or s.st.image_positions is not None:
             return []
         return sorted({p for p in [*self.fills[s.sid][0].stops, self._keep_at(s)] if start < p <= start + n})
 
