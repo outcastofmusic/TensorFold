@@ -69,7 +69,7 @@ def _decoder(prompts, stops, *, slots, rows=4_096):
     m = object.__new__(MultiDecoder)
     m.prefill_rows, m.share, m.round_s, m.row_s = rows, 0.0, None, None
     m.streams, m.passed, m.slots = {}, {}, [None] * slots
-    m.filling = [SimpleNamespace(sid=i, prompt=[0] * n, background=False, draft=True,
+    m.filling = [SimpleNamespace(sid=i, prompt=[0] * n, background=False, draft=True, transient=False,
                                  st=SimpleNamespace(image_positions=None)) for i, n in enumerate(prompts)]
     m.fills = {s.sid: [SimpleNamespace(stops=list(p)), True, 0, None] for s, p in zip(m.filling, stops)}
     return m

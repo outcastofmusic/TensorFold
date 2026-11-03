@@ -633,11 +633,19 @@ class App:
         budget = self._think_budget(prepared, think_end)
         # background: the request's own priority, else --name-priority's default for its id; title requests always
         by_name = "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ())
-        background = body.get("priority") == "background" or by_name or (chat and is_title_request(body.get("messages"), tools))
+        title = chat and is_title_request(body.get("messages"), tools)
+        background = body.get("priority") == "background" or by_name or title
         concurrent = getattr(self.engine, "concurrent", False)
         turns = None if concurrent else self._turns()
         if concurrent and background and "background" in inspect.signature(self.engine.generate).parameters:
             options["background"] = True            # the engine's scheduler orders its lanes and prompts
+        transient = body.get("transient", title)
+        if not isinstance(transient, bool):
+            raise RequestError("transient must be true or false")
+        # a one-off (a tool's extraction call, a session title by default) keeps no prompt state; an engine without
+        # kept slots ignores it
+        if concurrent and transient and "transient" in inspect.signature(self.engine.generate).parameters:
+            options["transient"] = True
         # one engine at a time: a background reply yields between rounds (not on two ranks, which decode to the end)
         yielding = background and turns is not None and getattr(self.engine, "tp", 1) == 1
         guard = self._thinking_guard(prepared, body)

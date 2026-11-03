@@ -244,7 +244,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
     def _on_disk(self, s: Stream):
         """The disk state ``s`` resumes from when it is a longer prefix of the prompt than any kept in memory."""
 
-        if self.disk is None or not s.draft or s.vision is not None:
+        if self.disk is None or not s.draft or s.vision is not None or s.transient:
             return None
         best = prefixes.longest(self.kept, list(s.prompt))
         return self.disk.find(s.prompt, len(best[0]) if best is not None else 0, lambda e: True)
@@ -338,6 +338,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             raise ValueError("concurrent Flash Next on two ranks serves text without grammars or logprobs")
         t0 = time.perf_counter()
         if self.w.comm is not None:
+            s.transient = False                  # rank 1 keeps every state rank 0 keeps: the ranks' slots must agree
             if s.vision is not None and self.link is not None and not hasattr(s.vision, "features"):
                 # rank 0 encodes first, so a refused image fails here alone; a readmitted request keeps its features
                 if self.vision is None:
@@ -382,7 +383,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             e.stops = list(s.stops)
         else:
             e.stops = sorted({p for p in self.points(s.prompt) if begin + MIN_GAP <= p < entry_end(s.prompt)}) \
-                if s.draft and st.image_positions is None and self.points is not None else []
+                if s.draft and not s.transient and st.image_positions is None and self.points is not None else []
         s.sid, s.st = self.next_id, st
         self.next_id += 1
         s.prefill_s = time.perf_counter() - t0
@@ -580,7 +581,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         model's continuation of the same text, but not bit for bit a cold run's."""
 
         st = s.st
-        if (s.error is not None or not s.draft or s.splice is not None or st.image_positions is not None
+        if (s.error is not None or not s.draft or s.transient or s.splice is not None or st.image_positions is not None
                 or len(keep) != kept_rows):
             return
         self._flush(s)                                   # the round's recurrent rows, held for the next round

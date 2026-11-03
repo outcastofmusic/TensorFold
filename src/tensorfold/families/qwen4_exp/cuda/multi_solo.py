@@ -135,7 +135,8 @@ class Alone:
             s.copies.verified(R - 1, len(path) - 1)
         new = [tokens[r] for r in path[1:]] + [end]
         last = len(s.out) + len(new) >= s.count or end in self._ends(s)
-        if last and getattr(self, "end_anchor", False) and s.splice is None and st.image_positions is None:
+        if (last and getattr(self, "end_anchor", False) and not s.transient and s.splice is None
+                and st.image_positions is None):
             n = len(path)                                # the reply's end, kept as a prompt state (multi._keep_end)
             if st.mtp_drafted:
                 st.set_mtp_len(st.mtp_len - st.mtp_drafted)

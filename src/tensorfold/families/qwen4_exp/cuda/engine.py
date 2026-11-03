@@ -699,9 +699,11 @@ class FlashNextEngine:
     def generate(self, prompt: list[int], max_tokens: int, sampling,
                  on_tokens: Callable[[list[int]], bool | None], draft: bool = True, constraint=None,
                  stop_eos: bool = True, background: bool = False, probabilities=None, *, vision=None,
-                 splice=None) -> dict[str, Any]:
+                 splice=None, transient: bool = False) -> dict[str, Any]:
         """``draft=False``: one token a round, no MTP drafts; ``background``: last, yielding lanes to waiting ones;
-        ``splice`` (only with ``splices``): a gate's cut, applied inside the live stream (``Stream.splice``)."""
+        ``splice`` (only with ``splices``): a gate's cut, applied inside the live stream (``Stream.splice``);
+        ``transient``: a one-off that keeps no prompt state, so it pushes no other conversation's state out (the
+        concurrent engine only: the one-stream engine's kept states share its one cache, which any prompt overwrites)."""
 
         max_tokens = self._limit(prompt, max_tokens)
         if probabilities is not None and not self.supports_logprobs:
@@ -721,6 +723,7 @@ class FlashNextEngine:
             grammar.update({} if splice is None else {"splice": splice})
             return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, stop_eos=stop_eos,
                                          **grammar, **({"background": True} if background else {}),
+                                         **({"transient": True} if transient else {}),
                                          probabilities=probabilities,
                                          **({"vision": vision} if vision is not None else {}))
         idle = getattr(self, "idle", None)
