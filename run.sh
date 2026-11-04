@@ -2,9 +2,9 @@
 # Serve one model from this checkout on a DGX Spark, with the settings the fork measured as best (README, "Run it").
 #
 #   ./run.sh                   the default: ./run.sh swap qwen-flash-next, every model on one endpoint, Qwen loaded first
-#   ./run.sh qwen-flash-next   Qwen3.8 Flash Next on 127.0.0.1:30000, with Clef-Flash beside it as the thinking guard
+#   ./run.sh qwen-flash-next   Qwen3.8 Flash Next on 127.0.0.1:30000, with KnowLine-4B beside it as the thinking guard
 #   ./run.sh glm-5.3-flash     GLM-5.3 Flash on 127.0.0.1:30000, with its DFlash2 draft model
-#   ./run.sh qwen-flash-next-fp4   Qwen3.8 Flash Next from NVIDIA's FP4-Local checkpoint (QAD NVFP4), Clef-Flash beside it
+#   ./run.sh qwen-flash-next-fp4   Qwen3.8 Flash Next from NVIDIA's FP4-Local checkpoint (QAD NVFP4), KnowLine-4B beside it
 #   ./run.sh qwen-27b          Qwen3.8-27B dense (EXL3 3.00bpw, 13 GB) with z-lab's DFlash2 draft model
 #   ./run.sh nemotron-bolt     Nemotron 3.5 Bolt 74B-A9B (24 GB) with its LiLiCorr draft model
 #   ./run.sh lfm2-24b          Liquid's LFM2.5-24B-A2B (block FP8, 24.75 GB): tool routing and sub-agents
@@ -27,7 +27,7 @@
 #   EXTRA="..."                more `tensorfold serve` flags
 #   QWEN_MODEL, QWEN_FP4_MODEL, QWEN27_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL, SUPER_MODEL, D1_MODEL   another checkpoint folder under $MODELS
 # Qwen, Qwen FP4, GLM:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused;  Qwen: STATES_ALL=0: each slot's shortest and longest state go to disk (1: every kept state)
-# Qwen:  CONTEXT=262144  PARALLEL=8 (FP4-Local: 4)  KEPT=4 a stream (TENSORFOLD_KEPT_STATES)  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef; CLEF_MODEL a Clef or KnowLine folder)  GUARD_THRESHOLD=0.8 (KnowLine: 0.6)  VISION=1 (0: text only)  GRID=4096 (TENSORFOLD_GRID_ANCHORS; 0: off)
+# Qwen:  CONTEXT=262144  PARALLEL=8 (FP4-Local: 4)  KEPT=4 a stream (TENSORFOLD_KEPT_STATES)  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no guard; CLEF_MODEL a KnowLine or Clef folder)  GUARD_THRESHOLD=0.6 (Clef: 0.8)  VISION=1 (0: text only)  GRID=4096 (TENSORFOLD_GRID_ANCHORS; 0: off)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   ANSWER_BUDGET=24576 (thinking off, no max_tokens asked; 0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)   COPIES=1 (0: no copy drafts in DFlash2 rounds)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
 # Qwen FP4-Local: Qwen's settings, VISION=0 by default (the image tower run.sh converts belongs to the EXL3 pack)
@@ -56,7 +56,7 @@ avail_mib() { awk '/MemAvailable/{printf "%d", $2 / 1024}' /proc/meminfo; }
 
 uncache() {  # drop the served checkpoints' files from the page cache (they stay on disk)
     local f
-    for f in "$MODELS"/{Qwen3.8-Flash-Next-exl3-3.05bpw,Qwen3.8-Flash-Next-FP4-Local,Qwen3.8-27B-exl3-3.00bpw,Qwen3.8-27B-DFlash2,clef-flash,glm53-flash-mosaic-12l,glm53-flash-sushi-experts-mosaic-dense,GLM-5.3-Flash-DFlash*,Nemotron-3.5-Bolt-74B-A9B-24GB*,LFM2.5-24B-A2B-FP8,NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4,d1-3B}/*.safetensors \
+    for f in "$MODELS"/{Qwen3.8-Flash-Next-exl3-3.05bpw,Qwen3.8-Flash-Next-FP4-Local,Qwen3.8-27B-exl3-3.00bpw,Qwen3.8-27B-DFlash2,KnowLine-4B-Gen5.5,clef-flash,glm53-flash-mosaic-12l,glm53-flash-sushi-experts-mosaic-dense,GLM-5.3-Flash-DFlash*,Nemotron-3.5-Bolt-74B-A9B-24GB*,LFM2.5-24B-A2B-FP8,NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4,d1-3B}/*.safetensors \
              "$MODELS"/Qwen3.8-Flash-Next-FP4-Local/tensors/*.safetensors \
              "${QWEN_MODEL:-}"/*.safetensors "${QWEN_FP4_MODEL:-}"/*.safetensors "${QWEN27_MODEL:-}"/*.safetensors "${CLEF_MODEL:-}"/*.safetensors \
              "${GLM_MODEL:-}"/*.safetensors "${BOLT_MODEL:-}"/*.safetensors "${LFM2_MODEL:-}"/*.safetensors \
@@ -208,13 +208,13 @@ d1() {
 }
 
 qwen() {  # [served name] [clef_first: 1 starts Clef before Qwen]
-    local model="${QWEN_MODEL:-$MODELS/Qwen3.8-Flash-Next-exl3-3.05bpw}" clef="${CLEF_MODEL:-$MODELS/clef-flash}"
+    local model="${QWEN_MODEL:-$MODELS/Qwen3.8-Flash-Next-exl3-3.05bpw}" clef="${CLEF_MODEL:-$MODELS/KnowLine-4B-Gen5.5-serve}"
     local name="${1:-qwen3.8-flash-next}" clef_first="${2:-0}"
     local tower="$MODELS/Qwen3.8-Flash-Next-exl3-3.05bpw-vision/vision-f16-v3.safetensors"
     [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh qwen-flash-next)"
     # checked before anything stops: a missing guard must leave the running model loaded
     [ "${GUARD:-1}" = 0 ] || [ -e "$clef/joint_head.safetensors" ] || [ -e "$clef/label_readout.json" ] \
-        || die "no decision model at $clef (run ./prepare.sh qwen-flash-next, or GUARD=0)"
+        || die "no decision model at $clef (run ./prepare.sh knowline, or GUARD=0)"
     # KnowLine-4B (label logits) says yes lower than Clef-Flash: at 0.6 it caught 72/72 complete states with 0/132
     # early cuts, at 0.8 only 61/72; Clef-Flash at 0.8 72/72 with 1/132 (notes tf-runs/decision-models-1104)
     local threshold="${GUARD_THRESHOLD:-0.8}"

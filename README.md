@@ -24,13 +24,13 @@ curl -s http://127.0.0.1:30000/swap    # {"loaded": "qwen3.8-flash-next", ...} o
 ```
 
 `./run.sh` with no argument runs `./run.sh swap qwen-flash-next`, the setup the numbers below come from. One endpoint
-serves either model, picked by the request's `"model"`. `qwen3.8-flash-next` gets Qwen with Clef-Flash beside it as the
+serves either model, picked by the request's `"model"`. `qwen3.8-flash-next` gets Qwen with KnowLine-4B beside it as the
 thinking guard, and `glm-5.3-flash` gets GLM-5.3 Flash alone. Qwen loads first, and a request for the other model swaps
 it in. `./run.sh qwen-flash-next` or `./run.sh glm-5.3-flash` serves one model with
 no swap endpoint. On this branch the think-loop detector is on (`TENSORFOLD_THINK_LOOP`, [TANDEM-EVAL.md](TANDEM-EVAL.md)).
 
 Three more models swap in the same way once `./prepare.sh qwen-flash-next-fp4`, `./prepare.sh nemotron-bolt` or
-`./prepare.sh lfm2-24b` has fetched them: `qwen3.8-flash-next-fp4` (NVIDIA's QAD FP4-Local checkpoint, Clef-Flash
+`./prepare.sh lfm2-24b` has fetched them: `qwen3.8-flash-next-fp4` (NVIDIA's QAD FP4-Local checkpoint, KnowLine-4B
 started before it, text only), `nemotron-3.5-bolt` (Nemotron 3.5 Bolt 74B-A9B with its LiLiCorr draft model, one
 stream, prompt reuse in memory) and `lfm2.5-24b-a2b` (Liquid's LFM2.5-24B-A2B in block FP8, one stream; LFM Open
 License v1.0, commercial use only below US$10M annual revenue).
@@ -48,7 +48,7 @@ below were measured on, and converts Qwen's image tower once. Downloads run insi
 
 | Target | Downloads | Disk |
 | --- | --- | --- |
-| `qwen-flash-next` | `turboderp/Qwen3.8-Flash-Next-exl3` (3.05 bpw), `Cloudflare/clef-flash`, a converted image tower | 99 GB |
+| `qwen-flash-next` | `turboderp/Qwen3.8-Flash-Next-exl3` (3.05 bpw), `PelaAI/KnowLine-4B-Gen5.5`, a converted image tower | 90 GB |
 | `glm-5.3-flash` | `0xSero/GLM-5.3-Flash-EXL3-Spark` (M288 Mosaic 12L), the routed experts of `beamster/GLM-5.3-Flash-Sushi-2.4bpw`, `cfontes/GLM-5.3-Flash-DFlash2-TR3-v3` | 182 GB |
 
 `run.sh` serves GLM as a hybrid that `prepare.sh` assembles with `tools/glm5_stacked_experts_pack.py`: Sushi's
@@ -86,7 +86,7 @@ swap stops a model, `swap.py` asks it to write the states not on disk yet (`POST
 | Window | 262,144 tokens | 98,304 tokens |
 | Streams | 4 (`--parallel 4`, `--kv-dtype int8`) | 1 |
 | Drafts | MTP head, 1 to 6 a round, and copy drafts in windows of 7 to 32 rows | DFlash2 draft model, up to 5 a round, and copy drafts in windows of 6 to 32 rows |
-| Thinking | Clef-Flash guard on port 30001, 8,000-token budget | No guard: 8 GiB stays free beside GLM |
+| Thinking | KnowLine-4B guard on port 30001 at 0.6, 8,000-token budget | No guard: 8 GiB stays free beside GLM |
 | Images | On | Off |
 | Decode, one stream | prose 60, code 98, json 118, rewrite 124 tok/s | prose 34, code 51, json 56, rewrite 60 tok/s |
 | Copied text, 20 Oct | A 40-line list 244 tok/s, a 60-line module rewritten 237 (one stream, before the furthest-match choice) | The same list 146 tok/s, the module 100 |
@@ -103,7 +103,7 @@ that change them. Three choices need a word:
 - **GLM's dense prompt matmul** (`TF_GLM_DENSE_PROMPT=1`, set by `run.sh`) reads a 20,500-token prompt at 362 tok/s
   against 310. It changes replies. TrueScore with it and the draft model is 87.1 against 87.9 before, a paired
   difference of -0.7 with a 95% interval of [-4.0, +2.6].
-- **Qwen's thinking guard** needs Clef-Flash beside the model (18 GB). `GUARD=0` serves without it.
+- **Qwen's thinking guard** needs KnowLine-4B beside the model (13 GiB served). `GUARD=0` serves without it.
 
 ## What the fork adds
 
@@ -160,6 +160,14 @@ over scenarios, is +0.9 with a 95% interval of [-0.9, +3.1], so quality holds. P
 `--thinking-budget`: without a budget, one coding task thought for 26,243 tokens because Clef never rated it above
 0.75.
 
+Since 2026-11-04 `run.sh` starts PelaAI's [KnowLine-4B](https://huggingface.co/PelaAI/KnowLine-4B-Gen5.5) in
+Clef-Flash's place, at a threshold of 0.6. It answers from its label logits through the same routes. On 336 labelled
+decision questions it got 334 right against Clef-Flash's 313, a paired +6.2 points [+3.5, +9.1]. On the guard's
+reasoning prefixes it caught 72/72 complete states with 0/132 early cuts, and with it as the guard 16/16 replies came
+out identical to Clef-Flash's. It serves in 13.0 GiB against Clef-Flash's 20-22, and answers a fresh 230-token
+question in 57 ms against 90. `CLEF_MODEL=~/models/clef-flash ./run.sh` (after `./prepare.sh clef-flash`) brings
+Clef-Flash back at 0.8.
+
 ```bash
 tensorfold serve ~/models/clef-flash --port 30001 --name clef --context 16384          # the decision model
 tensorfold serve ~/models/Qwen3.8-Flash-Next-exl3-3.05bpw --port 30000 --parallel 4 --kv-dtype int8 \
@@ -167,7 +175,7 @@ tensorfold serve ~/models/Qwen3.8-Flash-Next-exl3-3.05bpw --port 30000 --paralle
 ```
 
 A request turns the guard off with `"thinking_guard": false` and sets its own budget with `"thinking_budget"`. GLM-5.3
-Flash leaves 8 GiB free on a Spark, so Clef-Flash (18 GB) cannot run beside it. `./run.sh qwen-flash-next` starts both
+Flash leaves 8 GiB free on a Spark, so neither guard can run beside it. `./run.sh qwen-flash-next` starts both
 servers with these flags. `./run.sh glm-5.3-flash` serves GLM with `--thinking-budget 8000` and no guard.
 
 ## Credits
