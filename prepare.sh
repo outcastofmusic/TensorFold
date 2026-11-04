@@ -2,16 +2,17 @@
 # Download what run.sh serves on one DGX Spark, into $MODELS (default ~/models), and build the image-input weights.
 #
 #   ./prepare.sh                  both models
-#   ./prepare.sh qwen-flash-next  Qwen3.8 Flash Next (80 GB), Clef-Flash (18 GB), image tower (0.9 GB)
+#   ./prepare.sh qwen-flash-next  Qwen3.8 Flash Next (80 GB), KnowLine-4B (8.8 GB), image tower (0.9 GB)
 #   ./prepare.sh glm-5.3-flash    GLM-5.3 Flash hybrid (Sushi experts on Mosaic 12L's dense part, 182 GB of downloads)
 #                                 and its draft model (2.3 GB)
-#   ./prepare.sh qwen-flash-next-fp4   NVIDIA's Qwen3.8 Flash Next FP4-Local (96 GB) and Clef-Flash
+#   ./prepare.sh qwen-flash-next-fp4   NVIDIA's Qwen3.8 Flash Next FP4-Local (96 GB) and KnowLine-4B
 #   ./prepare.sh qwen-27b         Qwen3.8-27B dense, EXL3 3.00bpw (13 GB), and z-lab's DFlash2 draft model (3.6 GB)
 #   ./prepare.sh nemotron-bolt    Nemotron 3.5 Bolt 74B-A9B 24 GB (23 GB) and its LiLiCorr draft model (0.9 GB)
 #   ./prepare.sh d1               d1-3B, Liquid AI's decision model (6.3 GB), the sidecar run.sh starts beside each model;
 #                                 LFM Open License v1.0: commercial use only below US$10M annual revenue
-#   ./prepare.sh knowline         PelaAI's KnowLine-4B (8.8 GB, Apache-2.0), a thinking guard in place of Clef-Flash: at 0.6
-#                                 it closed the same paragraphs, 334/336 against Clef's 313/336, in 13 GiB against 20-22
+#   ./prepare.sh knowline         PelaAI's KnowLine-4B (8.8 GB, Apache-2.0), the thinking guard run.sh starts: at 0.6
+#                                 it closed the same paragraphs as Clef-Flash, 334/336 against 313/336, in 13 GiB against 20-22
+#   ./prepare.sh clef-flash       Cloudflare's Clef-Flash (18 GB), the guard before KnowLine (CLEF_MODEL=$MODELS/clef-flash)
 #   ./prepare.sh lfm2-24b         Liquid's LFM2.5-24B-A2B in block FP8 (24.75 GB; LFM Open License v1.0: commercial
 #                                 use only under US$10M annual revenue)
 #   ./prepare.sh nemotron-3.5-super   Nemotron 3.5 Super VL 120B-A12B NVFP4 (75.1 GB) and upstream TensorFold's native
@@ -71,7 +72,7 @@ fetch() {  # repo revision folder [file ...]: the whole repo, or the files named
 
 qwen() {
     fetch "${QWEN[@]}"
-    fetch "${CLEF[@]}"
+    knowline
     # The pack stores its image tower quantized inside the shards; serving reads an FP16 copy, converted once on the CPU.
     local out="$MODELS/${QWEN[2]}-vision/vision-f16-v3.safetensors"
     if [ -e "$out" ]; then
@@ -87,7 +88,7 @@ qwen() {
 
 qwen_fp4() {
     fetch "${QWEN_FP4[@]}"
-    fetch "${CLEF[@]}"
+    knowline
 }
 
 bolt() {
@@ -100,7 +101,7 @@ lfm2() {
 }
 
 # KnowLine-4B answers from label logits; run.sh serves it from a folder of links to the release plus
-# label_readout.json, which names the layout: CLEF_MODEL=$MODELS/KnowLine-4B-Gen5.5-serve ./run.sh
+# label_readout.json, which names the layout. It is run.sh's default CLEF_MODEL.
 knowline() {
     fetch "${KNOWLINE[@]}"
     local src="$MODELS/${KNOWLINE[2]}" view="$MODELS/${KNOWLINE[2]}-serve" f
@@ -167,17 +168,18 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE"
 what="${1:-all}"
 glm_need=$([ "${GLM_PACK:-hybrid}" = mosaic ] && echo 93 || echo 182)   # GB, the draft model included
 case "$what" in
-    qwen-flash-next) need=100 ;;
+    qwen-flash-next) need=91 ;;
     glm-5.3-flash)   need=$glm_need ;;
-    qwen-flash-next-fp4) need=115 ;;
+    qwen-flash-next-fp4) need=106 ;;
     qwen-27b)        need=17 ;;
     nemotron-bolt)   need=25 ;;
     d1)              need=7 ;;
     lfm2-24b)        need=26 ;;
     knowline)        need=9 ;;
+    clef-flash)      need=18 ;;
     nemotron-3.5-super) need=76 ;;
-    all)             need=$((100 + glm_need)) ;;
-    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, qwen-27b, nemotron-bolt, lfm2-24b, nemotron-3.5-super, d1, knowline, or nothing for the first two)" ;;
+    all)             need=$((91 + glm_need)) ;;
+    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, qwen-27b, nemotron-bolt, lfm2-24b, nemotron-3.5-super, d1, knowline, clef-flash, or nothing for the first two)" ;;
 esac
 free=$(df -BG --output=avail "$MODELS" | tail -1 | tr -dc 0-9)
 [ "$free" -ge "$need" ] || echo "prepare: $MODELS has $free GB free and a first download needs $need GB" >&2
@@ -191,6 +193,7 @@ case "$what" in
     d1)              fetch "${D1[@]}" ;;
     lfm2-24b)        lfm2 ;;
     knowline)        knowline ;;
+    clef-flash)      fetch "${CLEF[@]}" ;;
     nemotron-3.5-super) super ;;
     all)             qwen; glm ;;
 esac
