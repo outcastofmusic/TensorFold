@@ -149,13 +149,51 @@ def estimate_weights(model_dir: str | Path, transform: Callable, *, rank: int | 
     return Weights(resident, staging, mapped)
 
 
+PARKED_RESTING = 512 * 1024 * 1024     # what the per-CPU lists hold at rest on kernels that print no high_min (< 6.7)
+
+
+def parked_bytes(zoneinfo: str, page: int = 4096) -> int:
+    """Free pages on the kernel's per-CPU lists beyond their resting level: free, but not in MemAvailable.
+
+    Since kernel 6.7 the lists size themselves, and after a bulk free (the previous server exiting) they hold GiBs for
+    minutes. Sums the ``count:`` lines under every ``pagesets`` less their ``high_min:`` lines; 0 on a bad field.
+    Port of upstream #1323.
+    """
+
+    count = rest = 0
+    listed = False
+    for row in zoneinfo.splitlines():
+        words = row.split()
+        if row.strip() == "pagesets":
+            listed = True
+        elif listed and not row.startswith("    ") and not row.startswith("  vm stats"):
+            listed = False                 # the next zone, or this zone's next field
+        elif listed and words and words[0] in ("count:", "high_min:"):
+            if len(words) < 2 or not words[1].isdigit():
+                return 0
+            if words[0] == "count:":
+                count += int(words[1])
+            else:
+                rest += int(words[1])
+    if count == 0:
+        return 0
+    return max(0, count * page - (rest * page if rest else PARKED_RESTING))
+
+
 def _meminfo() -> dict | None:
     try:
         rows = Path("/proc/meminfo").read_text().splitlines()
         memory = {key.rstrip(":"): int(value) * 1024 for key, value, *_ in (row.split() for row in rows)}
     except (OSError, ValueError):
         return None
-    return memory if {"MemTotal", "MemAvailable"} <= memory.keys() else None
+    if not {"MemTotal", "MemAvailable"} <= memory.keys():
+        return None
+    try:       # read after meminfo, which the lists drain into: a page moving in between is missed, not counted twice
+        parked = parked_bytes(Path("/proc/zoneinfo").read_text(), os.sysconf("SC_PAGE_SIZE"))
+    except (OSError, ValueError):
+        parked = 0
+    memory["MemAvailable"] = min(memory["MemTotal"], memory["MemAvailable"] + parked)
+    return memory
 
 
 def unified(torch) -> bool:
