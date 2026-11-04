@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 import threading
 import time
 import uuid
@@ -570,8 +571,11 @@ class App:
                 reasoning, answer = "", raw
             answer_raw[0] = answer
             if tools:
-                answer = (policy.content(answer, finished=finished, accept=accept) if policy.single
-                          else hide_tool_calls(answer, finished=finished, opener=own_opener))
+                shown = (policy.content(answer, finished=finished, accept=accept) if policy.single
+                         else hide_tool_calls(answer, finished=finished, opener=own_opener))
+                # while streaming, text after a hidden envelope waits for the end: only the final parse knows whether
+                # the envelope was a call or stays in the content, as an unoffered call's does (upstream #1365)
+                answer = shown if finished or policy.single else os.path.commonprefix([answer, shown])
             return reasoning, answer
 
         serving: list[Any] = [None]
@@ -724,7 +728,9 @@ class App:
             content, calls, cut_streamed, deltas = cut
             for delta in deltas:
                 emit(delta)
-        tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
+        streamed_text = answer[:sent["content"]]            # the final parse strips the whitespace the stream led with
+        tail = (content[len(streamed_text):] if content.startswith(streamed_text) else
+                content[len(streamed_text.lstrip()):] if content.startswith(streamed_text.lstrip()) else "")
         if tail:
             final["content"] = tail
         finish = ("length" if cut is not None else "tool_calls" if calls
