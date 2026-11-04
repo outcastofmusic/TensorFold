@@ -84,7 +84,7 @@ def test_already_a_dict_is_left_alone():
 
 
 @pytest.mark.parametrize("args", ['{"cmd":"git status"', "not json at all", "[1, 2]", "null", "true",
-                                 "42", '"text"', "", [1, 2], None, True, 42])
+                                 "42", '"text"', [1, 2], None, True, 42])
 def test_invalid_arguments_are_preserved_in_a_renderable_mapping(args):
     msgs = [_msg(args)]
     original = copy.deepcopy(msgs)
@@ -92,6 +92,11 @@ def test_invalid_arguments_are_preserved_in_a_renderable_mapping(args):
     assert _args(out) == {"_invalid_arguments": args}
     assert msgs == original
     assert out[0]["tool_calls"][0]["id"] == "c1"
+
+
+@pytest.mark.parametrize("args", ["", "  ", "\n"])
+def test_blank_string_arguments_are_no_arguments(args):
+    assert _args(_normalize_tool_call_arguments([_msg(args)])) == {}
 
 
 def test_missing_arguments_are_left_alone():

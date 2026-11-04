@@ -6,7 +6,7 @@ model on BACKEND_PORT, and is then forwarded. A streaming request gets an SSE co
 clients that time out on a silent connection stay connected. Python's standard library only.
 
     GET  /v1/models      every model, "loaded" on the one in memory and a "state": ready, loading, unloading,
-                         unloaded or failed (with the "error" of its last load, kept until a load of it succeeds),
+                         unloaded or failed (with the "error" of its last load or of its engine, kept until a load of it succeeds),
                          and the "backend" the loaded one is forwarded to ("127.0.0.1:30002", null on the others);
                          "max_model_len" (vLLM's name) is the window the model served on its last load, kept in
                          SWAP_WINDOWS across restarts, and missing for a model whose server has never reported one
@@ -79,6 +79,21 @@ def served() -> list:
     except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
         return []
     return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
+
+
+def fault() -> str | None:
+    """Why the backend's engine needs a restart (its /health answers 503 after a lost CUDA context), or None."""
+
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", BACKEND, timeout=3)
+        conn.request("GET", "/health")
+        resp = conn.getresponse()
+        body = json.loads(resp.read() or b"{}")
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    if resp.status != 503:
+        return None
+    return str(body.get("fault") or body.get("status") or "unhealthy") if isinstance(body, dict) else "unhealthy"
 
 
 def loaded() -> str | None:
@@ -252,6 +267,17 @@ class Swapper:
             self.running += 1
             return want
 
+    def lost(self, why: str) -> None:
+        """The loaded model's engine died: the next request for it loads it afresh."""
+
+        with self.cond:
+            if self.current is None or self.loading is not None:
+                return
+            say(f"{self.current} lost its engine ({why[:200]}); the next request reloads it")
+            self.failed[self.current] = f"engine fault: {why}"
+            self.current = None
+            self.cond.notify_all()
+
     def leave(self) -> None:
         with self.cond:
             self.running -= 1
@@ -267,9 +293,11 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:        # the servers behind log the requests
         pass
 
-    def reply(self, status: int, payload: dict) -> None:
+    def reply(self, status: int, payload: dict, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload).encode()
         self.send_response(status)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
@@ -409,6 +437,11 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=self.watch, args=(conn, answered), daemon=True).start()
             resp = conn.getresponse()
             answered.set()
+            if resp.status in (500, 503) and (why := fault()) is not None:
+                SWAP.lost(why)          # a dead CUDA context: the client may retry, and its retry reloads the model
+                payload = {"error": {"message": f"the model's engine failed and reloads on the next request: {why}",
+                                     "type": "unavailable"}}
+                return self.event(payload) if sent else self.reply(503, payload, {"Retry-After": "1"})
             if sent and resp.status != 200:
                 return self.event({"error": {"message": resp.read().decode(errors="replace"), "code": resp.status}})
             if not sent:

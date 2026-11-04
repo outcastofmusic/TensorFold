@@ -100,8 +100,11 @@ def make_handler(app: App):
                      **({"max_model_len": window} if window is not None else {}),
                      **({"reasoning": reasoning} if reasoning is not None else {})} for model_id in app.model_ids]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
-                self._json(200, {"status": "ok"} if getattr(getattr(app, "auth", None), "enabled", False)
-                           else health.of(app).snapshot(app))
+                fault = health.of(app).fault
+                if getattr(getattr(app, "auth", None), "enabled", False):
+                    self._json(503 if fault else 200, {"status": "fault" if fault else "ok"})
+                else:
+                    self._json(503 if fault else 200, health.of(app).snapshot(app))
             elif responses.route(self.path):
                 responses.get(self, app, responses.route(self.path))
             else:
@@ -112,6 +115,11 @@ def make_handler(app: App):
 
         def do_POST(self):
             path = self.path.split("?", 1)[0].rstrip("/")
+            if (fault := health.of(app).fault) is not None:     # a lost CUDA context fails every request: say so
+                self._discard_body()
+                self.close_connection = True
+                return self._json(503, {"error": {"message": f"the engine needs a restart: {fault}",
+                                                  "type": "engine_fault"}})
             if path.endswith("/decisions"):
                 return self._post_decisions()
             if path.endswith("/systemone"):
@@ -322,6 +330,7 @@ def make_handler(app: App):
                 return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
             except Exception as exc:        # a scoring failure is the server's, not a bad body
                 _log_error(exc)
+                health.of(app).note(exc)
                 try:
                     return self._json(500, {"error": {"message": _error_message(exc)}})
                 except OSError:

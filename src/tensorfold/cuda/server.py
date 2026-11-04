@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 import threading
 import time
 import uuid
@@ -30,7 +31,8 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 from tensorfold.cuda import health
 from tensorfold.cuda.chat_template import ChatTemplate
 from tensorfold.cuda.prompt_ids import PromptIds
-from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, close_call, hide_tool_calls, parse_tool_calls
+from tensorfold.cuda.reply_text import (StopStrings, StreamDecoder, close_call, cut_glm_call, hide_tool_calls, open_call,
+                                        parse_tool_calls)
 from tensorfold.cuda.turns import Turns, Yield
 from tensorfold.server.text import (CALL_PROBE, THINK_MARKERS, call_opener, is_title_request, reasoning_count,
                                     split_thinking)
@@ -569,8 +571,11 @@ class App:
                 reasoning, answer = "", raw
             answer_raw[0] = answer
             if tools:
-                answer = (policy.content(answer, finished=finished, accept=accept) if policy.single
-                          else hide_tool_calls(answer, finished=finished, opener=own_opener))
+                shown = (policy.content(answer, finished=finished, accept=accept) if policy.single
+                         else hide_tool_calls(answer, finished=finished, opener=own_opener))
+                # while streaming, text after a hidden envelope waits for the end: only the final parse knows whether
+                # the envelope was a call or stays in the content, as an unoffered call's does (upstream #1365)
+                answer = shown if finished or policy.single else os.path.commonprefix([answer, shown])
             return reasoning, answer
 
         serving: list[Any] = [None]
@@ -716,10 +721,20 @@ class App:
         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
         if tools and policy.single:      # the stream's filter over the same text, so rejected envelopes stay
             content = policy.content(raw_answer, accept=accept).strip()
-        tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
+        cut = None
+        if tools and calls_stream is not None and not stopped["stop"] and not (out and out[-1] in ends):
+            cut = cut_calls(raw_answer, tools, calls_stream, policy.max_calls)     # max_tokens ended it in a call
+        if cut is not None:
+            content, calls, cut_streamed, deltas = cut
+            for delta in deltas:
+                emit(delta)
+        streamed_text = answer[:sent["content"]]            # the final parse strips the whitespace the stream led with
+        tail = (content[len(streamed_text):] if content.startswith(streamed_text) else
+                content[len(streamed_text.lstrip()):] if content.startswith(streamed_text.lstrip()) else "")
         if tail:
             final["content"] = tail
-        finish = "tool_calls" if calls else ("stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
+        finish = ("length" if cut is not None else "tool_calls" if calls
+                  else "stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
         warning = unanswered(finish, chat and thinking, content, calls)
         if warning:
             print(warning, flush=True)
@@ -729,7 +744,8 @@ class App:
         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
                     if probabilities is not None else None)
         # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
-        streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
+        streamed = (cut_streamed if cut is not None
+                    else calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0)
         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
                 "stop_sequence": matched_stop(raw_text, stops.strings),
                 **({"logprobs": logprobs} if logprobs is not None else {}),
@@ -872,6 +888,37 @@ def print_done(prompt: int, cached: int, thinking: bool, out: list[int], finish:
           f"ttft={(first - started) if first is not None else -1:.2f}s prefill={stats.get('prefill_s', -1):.2f}s "
           f"rounds={stats.get('rounds', 0)} accepted={stats.get('accepted', 0)}/{stats.get('drafted', 0)}",
           flush=True)
+
+
+def cut_calls(text: str, tools: list[dict[str, Any]], streamer: ToolCallStreamer,
+              max_calls: int | None) -> tuple[str, list[dict[str, Any]], int, list[dict[str, Any]]] | None:
+    """A reply ``max_tokens`` cut inside a call to an offered tool: its content without the envelope, its calls with
+    the cut one last (arguments as far as the model wrote them), how many of them streamed as deltas, and the deltas
+    still to send. None when it ends elsewhere, so the envelope stays text (upstream #1238, #1298).
+
+    An XML call streamed from ``<function=``, so the stream's own record is the call; a GLM call streams only once
+    closed, so its cut is read from the text."""
+
+    start = open_call(text)
+    if start is None:
+        return None
+    content, closed = parse_tool_calls(text[:start], tools, max_calls=max_calls)
+    closed = closed or []
+    if max_calls is not None and len(closed) >= max_calls:
+        return None
+    deltas = streamer.feed(text)                        # the final text's last bytes, if the rounds had not sent them
+    if streamer.open:
+        if streamer.index != len(closed):               # the stream followed a call the parser did not take
+            return None
+        deltas += streamer.cut(text)
+        call = streamer.calls[-1]
+        cut = {"id": call["id"], "type": "function", "function": {"name": call["name"], "arguments": call["arguments"]}}
+        return content, [*closed, cut], len(closed) + 1, deltas
+    glm = cut_glm_call(text[start + len("<tool_call>"):], tools)
+    if glm is None:
+        return None
+    cut = {"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function", "function": {"name": glm[0], "arguments": glm[1]}}
+    return content, [*closed, cut], streamer.index + 1 if streamer.streamed else 0, deltas
 
 
 from tensorfold.cuda.http import Server, make_handler, serve, usage_of  # noqa: E402,F401  (the HTTP side)
