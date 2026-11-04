@@ -121,3 +121,58 @@ def test_metrics_count_cached_prompt_tokens_under_this_server_s_name_and_vllm_s(
     body = metrics.render(app)
     assert "tensorfold:prompt_tokens_cached_total 60\n" in body
     assert "tensorfold:prefix_cache_hits_total 60\n" in body and "tensorfold:prefix_cache_queries_total 150\n" in body
+
+
+class FaultingEngine(PacedEngine):
+    """An engine whose CUDA context dies on the first request, as an illegal address does."""
+
+    def __init__(self, error: BaseException):
+        super().__init__()
+        self.error = error
+
+    def generate(self, *args, **kwargs):
+        raise self.error
+
+
+def _get(port, path):
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=WAIT)
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+
+
+def test_a_sticky_cuda_fault_turns_health_503_and_refuses_later_requests(tmp_path):
+    engine = FaultingEngine(RuntimeError("CUDA error: an illegal memory access was encountered"))
+    app = app_for(tmp_path, engine)
+    with serving(app) as port:
+        assert _get(port, "/health")[0] == 200
+        status, _ = post(port, {"messages": MESSAGES, "max_tokens": 4})
+        assert status == 500                                    # the request the fault hit
+        status, body = _get(port, "/health")
+        assert status == 503 and body["ok"] is False and "illegal memory access" in body["fault"]
+        calls = len(engine.calls)
+        status, text = post(port, {"messages": MESSAGES, "max_tokens": 4})
+        assert status == 503 and json.loads(text)["error"]["type"] == "engine_fault"
+        assert len(engine.calls) == calls                       # never reached the dead engine
+
+
+@pytest.mark.parametrize("error", [RuntimeError("out of tokens"), ValueError("CUDA error: an illegal memory access"),
+                                   RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")])
+def test_other_failures_leave_health_ok(tmp_path, error):
+    app = app_for(tmp_path, FaultingEngine(error))
+    with serving(app) as port:
+        post(port, {"messages": MESSAGES, "max_tokens": 4})
+        status, body = _get(port, "/health")
+        assert status == 200 and body["ok"] is True and "fault" not in body
+
+
+def test_sticky_reads_torch_s_error_code():
+    class AcceleratorError(RuntimeError):
+        error_code = 700
+
+    assert health.sticky(AcceleratorError("something"))
+    assert health.sticky(RuntimeError("Triton Error [CUDA]: unspecified launch failure"))
+    assert not health.sticky(RuntimeError("CUDA error: invalid argument"))

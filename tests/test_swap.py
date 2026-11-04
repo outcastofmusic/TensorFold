@@ -535,3 +535,71 @@ def test_the_endpoint_reads_the_window_of_a_model_already_loaded_at_start(swap, 
         assert _windows(swap.Swapper()) == {"qwen3.8-27b": 262144}
     finally:
         backend.shutdown()
+
+
+class _Faulted(BaseHTTPRequestHandler):
+    """An engine whose CUDA context died: requests fail and /health answers 503 with the fault."""
+
+    protocol_version = "HTTP/1.1"
+    healthy = False
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def _send(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if _Faulted.healthy:
+            return self._send(200, {"ok": True})
+        self._send(503, {"ok": False, "fault": "AcceleratorError: CUDA error: an illegal memory access"})
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self._send(500, {"error": {"message": "CUDA error: an illegal memory access"}})
+
+
+def _post_front(port: int, model: str):
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request("POST", "/v1/chat/completions", json.dumps({"model": model, "messages": []}),
+                     {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        return resp.status, resp.getheader("Retry-After"), json.loads(resp.read())
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("healthy", [False, True])
+def test_an_engine_that_lost_its_cuda_context_is_reloaded_by_the_next_request(swap, tmp_path, healthy):
+    log = tmp_path / "order"
+    run = tmp_path / "run.sh"
+    run.write_text(f"#!/bin/sh\necho run $1 >> {log}\n")
+    run.chmod(0o755)
+    swap.RUN = str(run)
+    _Faulted.healthy = healthy
+    backend = _serve(_Faulted)
+    swap.BACKEND = backend.server_address[1]
+    swap.SWAP = swap.Swapper()
+    swap.SWAP.current = "qwen3.8-flash-next"
+    front = _serve(swap.Handler)
+    try:
+        status, retry, body = _post_front(front.server_address[1], "qwen3.8-flash-next")
+        if healthy:                                        # an ordinary 500 is the request's: it passes through
+            assert (status, retry) == (500, None) and swap.SWAP.current == "qwen3.8-flash-next"
+            return
+        assert (status, retry) == (503, "1") and "illegal memory access" in body["error"]["message"]
+        assert swap.SWAP.current is None
+        state, error = _states(swap.SWAP)["qwen3.8-flash-next"]
+        assert state == "failed" and error.startswith("engine fault")
+        assert swap.SWAP.enter("qwen3.8-flash-next") == "qwen3.8-flash-next"   # the retry reloads it
+        swap.SWAP.leave()
+        assert log.read_text().splitlines() == ["run qwen-flash-next"]
+    finally:
+        front.shutdown()
+        backend.shutdown()
