@@ -106,7 +106,9 @@ def _normalize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[
             args = fn.get("arguments") if isinstance(fn, dict) else None
             if isinstance(fn, dict) and "arguments" in fn and not isinstance(args, dict):
                 parsed = args
-                if isinstance(args, str):
+                if isinstance(args, str) and not args.strip():
+                    parsed = {}  # a call with no arguments, as clients spell it
+                elif isinstance(args, str):
                     try:
                         parsed = json.loads(args)
                     except (ValueError, TypeError):
