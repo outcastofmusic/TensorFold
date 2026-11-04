@@ -122,12 +122,20 @@ class App:
             raise ValueError("context_window must be 0 or a positive token count")
         self.turns = Turns()                # one request at a time where the engine decodes one
         from tensorfold.server.joint_schema import JointSchema, has_head
+        from tensorfold.server.label_readout import LabelReadout, has_readout
+
+        def plain(text: str) -> list[int]:
+            return [int(t) for t in self.tok.encode(text, add_special_tokens=False).ids]
 
         if has_head(self.model_dir):          # it answers /v1/decisions and /v1/systemone
             request = self._prompt_ids().request          # the state and questions encode as plain text
-            self.joint = JointSchema.load(self.model_dir, engine,
-                                          lambda text: [int(t) for t in self.tok.encode(text, add_special_tokens=False).ids],
-                                          request.ids if request is not None else None)
+            self.joint = JointSchema.load(self.model_dir, engine, plain, request.ids if request is not None else None)
+        elif has_readout(self.model_dir):     # the same routes, answered from label logits (PelaAI/KnowLine)
+            ids = self._prompt_ids()
+            self.joint = LabelReadout.load(
+                self.model_dir, engine,
+                lambda turns: self.template.render(turns, tools=None, enable_thinking=False, request=ids.request),
+                ids.encode, plain)
 
     @property
     def model_ids(self) -> list[str]:
@@ -270,7 +278,7 @@ class App:
         """A Jev/SystemOne request body, answered by a decision model's joint schema head."""
 
         if self.joint is None:
-            raise RequestError("/v1/systemone needs a decision model with a joint schema head (Cloudflare/clef)")
+            raise RequestError("/v1/systemone needs a decision model: a joint schema head (Cloudflare/clef) or label logits (PelaAI/KnowLine)")
         return self._joint(self.joint.systemone, body)
 
     def _joint(self, answer: Callable[[dict[str, Any]], dict[str, Any]], body: dict[str, Any]) -> dict[str, Any]:
