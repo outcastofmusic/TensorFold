@@ -27,7 +27,7 @@
 #   EXTRA="..."                more `tensorfold serve` flags
 #   QWEN_MODEL, QWEN_FP4_MODEL, QWEN27_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL, SUPER_MODEL, D1_MODEL   another checkpoint folder under $MODELS
 # Qwen, Qwen FP4, GLM:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused;  Qwen: STATES_ALL=0: each slot's shortest and longest state go to disk (1: every kept state)
-# Qwen:  CONTEXT=262144  PARALLEL=8 (FP4-Local: 4)  KEPT=4 a stream (TENSORFOLD_KEPT_STATES)  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)
+# Qwen:  CONTEXT=262144  PARALLEL=8 (FP4-Local: 4)  KEPT=4 a stream (TENSORFOLD_KEPT_STATES)  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)  GRID=4096 (TENSORFOLD_GRID_ANCHORS; 0: off)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   ANSWER_BUDGET=24576 (thinking off, no max_tokens asked; 0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)   COPIES=1 (0: no copy drafts in DFlash2 rounds)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
 # Qwen FP4-Local: Qwen's settings, VISION=0 by default (the image tower run.sh converts belongs to the EXL3 pack)
@@ -232,6 +232,9 @@ qwen() {  # [served name] [clef_first: 1 starts Clef before Qwen]
         wait_ready clef-serve "$CLEF_PORT" || failed clef-serve
     fi
     [ -z "${KEPT:-}" ] || flags+=(-e "TENSORFOLD_KEPT_STATES=$KEPT")
+    # prompt states at every 4,096th token too, so a long document re-sent with a new question resumes: 128k first
+    # token 51 s -> 1.4-1.9 s, same reply, four agents' cached tokens unchanged (EXL3, tf-runs/gpu-1104, 2026-11-04)
+    [ "${GRID:-4096}" = 0 ] || flags+=(-e "TENSORFOLD_GRID_ANCHORS=${GRID:-4096}")
     [ "${STATES:-1}" = 0 ] || flags+=(-v tensorfold-states:/states -e TENSORFOLD_QWEN_STATES=/states/qwen -e "TENSORFOLD_QWEN_STATES_GIB=${STATES_GIB:-64}" -e "TENSORFOLD_QWEN_STATES_TTL_H=${STATES_TTL_H:-72}" -e "TENSORFOLD_QWEN_STATES_ALL=${STATES_ALL:-0}")
     # 8 streams: eight 6-turn agent sessions put out 51.6 tok/s against 31.6 at 4, and one session the same (tf-runs/
     # agents-1026, EXL3, 2026-10-26)
