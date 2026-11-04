@@ -1,7 +1,8 @@
 # Dense Llama on CUDA
 
 The CUDA engine for plain `LlamaForCausalLM` checkpoints (model type `llama`), written for Nanbeige4.3-33B. It
-serves one stream on one GPU and drafts copies from the context, verified as chains. See
+serves one stream on one GPU and drafts copies from the context, verified as chains. With `--drafter` pointing at a
+DFlash2 folder (ProCreations/Nanbeige4.3-33B-DFlash2), a round without a copy verifies a 16-row DFlash2 tree. See
 [the recipe](../../../../../docs/recipes/nanbeige4.3-33b.md) for setup and the first real-weights run.
 
 A verify window of up to 128 rows gives each row the bits that row gets alone, so a drafted token is the token
@@ -28,7 +29,11 @@ kernels, except the rotary embedding in `glue.py`:
   `prefill_attention`). Their bits do not depend on chunk bounds but differ from decode's. The KV cache is the
   whole state, so a kept state is a clone of the prefilled state with `pos` set back.
 - `decode.py` has `prefill`, `serial_decode` and `draft_decode`. A copy's window starts at 16 rows, doubles while
-  copies land whole and halves when one breaks, up to 128.
+  copies land whole and halves when one breaks, up to 128. Without a copy, the drafter proposes a tree and every
+  committed row's residuals at the drafter's tap layers (1, 25 and 49 for Nanbeige) feed its context.
+- The drafter is qwen3_5's `DFlash2`, reading its tap layers, candidate count and window from the drafter's
+  config.json. A config with `sliding_window: null` keeps the last 2,047 taps. Prefill hands it only the rows that
+  window keeps at each kept prompt state, and the prefix cache stores its snapshot beside each state.
 - `engine.py` is what `tensorfold serve` runs: startup memory admission, prefix reuse at message starts and at each
   prompt's end minus one token.
 - `../reference.py` is an fp32 forward in transformers' Llama math for the quality test.

@@ -58,7 +58,7 @@ def test_check_refuses_from_config_alone(tmp_path):
 @pytest.mark.parametrize(("options", "why"), [
     ({"tp": 2}, "one GPU"),
     ({"master": "10.0.0.1"}, "one GPU"),
-    ({"drafter": "some/drafter"}, "no draft model"),
+    ({"drafter": "some/drafter"}, "no config.json"),
     ({"parallel": 2}, "one stream"),
     ({"vision": True}, "text model"),
     ({"mtp_drafts": 3}, "mtp_drafts"),
@@ -179,3 +179,14 @@ def test_rope_theta_is_read_from_rope_parameters_too(tmp_path):
     exported["rope_parameters"] = {"rope_theta": 120000000, "rope_type": "default"}
     (tmp_path / "config.json").write_text(json.dumps(exported))
     assert refusal(exported) is None and Config.read(tmp_path).rope_theta == 1.2e8
+
+
+def test_drafter_estimate_bounds_a_config_without_sliding_window():
+    """The Nanbeige drafter's config sets ``sliding_window: null``: its context is bounded as DFlash2 keeps it."""
+
+    from tensorfold.cuda.geometry import DRAFT_CONTEXT, draft_geometry
+
+    drafter = json.loads((FIXTURES / "dflash2_config.json").read_text())
+    assert drafter["sliding_window"] is None and drafter["dflash_config"]["target_layer_ids"] == [1, 25, 49]
+    g = draft_geometry(drafter, 1, 128, bounded=True, kept=4)
+    assert g.bytes_at(DRAFT_CONTEXT) == g.bytes_at(131072) > g.bytes_at(16)

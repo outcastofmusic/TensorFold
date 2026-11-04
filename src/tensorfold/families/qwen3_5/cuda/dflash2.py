@@ -1,4 +1,4 @@
-"""DFlash2 proposals use committed Qwen3.8 target taps and target verification, so draft rounding changes acceptance without changing output."""
+"""DFlash2 proposals use committed target taps and target verification, so draft rounding changes acceptance without changing output."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from tensorfold.cuda.direct_read import SafeTensors
+from tensorfold.cuda.geometry import DRAFT_CONTEXT
 from tensorfold.engine.exact_sampling import Sampling
 
 from .affine_memory import packed_draft
@@ -22,6 +23,8 @@ from .draft_attention import append, block_attention
 from .qmm import group_sums
 from .qmm_fast import matmul, matmul_group, matmul_rows, rows, tile, untile
 from .weights import Exl3, Plain, QLinear, Weights
+
+QWEN_SPANS = ((0, 98304), (248032, 248320))      # Qwen3.8's token ids; the rows between are never emitted
 
 
 @triton.jit
@@ -180,10 +183,11 @@ def _exl3_sub_head(layer, spans: tuple[tuple[int, int], ...]):
 
 
 class DFlash2:
-    """Five-layer DFlash2; context is the last 2,047 committed target taps."""
+    """A DFlash2 drafter over the target layers its config names; context is the last ``window`` committed taps."""
 
     def __init__(self, draft_dir: str | Path, target: Weights, bits: int = 4, block: int = 16,
-                 fast: bool = True, rank: int = 0, world: int = 1):
+                 fast: bool = True, rank: int = 0, world: int = 1,
+                 vocab_spans: tuple[tuple[int, int], ...] = QWEN_SPANS):
         path = Path(draft_dir)
         # Two-rank drafting requires both ranks to call propose_tree/add_taps together on the fused path with ordered partial sums.
         if world not in (1, 2) or (world == 2 and not (fast and bits == 4)):
@@ -197,11 +201,15 @@ class DFlash2:
         self.kv_heads = int(cfg["num_key_value_heads"])
         self.eps = float(cfg["rms_norm_eps"])
         self.theta = float(cfg["rope_parameters"]["rope_theta"])
-        self.mask_id = int(cfg["dflash_config"]["mask_token_id"])
-        self.trained = int(cfg["dflash_config"].get("block_size", 8))     # its training block: the planner's floor
-        self.group_size = int(cfg["dflash_config"]["conv_group_size"])
+        dc = cfg["dflash_config"]
+        self.mask_id = int(dc["mask_token_id"])
+        self.trained = int(dc.get("block_size", 8))     # its training block: the planner's floor
+        self.group_size = int(dc["conv_group_size"])
+        self.tap_layers = tuple(int(i) for i in dc.get("target_layer_ids", (5, 19, 33, 47, 61)))
+        self.top_k = int(dc.get("selector_top_k", 16))
         self.layers = int(cfg["num_hidden_layers"])
-        self.window = int(cfg["sliding_window"]) - 1
+        # ``sliding_window: null`` trained on full context; the drafter still keeps a bounded window of taps
+        self.window = int(cfg.get("sliding_window") or DRAFT_CONTEXT) - 1
         self.is_causal = bool(cfg.get("is_causal", True))
         self.target_embed = target.embed
         self.device = target.norm.device
@@ -215,17 +223,21 @@ class DFlash2:
             else:
                 self.weights[name] = tensor                  # on the host until packed: no bf16 copy on the device
         del f
+        fc = tuple(self.weights["fc.weight"].shape)
+        if fc != (self.hidden, len(self.tap_layers) * self.hidden):
+            raise ValueError(f"fc.weight is {fc[0]} x {fc[1]}: {len(self.tap_layers)} taps of {self.hidden} imply "
+                             f"{self.hidden} x {len(self.tap_layers) * self.hidden}")
         self.inv_freq = (1.0 / self.theta **
                          (torch.arange(self.head_dim // 2, device=self.device,
                                        dtype=torch.float32) * 2 / self.head_dim))
         vocab = target.config.vocab
-        spans = tuple((a, min(b, vocab)) for a, b in ((0, 98304), (248032, 248320)) if a < vocab)
+        spans = tuple((a, min(b, vocab)) for a, b in vocab_spans if a < vocab)
         self.vocab_spans = spans
         self.head_ids = torch.cat([torch.arange(a, b, device=self.device) for a, b in spans])
         self.head_cols: torch.Tensor | None = None           # an EXL3 head's span columns in its sliced strips
         self.sub_rows: list[QLinear] | None = None           # one GPU, tiled head: its rows as views, no copy
         self.sub_parts: list | None = None                   # an NVFP4 checkpoint's head: tile views and span columns
-        if target.quant == "nvfp4":
+        if target.quant == "nvfp4" or isinstance(target.head, Plain):       # a bf16 head as stored: row views
             if world != 1:
                 raise ValueError("a two-rank drafter needs the MLX checkpoint's 4-bit head")
             self.sub_parts = _sub_parts(target.head, spans)
@@ -318,8 +330,8 @@ class DFlash2:
 
     @torch.no_grad()
     def add_taps(self, taps: torch.Tensor) -> None:
-        if taps.ndim != 2 or taps.shape[1] != 5 * self.hidden:
-            raise ValueError("DFlash2 expects five target layer taps per committed row")
+        if taps.ndim != 2 or taps.shape[1] != len(self.tap_layers) * self.hidden:
+            raise ValueError(f"DFlash2 expects {len(self.tap_layers)} target layer taps per committed row")
         projected = _norm(self._lin(taps, "fc.weight"), self.weights["hidden_norm.weight"], self.eps)
         n = projected.shape[0]
         if self.fast:
@@ -528,7 +540,7 @@ class DFlash2:
             logits = matmul_rows(h, self.sub_rows)
         else:
             logits = matmul(h, self.sub_head)
-        values, local_ids = torch.topk(logits.float(), k=16, dim=-1, sorted=False)
+        values, local_ids = torch.topk(logits.float(), k=self.top_k, dim=-1, sorted=False)
         global_ids = self.head_ids[local_ids]
         if self.world == 2:
             import torch.distributed as dist
@@ -538,7 +550,7 @@ class DFlash2:
             dist.all_gather_into_tensor(both_values, values.contiguous())
             dist.all_gather_into_tensor(both_ids, global_ids.contiguous())
             merged = torch.cat((both_values[0], both_values[1]), dim=1)
-            values, pick = torch.topk(merged, k=16, dim=-1, sorted=False)
+            values, pick = torch.topk(merged, k=self.top_k, dim=-1, sorted=False)
             global_ids = torch.cat((both_ids[0], both_ids[1]), dim=1).gather(1, pick)
         shared = [global_ids, torch.cat((values, projected), dim=1), None]     # read back once, by the first finish
         for j, i in enumerate(live):
@@ -555,8 +567,8 @@ class DFlash2:
         if shared[2] is None:
             shared[2] = (shared[0].cpu().numpy().astype(np.int64), shared[1].cpu().numpy().astype(np.float64))
         ids, floats = shared[2][0][start:start + rows], shared[2][1][start:start + rows]
-        self.last_candidates = ids                       # (depths, 16) ids this round, for decode traces
-        return best_first(ids, floats[:, :16], floats[:, 16:],
+        self.last_candidates = ids                       # (depths, top_k) ids this round, for decode traces
+        return best_first(ids, floats[:, :self.top_k], floats[:, self.top_k:],
                           self.weights["candidate_selector.predecessor_codebook"],
                           self.weights["candidate_selector.successor_codebook"],
                           pending, min(127, max_nodes), sampling, context_length)

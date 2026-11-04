@@ -26,7 +26,7 @@ PROJECTIONS = {"self_attn.q_proj": (HEADS * HEAD_DIM, HIDDEN), "self_attn.k_proj
                "mlp.gate_proj": (INTER, HIDDEN), "mlp.up_proj": (INTER, HIDDEN), "mlp.down_proj": (HIDDEN, INTER)}
 
 
-def tensors(seed: int = 0) -> dict[str, torch.Tensor]:
+def tensors(seed: int = 0, layers: int = LAYERS) -> dict[str, torch.Tensor]:
     """Every tensor of the bf16 checkpoint by name; norms near 1 (stored as gamma, transformers' Llama layout)."""
 
     g = torch.Generator().manual_seed(seed)
@@ -36,7 +36,7 @@ def tensors(seed: int = 0) -> dict[str, torch.Tensor]:
 
     out = {"model.embed_tokens.weight": rand(VOCAB, HIDDEN, scale=1.0), "model.norm.weight": 1 + rand(HIDDEN, scale=0.1),
            "lm_head.weight": rand(VOCAB, HIDDEN, scale=HIDDEN ** -0.5)}
-    for i in range(LAYERS):
+    for i in range(layers):
         p = f"model.layers.{i}."
         out[p + "input_layernorm.weight"] = 1 + rand(HIDDEN, scale=0.1)
         out[p + "post_attention_layernorm.weight"] = 1 + rand(HIDDEN, scale=0.1)
@@ -58,10 +58,10 @@ def _save(folder: Path, named: dict[str, torch.Tensor], config: dict) -> Path:
     return folder
 
 
-def write(folder: Path, seed: int = 0, **change) -> Path:
+def write(folder: Path, seed: int = 0, layers: int = LAYERS, **change) -> Path:
     """The bf16 checkpoint as transformers saves it."""
 
-    return _save(Path(folder), tensors(seed), text_config(**change))
+    return _save(Path(folder), tensors(seed, layers), text_config(num_hidden_layers=layers, **change))
 
 
 def write_exl3(folder: Path, seed: int = 0, bits: int = 3, head: bool = True) -> Path:

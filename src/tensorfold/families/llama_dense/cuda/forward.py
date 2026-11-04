@@ -34,8 +34,10 @@ def new_state(w: Weights) -> State:
 
 
 @torch.no_grad()
-def tree_forward(w: Weights, tokens: torch.Tensor, parents: Sequence[int], st: State, *, hidden: bool = False):
-    """Logits of every window row and the layers' records; a row sees its root-to-row path and the committed keys."""
+def tree_forward(w: Weights, tokens: torch.Tensor, parents: Sequence[int], st: State, *, hidden: bool = False,
+                 taps: Sequence[int] = ()):
+    """Logits of every window row and the layers' records; a row sees its root-to-row path and the committed keys.
+    ``hidden`` adds the final normed rows, ``taps`` the residuals after those layers side by side (a drafter's input)."""
 
     c = w.config
     parents = [int(p) for p in parents]
@@ -50,6 +52,7 @@ def tree_forward(w: Weights, tokens: torch.Tensor, parents: Sequence[int], st: S
     x = qglue.embedding(tokens.to(torch.int32), w.embed)
     pending: torch.Tensor | None = None
     record: list[AttentionRecord] = []
+    tapped: list[torch.Tensor] = []
     scale = c.head_dim ** -0.5
     for i, layer in enumerate(w.layers):
         x, h, _ = qglue.add_rmsnorm(x, pending, layer.input_norm, c.eps)
@@ -63,6 +66,8 @@ def tree_forward(w: Weights, tokens: torch.Tensor, parents: Sequence[int], st: S
         x, h, _ = qglue.add_rmsnorm(x, r, layer.post_norm, c.eps)
         act, _ = qglue.swiglu(*_mm_group(h, [layer.gate, layer.up]))
         pending = _mm(act, layer.down)
+        if i in taps:
+            tapped.append((x.float() + pending.float()).to(torch.bfloat16))
     _, h, _ = qglue.add_rmsnorm(x, pending, w.norm, c.eps)
     logits = _mm(h, w.head)
-    return (logits, record, h) if hidden else (logits, record)
+    return (logits, record) + ((h,) if hidden else ()) + ((torch.cat(tapped, dim=-1),) if taps else ())

@@ -1,5 +1,5 @@
 """Plain dense Llama checkpoints (``LlamaForCausalLM``) on CUDA: one GPU, one stream, context-copy drafts verified as
-chains, every drafted token the serial decode's."""
+chains and, with ``--drafter``, DFlash2 trees; every drafted token the serial decode's."""
 
 from __future__ import annotations
 
@@ -58,12 +58,11 @@ def check(model_dir: str | Path) -> None:
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
                 master_port: int = 29551, no_drafts: bool = False, context: int | None = None,
                 context_explicit: bool = False, **options: Any):
-    """One GPU, one stream; copies from the context draft unless ``no_drafts``. Unused serve options are refused."""
+    """One GPU, one stream; copies from the context draft unless ``no_drafts``, and a DFlash2 ``drafter`` (a folder
+    such as ProCreations/Nanbeige4.3-33B-DFlash2) adds trees. Unused serve options are refused."""
 
     if int(tp) != 1 or int(rank) != 0 or master:
         raise ValueError(f"{TITLE} runs on one GPU on CUDA: serve with --tp 1")
-    if drafter:
-        raise ValueError(f"{TITLE} has no draft model on CUDA (it drafts copies from the context): drop --drafter")
     if options.pop("vision", False):
         raise ValueError(f"{TITLE} is a text model: drop --vision")
     if int(options.pop("parallel", None) or 1) > 1:
@@ -73,5 +72,9 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     check(model_dir)
     from .cuda.engine import LlamaEngine
 
-    return LlamaEngine(Path(model_dir), allow_copy=not no_drafts, context=context,
+    draft = Path(drafter) if drafter and not no_drafts else None
+    if draft is not None and not (draft / "config.json").exists():
+        raise ValueError(f"--drafter {drafter}: no config.json there (a DFlash2 folder, e.g. "
+                         "ProCreations/Nanbeige4.3-33B-DFlash2)")
+    return LlamaEngine(Path(model_dir), draft_dir=draft, allow_copy=not no_drafts, context=context,
                        context_explicit=bool(context_explicit))

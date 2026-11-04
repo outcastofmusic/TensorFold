@@ -12,6 +12,7 @@ PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fracti
 PREFILL_ATT_ROWS = 256  # Flash Next's prompt attention block
 MLA_PROMPT_ATT_ROWS = 512   # GLM's prompt-chunk rows one dense latent attention call takes (forward.PROMPT_ATT_ROWS)
 MLA_SELECT_ROWS = 512       # GLM's prompt-chunk rows whose pool scores are held at once (sparse.SELECT_ROWS)
+DRAFT_CONTEXT = 2048        # a DFlash2 drafter's context rows plus one when its config sets no sliding_window
 
 
 def indexed_prefill_rows() -> int | None:
@@ -314,7 +315,7 @@ def draft_geometry(t: dict, world: int, reserve: int, *, bounded: bool = False, 
     heads = int(t["num_key_value_heads"]) // world
     hd = int(t["head_dim"])
     block = int((t.get("dflash_config") or {}).get("block_size", 16))
-    window = int(t.get("sliding_window", 0))
+    window = int(t.get("sliding_window") or DRAFT_CONTEXT)
     hidden = int(t["hidden_size"])
     fixed = 16 * max(64, streams * block) * (hidden + int(t["intermediate_size"])) * 4
     copies = 2 * streams + kept      # a stream's context and the one its taps replace it with; each kept prompt end
