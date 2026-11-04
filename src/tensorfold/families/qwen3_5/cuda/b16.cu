@@ -99,8 +99,18 @@ void launch(const at::Tensor& x, const at::Tensor& w, const void* bp, at::Tensor
 template <typename T>
 void by_rows(const at::Tensor& x, const at::Tensor& w, const void* bp, at::Tensor& y, int M, int K, int N,
              const at::Tensor* w1 = nullptr, at::Tensor* y1 = nullptr) {
-    if (M >= 512) launch<T, 16, 16>(x, w, bp, y, M, K, N, w1, y1);    // rows a warp, warps a block: never a row's bits
-    else if (M >= 64) launch<T, 4, 8>(x, w, bp, y, M, K, N, w1, y1);
+    // rows a warp, warps a block: never a row's bits. On a wide weight (a 2.4 GB bf16 head) one load serves up to 16
+    // rows, so a verify window reads it about once instead of once a row; a narrow one keeps a block a row (parallel)
+    const int wide = (w1 && w1->size(0) > N) ? (int)w1->size(0) : N;
+    if (M >= 512) launch<T, 16, 16>(x, w, bp, y, M, K, N, w1, y1);
+    else if (wide < 2048) {
+        if (M >= 64) launch<T, 4, 8>(x, w, bp, y, M, K, N, w1, y1);
+        else launch<T, 1, 4>(x, w, bp, y, M, K, N, w1, y1);
+    }
+    else if (M > 8) launch<T, 16, 4>(x, w, bp, y, M, K, N, w1, y1);
+    else if (M > 4) launch<T, 8, 4>(x, w, bp, y, M, K, N, w1, y1);
+    else if (M > 2) launch<T, 4, 4>(x, w, bp, y, M, K, N, w1, y1);
+    else if (M == 2) launch<T, 2, 4>(x, w, bp, y, M, K, N, w1, y1);
     else launch<T, 1, 4>(x, w, bp, y, M, K, N, w1, y1);
 }
 
