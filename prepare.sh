@@ -10,6 +10,8 @@
 #   ./prepare.sh nemotron-bolt    Nemotron 3.5 Bolt 74B-A9B 24 GB (23 GB) and its LiLiCorr draft model (0.9 GB)
 #   ./prepare.sh d1               d1-3B, Liquid AI's decision model (6.3 GB), the sidecar run.sh starts beside each model;
 #                                 LFM Open License v1.0: commercial use only below US$10M annual revenue
+#   ./prepare.sh knowline         PelaAI's KnowLine-4B (8.8 GB, Apache-2.0), a thinking guard in place of Clef-Flash: at 0.6
+#                                 it closed the same paragraphs, 334/336 against Clef's 313/336, in 13 GiB against 20-22
 #   ./prepare.sh lfm2-24b         Liquid's LFM2.5-24B-A2B in block FP8 (24.75 GB; LFM Open License v1.0: commercial
 #                                 use only under US$10M annual revenue)
 #   ./prepare.sh nemotron-3.5-super   Nemotron 3.5 Super VL 120B-A12B NVFP4 (75.1 GB) and upstream TensorFold's native
@@ -39,6 +41,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 # repo, revision, folder under $MODELS: the revisions the fork's numbers were measured on
 QWEN=(turboderp/Qwen3.8-Flash-Next-exl3 69e33439ae950f17bcbe95c98f117d80f759ab6d Qwen3.8-Flash-Next-exl3-3.05bpw)
 CLEF=(Cloudflare/clef-flash 17f0b0ad64efb65d273590632833508766b2aae6 clef-flash)
+KNOWLINE=(PelaAI/KnowLine-4B-Gen5.5 779944d2cc8ffa19cef386aee83c83bcb967ade2 KnowLine-4B-Gen5.5)
 GLM=(0xSero/GLM-5.3-Flash-EXL3-Spark 2642851741fc833764e77d03039117be559dc83e glm53-flash-mosaic-12l)
 SUSHI=(beamster/GLM-5.3-Flash-Sushi-2.4bpw 0bc3bf157723d2bb7723e31118addf48b22101b0 glm53-flash-sushi-2.4bpw)
 HYBRID=glm53-flash-sushi-experts-mosaic-dense
@@ -94,6 +97,17 @@ bolt() {
 
 lfm2() {
     fetch "${LFM2[@]}"
+}
+
+# KnowLine-4B answers from label logits; run.sh serves it from a folder of links to the release plus
+# label_readout.json, which names the layout: CLEF_MODEL=$MODELS/KnowLine-4B-Gen5.5-serve ./run.sh
+knowline() {
+    fetch "${KNOWLINE[@]}"
+    local src="$MODELS/${KNOWLINE[2]}" view="$MODELS/${KNOWLINE[2]}-serve" f
+    mkdir -p "$view"
+    for f in "$src"/*; do ln -sfn "$f" "$view/"; done
+    echo '{"layout": "knowline", "read_twice": true}' > "$view/label_readout.json"
+    echo "prepare: KnowLine's serving folder at $view"
 }
 
 # The archive has no libturbojpeg or libwebpdecoder, so the server refuses JPEG images until lib/ holds libjpeg-turbo
@@ -160,9 +174,10 @@ case "$what" in
     nemotron-bolt)   need=25 ;;
     d1)              need=7 ;;
     lfm2-24b)        need=26 ;;
+    knowline)        need=9 ;;
     nemotron-3.5-super) need=76 ;;
     all)             need=$((100 + glm_need)) ;;
-    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, qwen-27b, nemotron-bolt, lfm2-24b, nemotron-3.5-super, d1, or nothing for the first two)" ;;
+    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, qwen-27b, nemotron-bolt, lfm2-24b, nemotron-3.5-super, d1, knowline, or nothing for the first two)" ;;
 esac
 free=$(df -BG --output=avail "$MODELS" | tail -1 | tr -dc 0-9)
 [ "$free" -ge "$need" ] || echo "prepare: $MODELS has $free GB free and a first download needs $need GB" >&2
@@ -175,6 +190,7 @@ case "$what" in
     nemotron-bolt)   bolt ;;
     d1)              fetch "${D1[@]}" ;;
     lfm2-24b)        lfm2 ;;
+    knowline)        knowline ;;
     nemotron-3.5-super) super ;;
     all)             qwen; glm ;;
 esac
