@@ -27,7 +27,7 @@
 #   EXTRA="..."                more `tensorfold serve` flags
 #   QWEN_MODEL, QWEN_FP4_MODEL, QWEN27_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL, SUPER_MODEL, D1_MODEL   another checkpoint folder under $MODELS
 # Qwen, Qwen FP4, GLM:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused;  Qwen: STATES_ALL=0: each slot's shortest and longest state go to disk (1: every kept state)
-# Qwen:  CONTEXT=262144  PARALLEL=8 (FP4-Local: 4)  KEPT=4 a stream (TENSORFOLD_KEPT_STATES)  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef)  VISION=1 (0: text only)  GRID=4096 (TENSORFOLD_GRID_ANCHORS; 0: off)
+# Qwen:  CONTEXT=262144  PARALLEL=8 (FP4-Local: 4)  KEPT=4 a stream (TENSORFOLD_KEPT_STATES)  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no Clef; CLEF_MODEL a Clef or KnowLine folder)  GUARD_THRESHOLD=0.8 (KnowLine: 0.6)  VISION=1 (0: text only)  GRID=4096 (TENSORFOLD_GRID_ANCHORS; 0: off)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   ANSWER_BUDGET=24576 (thinking off, no max_tokens asked; 0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)   COPIES=1 (0: no copy drafts in DFlash2 rounds)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
 # Qwen FP4-Local: Qwen's settings, VISION=0 by default (the image tower run.sh converts belongs to the EXL3 pack)
@@ -213,12 +213,16 @@ qwen() {  # [served name] [clef_first: 1 starts Clef before Qwen]
     local tower="$MODELS/Qwen3.8-Flash-Next-exl3-3.05bpw-vision/vision-f16-v3.safetensors"
     [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh qwen-flash-next)"
     # checked before anything stops: a missing guard must leave the running model loaded
-    [ "${GUARD:-1}" = 0 ] || [ -e "$clef/joint_head.safetensors" ] \
-        || die "no Clef-Flash at $clef (run ./prepare.sh qwen-flash-next, or GUARD=0)"
+    [ "${GUARD:-1}" = 0 ] || [ -e "$clef/joint_head.safetensors" ] || [ -e "$clef/label_readout.json" ] \
+        || die "no decision model at $clef (run ./prepare.sh qwen-flash-next, or GUARD=0)"
+    # KnowLine-4B (label logits) says yes lower than Clef-Flash: at 0.6 it caught 72/72 complete states with 0/132
+    # early cuts, at 0.8 only 61/72; Clef-Flash at 0.8 72/72 with 1/132 (notes tf-runs/decision-models-1104)
+    local threshold="${GUARD_THRESHOLD:-0.8}"
+    [ -n "${GUARD_THRESHOLD:-}" ] || [ ! -e "$clef/label_readout.json" ] || threshold=0.6
     IMAGE=$(image)
     stop_all
     local guard=() budget=() vision=() flags=()
-    [ "${GUARD:-1}" = 0 ] || guard=(--thinking-guard "http://127.0.0.1:$CLEF_PORT/v1")
+    [ "${GUARD:-1}" = 0 ] || guard=(--thinking-guard "http://127.0.0.1:$CLEF_PORT/v1" --thinking-guard-threshold "$threshold")
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
     if [ "${VISION:-1}" != 0 ] && [ -e "$tower" ]; then
         vision=(--vision); flags=(-e "TENSORFOLD_VISION_WEIGHTS=$tower")

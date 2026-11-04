@@ -345,8 +345,11 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
         layers.append(Layer(linear=cfg.is_linear(i), input_norm=norm(p + "input_layernorm.weight"),
                             post_norm=norm(p + "post_attention_layernorm.weight"), gdn=gdn, attn=attn,
                             **{"gate": None, "up": None, "down": None, **fields}))
-    w = Weights(config=cfg, embed=qlinear("model.embed_tokens", pack=False), layers=layers,
-                norm=norm("model.norm.weight"), head=qlinear("lm_head"))
+    embed = qlinear("model.embed_tokens", pack=False)
+    # a release that ties its head to the embedding (PelaAI/KnowLine-4B) has no lm_head: the head is the same matrix
+    tied = raw.get("tie_word_embeddings", raw.get("text_config", {}).get("tie_word_embeddings", False))
+    head = embed if tied and (prefix + "lm_head.weight") not in t else qlinear("lm_head")
+    w = Weights(config=cfg, embed=embed, layers=layers, norm=norm("model.norm.weight"), head=head)
     half = cfg.rope_dims // 2
     inv = cfg.rope_theta ** (-torch.arange(0, half, dtype=torch.float64) / half)
     w.inv_freq = inv.to(torch.float32).to(device)
