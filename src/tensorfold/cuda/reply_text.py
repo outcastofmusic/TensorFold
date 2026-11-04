@@ -11,7 +11,7 @@ from tensorfold.server import pythonic_calls
 from tensorfold.server.stopping import StopPolicy
 from tensorfold.server.text import hide_tool_calls  # noqa: F401  (the CUDA server's, with the Mac's four formats)
 from tensorfold.server.tools import parse_glm_tool_call_block, tool_call_blocks, tool_parameters, tool_spec_name
-from tensorfold.tool_parameters import closed_json, decode_parameter, parameter_schemas
+from tensorfold.tool_parameters import closed_json, decode_parameter, parameter_schemas, typed_parameter
 
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
 _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
@@ -165,6 +165,51 @@ def _arguments_close(body: str) -> str:
     return closed[len(body):] if closed is not None else ""
 
 
+def open_call(text: str) -> int | None:
+    """Where the ``<tool_call>`` that ``text`` ends inside begins (the first with no closer after it), or None."""
+
+    low, at = text.lower(), 0
+    while (opener := low.find(_CALL_OPEN, at)) >= 0:
+        closer = low.find(_CALL_CLOSE, opener + len(_CALL_OPEN))
+        if closer < 0:
+            return opener
+        at = closer + len(_CALL_CLOSE)
+    return None
+
+
+def cut_glm_call(block: str, tools: list[dict[str, Any]]) -> tuple[str, str] | None:
+    """A GLM call ``max_tokens`` cut: its name and its arguments as far as the model wrote them, in the XML stream's
+    form (``{"path":"notes.txt","content":"The hist``), closed values typed by the schema (upstream #1298).
+
+    None when no key has closed yet (its name may be cut too) or the call names a tool the request did not offer."""
+
+    name, found, rest = block.partition("<arg_key>")
+    known = {tool_spec_name(t).lower(): tool_spec_name(t) for t in tools}
+    name = known.get(name.strip().lower())
+    if not found or name is None:
+        return None
+    schema = parameter_schemas(tools).get(name.lower(), {})
+    text, at, parts = found + rest, 0, []
+    while (key_at := text.find("<arg_key>", at)) >= 0:
+        key_end = text.find("</arg_key>", key_at)
+        value_at = text.find("<arg_value>", key_end) if key_end >= 0 else -1
+        if value_at < 0 or text[key_end + len("</arg_key>"):value_at].strip():
+            break                                      # the key, or the gap before its value, is where it was cut
+        key = text[key_at + len("<arg_key>"):key_end].strip()
+        value_end = text.find("</arg_value>", value_at)
+        value = text[value_at + len("<arg_value>"):value_end if value_end >= 0 else None]
+        prop = schema.get(key, {})
+        if value_end >= 0:
+            piece = json.dumps(decode_parameter(value, prop, python=False), ensure_ascii=False)
+        else:
+            piece = value if typed_parameter(prop) else '"' + json.dumps(value, ensure_ascii=False)[1:-1]
+        parts.append(json.dumps(key, ensure_ascii=False) + ":" + piece)
+        if value_end < 0:
+            break
+        at = value_end + len("</arg_value>")
+    return (name, "{" + ",".join(parts)) if parts else None
+
+
 def close_call(text: str, tools: list[dict[str, Any]]) -> str:
     """What closes the call ``text`` ends inside, for a reply the model's end token ended before ``</tool_call>``:
     "" unless the closed call parses whole, one call to an offered tool and nothing but its markup (upstream
@@ -172,15 +217,9 @@ def close_call(text: str, tools: list[dict[str, Any]]) -> str:
 
     if not tools:
         return ""
-    low, at, start = text.lower(), 0, None
-    if text.rfind(pythonic_calls.CALL_OPEN) > low.rfind(_CALL_OPEN):     # the reply ends in LFM2's list
+    if text.rfind(pythonic_calls.CALL_OPEN) > text.lower().rfind(_CALL_OPEN):     # the reply ends in LFM2's list
         return pythonic_calls.close_call(text, tools)
-    while (opener := low.find(_CALL_OPEN, at)) >= 0:
-        closer = low.find(_CALL_CLOSE, opener + len(_CALL_OPEN))
-        if closer < 0:
-            start = opener
-            break
-        at = closer + len(_CALL_CLOSE)
+    start = open_call(text)
     if start is None:
         return ""
     block = text[start + len(_CALL_OPEN):]

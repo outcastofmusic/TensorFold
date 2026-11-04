@@ -261,9 +261,32 @@ class ToolCallStreamer:
         self.lead = False       # the framing newline after <parameter=NAME> has not arrived yet
         self.held = ""
         self.streamed = False
+        self.calls: list[dict[str, str]] = []      # every call streamed so far: its id, name and arguments sent
 
     def _args(self, fragment: str) -> dict[str, Any]:
+        self.calls[self.index]["arguments"] += fragment
         return {"tool_calls": [{"index": self.index, "function": {"arguments": fragment}}]}
+
+    @property
+    def open(self) -> bool:
+        """A call is streaming and its ``</function>`` has not come."""
+
+        return self.state in ("function", "value")
+
+    def cut(self, text: str) -> list[dict[str, Any]]:
+        """At a ``max_tokens`` cut inside a value: the bytes held back for a ``</parameter>`` that never came, so the
+        call carries its value up to the cut (upstream #1238). Its arguments stay unclosed, as written."""
+
+        if self.state != "value":
+            return []
+        piece = self.held + text[self.pos:]
+        if self.lead and piece.startswith("\n"):
+            piece = piece[1:]
+        self.pos, self.held, self.lead = len(text), "", False
+        if self.typed:
+            piece, self.value_buffer = self.value_buffer + piece, ""
+            return [self._args(piece)] if piece else []
+        return [self._args(self._esc(piece))] if piece else []
 
     @staticmethod
     def _esc(text: str) -> str:
@@ -296,8 +319,9 @@ class ToolCallStreamer:
                 self.current_schema = self.schemas.get(name.lower(), {})
                 self.index += 1
                 self.streamed = True
-                out.append({"tool_calls": [{"index": self.index, "id": f"call_{uuid.uuid4().hex[:24]}",
-                                            "type": "function",
+                call_id = f"call_{uuid.uuid4().hex[:24]}"
+                self.calls.append({"id": call_id, "name": name, "arguments": ""})
+                out.append({"tool_calls": [{"index": self.index, "id": call_id, "type": "function",
                                             "function": {"name": name, "arguments": ""}}]})
                 self.args_open = False
                 self.pos += m.end()
