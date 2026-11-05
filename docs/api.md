@@ -101,6 +101,7 @@ out. `{"model": ..., "end_session": id}` frees a session's kept prefill at once 
 | `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` | Both |
 | `thinking_budget` | Token-count limit inside reasoning | Both |
 | `thinking_guard` | `false` turns the server's thinking guard off; `{"threshold": t}` sets its threshold | CUDA |
+| `thinking_prefill` | Text the think block starts with, as if the model wrote it | CUDA |
 | `priority` | `background` yields to foreground requests | Both |
 
 `n` must be 1; multiple choices receive HTTP 400.
@@ -242,6 +243,16 @@ while it is still thinking, with a newline, the closing think marker and a blank
 The cut depends on token count, so serial and drafted decoding use the same cut. A model that closes the block
 earlier is left alone. The MLX engine forces the close inside its rounds; CUDA stops the engine at the cut and
 decodes on from the reply, as for a required tool call.
+
+`thinking_prefill` (CUDA, chat with thinking on) puts its text after the prompt's open think block, so the model
+reasons in the shape the text starts. With `"## 1. Understand the problem\n"` and a prompt asking for Pólya's four
+steps, Qwen3.8 Flash Next followed all four in 66 of 80 replies, against 21 of 91 with the prompt alone, and thought
+43% fewer tokens (5 Nov 2026). The reply's reasoning is the model's text after the prefill. The server refuses a
+prefill with thinking off, with `continue_final_message`, with images, or one that spells a special token.
+
+On CUDA an end token sampled while the think block is open becomes the same close as the thinking budget's, and the
+reply goes on to its answer. Without it the reply ended with the answer in its reasoning and empty content, which 5 of
+those 80 prefilled replies did. `ignore_eos` turns the close off.
 
 A CUDA server started with `--thinking-guard URL` asks a decision model whether the thinking is enough, after
 each paragraph of thinking (text followed by a blank line). The question goes to `URL/systemone`, for example a

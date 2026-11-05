@@ -22,7 +22,7 @@ from tensorfold.server.stopping import matched_stop, stop_options
 from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
 from tensorfold.server.tool_policy import ToolCallPolicy
-from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
+from tensorfold.engine.call_gate import CallGate, ThinkBudget, ThinkEnd, call_format, generate_gated
 from tensorfold.engine import think_loop
 from tensorfold.engine.think_guard import GuardConfig, ThinkGuard, decide, end_session
 from tensorfold.engine.tool_draft import ToolCallStreamer
@@ -301,6 +301,22 @@ class App:
                     raise RequestError(f"{name} must be an integer token count") from exc
         return max(1, int(body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens))
 
+    def _thinking_prefill(self, body: dict[str, Any], thinking: bool) -> str:
+        """The request's ``thinking_prefill``: text the reply's think block starts with, as if the model wrote it, so
+        it reasons in the shape the text opens (tf-runs/gpu-1105: Pólya's four steps 66/80 with it, 21/91 without).
+        The reply's reasoning is the model's text after it. "" when absent."""
+
+        prefill = body.get("thinking_prefill")
+        if prefill is None or prefill == "":
+            return ""
+        if not isinstance(prefill, str):
+            raise RequestError("thinking_prefill must be a string")
+        if not thinking:
+            raise RequestError("thinking_prefill needs thinking on, without continue_final_message")
+        if any(spelling in prefill for spelling in {*self._prompt_ids().ids, "<think>", THINK_MARKERS[1]}):
+            raise RequestError("thinking_prefill must not hold a special token such as </think>")
+        return prefill
+
     def _guard(self, body: dict[str, Any], thinking: bool) -> GuardConfig | None:
         """The thinking guard as the request sets it: ``thinking_guard`` false turns it off, an object sets its
         ``threshold`` or ``gap``, and absent takes ``--thinking-guard``'s; None without a guard or with the think
@@ -380,6 +396,7 @@ class App:
                 if not (isinstance(last, dict) and last.get("role") == "assistant"
                         and isinstance(last.get("content") or "", str)):
                     raise RequestError("continue_final_message needs a final assistant message with text content")
+            prefill = self._thinking_prefill(body, thinking and not continued)
 
             def render(messages: list[dict[str, Any]], **images: bool) -> str:   # text renders as it always has
                 extra = kwargs
@@ -407,6 +424,8 @@ class App:
                 return continued and text.rfind(THINK_MARKERS[1]) > text.rfind("<think>")
 
             if has_images(body["messages"]):
+                if prefill:
+                    raise RequestError("thinking_prefill supports text chat only, without images")
                 shown: list[str] = []            # the text the frontend expands, its escapes in place
 
                 def render_images(messages: list[dict[str, Any]]) -> str:
@@ -427,6 +446,11 @@ class App:
             prompt = self._prompt_ids().encode(text)
             thinking = thinking and not answering(text)
             budget = budget if thinking else 0
+            if prefill:
+                if text.rfind("<think>") <= text.rfind(THINK_MARKERS[1]):
+                    raise RequestError("thinking_prefill: the chat template's prompt does not open a think block")
+                # its own ids after the prompt's, as tf-runs/gpu-1105 measured it (a joined text can merge "\n##")
+                prompt += self.tok.encode(prefill, add_special_tokens=False).ids
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
         else:
@@ -663,7 +687,8 @@ class App:
         yielding = background and turns is not None and getattr(self.engine, "tp", 1) == 1
         guard = self._thinking_guard(prepared, body)
         loop = self._think_loop(prepared, chat and thinking)
-        gates = [g for g in (gate, budget, guard, loop, Yield(turns) if yielding else None) if g is not None]
+        closing = self._think_end(prepared, ends, chat and thinking)
+        gates = [g for g in (gate, budget, guard, loop, closing, Yield(turns) if yielding else None) if g is not None]
 
         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
 
@@ -717,6 +742,9 @@ class App:
             stats["thinking_guard"] = guard.finish()
         if loop is not None and loop.record:          # the arm that closed a looping block, and where
             stats["think_loop"] = loop.record
+        if closing is not None and closing.fired:     # the end token came inside the think block: closed instead
+            stats["think_end_closed"] = True
+            print("[tensorfold] an end token inside the think block: closed the block, the answer follows", flush=True)
         reasoning, answer = visible(True)
         final: dict[str, Any] = {}
         if len(reasoning) > sent["reasoning"]:
@@ -793,14 +821,28 @@ class App:
             return self.__dict__.setdefault("turns", Turns())
 
     def _think_budget(self, prepared: PreparedRequest, think_end: int | None) -> ThinkBudget | None:
-        """The Mac's thinking budget: the cut becomes a newline, </think> and a blank line (</think> alone under a grammar)."""
+        """The Mac's thinking budget: the cut becomes ``_think_close``."""
 
         if prepared.think_budget <= 0 or think_end is None:
             return None
+        return ThinkBudget(prepared.think_budget, self._think_close(prepared, think_end), think_end)
+
+    def _think_end(self, prepared: PreparedRequest, ends: tuple[int, ...], thinking: bool) -> ThinkEnd | None:
+        """The gate that turns an end token inside the think block into ``_think_close``; None with thinking off, or
+        when the request ignores end tokens (``ignore_eos`` asks for the raw reply)."""
+
+        think_end = self.tok.token_to_id("</think>") if thinking else None
+        if think_end is None or not ends or prepared.ignore_eos:
+            return None
+        return ThinkEnd(ends, self._think_close(prepared, think_end), think_end)
+
+    def _think_close(self, prepared: PreparedRequest, think_end: int) -> list[int]:
+        """A newline, </think> and a blank line (</think> alone under a grammar, which starts after it)."""
+
         close = [*self.tok.encode("\n", add_special_tokens=False).ids, think_end]
         if prepared.grammar is None:
             close += self.tok.encode("\n\n", add_special_tokens=False).ids
-        return ThinkBudget(prepared.think_budget, close, think_end)
+        return close
 
     def _think_loop(self, prepared: PreparedRequest, thinking: bool) -> think_loop.LoopGate | None:
         """The gate that closes a looping think block with a hidden phrase (TENSORFOLD_THINK_LOOP=0: None)."""
