@@ -13,6 +13,20 @@ GitHub has the full notes and the measurements behind them.
   models included, and keeps the numbers in `~/.local/state/tensorfold-run/windows.json` across restarts. A model
   never loaded since that file was made has no window yet, and Nemotron 3.5 Super on upstream's native server
   reports none.
+- **Dense Llama checkpoints serve on CUDA, written for Nanbeige4.3-33B.** The new `llama_dense` family takes
+  model_type `llama` on one GPU and one stream, from bf16 as released, an EXL3 pack or a ModelOpt or compressed-tensors
+  NVFP4 / FP8 export. Decode drafts copies from the context and verifies each as a chain of up to 128 rows; every
+  drafted token is the serial decode's. Prompts resume from message starts and from each prompt's end less one token.
+  config.json refusals come before any load: rope_scaling, biases, a non-SiLU MLP, a tied head, head_dim other than
+  128 or 256, and more than 16 query heads a KV head. `--tp 2` and `--parallel` are refused too. Nanbeige4.3-33B NVFP4
+  scored 89.0 on TrueScore 76x2 (2026-10-28), level with Qwen3.8-27B.
+- **`--drafter` on a Llama checkpoint runs DFlash2 trees (ProCreations/Nanbeige4.3-33B-DFlash2).** A round without a
+  copy verifies a 16-row tree drafted from the target's residuals at layers 1, 25 and 49. On Nanbeige NVFP4, one
+  stream (2026-11-04, 12 cells of kind and temperature): 1.55x copies alone by geometric mean, 17.2 -> 29.2 tok/s over
+  the batch, code 2.1x, prose 1.2x, and all 72 replies identical to copies alone.
+- **The bf16 linear shares weight loads across rows on weights of 2,048+ outputs.** Below 64 rows it ran one row a
+  block, so a 16-row verify read Nanbeige's 2.4 GB bf16 head 16 times: 296 ms where one row costs 18. Rows now share
+  each load, 21-42 ms at 16 rows, with the same bits. A Nanbeige tree round fell from 400 to 124 ms.
 - **Qwen3.8 Flash Next on CUDA keeps 4 prompt states a stream, where it kept 8 in all, and `run.sh` serves the EXL3
   pack with 8 streams.** Each turn of a conversation keeps its message start, its prompt end and its reply end, so 8
   states held about two conversations' latest turns: with eight agent sessions on 8 streams, a turn pushed out
