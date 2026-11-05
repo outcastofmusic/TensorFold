@@ -136,6 +136,36 @@ class ThinkBudget:
         self.open = self.open and int(token) != self.think_end
 
 
+class ThinkEnd:
+    """An end token sampled while the think block is open becomes ``close``, so the reply goes on to its answer.
+
+    Without it the reply ended with its answer inside the reasoning and an empty content: 5 of 80 replies with a
+    thinking prefill did, 0 of 311 without (tf-runs/gpu-1105, 5 Nov 2026). ``fired`` says whether it closed one."""
+
+    def __init__(self, ends: Sequence[int], close: Sequence[int], think_end: int) -> None:
+        self.ends, self.close, self.think_end = frozenset(int(t) for t in ends), [int(t) for t in close], int(think_end)
+        self.count, self.open, self.fired = 0, True, False
+        self.expect: int | None = None               # the reply index the last cut replaces
+
+    def cut(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
+        self.expect = None
+        if not self.open:
+            return None
+        for i, token in enumerate(tokens):
+            if int(token) == self.think_end:
+                return None
+            if int(token) in self.ends:
+                self.expect = self.count + i
+                return i, list(self.close)
+        return None
+
+    def observe(self, token: int) -> None:
+        # another gate's earlier cut may win: this one fired only if its close took the end token's place
+        self.fired = self.fired or (self.count == self.expect and int(token) == self.close[0])
+        self.count += 1
+        self.open = self.open and int(token) != self.think_end
+
+
 def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], bool]], Any], prompt: Sequence[int],
                    max_tokens: int, gates: Sequence[Any], on_tokens: Callable[[list[int]], bool],
                    inline: Callable[..., Any] | None = None) -> Any:
@@ -208,4 +238,4 @@ def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], boo
     return stats
 
 
-__all__ = ["CallGate", "ThinkBudget", "call_format", "generate_gated"]
+__all__ = ["CallGate", "ThinkBudget", "ThinkEnd", "call_format", "generate_gated"]

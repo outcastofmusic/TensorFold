@@ -5,6 +5,11 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **A chat request's `thinking_prefill` starts the think block with its text (CUDA).** On Qwen3.8 Flash Next a
+  Pólya prompt with `"## 1. Understand the problem\n"` prefilled followed all four steps in 66 of 80 replies,
+  against 21 of 91 without it, with 43% fewer thinking tokens (5 Nov 2026).
+- **An end token sampled inside the think block closes the block instead of ending the reply (CUDA).** The reply then
+  writes its answer. 5 of 80 prefilled replies had ended with the answer left in the reasoning and empty content.
 - **`run.sh` serving images include xgrammar, so `response_format` and `guided_*` work there.** The image installed
   only the vision extra, and every structured request got HTTP 400 asking for `pip install 'tensorfold[grammar]'`.
 - **`GET /v1/models` gives each model's window as `max_model_len`, as vLLM does.** A client that leaves its context

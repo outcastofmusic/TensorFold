@@ -1,7 +1,7 @@
 """A gate's cut inside a live stream: the fix is written as forced drafts and the reply is not prefilled again."""
 
 from tensorfold.cuda.streams import Stream
-from tensorfold.engine.call_gate import ThinkBudget, generate_gated
+from tensorfold.engine.call_gate import ThinkBudget, ThinkEnd, generate_gated
 
 END = 99
 
@@ -84,3 +84,47 @@ def test_a_long_fix_goes_on_in_the_next_window_and_a_count_ends_it():
 def test_a_stream_without_gates_is_untouched():
     s = Stream([1], 100)
     assert _spliced(s, [20, 21], [21, 30], [0, 1], 30) == ([0, 1], 30)
+
+
+EOS = 0
+
+
+def test_an_end_token_sampled_in_the_think_block_becomes_the_close_in_the_live_stream():
+    closing, sent, runs = ThinkEnd([EOS], [7, END, 8], END), [], []
+    generate_gated(None, [1, 2], 50, [closing], lambda new: sent.extend(new) or False,
+                   _engine([[10, 11, 12], [13, EOS]], runs))
+    assert sent == [10, 11, 12, 13, 7, END, 8] and runs == [[1, 2]]
+    assert closing.fired and not closing.open
+
+
+def test_the_sampled_end_token_a_round_ends_on_is_cut_too():
+    closing = ThinkEnd([EOS], [7, END, 8], END)
+    s = Stream([1], 100, splice=lambda new: _splice([closing], new))
+    s.out = [20]
+    # the window [20, 21]: the draft kept, then the end token sampled after it, which the round passes as its end
+    assert _spliced(s, [20, 21], [21, EOS], [0, 1], EOS) == ([0, 1], 7)
+    assert s.forced == [END, 8]
+
+
+def test_after_the_block_closes_the_end_token_ends_the_reply():
+    closing = ThinkEnd([EOS], [7, END, 8], END)
+    assert closing.cut([10, END, 11, EOS]) is None
+    for token in (10, END, 11):
+        closing.observe(token)
+    assert closing.cut([EOS]) is None and not closing.fired
+
+
+def test_an_earlier_gates_cut_wins_and_the_end_close_did_not_fire():
+    budget, closing, sent = ThinkBudget(2, [7, END, 8], END), ThinkEnd([EOS], [7, END, 8], END), []
+    generate_gated(None, [1], 50, [budget, closing], lambda new: sent.extend(new) or False,
+                   _engine([[10, 11, EOS]], []))
+    assert sent == [10, 7, END, 8] and not closing.fired
+
+
+def _splice(gates, new):
+    hits = [hit for gate in gates if (hit := gate.cut(new)) is not None]
+    at, fix = min(hits, key=lambda h: h[0]) if hits else (len(new), [])
+    for token in [*new[:at], *fix]:
+        for gate in gates:
+            gate.observe(token)
+    return (at, list(fix)) if hits else None
