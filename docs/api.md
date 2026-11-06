@@ -250,6 +250,14 @@ steps, Qwen3.8 Flash Next followed all four in 66 of 80 replies, against 21 of 9
 43% fewer tokens (5 Nov 2026). The reply's reasoning is the model's text after the prefill. The server refuses a
 prefill with thinking off, with `continue_final_message`, with images, or one that spells a special token.
 
+End a prefill with a blank line or with no newline at all. A prefill that ends in a finished sentence and one newline
+reads to Qwen3.8 Flash Next as the end of its thinking. Its first token was `</think>` in 24 of 24 draws at
+temperature 1 after `"Before I answer: … with a query.\n"`, and in 15 of 24 after `"Okay.\n"`. The same text ending
+in `"\n\n"` gave 0 of 24, and a heading such as `"## 1. Understand the problem\n"` also gave 0 of 24 (6 Nov 2026).
+The CUDA server therefore turns a `</think>` sampled as the reply's first token after a prefill into a blank line,
+and the model thinks on. In 72 of 72 draws over three such prefills it did. The reply's reasoning then starts with
+that blank line, and the server log says so.
+
 On CUDA an end token sampled while the think block is open becomes the same close as the thinking budget's, and the
 reply goes on to its answer. Without it the reply ended with the answer in its reasoning and empty content, which 5 of
 those 80 prefilled replies did. `ignore_eos` turns the close off.

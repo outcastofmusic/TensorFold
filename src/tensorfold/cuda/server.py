@@ -22,7 +22,7 @@ from tensorfold.server.stopping import matched_stop, stop_options
 from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
 from tensorfold.server.tool_policy import ToolCallPolicy
-from tensorfold.engine.call_gate import CallGate, ThinkBudget, ThinkEnd, call_format, generate_gated
+from tensorfold.engine.call_gate import CallGate, PrefillOpen, ThinkBudget, ThinkEnd, call_format, generate_gated
 from tensorfold.engine import think_loop
 from tensorfold.engine.think_guard import GuardConfig, ThinkGuard, decide, end_session
 from tensorfold.engine.tool_draft import ToolCallStreamer
@@ -60,6 +60,7 @@ class PreparedRequest:
     grammar: Any = None     # (spec, compiled grammar) of the request's response_format, or None
     think_budget: int = 0   # reply tokens before the server closes a think block the reply leaves open (0: no limit)
     guard: GuardConfig | None = None   # the thinking guard as this request sets it (None: no guard)
+    prefilled: bool = False  # the prompt ends in a thinking_prefill
 
 
 def _native_context(model_dir: Path) -> int:
@@ -385,6 +386,7 @@ class App:
             if not hasattr(self, "_probability_decoder"):
                 self._probability_decoder = TokenBytes(self.tok)
         compiled = (spec, self._grammars().compile(spec)) if spec is not None else None
+        prefill = ""
         if chat:
             if not isinstance(body.get("messages"), list):
                 raise RequestError("messages must be a list")
@@ -463,7 +465,7 @@ class App:
         # sampling is resolved here, so a malformed control is refused before a stream opens
         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
                                ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget,
-                               guard=self._guard(body, chat and thinking))
+                               guard=self._guard(body, chat and thinking), prefilled=bool(prefill))
 
     def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
         """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the
@@ -688,7 +690,8 @@ class App:
         guard = self._thinking_guard(prepared, body)
         loop = self._think_loop(prepared, chat and thinking)
         closing = self._think_end(prepared, ends, chat and thinking)
-        gates = [g for g in (gate, budget, guard, loop, closing, Yield(turns) if yielding else None) if g is not None]
+        opening = self._prefill_open(prepared, chat and thinking)
+        gates = [g for g in (gate, budget, guard, loop, closing, opening, Yield(turns) if yielding else None) if g is not None]
 
         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
 
@@ -745,6 +748,10 @@ class App:
         if closing is not None and closing.fired:     # the end token came inside the think block: closed instead
             stats["think_end_closed"] = True
             print("[tensorfold] an end token inside the think block: closed the block, the answer follows", flush=True)
+        if opening is not None and opening.fired:     # </think> straight after the prefill: a blank line instead
+            stats["prefill_kept_open"] = True
+            print("[tensorfold] </think> right after the thinking prefill: a blank line instead, the thinking goes on",
+                  flush=True)
         reasoning, answer = visible(True)
         final: dict[str, Any] = {}
         if len(reasoning) > sent["reasoning"]:
@@ -835,6 +842,14 @@ class App:
         if think_end is None or not ends or prepared.ignore_eos:
             return None
         return ThinkEnd(ends, self._think_close(prepared, think_end), think_end)
+
+    def _prefill_open(self, prepared: PreparedRequest, thinking: bool) -> PrefillOpen | None:
+        """The gate that turns a ``</think>`` sampled straight after a thinking prefill into a blank line."""
+
+        think_end = self.tok.token_to_id("</think>") if thinking and prepared.prefilled else None
+        if think_end is None:
+            return None
+        return PrefillOpen(think_end, self.tok.encode("\n\n", add_special_tokens=False).ids)
 
     def _think_close(self, prepared: PreparedRequest, think_end: int) -> list[int]:
         """A newline, </think> and a blank line (</think> alone under a grammar, which starts after it)."""

@@ -10,6 +10,10 @@ GitHub has the full notes and the measurements behind them.
   against 21 of 91 without it, with 43% fewer thinking tokens (5 Nov 2026).
 - **An end token sampled inside the think block closes the block instead of ending the reply (CUDA).** The reply then
   writes its answer. 5 of 80 prefilled replies had ended with the answer left in the reasoning and empty content.
+- **A `</think>` sampled straight after a `thinking_prefill` becomes a blank line, and the model thinks on (CUDA).**
+  A prefill ending in a finished sentence and one newline had closed the thinking at once: 24 of 24 first tokens were
+  `</think>` on Qwen3.8 Flash Next, and 0 of 72 were after a blank line in their place (6 Nov 2026). `docs/api.md`
+  says how to end a prefill.
 - **`run.sh` serving images include xgrammar, so `response_format` and `guided_*` work there.** The image installed
   only the vision extra, and every structured request got HTTP 400 asking for `pip install 'tensorfold[grammar]'`.
 - **`GET /v1/models` gives each model's window as `max_model_len`, as vLLM does.** A client that leaves its context

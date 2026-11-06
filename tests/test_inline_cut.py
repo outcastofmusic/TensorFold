@@ -128,3 +128,23 @@ def _splice(gates, new):
         for gate in gates:
             gate.observe(token)
     return (at, list(fix)) if hits else None
+
+
+def test_prefill_open_turns_only_a_first_think_end_into_its_blank_line():
+    from tensorfold.engine.call_gate import PrefillOpen
+
+    gate = PrefillOpen(9, [5])
+    assert gate.cut([9, 1]) == (0, [5])
+    gate.observe(5)
+    assert gate.fired
+    assert gate.cut([9]) is None
+
+
+def test_prefill_open_leaves_a_later_think_end_alone():
+    from tensorfold.engine.call_gate import PrefillOpen
+
+    gate = PrefillOpen(9, [5])
+    assert gate.cut([1, 9]) is None
+    gate.observe(1)
+    gate.observe(9)
+    assert not gate.fired and gate.cut([9]) is None
