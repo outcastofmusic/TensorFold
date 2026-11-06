@@ -148,3 +148,16 @@ def test_prefill_open_leaves_a_later_think_end_alone():
     gate.observe(1)
     gate.observe(9)
     assert not gate.fired and gate.cut([9]) is None
+
+
+def test_think_call_moves_an_opener_inside_the_block_and_not_after_it():
+    from tensorfold.engine.call_gate import ThinkCall
+
+    gate = ThinkCall(7, [5, 9, 6], 9)
+    assert gate.cut([1, 7, 2]) == (1, [5, 9, 6, 7])
+    for token in (1, 5, 9, 6, 7):
+        gate.observe(token)
+    assert gate.fired and gate.cut([7]) is None
+
+    later = ThinkCall(7, [5, 9, 6], 9)
+    assert later.cut([1, 9, 7]) is None

@@ -256,7 +256,16 @@ temperature 1 after `"Before I answer: … with a query.\n"`, and in 15 of 24 af
 in `"\n\n"` gave 0 of 24, and a heading such as `"## 1. Understand the problem\n"` also gave 0 of 24 (6 Nov 2026).
 The CUDA server therefore turns a `</think>` sampled as the reply's first token after a prefill into a blank line,
 and the model thinks on. In 72 of 72 draws over three such prefills it did. The reply's reasoning then starts with
-that blank line, and the server log says so.
+that blank line, and the reply's `tensorfold` block holds `"prefill_kept_open": true`.
+
+With tools declared, a `<tool_call>` the model opens inside the think block becomes the same close followed by the
+call, so the call lands in the answer and comes back in `tool_calls`. After a prefill ending in one newline, 13 of 63
+agent replies had written their call inside the thinking, and 2 of those calls never ran (6 Nov 2026). The reply's
+`tensorfold` block then holds `"think_call_moved": true`.
+
+A tool call the parser leaves in `content` as text, because it names a tool the request did not declare or the
+request declared none, keeps `finish_reason` as it was. The reply's `tensorfold` block names each such call in
+`unparsed_tool_calls`, for example `["memory"]`, with `""` for a call whose name the text does not give.
 
 On CUDA an end token sampled while the think block is open becomes the same close as the thinking budget's, and the
 reply goes on to its answer. Without it the reply ended with the answer in its reasoning and empty content, which 5 of

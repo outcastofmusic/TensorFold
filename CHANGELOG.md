@@ -14,6 +14,11 @@ GitHub has the full notes and the measurements behind them.
   A prefill ending in a finished sentence and one newline had closed the thinking at once: 24 of 24 first tokens were
   `</think>` on Qwen3.8 Flash Next, and 0 of 72 were after a blank line in their place (6 Nov 2026). `docs/api.md`
   says how to end a prefill.
+- **A tool call opened inside the think block moves to the answer, where the parser reads it (CUDA).** After a
+  thinking prefill, 13 of 63 agent replies wrote their call inside the thinking, and 2 of those calls never ran.
+- **A tool call left in `content` as text is named in the reply's `tensorfold.unparsed_tool_calls` (CUDA).** A call
+  to an undeclared tool, such as `memory` when the request declared `remember`, came back as plain text with
+  `finish_reason` `stop`, so a client could not tell it from an answer.
 - **`run.sh` serving images include xgrammar, so `response_format` and `guided_*` work there.** The image installed
   only the vision extra, and every structured request got HTTP 400 asking for `pip install 'tensorfold[grammar]'`.
 - **`GET /v1/models` gives each model's window as `max_model_len`, as vLLM does.** A client that leaves its context
