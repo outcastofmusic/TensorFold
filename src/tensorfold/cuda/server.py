@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -22,7 +23,7 @@ from tensorfold.server.stopping import matched_stop, stop_options
 from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
 from tensorfold.server.tool_policy import ToolCallPolicy
-from tensorfold.engine.call_gate import CallGate, PrefillOpen, ThinkBudget, ThinkEnd, call_format, generate_gated
+from tensorfold.engine.call_gate import CallGate, PrefillOpen, ThinkBudget, ThinkCall, ThinkEnd, call_format, generate_gated
 from tensorfold.engine import think_loop
 from tensorfold.engine.think_guard import GuardConfig, ThinkGuard, decide, end_session
 from tensorfold.engine.tool_draft import ToolCallStreamer
@@ -61,6 +62,19 @@ class PreparedRequest:
     think_budget: int = 0   # reply tokens before the server closes a think block the reply leaves open (0: no limit)
     guard: GuardConfig | None = None   # the thinking guard as this request sets it (None: no guard)
     prefilled: bool = False  # the prompt ends in a thinking_prefill
+
+
+_CALL_NAME = re.compile(r"<function=([^>\s]+)>|\"name\"\s*:\s*\"([^\"]+)\"")
+
+
+def unparsed_calls(content: str) -> list[str]:
+    """The name of each ``<tool_call>`` the parser left in ``content`` ("" when the text names none), in order."""
+
+    names = []
+    for piece in content.split("<tool_call>")[1:]:
+        found = _CALL_NAME.search(piece.split("</tool_call>")[0])
+        names.append((next((g for g in found.groups() if g), "") if found else "")[:64])   # model text: bounded
+    return names
 
 
 def _native_context(model_dir: Path) -> int:
@@ -691,7 +705,8 @@ class App:
         loop = self._think_loop(prepared, chat and thinking)
         closing = self._think_end(prepared, ends, chat and thinking)
         opening = self._prefill_open(prepared, chat and thinking)
-        gates = [g for g in (gate, budget, guard, loop, closing, opening, Yield(turns) if yielding else None) if g is not None]
+        moving = self._think_call(prepared, chat and thinking and bool(tools))
+        gates = [g for g in (gate, budget, guard, loop, closing, opening, moving, Yield(turns) if yielding else None) if g is not None]
 
         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
 
@@ -752,6 +767,9 @@ class App:
             stats["prefill_kept_open"] = True
             print("[tensorfold] </think> right after the thinking prefill: a blank line instead, the thinking goes on",
                   flush=True)
+        if moving is not None and moving.fired:       # a call opened inside the think block: closed, the call follows
+            stats["think_call_moved"] = True
+            print("[tensorfold] a tool call inside the think block: closed the block, the call follows", flush=True)
         reasoning, answer = visible(True)
         final: dict[str, Any] = {}
         if len(reasoning) > sent["reasoning"]:
@@ -779,6 +797,10 @@ class App:
         finish = ("length" if cut is not None else "tool_calls" if calls
                   else "stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
         warning = unanswered(finish, chat and thinking, content, calls)
+        unparsed = unparsed_calls(content)
+        if unparsed:          # a call the parser left as text (an undeclared name, or no tools): the client can tell
+            stats = {**(stats or {}), "unparsed_tool_calls": unparsed}
+            print(f"[tensorfold] the answer holds {len(unparsed)} tool call(s) left as text: {unparsed}", flush=True)
         if warning:
             print(warning, flush=True)
         print_done(len(prompt), (cached or [0])[0], thinking, out, finish, stats, request)
@@ -850,6 +872,16 @@ class App:
         if think_end is None:
             return None
         return PrefillOpen(think_end, self.tok.encode("\n\n", add_special_tokens=False).ids)
+
+    def _think_call(self, prepared: PreparedRequest, thinking: bool) -> ThinkCall | None:
+        """The gate that moves a tool call opened inside the think block into the answer, or None (thinking off, no
+        tools, or a tokenizer without a ``<tool_call>`` token)."""
+
+        think_end = self.tok.token_to_id("</think>") if thinking else None
+        opener = self.tok.token_to_id("<tool_call>") if think_end is not None else None
+        if opener is None:
+            return None
+        return ThinkCall(opener, self._think_close(prepared, think_end), think_end)
 
     def _think_close(self, prepared: PreparedRequest, think_end: int) -> list[int]:
         """A newline, </think> and a blank line (</think> alone under a grammar, which starts after it)."""

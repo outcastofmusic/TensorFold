@@ -166,6 +166,36 @@ class ThinkEnd:
         self.open = self.open and int(token) != self.think_end
 
 
+class ThinkCall:
+    """A tool call's opening token sampled while the think block is open becomes ``close`` and that token, so the call
+    lands in the answer, where the parser reads it.
+
+    After a thinking prefill, 13 of 63 agent replies wrote a call inside the thinking, and in 2 of them the call never
+    ran (the gateway team's eval, 6 Nov 2026). ``fired`` says whether it moved one."""
+
+    def __init__(self, opener: int, close: Sequence[int], think_end: int) -> None:
+        self.opener, self.close, self.think_end = int(opener), [int(t) for t in close], int(think_end)
+        self.count, self.open, self.fired = 0, True, False
+        self.expect: int | None = None
+
+    def cut(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
+        self.expect = None
+        if not self.open:
+            return None
+        for i, token in enumerate(tokens):
+            if int(token) == self.think_end:
+                return None
+            if int(token) == self.opener:
+                self.expect = self.count + i
+                return i, [*self.close, self.opener]
+        return None
+
+    def observe(self, token: int) -> None:
+        self.fired = self.fired or (self.count == self.expect and int(token) == self.close[0])
+        self.count += 1
+        self.open = self.open and int(token) != self.think_end
+
+
 class PrefillOpen:
     """A ``</think>`` sampled as a prefilled reply's first token becomes ``blank`` (a blank line), so the model thinks.
 
@@ -262,4 +292,4 @@ def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], boo
     return stats
 
 
-__all__ = ["CallGate", "PrefillOpen", "ThinkBudget", "ThinkEnd", "call_format", "generate_gated"]
+__all__ = ["CallGate", "PrefillOpen", "ThinkBudget", "ThinkCall", "ThinkEnd", "call_format", "generate_gated"]
