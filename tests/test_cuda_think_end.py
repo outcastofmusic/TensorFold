@@ -106,3 +106,61 @@ def test_a_prefill_the_server_cannot_place_is_refused(tmp_path, fields, why):
     engine = EndingEngine()
     status, body = ask(app_for(tmp_path, engine), max_tokens=200, **fields)
     assert status == 400 and why in str(body) and not engine.prompts
+
+
+SENTENCE = "I will multiply the numbers.\n"
+
+
+class EarlyCloseEngine:
+    """Samples ``</think>`` first when its prompt ends in the prefill, as Qwen3.8 Flash Next does after a sentence and
+    one newline; after a blank line it thinks and closes the block itself. Records every prompt."""
+
+    eos = (EOS,)
+
+    def __init__(self, width=3):
+        self.width, self.prompts = width, []
+
+    def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True):
+        self.prompts.append(list(prompt))
+        if Tokens().decode(prompt).endswith(SENTENCE):
+            reply = [END] + text("\n\nThe answer is 391.") + [EOS]
+        else:
+            reply = text("17 times 23 is 391.") + [END] + text("\n\nThe answer is 391.") + [EOS]
+        reply = reply[:max_tokens]
+        width = self.width if draft else 1
+        for at in range(0, len(reply), width):
+            if on_tokens(reply[at:at + width]) or EOS in reply[at:at + width]:
+                break
+        return {"rounds": 1}
+
+
+@pytest.mark.parametrize("width", [1, 3, 5])
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_close_straight_after_the_prefill_becomes_a_blank_line_and_the_model_thinks(tmp_path, width, stream):
+    engine = EarlyCloseEngine(width)
+    status, body = ask(app_for(tmp_path, engine), stream, max_tokens=200, thinking_prefill=SENTENCE)
+    assert status == 200
+    reasoning, content = message(body, stream)
+    assert reasoning.strip() == "17 times 23 is 391." and content == "The answer is 391."
+    assert body["tensorfold"]["token_ids"][:2] == text("\n\n")
+    assert len(engine.prompts) == 2 and engine.prompts[1][-2:] == text("\n\n")
+
+
+def test_without_a_prefill_a_first_close_is_left_alone(tmp_path):
+    class Closes(EarlyCloseEngine):
+        def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True):
+            self.prompts.append(list(prompt))
+            on_tokens([END, *text("\n\nThe answer is 391."), EOS])
+            return {"rounds": 1}
+
+    engine = Closes()
+    status, body = ask(app_for(tmp_path, engine), max_tokens=200)
+    assert status == 200 and message(body, False) == ("", "The answer is 391.")
+    assert len(engine.prompts) == 1
+
+
+def test_a_close_after_the_prefilled_reply_has_begun_is_left_alone(tmp_path):
+    engine = EndingEngine(closes=True)
+    status, body = ask(app_for(tmp_path, engine), max_tokens=200, thinking_prefill=PREFILL)
+    assert status == 200 and message(body, False) == ("thought", "The answer is 42.")
+    assert len(engine.prompts) == 1

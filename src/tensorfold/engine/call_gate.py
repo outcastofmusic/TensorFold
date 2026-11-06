@@ -166,6 +166,30 @@ class ThinkEnd:
         self.open = self.open and int(token) != self.think_end
 
 
+class PrefillOpen:
+    """A ``</think>`` sampled as a prefilled reply's first token becomes ``blank`` (a blank line), so the model thinks.
+
+    A thinking prefill that ends in a finished sentence and one newline reads to Qwen3.8 Flash Next as the end of its
+    thinking: the first token was ``</think>`` in 24 of 24 draws at temperature 1. After a blank line in its place it
+    was in 0 of 72, over three such prefills (tf-runs/prefill-close-1106, 6 Nov 2026). ``fired`` says whether it did."""
+
+    def __init__(self, think_end: int, blank: Sequence[int]) -> None:
+        self.think_end, self.blank = int(think_end), [int(t) for t in blank]
+        self.count, self.fired = 0, False
+        self.expect: int | None = None
+
+    def cut(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
+        self.expect = None
+        if self.count or not tokens or int(tokens[0]) != self.think_end:
+            return None
+        self.expect = 0
+        return 0, list(self.blank)
+
+    def observe(self, token: int) -> None:
+        self.fired = self.fired or (self.count == self.expect and int(token) == self.blank[0])
+        self.count += 1
+
+
 def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], bool]], Any], prompt: Sequence[int],
                    max_tokens: int, gates: Sequence[Any], on_tokens: Callable[[list[int]], bool],
                    inline: Callable[..., Any] | None = None) -> Any:
@@ -238,4 +262,4 @@ def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], boo
     return stats
 
 
-__all__ = ["CallGate", "ThinkBudget", "ThinkEnd", "call_format", "generate_gated"]
+__all__ = ["CallGate", "PrefillOpen", "ThinkBudget", "ThinkEnd", "call_format", "generate_gated"]
