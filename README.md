@@ -166,7 +166,8 @@ decision questions it got 334 right against Clef-Flash's 313, a paired +6.2 poin
 reasoning prefixes it caught 72/72 complete states with 0/132 early cuts, and with it as the guard 16/16 replies came
 out identical to Clef-Flash's. It serves in 13.0 GiB against Clef-Flash's 20-22, and answers a fresh 230-token
 question in 57 ms against 90. `CLEF_MODEL=~/models/clef-flash ./run.sh` (after `./prepare.sh clef-flash`) brings
-Clef-Flash back at 0.8.
+Clef-Flash back at 0.8. The decision model answers to its folder's name, `knowline-4b-gen5.5` or `clef-flash`, so
+`/v1/models` and the gateway's model list say which one runs.
 
 ```bash
 tensorfold serve ~/models/clef-flash --port 30001 --name clef --context 16384          # the decision model
