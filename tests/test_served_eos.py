@@ -29,6 +29,8 @@ SERVED = {
     "glm": ("glm53-flash-sushi-experts-mosaic-dense", "tensorfold.families.glm5_next.cuda.weights"),
     "bolt": ("Nemotron-3.5-Bolt-74B-A9B-24GB", "tensorfold.families.nemotron_bolt.cuda.weights"),
     "lfm2": ("LFM2.5-24B-A2B-FP8", "tensorfold.families.lfm2_moe.config"),
+    "knowline": ("KnowLine-4B-Gen5.5-serve", "tensorfold.families.qwen3_5.cuda.weights"),
+    "qwen27": ("Qwen3.8-27B-exl3-3.00bpw", "tensorfold.families.qwen3_5.cuda.weights"),
 }
 
 def folder_of(name: str) -> Path:
@@ -103,7 +105,8 @@ def copy(folder: Path, into: Path, config_eos, generation_eos) -> Path:
     if config_eos is not None:
         (raw.get("text_config") or raw)["eos_token_id"] = config_eos
     (into / "config.json").write_text(json.dumps(raw))
-    gen = json.loads((folder / "generation_config.json").read_text())
+    path = folder / "generation_config.json"
+    gen = json.loads(path.read_text()) if path.is_file() else {}   # KnowLine ships none
     gen.pop("eos_token_id", None)
     if generation_eos is not None:
         gen["eos_token_id"] = generation_eos

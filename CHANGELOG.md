@@ -5,6 +5,11 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
+- **KnowLine-4B's chat replies end at `<|im_end|>` instead of writing it into the content (CUDA).** The checkpoint
+  names that token only as its tokenizer's `eos_token`, and the Qwen3.5 family read only `config.json` and
+  `generation_config.json`. A reply came back as `"OK<|im_end|>\n"`.
+- **`run.sh` serves the thinking guard's decision model under its folder's name.** KnowLine-4B had answered as `clef`
+  since it took Clef-Flash's place; it is now `knowline-4b-gen5.5`, and Clef-Flash is `clef-flash`.
 - **A chat request's `thinking_prefill` starts the think block with its text (CUDA).** On Qwen3.8 Flash Next a
   Pólya prompt with `"## 1. Understand the problem\n"` prefilled followed all four steps in 66 of 80 replies,
   against 21 of 91 without it, with 43% fewer thinking tokens (5 Nov 2026).

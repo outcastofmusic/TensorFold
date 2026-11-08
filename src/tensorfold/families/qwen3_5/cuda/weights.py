@@ -11,6 +11,18 @@ from typing import Any
 import torch
 
 
+def _tokenizer_eos(model_dir: Path) -> list[int]:
+    """tokenizer_config.json's eos_token as an id from tokenizer.json's added tokens, or nothing."""
+
+    config, table = model_dir / "tokenizer_config.json", model_dir / "tokenizer.json"
+    if not (config.exists() and table.exists()):
+        return []
+    eos = json.loads(config.read_text()).get("eos_token")
+    eos = eos.get("content") if isinstance(eos, dict) else eos
+    added = {t["content"]: int(t["id"]) for t in json.loads(table.read_text()).get("added_tokens", [])}
+    return [added[eos]] if eos in added else []
+
+
 @dataclass
 class QLinear:
     weight: torch.Tensor      # original MLX words, or the optimized four-bit tile layout
@@ -145,6 +157,9 @@ class Config:
         for value in (raw.get("eos_token_id", t.get("eos_token_id")),
                       json.loads(gen.read_text()).get("eos_token_id") if gen.exists() else None):
             found += [] if value is None else [int(e) for e in value] if isinstance(value, list) else [int(value)]
+        # KnowLine-4B ships no generation_config.json and names <|im_end|> only as the tokenizer's eos_token: without
+        # it a chat reply wrote <|im_end|> into its content and stopped on <|endoftext|> after it
+        found += _tokenizer_eos(Path(model_dir))
         if not found:
             raise ValueError("no eos_token_id in config.json or generation_config.json")
         eos = tuple(dict.fromkeys(found))
