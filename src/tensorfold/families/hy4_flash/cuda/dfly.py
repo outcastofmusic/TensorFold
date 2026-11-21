@@ -131,6 +131,8 @@ class DFly:
         self.vocab, self.head = self._head(engine.w.head, c, cuda)
         adaptive = os.environ.get("TF_HY4_DFLY_ADAPTIVE", "0") != "0"
         self.floor = float(os.environ.get("TF_HY4_DFLY_FLOOR", "0.15")) if adaptive else None
+        # TF_HY4_DFLY_KEYED=0: draft greedily under sampling too (verification still samples by the key)
+        self.keyed = os.environ.get("TF_HY4_DFLY_KEYED", "1") != "0"
         self.confidence: list[float] = []         # the last round's slot probabilities (adaptive rounds only)
         self.inv = (1.0 / (c.sparse.theta ** (torch.arange(0, c.sparse.rope, 2, dtype=torch.float32)
                                               / c.sparse.rope))).to(device)
@@ -239,7 +241,7 @@ class DFly:
             hidden = layer.down(_silu_mul(layer.gate(h), layer.up(h)))
         out = K.rmsnorm((hidden.float() + residual.float()).to(torch.bfloat16), self.final_norm, c.eps)
         depth = self.width - 1 if self.floor is None else self.depth(out[1:])
-        greedy = sampling is None or sampling.temperature <= 0
+        greedy = sampling is None or sampling.temperature <= 0 or not self.keyed
         prev = ids[:1]
         drafts = []
         for step in range(depth):

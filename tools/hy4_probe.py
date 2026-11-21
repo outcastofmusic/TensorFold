@@ -7,7 +7,8 @@ kernel profile.
 Each kind decodes serial (one-row graph steps), then drafted (DFly2 and copies, DFly2 alone for each ``--drafters``
 draft head, copies alone), from the same prompt and key; the drafted tokens must equal the serial ones. A drafter is
 a draft head (``nvfp4`` or ``slice``, TF_HY4_DRAFT_HEAD), and ``+adaptive@FLOOR`` turns on confidence-head depth
-(TF_HY4_DFLY_ADAPTIVE, TF_HY4_DFLY_FLOOR). The drafted arms run in a rotated order a kind, so no arm is always the
+(TF_HY4_DFLY_ADAPTIVE, TF_HY4_DFLY_FLOOR), ``+greedy`` drafts greedily under sampling (TF_HY4_DFLY_KEYED=0), and
+``+copy`` lets copies draft too. The drafted arms run in a rotated order a kind, so no arm is always the
 first to read rejected drafts' Engram rows cold (plan B9). ``--trace`` keeps every DFly2 round (its confidences and
 accepted count) for the confidence head's calibration. ``--profile`` times one 2,048-row prompt chunk by kernel.
 """
@@ -60,10 +61,12 @@ def main() -> None:
     e = Engine(w, max_len=16384)
     drafters = {}
     for spec in a.drafters.split(","):
-        head, _, rest = spec.partition("+")
-        env = {"TF_HY4_DRAFT_HEAD": head, "TF_HY4_DFLY_ADAPTIVE": "1" if rest.startswith("adaptive") else "0"}
-        if "@" in rest:
-            env["TF_HY4_DFLY_FLOOR"] = rest.split("@", 1)[1]
+        head, *opts = spec.split("+")
+        adaptive = next((o for o in opts if o.startswith("adaptive")), "")
+        env = {"TF_HY4_DRAFT_HEAD": head, "TF_HY4_DFLY_ADAPTIVE": "1" if adaptive else "0",
+               "TF_HY4_DFLY_KEYED": "0" if "greedy" in opts else "1"}
+        if "@" in adaptive:
+            env["TF_HY4_DFLY_FLOOR"] = adaptive.split("@", 1)[1]
         saved = {k: os.environ.get(k) for k in env}
         os.environ.update(env)
         try:
@@ -79,7 +82,7 @@ def main() -> None:
     report: dict = {"tokens": a.tokens, "temperature": a.temperature, "drafters": list(drafters)}
     traces: dict = {}
     drafted = [("dfly+copy", {"drafter": drafters[first_spec], "allow_copy": True})]
-    drafted += [(f"dfly:{spec}", {"drafter": d, "allow_copy": False}) for spec, d in drafters.items()]
+    drafted += [(f"dfly:{spec}", {"drafter": d, "allow_copy": "copy" in spec.split("+")}) for spec, d in drafters.items()]
     drafted += [("copy", {"drafter": None, "allow_copy": True})]
     for i, (name, text) in enumerate(PROMPTS.items()):
         ids = tok.encode(template.render([{"role": "user", "content": text}], tools=None, enable_thinking=False),
