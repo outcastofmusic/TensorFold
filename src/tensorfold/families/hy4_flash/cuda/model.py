@@ -612,7 +612,8 @@ def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sa
         while n < len(guesses) and guesses[n] == sampled[n] and not (stop_eos and sampled[n] in eos):
             n += 1
         if trace is not None:
-            trace.append({"base": base, "tokens": tokens, "sampled": sampled, "accepted": n, "copied": copied})
+            trace.append({"base": base, "tokens": tokens, "sampled": sampled, "accepted": n, "copied": copied,
+                          "confidence": None if copied else list(getattr(drafter, "confidence", None) or [])})
         e.rewind(len(tokens) - (n + 1))
         if drafter is not None:
             drafter.commit(e, n)

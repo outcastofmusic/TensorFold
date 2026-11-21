@@ -11,7 +11,12 @@ target's head, in turn: by default an NVFP4 copy of all of it made at load (209 
 742 MB), ``TF_HY4_DRAFT_HEAD=slice`` the bf16 rows of the first ``TF_HY4_DRAFT_VOCAB`` ids and the specials. Draft i
 is drawn by the request's keyed sampler at position pos + 1 + i, where the verify
 window samples it (playbook 5.2): a sampled reply then accepts the drafts serial decoding would write, where greedy
-drafts matched only its argmax. This follows vLLM's ``HYV4DFlyQueryModel`` and ``build_dfly_reuse_indices``.
+drafts matched only its argmax.
+
+With ``TF_HY4_DFLY_ADAPTIVE=1`` a round keeps fewer drafts: the checkpoint's ``confidence_head`` (sigmoid of one
+projection of a slot's normed row) gives each slot's chance of landing, and the round keeps the slots whose product
+of chances from the first stays at or above ``TF_HY4_DFLY_FLOOR``, always the first. A verify row costs 5.6 ms plus
+its cold Engram rows, and prose landed 0.75 drafts of 5 a round (21 Nov). Off until a GPU A/B. This follows vLLM's ``HYV4DFlyQueryModel`` and ``build_dfly_reuse_indices``.
 """
 
 from __future__ import annotations
@@ -119,11 +124,13 @@ class DFly:
             left = list(t)
         finally:
             t.close()
-        unused = [n for n in left if "confidence_head" not in n]
-        if unused:
-            raise ValueError(f"unused DFly2 tensors: {unused[:5]}")
+        if left:
+            raise ValueError(f"unused DFly2 tensors: {left[:5]}")
         engine.watch |= set(self.kv_layers)
         self.vocab, self.head = self._head(engine.w.head, c, cuda)
+        adaptive = os.environ.get("TF_HY4_DFLY_ADAPTIVE", "0") != "0"
+        self.floor = float(os.environ.get("TF_HY4_DFLY_FLOOR", "0.15")) if adaptive else None
+        self.confidence: list[float] = []         # the last round's slot probabilities (adaptive rounds only)
         self.inv = (1.0 / (c.sparse.theta ** (torch.arange(0, c.sparse.rope, 2, dtype=torch.float32)
                                               / c.sparse.rope))).to(device)
         self.offsets = torch.arange(self.width, device=device)
@@ -192,8 +199,8 @@ class DFly:
         hc = "hidden_correction."
         self.hidden_norm, self.embed_norm = bf16(hc + "hidden_norm.weight"), bf16(hc + "embed_norm.weight")
         self.hc_gate, self.hc_up, self.hc_down = lin(hc + "gate_proj"), lin(hc + "up_proj"), lin(hc + "down_proj")
-        for name in [n for n in t if "confidence_head" in n]:
-            t.pop(name)
+        cf = "confidence_head.proj."
+        self.conf_w, self.conf_b = t.pop(PREFIX + cf + "weight").float(), t.pop(PREFIX + cf + "bias").float()
 
     def nbytes(self) -> int:
         return sum(x.nbytes() for layer in self.layers for x in (layer.gate, layer.up, layer.down))
@@ -230,10 +237,11 @@ class DFly:
             h = K.rmsnorm(hidden, layer.post_norm, c.eps)
             hidden = layer.down(_silu_mul(layer.gate(h), layer.up(h)))
         out = K.rmsnorm((hidden.float() + residual.float()).to(torch.bfloat16), self.final_norm, c.eps)
+        depth = self.width - 1 if self.floor is None else self.depth(out[1:])
         greedy = sampling is None or sampling.temperature <= 0
         prev = ids[:1]
         drafts = []
-        for step in range(self.width - 1):
+        for step in range(depth):
             h = out[step + 1:step + 2]
             both = torch.cat([K.rmsnorm(h, self.hidden_norm, c.eps), K.rmsnorm(e.w.embed[prev], self.embed_norm, c.eps)],
                              -1)
@@ -246,6 +254,20 @@ class DFly:
                 prev = torch.tensor(keyed_rows(logits, [anchor + 1 + step], sampling, self.vocab), device=dev)
             drafts.append(prev)
         return [int(t) for t in torch.cat(drafts).tolist()]
+
+    def depth(self, rows: torch.Tensor) -> int:
+        """The drafts a round keeps from the slots' normed rows [5, D]: the leading slots whose chance of landing with
+        every slot before it stays at or above the floor, at least one. One read-back of five floats."""
+
+        p = torch.sigmoid(rows.float() @ self.conf_w.t() + self.conf_b)[:, 0]
+        self.confidence = [float(x) for x in p.tolist()]
+        reach, keep = 1.0, 0
+        for x in self.confidence:
+            reach *= x
+            if reach < self.floor:
+                break
+            keep += 1
+        return max(1, keep)
 
     def _attention(self, e, j: int, a: Attention, x: torch.Tensor, pos: torch.Tensor, anchor: int) -> torch.Tensor:
         """The block's MLA over target layer ``kv_layers[j]``: the target's list for its last row, then the block."""

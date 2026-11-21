@@ -201,3 +201,95 @@ def test_dfly_reads_the_whole_vocabulary_through_an_nvfp4_head(weights, checkpoi
     sliced = DFly(checkpoint, e, device="cpu")
     assert sliced.vocab.numel() == 128 + weights.head.shape[0] - weights.config.bos
     assert sliced.head(h).shape == (64, sliced.vocab.numel())
+
+
+# -- adaptive depth -------------------------------------------------------------------------------------------------
+
+def _confident(drafter, p: float):
+    """The confidence head set to give every slot probability ``p`` (a zero weight and the bias logit(p))."""
+
+    import math
+
+    import torch
+
+    drafter.conf_w = torch.zeros_like(drafter.conf_w)
+    drafter.conf_b = torch.full_like(drafter.conf_b, math.log(p / (1 - p)))
+
+
+@pytest.mark.parametrize("p, depth", [(0.6, 3), (0.95, 5), (0.05, 1)])
+def test_adaptive_depth_keeps_the_drafts_whose_chance_of_landing_clears_the_floor(weights, checkpoint, monkeypatch,
+                                                                                  p, depth):
+    """TF_HY4_DFLY_ADAPTIVE=1: slot i's chance of landing is the product of the confidence head's first i + 1
+    probabilities; a round keeps the slots at or above TF_HY4_DFLY_FLOOR, and always the first."""
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.hy4_flash.cuda.dfly import DFly
+    from tensorfold.families.hy4_flash.cuda.model import prefill
+
+    monkeypatch.setenv("TF_HY4_DFLY_ADAPTIVE", "1")
+    monkeypatch.setenv("TF_HY4_DFLY_FLOOR", "0.2")          # 0.6: 0.6, 0.36, 0.216 stay, 0.13 goes
+    e = _engine(weights)
+    drafter = DFly(checkpoint, e, device="cpu")
+    _confident(drafter, p)
+    s = Sampling(seed=0, temperature=0.0)
+    got = drafter.propose(e, prefill(e, PROMPT, s), s)
+    assert len(got) == depth
+    assert drafter.confidence == pytest.approx([p] * 5, abs=1e-6)
+
+
+def test_adaptive_depth_is_off_by_default(weights, checkpoint):
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.hy4_flash.cuda.dfly import DFly
+    from tensorfold.families.hy4_flash.cuda.model import prefill
+
+    e = _engine(weights)
+    drafter = DFly(checkpoint, e, device="cpu")
+    _confident(drafter, 0.05)
+    s = Sampling(seed=0, temperature=0.0)
+    assert len(drafter.propose(e, prefill(e, PROMPT, s), s)) == 5
+
+
+def test_the_confidence_head_reads_each_slot_s_normed_row(weights, checkpoint, monkeypatch):
+    """sigmoid(proj(final_norm(row))) a slot, from the checkpoint's own weights."""
+
+    import torch
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.hy4_flash.cuda import dfly
+    from tensorfold.families.hy4_flash.cuda.model import prefill
+
+    monkeypatch.setenv("TF_HY4_DFLY_ADAPTIVE", "1")
+    monkeypatch.setenv("TF_HY4_DFLY_FLOOR", "0")
+    _, values = tiny.tensors()
+    w = torch.from_numpy(values["model.dfly_layers.confidence_head.proj.weight"])
+    b = torch.from_numpy(values["model.dfly_layers.confidence_head.proj.bias"])
+    e = _engine(weights)
+    drafter = dfly.DFly(checkpoint, e, device="cpu")
+    seen = []
+    norm = dfly.K.rmsnorm
+
+    def keep(x, weight, eps, out=None):
+        y = norm(x, weight, eps)
+        if weight is drafter.final_norm:
+            seen.append(y)
+        return y
+
+    monkeypatch.setattr(dfly.K, "rmsnorm", keep)
+    s = Sampling(seed=0, temperature=0.0)
+    drafter.propose(e, prefill(e, PROMPT, s), s)
+    want = torch.sigmoid(seen[0][1:].float() @ w.t() + b)[:, 0]
+    assert drafter.confidence == pytest.approx(want.tolist(), abs=1e-5)
+
+
+def test_adaptive_drafted_equals_serial(weights, checkpoint, monkeypatch):
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.hy4_flash.cuda.dfly import DFly
+    from tensorfold.families.hy4_flash.cuda.model import draft_decode, prefill
+
+    monkeypatch.setenv("TF_HY4_DFLY_ADAPTIVE", "1")
+    s = Sampling(seed=5, temperature=0.0)
+    serial = _serial(_engine(weights), s)
+    e = _engine(weights)
+    drafter = DFly(checkpoint, e, device="cpu")
+    got = draft_decode(e, PROMPT, prefill(e, PROMPT, s), 30, s, stop_eos=False, drafter=drafter)
+    assert got.tokens == serial
