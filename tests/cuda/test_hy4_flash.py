@@ -109,11 +109,12 @@ def test_drafted_equals_serial(weights, goldens, temperature):
     assert got.stats["accepted"] > got.stats["rounds"] and got.stats["accepted"] < got.stats["drafted"]
 
 
+@pytest.mark.parametrize("graphs", [False, True])
 @pytest.mark.parametrize("head", ["nvfp4", "slice"])
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
-def test_dfly_drafted_equals_serial(weights, goldens, temperature, head, tmp_path, monkeypatch):
+def test_dfly_drafted_equals_serial(weights, goldens, temperature, head, graphs, tmp_path, monkeypatch):
     """DFly2's real rounds (random weights: few drafts land) and copies, keyed drafts, either draft head: the reply is
-    serial decoding's."""
+    serial decoding's, also when the verify windows replay graphs and DFly2 reads the rows a graph keeps."""
 
     monkeypatch.setenv("TF_HY4_DRAFT_HEAD", head)
     monkeypatch.setenv("TF_HY4_DRAFT_VOCAB", "128")
@@ -125,7 +126,7 @@ def test_dfly_drafted_equals_serial(weights, goldens, temperature, head, tmp_pat
     s = Sampling(seed=5, temperature=temperature)
     e = _engine(weights)
     serial = serial_decode(e, prefill(e, prompt, s), 40, s, stop_eos=False).tokens
-    e = _engine(weights)
+    e = _engine(weights, graphs=graphs)
     drafter = DFly(tiny.write(tmp_path / "t"), e)
     got = draft_decode(e, prompt, prefill(e, prompt, s), 40, s, stop_eos=False, drafter=drafter)
     assert got.tokens == serial
@@ -179,3 +180,29 @@ def test_nvfp4_draft_head_gives_its_dense_values(weights):
     got, want = head(h).float(), h.float() @ dense.t()
     assert vocab is None and got.shape == want.shape
     assert float((got - want).abs().max() / want.abs().max()) < 0.01
+
+
+def test_graphed_calls_keep_the_eager_rows(weights, goldens):
+    """After every graphed call, the first (captured) and later (replayed) ones of each width, the normed rows and the
+    watched lists a drafter reads are an eager engine's."""
+
+    ids = goldens["long_ids"].tolist()
+    engines = []
+    for graphs in (False, True):
+        e = _engine(weights, graphs=graphs)
+        e.watch = {li for li, layer in enumerate(e.w.layers) if layer.attn.indexer is not None}
+        e.forward(ids[:26], prompt=True)          # the windows cross the tiny indexer's 32-key limit
+        engines.append(e)
+    assert engines[0].watch
+    for width in (6, 1, 3, 6, 1, 16, 3):
+        for e in engines:
+            e.forward(ids[e.pos:e.pos + width], prompt=False, every=True)
+        want, got = engines
+        assert torch.equal(got.normed, want.normed), width
+        for li in want.watch:
+            (sel, tok, cnt), (gsel, gtok, gcnt) = want.lists[li], got.lists[li]
+            assert torch.equal(sel, gsel) and torch.equal(cnt, gcnt), (width, li)
+            sparse = sel != 0                        # a graph always ranks groups; dense rows read no token list
+            assert torch.equal(tok[sparse], gtok[sparse]), (width, li)
+        for e in engines:
+            e.rewind(width - 1)
