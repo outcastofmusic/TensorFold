@@ -13,6 +13,7 @@ import json
 import uuid
 from typing import Any
 
+from tensorfold.server.code_spans import Quoted, live_find
 from tensorfold.server.tools import tool_spec_name
 
 CALL_OPEN, CALL_CLOSE = "<|tool_call_start|>", "<|tool_call_end|>"
@@ -120,13 +121,14 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *,
     known = {tool_spec_name(t).lower(): tool_spec_name(t) for t in tools}
     calls: list[dict[str, Any]] = []
     residue: list[str] = []
-    at = 0
-    while (start := text.find(CALL_OPEN, at)) >= 0:
+    at, quoted = 0, Quoted(text)
+    while (start := live_find(text, CALL_OPEN, quoted, at)) >= 0:       # a block quoted in Markdown code is prose
         end = text.find(CALL_CLOSE, start + len(CALL_OPEN))
         if end < 0:
             break
         residue.append(text[at:start])
         at = end + len(CALL_CLOSE)
+        quoted.jump(at)
         try:
             found = parse_block(text[start + len(CALL_OPEN):end], tools)
             for _, args in found:
@@ -154,6 +156,9 @@ def close_call(text: str, tools: list[dict[str, Any]]) -> str:
     start = text.rfind(CALL_OPEN)
     if not tools or start < 0 or text.find(CALL_CLOSE, start) >= 0:
         return ""
+    last = text.rfind(CALL_CLOSE, 0, start)
+    if Quoted(text, start=last + len(CALL_CLOSE) if last >= 0 else 0).check(start) is not None:
+        return ""                                       # the block is quoted in Markdown code: prose
     body = text[start + len(CALL_OPEN):].rstrip()
     for tail in ("", "]", ")]"):
         content, calls = parse_tool_calls(CALL_OPEN + body + tail + CALL_CLOSE, tools)

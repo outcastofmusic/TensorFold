@@ -7,6 +7,7 @@ import re
 import uuid
 from typing import Any
 
+from tensorfold.server.code_spans import Quoted
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas
 
 def tool_spec_name(tool: dict[str, Any]) -> str:
@@ -397,9 +398,10 @@ def _namespace(m: re.Match[str]) -> str:
 
 
 def _pairs(text: str, opener: re.Pattern[str], closer: re.Pattern[str],
-           key=lambda m: "") -> list[tuple[re.Match[str], int, int]]:
+           key=lambda m: "", quoted: Quoted | None = None) -> list[tuple[re.Match[str], int, int]]:
     """(opener match, closer start, closer end) of each block that runs from an ``opener`` match to the first
-    ``closer`` match after it with the same ``key``, in order; an opener inside an earlier block is part of it.
+    ``closer`` match after it with the same ``key``, in order; an opener inside an earlier block is part of it, and
+    with ``quoted`` one in Markdown code is prose (upstream #3588).
 
     This is what the lazy regex ``opener\\s*(.*?)\\s*closer`` found (upstream #913), but that regex searched the rest
     of the reply again from every opener without a closer: 2,000 of them in 1 MB took 10 s, holding the GIL. Here
@@ -412,7 +414,7 @@ def _pairs(text: str, opener: re.Pattern[str], closer: re.Pattern[str],
     found: list[tuple[re.Match[str], int, int]] = []
     at = 0
     for m in opener.finditer(text):
-        if m.start() < at:
+        if m.start() < at or (quoted is not None and quoted.check(m.start()) is not None):
             continue
         name = key(m)
         spans, e = closers.get(name, []), passed.get(name, 0)
@@ -422,14 +424,16 @@ def _pairs(text: str, opener: re.Pattern[str], closer: re.Pattern[str],
         if e < len(spans):
             found.append((m, *spans[e]))
             at = spans[e][1]
+            if quoted is not None:
+                quoted.jump(at)
     return found
 
 
 def _blocks(text: str, opener: re.Pattern[str], closer: re.Pattern[str],
-            key=lambda m: "") -> list[tuple[int, int, str]]:
+            key=lambda m: "", quoted: Quoted | None = None) -> list[tuple[int, int, str]]:
     """(start, end, body) of each block ``_pairs`` finds."""
 
-    return [(m.start(), end, text[m.end():start]) for m, start, end in _pairs(text, opener, closer, key)]
+    return [(m.start(), end, text[m.end():start]) for m, start, end in _pairs(text, opener, closer, key, quoted)]
 
 
 def _tagged(text: str, opener: re.Pattern[str], closer: re.Pattern[str]) -> tuple[list[tuple[re.Match[str], str]], str]:
@@ -456,9 +460,10 @@ def tool_parameters(body: str) -> tuple[list[tuple[str, str]], str]:
 
 
 def tool_call_blocks(text: str) -> list[tuple[int, int, str]]:
-    """(start, end, body) of each ``<tool_call>`` ... ``</tool_call>`` block in ``text`` (any case), in order."""
+    """(start, end, body) of each ``<tool_call>`` ... ``</tool_call>`` block in ``text`` (any case) outside Markdown
+    code, in order."""
 
-    return _blocks(text, _CALL_OPEN_RE, _CALL_CLOSE_RE)
+    return _blocks(text, _CALL_OPEN_RE, _CALL_CLOSE_RE, quoted=Quoted(text))
 
 
 def _envelopes(text: str) -> list[tuple[int, int, str]]:
@@ -466,9 +471,11 @@ def _envelopes(text: str) -> list[tuple[int, int, str]]:
 
     found = sorted([(s, e, body.strip()) for s, e, body in tool_call_blocks(text)]
                    + [(s, e, body.strip()) for s, e, body in
-                      _blocks(text, _NAMESPACED_OPEN_RE, _NAMESPACED_CLOSE_RE, _namespace)]
-                   + [(s, e, body.strip()) for s, e, body in _blocks(text, _GEMMA_OPEN_RE, _GEMMA_CLOSE_RE)]
-                   + [(s, e, text[s:e]) for s, e, _ in _blocks(text, _DSML_OPEN_RE, _DSML_CLOSE_RE)])
+                      _blocks(text, _NAMESPACED_OPEN_RE, _NAMESPACED_CLOSE_RE, _namespace, Quoted(text))]
+                   + [(s, e, body.strip()) for s, e, body in
+                      _blocks(text, _GEMMA_OPEN_RE, _GEMMA_CLOSE_RE, quoted=Quoted(text))]
+                   + [(s, e, text[s:e]) for s, e, _ in
+                      _blocks(text, _DSML_OPEN_RE, _DSML_CLOSE_RE, quoted=Quoted(text))])
     kept: list[tuple[int, int, str]] = []
     for envelope in found:
         if not kept or envelope[0] >= kept[-1][1]:

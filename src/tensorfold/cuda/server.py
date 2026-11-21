@@ -881,7 +881,8 @@ class App:
         opener = self.tok.token_to_id("<tool_call>") if think_end is not None else None
         if opener is None:
             return None
-        return ThinkCall(opener, self._think_close(prepared, think_end), think_end)
+        decode = lambda ids: self.tok.decode(ids, skip_special_tokens=False)
+        return ThinkCall(opener, self._think_close(prepared, think_end), think_end, decode=decode)
 
     def _think_close(self, prepared: PreparedRequest, think_end: int) -> list[int]:
         """A newline, </think> and a blank line (</think> alone under a grammar, which starts after it)."""
@@ -1003,7 +1004,7 @@ def cut_calls(text: str, tools: list[dict[str, Any]], streamer: ToolCallStreamer
     closed = closed or []
     if max_calls is not None and len(closed) >= max_calls:
         return None
-    deltas = streamer.feed(text)                        # the final text's last bytes, if the rounds had not sent them
+    deltas = streamer.feed(text, finished=True)         # the final text's last bytes, if the rounds had not sent them
     if streamer.open:
         if streamer.index != len(closed):               # the stream followed a call the parser did not take
             return None

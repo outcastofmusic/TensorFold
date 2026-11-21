@@ -8,6 +8,7 @@ import uuid
 from typing import Any
 
 from tensorfold.server import pythonic_calls
+from tensorfold.server.code_spans import Quoted, live_find
 from tensorfold.server.stopping import StopPolicy
 from tensorfold.server.text import hide_tool_calls  # noqa: F401  (the CUDA server's, with the Mac's four formats)
 from tensorfold.server.tools import parse_glm_tool_call_block, tool_call_blocks, tool_parameters, tool_spec_name
@@ -166,14 +167,17 @@ def _arguments_close(body: str) -> str:
 
 
 def open_call(text: str) -> int | None:
-    """Where the ``<tool_call>`` that ``text`` ends inside begins (the first with no closer after it), or None."""
+    """Where the ``<tool_call>`` that ``text`` ends inside begins (the first with no closer after it, outside Markdown
+    code), or None."""
 
     low, at = text.lower(), 0
-    while (opener := low.find(_CALL_OPEN, at)) >= 0:
+    quoted = Quoted(low)
+    while (opener := live_find(low, _CALL_OPEN, quoted, at)) >= 0:        # one quoted in Markdown code is prose
         closer = low.find(_CALL_CLOSE, opener + len(_CALL_OPEN))
         if closer < 0:
             return opener
         at = closer + len(_CALL_CLOSE)
+        quoted.jump(at)
     return None
 
 

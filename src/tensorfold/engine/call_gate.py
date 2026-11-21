@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Sequence
 
+from tensorfold.server.code_spans import Quoted
+
 _ANSWER, _LEAD, _NAME, _DONE = range(4)
 
 
@@ -173,10 +175,20 @@ class ThinkCall:
     After a thinking prefill, 13 of 63 agent replies wrote a call inside the thinking, and in 2 of them the call never
     ran (the gateway team's eval, 6 Nov 2026). ``fired`` says whether it moved one."""
 
-    def __init__(self, opener: int, close: Sequence[int], think_end: int) -> None:
+    def __init__(self, opener: int, close: Sequence[int], think_end: int,
+                 decode: Callable[[list[int]], str] | None = None) -> None:
         self.opener, self.close, self.think_end = int(opener), [int(t) for t in close], int(think_end)
         self.count, self.open, self.fired = 0, True, False
         self.expect: int | None = None
+        # with ``decode`` (token ids -> text), an opener quoted in Markdown code, or that may still be, stays in the
+        # thinking: the model is writing about the markup, not calling (upstream #3588)
+        self.decode, self.seen = decode, []
+
+    def _quoted(self, before: Sequence[int]) -> bool:
+        if self.decode is None:
+            return False
+        text = self.decode([*self.seen, *(int(t) for t in before)])
+        return Quoted(text + "<tool_call>", finished=False).check(len(text)) is not None
 
     def cut(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
         self.expect = None
@@ -185,7 +197,7 @@ class ThinkCall:
         for i, token in enumerate(tokens):
             if int(token) == self.think_end:
                 return None
-            if int(token) == self.opener:
+            if int(token) == self.opener and not self._quoted(tokens[:i]):
                 self.expect = self.count + i
                 return i, [*self.close, self.opener]
         return None
@@ -194,6 +206,8 @@ class ThinkCall:
         self.fired = self.fired or (self.count == self.expect and int(token) == self.close[0])
         self.count += 1
         self.open = self.open and int(token) != self.think_end
+        if self.decode is not None and self.open:
+            self.seen.append(int(token))
 
 
 class PrefillOpen:
