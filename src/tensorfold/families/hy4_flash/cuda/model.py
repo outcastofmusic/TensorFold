@@ -71,7 +71,6 @@ class Engine:
                                                   / c.sparse.rope))).to(dev)
         self.meta = torch.zeros(4, dtype=torch.int32, device=dev)            # meta[0]: the call's first position
         self.offsets = torch.arange(max(prefill_rows, DECODE_ROWS), dtype=torch.int32, device=dev)
-        self.sampled = torch.zeros(1, dtype=torch.int32, device=dev)
         self.tok = torch.zeros(1, dtype=torch.int32, device=dev)
         self.ids: list[int] = []                                            # the committed tokens (n-grams, states)
         width = max(c.sparse.heads, c.sliding.heads)
@@ -84,11 +83,6 @@ class Engine:
         self.graph = None
         self.graph_out: torch.Tensor | None = None
         self.sampling = None
-        self.params = None
-        if self.cuda:
-            from tensorfold.families.nemotron_h.cuda import sampler as S
-
-            self.params = S.Params(dev)
         self.pos = 0
         self.prompt = False
         # tests only: expert picks [T, top_k] by layer to use at positions 0.. (``replay``), and the engine's own (``seen``)
@@ -132,8 +126,13 @@ class Engine:
 
     def set_sampling(self, sampling) -> None:
         self.sampling = sampling
-        if self.params is not None:
-            self.params.set(sampling)
+
+    def rewind(self, n: int) -> None:
+        """Drop the last ``n`` committed rows (a window's rejected drafts); a later call overwrites their cache rows."""
+
+        if n:
+            self.pos -= n
+            del self.ids[-n:]
 
     @property
     def eos(self) -> tuple[int, ...]:
@@ -370,9 +369,7 @@ class Engine:
     def head(self, normed: torch.Tensor) -> torch.Tensor:
         """fp32 logits [n, V]: the bf16 rows times the bf16 head, summed in fp32 (``enable_lm_head_fp32``)."""
 
-        if not self.cuda:
-            return normed.float() @ self.w.head.float().t()
-        return torch.mm(normed, self.w.head.t(), out_dtype=torch.float32)
+        return K.head(normed, self.w.head)
 
     # -- Engram rows ---------------------------------------------------------------------------------------------
     def _stage_engram(self, tokens: Sequence[int]) -> None:
@@ -438,12 +435,10 @@ class Engine:
         """The token after position pos - 1 from its logits [1, V], by the request's keyed rule (greedy at T = 0)."""
 
         s = self.sampling
-        if self.cuda:
-            from tensorfold.families.nemotron_h.cuda import sampler as S
+        if self.cuda:                         # the rule a drafted window's rows sample by (``draft_decode``)
+            from tensorfold.cuda.sampling import sample_rows
 
-            self.meta[0] = self.pos - 1
-            S.sample(logits, self.meta, self.params, self.sampled)
-            return int(self.sampled[0])
+            return sample_rows(logits[-1:], [self.pos], s)[0]
         if s is None or s.temperature <= 0:
             return int(torch.argmax(logits[0]))
         from tensorfold.engine.exact_sampling import MARGIN, choose
@@ -522,3 +517,61 @@ def serial_decode(e: Engine, pending: int, count: int, sampling, *, stop_eos: bo
             break
     _sync(e)
     return DecodeResult(out, time.perf_counter() - start)
+
+
+FIRST_COPY_ROWS = 16          # a copy's first window; it doubles while copies land whole, up to DECODE_ROWS
+
+
+@torch.no_grad()
+def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sampling, *, stop_eos: bool = True,
+                 on_tokens: Callable[[list[int]], bool | None] | None = None, drafter=None,
+                 allow_copy: bool = True) -> DecodeResult:
+    """Drafted chains verified as one window, each token the one serial decoding gives: a copy from the context when
+    one matches, else the ``drafter``'s block (DFly2), else one row. Every window row samples by the serial rule at
+    its position, and rows past the first rejected draft are rewound."""
+
+    from tensorfold.cuda.sampling import sample_rows
+    from tensorfold.families.qwen3_5.cuda.decode import CopyIndex, next_copy_rows
+
+    e.set_sampling(sampling)
+    out = [int(pending)]
+    ctx = list(context) + out
+    eos = set(e.c.eos)
+    copies = CopyIndex() if allow_copy else None
+    rows = FIRST_COPY_ROWS
+    stats = {"rounds": 0, "drafted": 0, "accepted": 0, "copy": 0, "draft_s": 0.0}
+    _sync(e)
+    start = time.perf_counter()
+    while len(out) < count and not (stop_eos and out[-1] in eos):
+        t0 = time.perf_counter()
+        room = min(count - len(out) - 1, DECODE_ROWS - 1)
+        guesses = copies.propose(ctx, min(rows, DECODE_ROWS) - 1)[:room] if copies is not None else []
+        copied = bool(guesses)
+        if not guesses and drafter is not None and room > 0:
+            guesses = drafter.propose(e, out[-1], sampling)[:room]
+        stats["draft_s"] += time.perf_counter() - t0
+        tokens = [out[-1]] + guesses
+        base = e.pos
+        logits = e.forward(tokens, prompt=False, every=True)
+        sampled = sample_rows(logits, [base + 1 + i for i in range(len(tokens))], sampling)
+        n = 0
+        while n < len(guesses) and guesses[n] == sampled[n] and not (stop_eos and sampled[n] in eos):
+            n += 1
+        e.rewind(len(tokens) - (n + 1))
+        if drafter is not None:
+            drafter.commit(e, n)
+        new = guesses[:n] + [sampled[n]]
+        out.extend(new)
+        ctx.extend(new)
+        if copied:
+            rows = next_copy_rows(rows, n == len(guesses), FIRST_COPY_ROWS, DECODE_ROWS)
+            stats["copy"] += 1
+        stats["rounds"] += 1
+        stats["drafted"] += len(guesses)
+        stats["accepted"] += n
+        if on_tokens is not None and on_tokens(new):
+            break
+    _sync(e)
+    res = DecodeResult(out, time.perf_counter() - start)
+    res.stats = stats
+    return res

@@ -165,6 +165,7 @@ class Hy4Engine:
             raise ValueError(f"Hy4-flash needs {weights / gib:.1f} GiB for its weights; {free / gib:.1f} GiB is free "
                              "above the memory floor")
         self.max_len = fit
+        self.drafts = drafts
         started = time.perf_counter()
         self.w = load(self.model_dir, layers=layers)
         self.e = Engine(self.w, max_len=self.max_len)
@@ -197,7 +198,7 @@ class Hy4Engine:
 
         from tensorfold.cuda.kept_states import keep_points
 
-        from .model import prefill, serial_decode
+        from .model import draft_decode, prefill, serial_decode
 
         prompt = [int(t) for t in prompt]
         room = self.max_len - len(prompt)
@@ -219,11 +220,16 @@ class Hy4Engine:
         pending = prefill(self.e, prompt, sampling, resume=hit.state if hit is not None else None,
                           keeps=keep_points(prompt, begin, self.marks) if reuse else (), keep=keep)
         prefill_s = time.perf_counter() - t0
-        stats: dict[str, Any] = {"prefill_s": round(prefill_s, 4), "cached": begin, "drafts": False,
+        drafting = bool(draft) and self.drafts
+        stats: dict[str, Any] = {"prefill_s": round(prefill_s, 4), "cached": begin, "drafts": drafting,
                                  "prefill_tps": round((len(prompt) - begin) / prefill_s, 2) if prefill_s else 0.0}
         if report([pending]) or (stop_eos and pending in self.eos) or max_tokens <= 1:
             return stats
-        res = serial_decode(self.e, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=report)
+        if drafting:
+            res = draft_decode(self.e, prompt, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=report)
+            stats.update(drafted=res.stats["drafted"], accepted=res.stats["accepted"])
+        else:
+            res = serial_decode(self.e, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=report)
         stats.update(decode_s=round(res.seconds, 4), rounds=res.rounds, decode_tps=round(res.tokens_per_second, 2))
         return stats
 

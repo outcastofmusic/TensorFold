@@ -137,6 +137,38 @@ def hc_post(x: torch.Tensor, post: torch.Tensor, y: torch.Tensor) -> torch.Tenso
     return x
 
 
+# ------------------------------------------------------------------------------------------------- head ---
+
+@triton.jit
+def _head(X, W, OUT, R, V, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """Program (row tile, column block): OUT[r, n] = sum_k X[r, k] W[n, k] in fp32, K in BK steps in order."""
+
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    rn = tl.program_id(1) * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, D, BK):
+        x = tl.load(X + rm[:, None] * D + (k0 + rk)[None, :], mask=rm[:, None] < R, other=0.0)
+        w = tl.load(W + rn[:, None] * D + (k0 + rk)[None, :], mask=rn[:, None] < V, other=0.0)
+        acc = tl.dot(x, tl.trans(w), acc)
+    tl.store(OUT + rm[:, None] * V + rn[None, :], acc, mask=(rm[:, None] < R) & (rn[None, :] < V))
+
+
+def head(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """fp32 logits [R, V] of bf16 rows x [R, D] times the bf16 head w [V, D]: one fixed 16-row tile and K order, so a
+    row's logits are the same bits alone and in any window (``enable_lm_head_fp32``: the products are exact)."""
+
+    rows, d = x.shape
+    v = w.shape[0]
+    if not x.is_cuda:
+        return x.float() @ w.float().t()
+    x = x.contiguous()
+    out = torch.empty((rows, v), dtype=torch.float32, device=x.device)
+    _head[(triton.cdiv(rows, 16), triton.cdiv(v, 64))](x, w, out, rows, v, D=d, BM=16, BN=64, BK=128, num_warps=4,
+                                                     num_stages=4)
+    return out
+
+
 # ----------------------------------------------------------------------------------- MLA absorb and expand ---
 
 ROW_KERNEL = 16          # calls of up to this many rows take the per-row kernels; prompt chunks batched matmuls

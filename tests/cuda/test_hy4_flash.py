@@ -72,3 +72,39 @@ def test_graph_replay_equals_eager(weights, goldens):
         e.forward(ids[:10], prompt=True)
         out.append(torch.cat([e.forward([t], prompt=False) for t in ids[10:]]))
     assert torch.equal(out[0], out[1])
+
+
+class _Oracle:
+    """Proposes serial decoding's own next tokens, one of them wrong every third round: full and partial accepts."""
+
+    def __init__(self, serial: list[int], prompt_len: int):
+        self.serial, self.prompt_len, self.rounds = serial, prompt_len, 0
+
+    def propose(self, e, last: int, sampling) -> list[int]:
+        at = e.pos - self.prompt_len + 1
+        guess = list(self.serial[at:at + 5])
+        self.rounds += 1
+        if guess and self.rounds % 3 == 0:
+            guess[len(guess) // 2] = (guess[len(guess) // 2] + 1) % 512
+        return guess
+
+    def commit(self, e, accepted: int) -> None:
+        pass
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_drafted_equals_serial(weights, goldens, temperature):
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.hy4_flash.cuda.model import draft_decode, prefill, serial_decode
+
+    prompt = goldens["long_ids"].tolist()[:20]
+    s = Sampling(seed=3, temperature=temperature)
+    e = _engine(weights)
+    first = prefill(e, prompt, s)
+    serial = serial_decode(e, first, 40, s, stop_eos=False).tokens
+    e = _engine(weights)
+    first = prefill(e, prompt, s)
+    oracle = _Oracle(serial, len(prompt))
+    got = draft_decode(e, prompt, first, 40, s, stop_eos=False, drafter=oracle, allow_copy=False)
+    assert got.tokens == serial
+    assert got.stats["accepted"] > got.stats["rounds"] and got.stats["accepted"] < got.stats["drafted"]
