@@ -84,7 +84,35 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
     if instructions:
         out.insert(0, {**instructions[0], "role": "system",
                        "content": "\n\n".join(m["content"] for m in instructions)})
+    out = _order_parallel_results(out)
     return messages if out == messages else out
+
+
+def _order_parallel_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Put the tool results that follow an assistant's parallel calls in call order (upstream #3775).
+
+    Qwen3.8's templates render each result as an anonymous ``<tool_response>``, so the model pairs results with
+    calls by position: two ``read_file`` results sent back in finishing order were read as each other's. A run is
+    reordered only when it holds exactly one result for each call's id, with no missing or repeated id."""
+
+    out = messages
+    for i, message in enumerate(messages):
+        calls = message.get("tool_calls") if message.get("role") == "assistant" else None
+        if not isinstance(calls, list) or len(calls) < 2:
+            continue
+        end = i + 1
+        while end < len(messages) and messages[end].get("role") == "tool":
+            end += 1
+        ids = [call.get("id") if isinstance(call, dict) else None for call in calls]
+        results = messages[i + 1:end]
+        answered = [r.get("tool_call_id") for r in results]
+        if (not all(isinstance(x, str) and x for x in ids + answered) or len(set(ids)) != len(ids)
+                or sorted(answered) != sorted(ids)):
+            continue
+        ordered = sorted(results, key=lambda r: ids.index(r["tool_call_id"]))
+        if ordered != results:
+            out = [*out[:i + 1], *ordered, *out[end:]]
+    return out
 
 
 def _normalize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

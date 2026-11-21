@@ -190,6 +190,10 @@ def _parse_glm_payload(block: str, schemas: dict[str, dict[str, Any]] | None, *,
     pairs, left = _glm_args(rest)
     if complete and left.strip():
         return None
+    # a value that never closes, or runs into the next pair, is malformed: the call stays text (upstream #2801).
+    # Read to the next closer, it would carry the next pair's markup as valid JSON with corrupt arguments.
+    if "<arg_value>" in left or any("<arg_key>" in value for _, value in pairs):
+        return None
     schema = (schemas or {}).get(name.lower(), {})
     return name, {key.strip(): decode_parameter(value, schema.get(key.strip(), {}), python=False)
                   for key, value in pairs}
