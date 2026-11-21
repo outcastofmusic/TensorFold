@@ -77,6 +77,11 @@ class Engine:
         self.eg_rows = (torch.zeros((len(c.engram_layers), rows, heads, c.engram_dim), dtype=torch.float32,
                                     device=dev) if heads else None)        # a call's Engram rows, staged on the host
         self.graphs = flag("TF_HY4_GRAPHS", True) and self.cuda
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._readers = ThreadPoolExecutor(len(c.engram_layers) or 1, thread_name_prefix="engram-layer")
+        self._ahead_pool = ThreadPoolExecutor(1, thread_name_prefix="engram-ahead")
+        self._ahead: tuple | None = None
         self.graph = None
         self.graph_out: torch.Tensor | None = None
         self.sampling = None
@@ -362,21 +367,38 @@ class Engine:
         return K.head(normed, self.w.head)
 
     # -- Engram rows ---------------------------------------------------------------------------------------------
-    def _stage_engram(self, tokens: Sequence[int]) -> None:
-        """Read the call's Engram rows on the host and copy them into ``eg_rows`` (before a graph replays)."""
+    def _read_engram(self, tokens: Sequence[int], pos: int, previous: Sequence[int]) -> list[torch.Tensor]:
+        """A call's Engram rows, every layer's table read at once: fp32 [R, heads, dim] a layer, on the host."""
 
         c = self.c
+        grams = ngram_tokens(np.asarray(tokens), pos, np.asarray(previous[-(c.engram_ngram - 1):]), c.engram_ngram,
+                             c.pad)
+        layers = [self.w.layers[li].engram for li in c.engram_layers if li < len(self.w.layers)]
+        jobs = [self._readers.submit(gather_engram, e.table, e.hasher.rows_of(grams), c.engram_dim) for e in layers]
+        return [j.result() for j in jobs]
+
+    def prefetch(self, tokens: Sequence[int], pos: int, previous: Sequence[int]) -> None:
+        """Start reading the Engram rows of a later call (the next prompt chunk) while this one computes."""
+
+        if self.eg_rows is not None:
+            self._ahead = (pos, tuple(int(t) for t in tokens),
+                           self._ahead_pool.submit(self._read_engram, list(tokens), pos, list(previous)))
+
+    def _stage_engram(self, tokens: Sequence[int]) -> None:
+        """Copy the call's Engram rows into ``eg_rows`` (before a graph replays): prefetched when ``prefetch`` read
+        them, else read now."""
+
         if self.eg_rows is None:
             return
-        grams = ngram_tokens(np.asarray(tokens), self.pos, np.asarray(self.ids[-(c.engram_ngram - 1):]),
-                             c.engram_ngram, c.pad)
+        ahead = self._ahead
+        if ahead is not None and ahead[0] == self.pos and ahead[1] == tuple(int(t) for t in tokens):
+            self._ahead = None
+            got = ahead[2].result()
+        else:                                     # a prefetch for a later call stays for it
+            got = self._read_engram(tokens, self.pos, self.ids)
         rows = len(tokens)
-        for j, li in enumerate(c.engram_layers):
-            if li >= len(self.w.layers):          # a probe that loads the first layers only
-                break
-            e = self.w.layers[li].engram
-            got = gather_engram(e.table, e.hasher.rows_of(grams), c.engram_dim)
-            self.eg_rows[j, :rows, :got.shape[1]].copy_(got.to(self.device), non_blocking=False)
+        for j, part in enumerate(got):
+            self.eg_rows[j, :rows, :part.shape[1]].copy_(part.to(self.device), non_blocking=False)
 
     # -- calls ---------------------------------------------------------------------------------------------------
     @torch.no_grad()
@@ -487,6 +509,10 @@ def prefill(e: Engine, prompt: Sequence[int], sampling, *, resume: dict | None =
     for stop in stops:
         while s < stop:
             chunk = prompt[s:min(stop, s + e.prefill_rows)]
+            after = s + len(chunk)
+            if after < len(prompt):              # the next chunk's Engram rows, read while this one computes
+                nxt = prompt[after:min(after + e.prefill_rows, next(p for p in stops if p > after))]
+                e.prefetch(nxt, after, prompt[max(0, after - 2):after])
             logits = e.forward(chunk, prompt=True)
             s += len(chunk)
         if keep is not None and stop < len(prompt):
