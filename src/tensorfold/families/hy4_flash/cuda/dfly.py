@@ -9,14 +9,15 @@ cache at the block's positions (the target's verify window overwrites them). Aft
 is corrected by an MLP over it and the previous token's embedding (``hidden_correction``) and read through the
 target's head, in turn: by default an NVFP4 copy of all of it made at load (209 MB a read against the bf16 head's
 742 MB), ``TF_HY4_DRAFT_HEAD=slice`` the bf16 rows of the first ``TF_HY4_DRAFT_VOCAB`` ids and the specials. Draft i
-is drawn by the request's keyed sampler at position pos + 1 + i, where the verify
-window samples it (playbook 5.2): a sampled reply then accepts the drafts serial decoding would write, where greedy
-drafts matched only its argmax.
+is drawn by the request's keyed sampler at position pos + 1 + i, where the verify window samples it (playbook 5.2):
+a sampled reply then accepts the drafts serial decoding would write, where greedy drafts matched only its argmax.
 
 With ``TF_HY4_DFLY_ADAPTIVE=1`` a round keeps fewer drafts: the checkpoint's ``confidence_head`` (sigmoid of one
 projection of a slot's normed row) gives each slot's chance of landing, and the round keeps the slots whose product
 of chances from the first stays at or above ``TF_HY4_DFLY_FLOOR``, always the first. A verify row costs 5.6 ms plus
-its cold Engram rows, and prose landed 0.75 drafts of 5 a round (21 Nov). Off until a GPU A/B. This follows vLLM's ``HYV4DFlyQueryModel`` and ``build_dfly_reuse_indices``.
+its cold Engram rows, and prose landed 0.75 drafts of 5 a round (21 Nov). Off until a GPU A/B.
+
+This follows vLLM's ``HYV4DFlyQueryModel`` and ``build_dfly_reuse_indices``.
 """
 
 from __future__ import annotations
