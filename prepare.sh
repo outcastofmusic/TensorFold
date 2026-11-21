@@ -17,6 +17,8 @@
 #                                 use only under US$10M annual revenue)
 #   ./prepare.sh nemotron-3.5-super   Nemotron 3.5 Super VL 120B-A12B NVFP4 (75.1 GB) and upstream TensorFold's native
 #                                 1.2.2 server for linux-aarch64 (45.8 MB), which serves it in place of this checkout
+#   ./prepare.sh hy4-flash        Tencent's Hy4-flash in Avifenesh's NVFP4 pack (161.1 GB, 66 GB of it Engram tables read
+#                                 from disk; Tencent Hy License 1.0)
 #
 # Needs Docker with the NVIDIA runtime. Downloads run inside the serving image, so the host needs no Python packages.
 # A gated or rate-limited download reads HF_TOKEN from the environment. Reruns resume and skip what is complete.
@@ -53,6 +55,7 @@ BOLT=(nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB c6cc2e8ffa353403213d6b9b18aaf
 BOLT_DRAFT=(nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr abd478065678ee83a93821c4b3f512da24e4cecb Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr)
 D1=(LiquidAI/d1-3B 051bcc464b01b9f92942b364d9586b0ef5912432 d1-3B)
 LFM2=(LiquidAI/LFM2.5-24B-A2B-FP8 f54bf39547fd5b7955abb9fe8d1b151e31fbbddb LFM2.5-24B-A2B-FP8)
+HY4=(Avifenesh/Hy4-flash-NVFP4 f9eac06cf022cfd3dc2e8ed423922466b2adcd87 Hy4-flash-NVFP4)
 SUPER=(nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 82d93699acd3be9e4617c53360fe5b3f5dbeb1b3 NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)
 # upstream's release archive (version, sha256): its bin/ and lib/ are what run.sh's NATIVE points at
 NATIVE=(1.2.2 17632c30f761e7f9051255744a17fc36f0b9c0d46343d47617bb34e7ec4e4128)
@@ -175,11 +178,12 @@ case "$what" in
     nemotron-bolt)   need=25 ;;
     d1)              need=7 ;;
     lfm2-24b)        need=26 ;;
+    hy4-flash)       need=162 ;;
     knowline)        need=9 ;;
     clef-flash)      need=18 ;;
     nemotron-3.5-super) need=76 ;;
     all)             need=$((91 + glm_need)) ;;
-    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, qwen-27b, nemotron-bolt, lfm2-24b, nemotron-3.5-super, d1, knowline, clef-flash, or nothing for the first two)" ;;
+    *) die "unknown target '$what' (qwen-flash-next, glm-5.3-flash, qwen-flash-next-fp4, qwen-27b, nemotron-bolt, lfm2-24b, nemotron-3.5-super, hy4-flash, d1, knowline, clef-flash, or nothing for the first two)" ;;
 esac
 free=$(df -BG --output=avail "$MODELS" | tail -1 | tr -dc 0-9)
 [ "$free" -ge "$need" ] || echo "prepare: $MODELS has $free GB free and a first download needs $need GB" >&2
@@ -192,6 +196,7 @@ case "$what" in
     nemotron-bolt)   bolt ;;
     d1)              fetch "${D1[@]}" ;;
     lfm2-24b)        lfm2 ;;
+    hy4-flash)       fetch "${HY4[@]}" ;;
     knowline)        knowline ;;
     clef-flash)      fetch "${CLEF[@]}" ;;
     nemotron-3.5-super) super ;;

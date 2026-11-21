@@ -130,8 +130,77 @@ def hc_post(x: torch.Tensor, post: torch.Tensor, y: torch.Tensor) -> torch.Tenso
         x.copy_((post[..., None].float() * y.float()[:, None, :] + x.float()).to(torch.bfloat16))
         return x
     rows, s, d = x.shape
-    _hc_post[(rows, s)](x, post, y.contiguous(), D=d, S=s, BD=1024, num_warps=4)
+    bd = min(1024, triton.next_power_of_2(d))
+    if d % bd:
+        raise ValueError(f"hc_post: width {d} is not a multiple of {bd}")
+    _hc_post[(rows, s)](x, post, y.contiguous(), D=d, S=s, BD=bd, num_warps=4)
     return x
+
+
+# ----------------------------------------------------------------------------------- MLA absorb and expand ---
+
+ROW_KERNEL = 16          # calls of up to this many rows take the per-row kernels; prompt chunks batched matmuls
+
+
+@triton.jit
+def _absorb(Q, WK, QA, R, q_stride, H: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, LW: tl.constexpr,
+            BN: tl.constexpr):
+    """Program (head, latent block): QA[r, h, n] = sum_k Q[r, h, k] WK[h, k, n], one fp32 sum a row."""
+
+    h = tl.program_id(0)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    k = tl.arange(0, DP)
+    ok = k < D
+    w = tl.load(WK + (h * D + k[:, None]) * LW + n[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+    for r in range(R):
+        q = tl.load(Q + r * q_stride + h * D + k, mask=ok, other=0.0).to(tl.float32)
+        tl.store(QA + (r * H + h) * LW + n, tl.sum(q[:, None] * w, axis=0).to(tl.bfloat16))
+
+
+@triton.jit
+def _expand(OL, WV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.constexpr, BN: tl.constexpr):
+    """Program (head, output block): OUT[r, h, n] = sum_k OL[r, h, k] WV[h, n, k], one fp32 sum a row."""
+
+    h = tl.program_id(0)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    k = tl.arange(0, LW)
+    w = tl.load(WV + (h * DV + n[:, None]) * LW + k[None, :]).to(tl.float32)
+    for r in range(R):
+        o = tl.load(OL + (r * H + h) * LW + k).to(tl.float32)
+        tl.store(OUT + (r * H + h) * DV + n, tl.sum(w * o[None, :], axis=1).to(tl.bfloat16))
+
+
+def absorb(q: torch.Tensor, wk: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """q [R, H, D] (rows may be strided) times kv_b's key rows wk [H, D, LW] -> out [R, H, LW] bf16."""
+
+    rows, heads, d = q.shape
+    lw = wk.shape[2]
+    if not q.is_cuda:
+        out.copy_(torch.einsum("rhd,hdn->rhn", q.float(), wk.float()).to(torch.bfloat16))
+        return out
+    if rows > ROW_KERNEL:
+        out.copy_(torch.bmm(q.transpose(0, 1), wk).transpose(0, 1))
+        return out
+    if q.stride(2) != 1 or q.stride(1) != d:
+        q = q.contiguous()
+    _absorb[(heads, lw // 64)](q, wk, out, rows, q.stride(0), H=heads, D=d, DP=triton.next_power_of_2(d), LW=lw,
+                               BN=64, num_warps=4)
+    return out
+
+
+def expand(o_lat: torch.Tensor, wv: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """o_lat [R, H, LW] times kv_b's value rows wv [H, DV, LW] -> out [R, H, DV] bf16."""
+
+    rows, heads, lw = o_lat.shape
+    dv = wv.shape[1]
+    if not o_lat.is_cuda:
+        out.copy_(torch.einsum("rhn,hdn->rhd", o_lat.float(), wv.float()).to(torch.bfloat16))
+        return out
+    if rows > ROW_KERNEL:
+        out.copy_(torch.bmm(o_lat.transpose(0, 1), wv.transpose(1, 2)).transpose(0, 1))
+        return out
+    _expand[(heads, dv // 16)](o_lat, wv, out, rows, H=heads, DV=dv, LW=lw, BN=16, num_warps=4)
+    return out
 
 
 # ------------------------------------------------------------------------------------------- MLA attention ---

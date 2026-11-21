@@ -174,25 +174,13 @@ class Engine:
         lat[:, K.LW:] = self._rope(ckv[:, c.kv_rank:], pos, inv)
         self.latent[li].index_copy_(0, pos.long(), lat)
         qa = torch.empty((rows, heads.heads, K.LW + K.RW), dtype=torch.bfloat16, device=x.device)
-        if self.cuda:
-            from tensorfold.families.glm5_next.cuda import latent as GL
-
-            GL.absorb_q(q[:, :, :heads.nope].contiguous(), GL.AbsorbW(a.wk, a.wv), qa_view := torch.empty(
-                (rows, heads.heads, K.LW), dtype=torch.bfloat16, device=x.device))
-            qa[:, :, :K.LW] = qa_view
-        else:
-            qa[:, :, :K.LW] = torch.einsum("rhd,hdn->rhn", q[:, :, :heads.nope].float(), a.wk.float()).to(torch.bfloat16)
+        qa[:, :, :K.LW] = K.absorb(q[:, :, :heads.nope], a.wk, torch.empty(
+            (rows, heads.heads, K.LW), dtype=torch.bfloat16, device=x.device))
         qa[:, :, K.LW:] = self._rope(q[:, :, heads.nope:], pos, inv)
         lo, cnt, sel, tok = self._keys(li, a, x, qr, pos, prompt)
         o_lat = torch.empty((rows, heads.heads, K.LW), dtype=torch.bfloat16, device=x.device)
         K.attention(qa, self.latent[li], lo, cnt, sel, tok, a.sinks, heads.qk ** -0.5, o_lat, self.scratch)
-        if self.cuda:
-            from tensorfold.families.glm5_next.cuda import latent as GL
-
-            v = torch.empty((rows, heads.heads, heads.v), dtype=torch.bfloat16, device=x.device)
-            GL.expand_v(o_lat, GL.AbsorbW(a.wk, a.wv), v)
-        else:
-            v = torch.einsum("rhn,hdn->rhd", o_lat.float(), a.wv.float()).to(torch.bfloat16)
+        v = K.expand(o_lat, a.wv, torch.empty((rows, heads.heads, heads.v), dtype=torch.bfloat16, device=x.device))
         sig = torch.sigmoid(gate.float()).to(torch.bfloat16).float()
         out = (v.reshape(rows, -1).float() * sig).to(torch.bfloat16)
         return K.rmsnorm(a.o(out, prompt), a.post_norm, c.eps)
