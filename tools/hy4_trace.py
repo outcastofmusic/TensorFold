@@ -19,7 +19,7 @@ def main() -> None:
     p.add_argument("layers")
     p.add_argument("--rows", type=int, default=0)
     p.add_argument("--device", default="cuda", help="cpu: the engine's fp32 torch path (same semantics, no GPU)")
-    p.add_argument("--layers", type=int, default=0, help="load and compare only the first N layers")
+    p.add_argument("--first", type=int, default=0, help="load and compare only the first N layers")
     a = p.parse_args()
 
     import torch
@@ -29,7 +29,7 @@ def main() -> None:
 
     z = np.load(a.layers)
     ids = z["ids"].tolist()
-    w = load(a.model, a.device, layers=a.layers or None)
+    w = load(a.model, a.device, layers=a.first or None)
     e = Engine(w, max_len=8192)
     e.graphs = False
     got: dict[int, list] = {}

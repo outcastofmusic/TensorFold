@@ -50,8 +50,6 @@ def _engine(weights, goldens=None, name: str = "long", **kw):
 
     from tensorfold.families.hy4_flash.cuda import model
 
-    # transformers' bf16 run norms the Engram rows with nn.RMSNorm's bf16 epsilon
-    model.ENGRAM_EPS = float(torch.finfo(torch.bfloat16).eps)
     e = model.Engine(weights, max_len=kw.pop("max_len", 64), prefill_rows=kw.pop("prefill_rows", 64), **kw)
     if goldens is not None:
         e.replay = {int(k.rsplit("_", 1)[1]): torch.from_numpy(goldens[k]) for k in goldens.files

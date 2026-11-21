@@ -190,14 +190,23 @@ class Weights:
 
 # ------------------------------------------------------------------------------------------------ load ---
 
-def _nvfp4_dense(words: torch.Tensor, scales: torch.Tensor, scale2: torch.Tensor) -> torch.Tensor:
-    """NVFP4 codes [.., N, K/2] (low nibble first), e4m3 scales [.., N, K/16], fp32 scale2 [..] -> fp32 [.., N, K]."""
+def _nvfp4_dense(words: torch.Tensor, scales: torch.Tensor, scale2: torch.Tensor, dtype=torch.float32,
+                 chunk: int = 16) -> torch.Tensor:
+    """NVFP4 codes [.., N, K/2] (low nibble first), e4m3 scales [.., N, K/16], fp32 scale2 [..] -> [.., N, K] in
+    ``dtype`` (bf16 holds every value exactly), ``chunk`` experts at a time with int32 codes: a whole layer's int64
+    codes and fp32 products took about 35 GB."""
 
     lut = torch.tensor(E2M1, dtype=torch.float32, device=words.device)
-    w = words.to(torch.int64)
-    codes = torch.stack([w & 0xF, w >> 4], dim=-1).flatten(-2)
-    s = scales.view(torch.float8_e4m3fn).float().repeat_interleave(16, dim=-1)
-    return lut[codes] * s * scale2.float().reshape(*scale2.shape, *([1] * 2))
+    if words.dim() == 2:
+        return _nvfp4_dense(words[None], scales[None], scale2.reshape(1), dtype, chunk)[0]
+    out = torch.empty((*words.shape[:-1], words.shape[-1] * 2), dtype=dtype, device=words.device)
+    for e0 in range(0, words.shape[0], chunk):
+        w = words[e0:e0 + chunk].to(torch.int32)
+        v = lut[torch.stack([w & 0xF, w >> 4], dim=-1).flatten(-2)]
+        v *= scales[e0:e0 + chunk].view(torch.float8_e4m3fn).float().repeat_interleave(16, dim=-1)
+        v *= scale2.reshape(-1)[e0:e0 + chunk].float().reshape(-1, 1, 1)
+        out[e0:e0 + chunk] = v.to(dtype)
+    return out
 
 
 def _fp8_block_dense(w: torch.Tensor, s: torch.Tensor, block: int = 128) -> torch.Tensor:
@@ -358,10 +367,10 @@ def _experts(r: _Reader, prefix: str, cfg: Config, cuda: bool):
             dn = _fp8_block_dense(dn, r.get(prefix + "down_proj_scale_inv"))
         half = gu.shape[1] // 2
         if not cuda:
-            return gu[:, :half].float(), gu[:, half:].float(), dn.float()
+            return (gu[:, :half].to(torch.bfloat16), gu[:, half:].to(torch.bfloat16), dn.to(torch.bfloat16))
         gate, up, down = (nvx.quantize(t.to(torch.bfloat16)) for t in (gu[:, :half], gu[:, half:], dn))
     if not cuda:
-        return tuple(_nvfp4_dense(*t) for t in (gate, up, down))
+        return tuple(_nvfp4_dense(*t, dtype=torch.bfloat16) for t in (gate, up, down))
     return nvx.make(gate, up, down, limit=cfg.swiglu_limit)
 
 

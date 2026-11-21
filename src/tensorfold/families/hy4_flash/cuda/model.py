@@ -32,8 +32,10 @@ from . import kernels as K
 from .weights import DECODE_ROWS, Attention, Dense, Engram, Indexer, Layer, MoE, Weights, gather_engram
 
 PREFILL_ROWS = 2048
+# Engram's norms are nn.RMSNorm without an epsilon, which torch computes with fp32's (1.19e-7) even on bf16 rows, as
+# Tencent's llama.cpp patch spells out. bf16's 2^-7 sat above the streams' mean square (0.002 at layer 1), shrank the
+# query norm, divided the gate logits by about 3 and put layer 1's streams 69% (mean) off transformers' (21 Nov)
 ENGRAM_EPS = float(os.environ.get("TF_HY4_ENGRAM_EPS", str(torch.finfo(torch.float32).eps)))
-BF16_EPS = float(torch.finfo(torch.bfloat16).eps)    # nn.RMSNorm's default on bf16 rows (Engram's key, query norms)
 
 
 def _silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
@@ -284,8 +286,8 @@ class Engine:
         value = e.value(flat, self.prompt)
         main = (e.pre_gamma.float() * _rms_f32(value, None, ENGRAM_EPS))
         for s, key_proj in enumerate(e.keys):
-            key = _rms_f32(key_proj(flat, self.prompt), e.norm_key[s], BF16_EPS).to(torch.bfloat16)
-            query = _rms_f32(x[:, s], e.norm_query[s], BF16_EPS).to(torch.bfloat16)
+            key = _rms_f32(key_proj(flat, self.prompt), e.norm_key[s], ENGRAM_EPS).to(torch.bfloat16)
+            query = _rms_f32(x[:, s], e.norm_query[s], ENGRAM_EPS).to(torch.bfloat16)
             g = ((key.float() * query.float()).sum(-1) * c.hidden ** -0.5).to(torch.bfloat16).float()
             g = torch.sigmoid(g.abs().clamp_min(1e-6).sqrt() * g.sign())
             out[:, s] = ((g[:, None] + e.hc_scales[s].float()) * main).to(torch.bfloat16)
@@ -331,12 +333,12 @@ class Engine:
             for r in range(rows):
                 for k in range(c.top_k):
                     e = int(idx[r, k])
-                    g = (lat[r].float() @ gate[e].t()).to(torch.bfloat16)
-                    u = (lat[r].float() @ up[e].t()).to(torch.bfloat16)
+                    g = (lat[r].float() @ gate[e].float().t()).to(torch.bfloat16)
+                    u = (lat[r].float() @ up[e].float().t()).to(torch.bfloat16)
                     if c.swiglu_limit:
                         g, u = g.clamp(max=c.swiglu_limit), u.clamp(-c.swiglu_limit, c.swiglu_limit)
                     act = _silu_mul(g, u)
-                    out[r] += (act.float() @ down[e].t()).to(torch.bfloat16).float() * wts[r, k]
+                    out[r] += (act.float() @ down[e].float().t()).to(torch.bfloat16).float() * wts[r, k]
             return out.to(torch.bfloat16)
         from tensorfold.cuda import experts as grouped
         from tensorfold.cuda.nvfp4 import experts as nvx
@@ -393,6 +395,8 @@ class Engine:
                              c.engram_ngram, c.pad)
         rows = len(tokens)
         for j, li in enumerate(c.engram_layers):
+            if li >= len(self.w.layers):          # a probe that loads the first layers only
+                break
             e = self.w.layers[li].engram
             got = gather_engram(e.table, e.hasher.rows_of(grams), c.engram_dim)
             self.eg_rows[j, :rows, :got.shape[1]].copy_(got.to(self.device), non_blocking=False)

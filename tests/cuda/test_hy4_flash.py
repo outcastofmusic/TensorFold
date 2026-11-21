@@ -32,7 +32,6 @@ def weights(tmp_path_factory):
 def _engine(weights, goldens=None, *, graphs: bool = False, **kw):
     from tensorfold.families.hy4_flash.cuda import model
 
-    model.ENGRAM_EPS = float(torch.finfo(torch.bfloat16).eps)        # transformers' bf16 run
     e = model.Engine(weights, max_len=kw.pop("max_len", 64), prefill_rows=kw.pop("prefill_rows", 64), **kw)
     e.graphs = graphs
     if goldens is not None:
