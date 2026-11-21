@@ -1,0 +1,536 @@
+"""Hy4-flash's forward for one stream: prompt chunks, then one-row decode steps, sampled by the keyed sampler.
+
+The layer order is transformers PR #50903's: an Engram memory added to the four streams (layers 1, 11, 21, 31), the
+attention hyper-connection's collapse, the input norm, gated MLA, the write-back; the MLP hyper-connection's collapse,
+the post-attention norm, the MLP (dense in layer 0, the latent MoE in the rest), the write-back. The head collapses the
+streams through its own gates, norms and multiplies in fp32.
+
+Attention keeps one 576-wide row a token and layer: the 512-wide normed latent (keys and values) and the 64 rotated
+key channels. A query's no-rope part is absorbed into the latent through kv_b's key rows, and the output's latent
+expanded through its value rows, so no layer materializes per-head keys. A sliding layer reads its last 512 keys. A
+sparse layer reads every key below position 2,048, and from there the indexer's 511 best closed groups of four
+tokens plus the row's own group: at most 2,048 keys a row at any context.
+
+Every operation also runs on the CPU in fp32 torch ops, so the tests drive this code against transformers' reference.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+
+from tensorfold.env_flags import flag
+
+from ..config import SPARSE
+from ..engram import ngram_tokens
+from . import kernels as K
+from .weights import DECODE_ROWS, Attention, Dense, Engram, Indexer, Layer, MoE, Weights, gather_engram
+
+PREFILL_ROWS = 2048
+ENGRAM_EPS = float(os.environ.get("TF_HY4_ENGRAM_EPS", str(torch.finfo(torch.float32).eps)))
+BF16_EPS = float(torch.finfo(torch.bfloat16).eps)    # nn.RMSNorm's default on bf16 rows (Engram's key, query norms)
+
+
+def _silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """bf16(bf16(silu(g)) * u), transformers' SwiGLU on bf16 tensors."""
+
+    return (torch.nn.functional.silu(g.float()).to(torch.bfloat16).float() * u.float()).to(torch.bfloat16)
+
+
+def _rms_f32(x: torch.Tensor, w: torch.Tensor | None, eps: float) -> torch.Tensor:
+    f = x.float()
+    n = f * torch.rsqrt(f.square().mean(-1, keepdim=True) + eps)
+    return n if w is None else n * w.float()
+
+
+class Engine:
+    """One stream's caches: ``forward`` commits a prompt chunk or decode rows, ``sample`` draws the next token."""
+
+    def __init__(self, w: Weights, *, max_len: int = 8192, prefill_rows: int = PREFILL_ROWS):
+        c = self.c = w.config
+        self.w = w
+        dev = self.device = w.device
+        self.cuda = dev.type == "cuda"
+        if max_len % c.index_pool:
+            raise ValueError(f"max_len must be a multiple of {c.index_pool}")
+        self.max_len, self.prefill_rows = max_len, prefill_rows
+        self.latent = [torch.zeros((max_len, K.LW + K.RW), dtype=torch.bfloat16, device=dev) for _ in w.layers]
+        self.group_topk = c.index_topk // c.index_pool                           # 512: the open group plus 511
+        sparse = [i for i, layer in enumerate(w.layers) if layer.attn.indexer is not None]
+        self.tkeys = {i: torch.zeros((max_len, c.index_dim), dtype=torch.bfloat16, device=dev) for i in sparse}
+        self.gkeys = {i: torch.zeros((max_len // c.index_pool, c.index_dim), dtype=torch.bfloat16, device=dev)
+                      for i in sparse}
+        self.inv = {kind: (1.0 / (h.theta ** (torch.arange(0, h.rope, 2, dtype=torch.float32) / h.rope))).to(dev)
+                    for kind, h in ((SPARSE, c.sparse), ("sliding", c.sliding))}
+        self.idx_inv = (1.0 / (c.sparse.theta ** (torch.arange(0, c.sparse.rope, 2, dtype=torch.float32)
+                                                  / c.sparse.rope))).to(dev)
+        self.meta = torch.zeros(4, dtype=torch.int32, device=dev)            # meta[0]: the call's first position
+        self.offsets = torch.arange(max(prefill_rows, DECODE_ROWS), dtype=torch.int32, device=dev)
+        self.sampled = torch.zeros(1, dtype=torch.int32, device=dev)
+        self.tok = torch.zeros(1, dtype=torch.int32, device=dev)
+        self.ids: list[int] = []                                            # the committed tokens (n-grams, states)
+        width = max(c.sparse.heads, c.sliding.heads)
+        rows = max(prefill_rows, DECODE_ROWS)
+        self.scratch = K.Scratch(rows, width, -(-c.index_topk // K.CHUNK), dev) if self.cuda else None
+        heads = max((len(s) for s in c.engram_sizes), default=0)
+        self.eg_rows = (torch.zeros((len(c.engram_layers), rows, heads, c.engram_dim), dtype=torch.float32,
+                                    device=dev) if heads else None)        # a call's Engram rows, staged on the host
+        self.graphs = flag("TF_HY4_GRAPHS", True) and self.cuda
+        self.graph = None
+        self.graph_out: torch.Tensor | None = None
+        self.sampling = None
+        self.params = None
+        if self.cuda:
+            from tensorfold.families.nemotron_h.cuda import sampler as S
+
+            self.params = S.Params(dev)
+        self.pos = 0
+        self.prompt = False
+        # tests only: expert picks [T, top_k] by layer to use at positions 0.. (``replay``), and the engine's own (``seen``)
+        self.replay: dict[int, torch.Tensor] | None = None
+        self.seen: dict[int, list[torch.Tensor]] | None = None
+        # tests only: the indexer's closed groups [T, 511] by sparse layer (``replay_groups``), and its own with the
+        # margin between its last kept and first dropped group (``seen_groups``)
+        self.replay_groups: dict[int, torch.Tensor] | None = None
+        self.seen_groups: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] | None = None
+
+    # -- state ---------------------------------------------------------------------------------------------------
+    def reset(self) -> None:
+        self.pos = 0                       # keys past pos are never read: the caches need no clearing
+        self.ids = []
+
+    def state(self, n: int) -> dict:
+        """A copy of the committed state after positions 0 .. n - 1 (n == pos): the caches' first n rows."""
+
+        if n != self.pos or n <= 0:
+            raise ValueError(f"no committed state at {n} (the engine is at {self.pos})")
+        g = n // self.c.index_pool
+        return {"pos": n, "ids": list(self.ids), "latent": [x[:n].clone() for x in self.latent],
+                "tkeys": {i: t[:n].clone() for i, t in self.tkeys.items()},
+                "gkeys": {i: t[:g].clone() for i, t in self.gkeys.items()}}
+
+    def restore(self, st: dict) -> None:
+        n = int(st["pos"])
+        for dst, src in zip(self.latent, st["latent"]):
+            dst[:n].copy_(src)
+        for i, t in st["tkeys"].items():
+            self.tkeys[i][:n].copy_(t)
+        for i, t in st["gkeys"].items():
+            self.gkeys[i][:t.shape[0]].copy_(t)
+        self.ids = list(st["ids"])
+        self.pos = n
+
+    @staticmethod
+    def state_bytes(st: dict) -> int:
+        ts = list(st["latent"]) + list(st["tkeys"].values()) + list(st["gkeys"].values())
+        return sum(t.numel() * t.element_size() for t in ts)
+
+    def set_sampling(self, sampling) -> None:
+        self.sampling = sampling
+        if self.params is not None:
+            self.params.set(sampling)
+
+    @property
+    def eos(self) -> tuple[int, ...]:
+        return self.c.eos
+
+    # -- positions -----------------------------------------------------------------------------------------------
+    def _positions(self, rows: int) -> torch.Tensor:
+        """The call's positions from the device meta, so a captured step serves every position."""
+
+        return self.meta[0] + self.offsets[:rows]
+
+    @staticmethod
+    def _rope(x: torch.Tensor, pos: torch.Tensor, inv: torch.Tensor) -> torch.Tensor:
+        """Interleaved pairs (x[2i], x[2i+1]) turned by pos * inv[i], with transformers' bf16 cos and sin."""
+
+        ang = pos.float()[:, None] * inv[None, :]
+        cos, sin = ang.cos().to(torch.bfloat16).float(), ang.sin().to(torch.bfloat16).float()
+        shape = [cos.shape[0]] + [1] * (x.dim() - 2) + [cos.shape[1]]
+        cos, sin = cos.view(shape), sin.view(shape)
+        f = x.float()
+        a, b = f[..., 0::2], f[..., 1::2]
+        out = torch.stack([a * cos - b * sin, b * cos + a * sin], dim=-1).flatten(-2)
+        return out.to(torch.bfloat16)
+
+    # -- layers --------------------------------------------------------------------------------------------------
+    def _attention(self, li: int, a: Attention, x: torch.Tensor, prompt: bool) -> torch.Tensor:
+        c = self.c
+        rows = x.shape[0]
+        heads = c.heads_of(li)
+        pos = self._positions(rows)
+        inv = self.inv[SPARSE if a.kind == SPARSE else "sliding"]
+        gate = a.gate(x, prompt)
+        qr = K.rmsnorm(a.q_a(x, prompt), a.q_norm, c.eps)
+        q = a.q_b(qr, prompt).view(rows, heads.heads, heads.qk)
+        ckv = a.kv_a(x, prompt)
+        lat = torch.empty((rows, K.LW + K.RW), dtype=torch.bfloat16, device=x.device)
+        lat[:, :K.LW] = K.rmsnorm(ckv[:, :c.kv_rank], a.kv_norm, c.eps)
+        lat[:, K.LW:] = self._rope(ckv[:, c.kv_rank:], pos, inv)
+        self.latent[li].index_copy_(0, pos.long(), lat)
+        qa = torch.empty((rows, heads.heads, K.LW + K.RW), dtype=torch.bfloat16, device=x.device)
+        if self.cuda:
+            from tensorfold.families.glm5_next.cuda import latent as GL
+
+            GL.absorb_q(q[:, :, :heads.nope].contiguous(), GL.AbsorbW(a.wk, a.wv), qa_view := torch.empty(
+                (rows, heads.heads, K.LW), dtype=torch.bfloat16, device=x.device))
+            qa[:, :, :K.LW] = qa_view
+        else:
+            qa[:, :, :K.LW] = torch.einsum("rhd,hdn->rhn", q[:, :, :heads.nope].float(), a.wk.float()).to(torch.bfloat16)
+        qa[:, :, K.LW:] = self._rope(q[:, :, heads.nope:], pos, inv)
+        lo, cnt, sel, tok = self._keys(li, a, x, qr, pos, prompt)
+        o_lat = torch.empty((rows, heads.heads, K.LW), dtype=torch.bfloat16, device=x.device)
+        K.attention(qa, self.latent[li], lo, cnt, sel, tok, a.sinks, heads.qk ** -0.5, o_lat, self.scratch)
+        if self.cuda:
+            from tensorfold.families.glm5_next.cuda import latent as GL
+
+            v = torch.empty((rows, heads.heads, heads.v), dtype=torch.bfloat16, device=x.device)
+            GL.expand_v(o_lat, GL.AbsorbW(a.wk, a.wv), v)
+        else:
+            v = torch.einsum("rhn,hdn->rhd", o_lat.float(), a.wv.float()).to(torch.bfloat16)
+        sig = torch.sigmoid(gate.float()).to(torch.bfloat16).float()
+        out = (v.reshape(rows, -1).float() * sig).to(torch.bfloat16)
+        return K.rmsnorm(a.o(out, prompt), a.post_norm, c.eps)
+
+    def _keys(self, li: int, a: Attention, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, prompt: bool):
+        """Each row's key list: (lo, cnt, sel, tok) for ``kernels.attention``."""
+
+        c = self.c
+        rows = x.shape[0]
+        p32 = pos.to(torch.int32)
+        if a.indexer is None:
+            lo = torch.clamp(p32 - (c.window - 1), min=0)
+            tok = torch.zeros((rows, 1), dtype=torch.int32, device=x.device)
+            return lo, p32 - lo + 1, torch.zeros_like(p32), tok
+        tok, sel, cnt = self._index(li, a.indexer, x, qr, pos, prompt)
+        return torch.zeros_like(p32), torch.where(sel != 0, cnt, p32 + 1), sel, tok
+
+    def _index(self, li: int, ix: Indexer, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, prompt: bool):
+        """The compressed indexer: cache the rows' token keys, pool the groups they touch, and for rows past
+        ``index_topk`` keys pick the 511 best closed groups plus the row's own group (tokens ascending)."""
+
+        c = self.c
+        rows = x.shape[0]
+        pool, dim, rope = c.index_pool, c.index_dim, c.sparse.rope
+        tk = K.rmsnorm(ix.wk(x, prompt), ix.k_norm, c.eps)
+        self.tkeys[li].index_copy_(0, pos.long(), tk)
+        # every group the call touches: a group's key is right once its last token is in, and no row reads a group
+        # before it closes
+        groups = (rows + pool - 1) // pool + 1
+        g0 = self.meta[0] // pool
+        gids = (g0 + torch.arange(groups, device=x.device, dtype=torch.int32)).clamp(max=self.max_len // pool - 1)
+        members = self.tkeys[li][(gids.long()[:, None] * pool + torch.arange(pool, device=x.device)).view(-1)]
+        members = members.view(groups, pool, dim).float()
+        vals = members @ ix.pv.t()
+        gates = members @ ix.pg.t() + ix.ape
+        pooled = (vals * gates.softmax(dim=1)).sum(1)
+        gk = (ix.g_norm * (pooled * torch.rsqrt(pooled.square().mean(-1, keepdim=True) + c.eps))).to(torch.bfloat16)
+        gk = torch.cat([gk[:, :dim - rope], self._rope(gk[:, dim - rope:], gids * pool, self.idx_inv)], -1)
+        self.gkeys[li].index_copy_(0, gids.long(), gk)
+        closed = (pos // pool).to(torch.int32)
+        sel = (closed >= self.group_topk).to(torch.int32)
+        tok = torch.zeros((rows, c.index_topk), dtype=torch.int32, device=x.device)
+        cnt = (self.group_topk - 1) * pool + pos.to(torch.int32) % pool + 1
+        if not self._sparse_rows(rows):
+            return tok, sel, cnt
+        qi = ix.wq(qr, prompt).view(rows, c.index_heads, dim)
+        qi = torch.cat([qi[..., :dim - rope], self._rope(qi[..., dim - rope:], pos, self.idx_inv)], -1)
+        hw = ix.wh(x, prompt).float() * (c.index_heads ** -0.5 * dim ** -0.5)
+        logits = self._group_scores(li, qi, hw, closed)
+        ranked = logits.topk(min(self.group_topk, logits.shape[-1]), dim=-1)
+        top = ranked.indices[:, :self.group_topk - 1].sort(-1).values.to(torch.int32)                   # [R, 511]
+        if self.seen_groups is not None:
+            margin = ranked.values[:, self.group_topk - 2] - ranked.values[:, -1]
+            self.seen_groups.setdefault(li, []).append((top.clone(), margin.clone()))
+        if self.replay_groups is not None:
+            forced = self.replay_groups[li][self.pos:self.pos + rows].to(top.device, torch.int32)
+            top = torch.where(sel[:, None] != 0, forced, top)
+        expand = (top[:, :, None] * pool + torch.arange(pool, device=x.device, dtype=torch.int32)).view(rows, -1)
+        own = closed[:, None] * pool + torch.arange(pool, device=x.device, dtype=torch.int32)
+        tok[:, :expand.shape[1]] = expand
+        tok[:, expand.shape[1]:] = own
+        return tok, sel, cnt
+
+    def _sparse_rows(self, rows: int) -> bool:
+        """Whether any row of the call can sit past the dense limit (host-known; a graph always scores)."""
+
+        return self.graph_capturing or self.pos + rows - 1 >= self.c.index_topk
+
+    graph_capturing = False
+
+    def _group_scores(self, li: int, qi: torch.Tensor, hw: torch.Tensor, closed: torch.Tensor) -> torch.Tensor:
+        """logits [R, G] fp32: sum over heads of w * relu(q . k_g) for closed groups g, -inf for the rest."""
+
+        n_groups = self.max_len // self.c.index_pool if self.graph_capturing else \
+            (self.pos + qi.shape[0]) // self.c.index_pool + 1
+        keys = self.gkeys[li][:n_groups].float()
+        scores = torch.relu(torch.einsum("rhd,gd->rhg", qi.float(), keys))
+        logits = torch.einsum("rh,rhg->rg", hw, scores)
+        valid = torch.arange(n_groups, device=qi.device)[None, :] < closed[:, None]
+        return logits.masked_fill(~valid, float("-inf"))
+
+    def _engram(self, j: int, e: Engram, x: torch.Tensor) -> torch.Tensor:
+        """The memory's residual for the streams x [R, S, D] from the rows staged in ``eg_rows[j]``."""
+
+        c = self.c
+        rows = x.shape[0]
+        heads = e.head_norms.shape[0]
+        emb = self.eg_rows[j, :rows, :heads]                                        # fp32 [R, heads, dim]
+        flat = (_rms_f32(emb, e.head_norms, ENGRAM_EPS)).to(torch.bfloat16).reshape(rows, -1)
+        out = torch.empty_like(x)
+        value = e.value(flat, self.prompt)
+        main = (e.pre_gamma.float() * _rms_f32(value, None, ENGRAM_EPS))
+        for s, key_proj in enumerate(e.keys):
+            key = _rms_f32(key_proj(flat, self.prompt), e.norm_key[s], BF16_EPS).to(torch.bfloat16)
+            query = _rms_f32(x[:, s], e.norm_query[s], BF16_EPS).to(torch.bfloat16)
+            g = ((key.float() * query.float()).sum(-1) * c.hidden ** -0.5).to(torch.bfloat16).float()
+            g = torch.sigmoid(g.abs().clamp_min(1e-6).sqrt() * g.sign())
+            out[:, s] = ((g[:, None] + e.hc_scales[s].float()) * main).to(torch.bfloat16)
+        return out
+
+    def _mlp(self, li: int, m, x: torch.Tensor, prompt: bool) -> torch.Tensor:
+        c = self.c
+        if isinstance(m, Dense):
+            return K.rmsnorm(m.down(_silu_mul(m.gate(x, prompt), m.up(x, prompt)), prompt), m.post_norm, c.eps)
+        return self._moe(li, m, x, prompt)
+
+    def _moe(self, li: int, m: MoE, x: torch.Tensor, prompt: bool) -> torch.Tensor:
+        c = self.c
+        rows = x.shape[0]
+        if self.cuda:
+            from tensorfold.cuda import moe as moe_mod
+
+            logits = moe_mod.router(x, m.router)
+        else:
+            logits = x.float() @ m.router.float().t()
+        scores = torch.sigmoid(logits)
+        idx = torch.topk(scores + m.bias, c.top_k, dim=-1).indices
+        if self.seen is not None:
+            self.seen.setdefault(li, []).append(idx.clone())
+        if self.replay is not None:
+            idx = self.replay[li][self.pos:self.pos + rows].to(idx.device)
+        wts = scores.gather(1, idx)
+        wts = wts / (wts.sum(-1, keepdim=True) + 1e-20) * c.scaling
+        lat = m.pre(x, prompt)
+        routed = self._experts(m, lat, idx, wts)
+        shared = m.s_down(_silu_mul(m.s_gate(x, prompt), m.s_up(x, prompt)), prompt)
+        h = (m.post(routed, prompt).float() + shared.float()).to(torch.bfloat16)
+        return K.rmsnorm(h, m.combine_norm, c.eps)
+
+    def _experts(self, m: MoE, lat: torch.Tensor, idx: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+        """Each row's top-k experts on the latent, combined by their weights in fp32 -> [R, latent] bf16."""
+
+        c = self.c
+        rows = lat.shape[0]
+        if not self.cuda:
+            gate, up, down = m.experts
+            out = torch.zeros((rows, c.latent), dtype=torch.float32)
+            for r in range(rows):
+                for k in range(c.top_k):
+                    e = int(idx[r, k])
+                    g = (lat[r].float() @ gate[e].t()).to(torch.bfloat16)
+                    u = (lat[r].float() @ up[e].t()).to(torch.bfloat16)
+                    if c.swiglu_limit:
+                        g, u = g.clamp(max=c.swiglu_limit), u.clamp(-c.swiglu_limit, c.swiglu_limit)
+                    act = _silu_mul(g, u)
+                    out[r] += (act.float() @ down[e].t()).to(torch.bfloat16).float() * wts[r, k]
+            return out.to(torch.bfloat16)
+        from tensorfold.cuda import experts as grouped
+        from tensorfold.cuda.nvfp4 import experts as nvx
+
+        prompt = rows > DECODE_ROWS
+        plan = grouped.Plan(rows, c.top_k, c.experts, lat.device, prefill=prompt)
+        tile = prompt and rows >= nvx.TILE_ROWS
+        grouped.route(idx.to(torch.int32).contiguous(), plan, nvx.TILE_ITEM if tile else nvx.PREFILL_TILE)
+        act = torch.empty((rows * c.top_k, c.moe_width), dtype=torch.bfloat16, device=lat.device)
+        nvx.gate_up(lat.contiguous(), m.experts, plan, act, rows, tile=tile)
+        y = torch.empty((rows * c.top_k, c.latent), dtype=torch.float32, device=lat.device)
+        nvx.down(act, m.experts, plan, y, rows, tile=tile)
+        return (y.view(rows, c.top_k, c.latent) * wts[:, :, None]).sum(1).to(torch.bfloat16)
+
+    def _layers(self, ids: torch.Tensor, prompt: bool) -> torch.Tensor:
+        """Every layer over the rows ``ids`` at positions pos..: the final-normed rows [R, D] bf16."""
+
+        c, w = self.c, self.w
+        self.prompt = prompt
+        rows = ids.shape[0]
+        x = w.embed[ids.long()][:, None, :].expand(rows, c.hc, c.hidden).contiguous()
+        for i, layer in enumerate(w.layers):
+            x = self._layer(i, layer, x, prompt)
+        _, h = K.hc_pre(x, w.hc_head.fn, w.hc_head.base, w.hc_head.scale, eps=c.eps, hc_eps=c.hc_eps, head=True)
+        return K.rmsnorm(h, w.norm, c.eps)
+
+    def _layer(self, i: int, layer: Layer, x: torch.Tensor, prompt: bool) -> torch.Tensor:
+        c = self.c
+        if layer.engram is not None:
+            x = (x.float() + self._engram(c.engram_layers.index(i), layer.engram, x).float()).to(torch.bfloat16)
+        hc = layer.attn_hc
+        post, h = K.hc_pre(x, hc.fn, hc.base, hc.scale, eps=c.eps, hc_eps=c.hc_eps, magnitude=c.hc_magnitude)
+        y = self._attention(i, layer.attn, K.rmsnorm(h, layer.input_norm, c.eps), prompt)
+        K.hc_post(x, post, y)
+        hc = layer.ffn_hc
+        post, h = K.hc_pre(x, hc.fn, hc.base, hc.scale, eps=c.eps, hc_eps=c.hc_eps, magnitude=c.hc_magnitude)
+        y = self._mlp(i, layer.mlp, K.rmsnorm(h, layer.post_norm, c.eps), prompt)
+        K.hc_post(x, post, y)
+        return x
+
+    def head(self, normed: torch.Tensor) -> torch.Tensor:
+        """fp32 logits [n, V]: the bf16 rows times the bf16 head, summed in fp32 (``enable_lm_head_fp32``)."""
+
+        if not self.cuda:
+            return normed.float() @ self.w.head.float().t()
+        return torch.mm(normed, self.w.head.t(), out_dtype=torch.float32)
+
+    # -- Engram rows ---------------------------------------------------------------------------------------------
+    def _stage_engram(self, tokens: Sequence[int]) -> None:
+        """Read the call's Engram rows on the host and copy them into ``eg_rows`` (before a graph replays)."""
+
+        c = self.c
+        if self.eg_rows is None:
+            return
+        grams = ngram_tokens(np.asarray(tokens), self.pos, np.asarray(self.ids[-(c.engram_ngram - 1):]),
+                             c.engram_ngram, c.pad)
+        rows = len(tokens)
+        for j, li in enumerate(c.engram_layers):
+            e = self.w.layers[li].engram
+            got = gather_engram(e.table, e.hasher.rows_of(grams), c.engram_dim)
+            self.eg_rows[j, :rows, :got.shape[1]].copy_(got.to(self.device), non_blocking=False)
+
+    # -- calls ---------------------------------------------------------------------------------------------------
+    @torch.no_grad()
+    def forward(self, tokens: Sequence[int], *, prompt: bool, every: bool = False) -> torch.Tensor:
+        """Commit ``tokens`` at positions pos..; the logits of the last row, or of every row with ``every``."""
+
+        rows = len(tokens)
+        if not 1 <= rows <= (self.prefill_rows if prompt else DECODE_ROWS):
+            raise ValueError(f"a call holds 1..{self.prefill_rows} prompt rows or 1..{DECODE_ROWS} decode rows")
+        if self.pos + rows > self.max_len:
+            raise ValueError("the KV cache is full")
+        self.meta[0] = self.pos
+        self._stage_engram(tokens)
+        if self.graphs and not prompt and rows == 1:
+            self.tok[0] = int(tokens[0])
+            logits = self._graphed()
+        else:
+            ids = torch.as_tensor(list(tokens), dtype=torch.int32).to(self.device)
+            normed = self._layers(ids, prompt)
+            logits = self.head(normed if every else normed[rows - 1:rows])
+        self.pos += rows
+        self.ids.extend(int(t) for t in tokens)
+        return logits
+
+    def _step(self) -> torch.Tensor:
+        return self.head(self._layers(self.tok, False))
+
+    def _graphed(self) -> torch.Tensor:
+        """``_step`` by graph replay. The first call runs the step eagerly (it compiles the kernels), then captures
+        it; capturing launches nothing, so the state moves once."""
+
+        if self.graph is None:
+            out = self._step()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            self.graph_capturing = True
+            try:
+                with torch.cuda.graph(g, capture_error_mode="thread_local"):
+                    self.graph_out = self._step()
+            finally:
+                self.graph_capturing = False
+            self.graph = g
+            return out
+        self.graph.replay()
+        return self.graph_out.clone()
+
+    def sample(self, logits: torch.Tensor) -> int:
+        """The token after position pos - 1 from its logits [1, V], by the request's keyed rule (greedy at T = 0)."""
+
+        s = self.sampling
+        if self.cuda:
+            from tensorfold.families.nemotron_h.cuda import sampler as S
+
+            self.meta[0] = self.pos - 1
+            S.sample(logits, self.meta, self.params, self.sampled)
+            return int(self.sampled[0])
+        if s is None or s.temperature <= 0:
+            return int(torch.argmax(logits[0]))
+        from tensorfold.engine.exact_sampling import MARGIN, choose
+
+        vals, ids = torch.topk(logits[0].float(), min(logits.shape[-1], (s.top_k or logits.shape[-1]) + MARGIN))
+        return choose(vals.numpy(), ids.numpy(), self.pos, s)
+
+
+@dataclass
+class DecodeResult:
+    tokens: list[int]
+    seconds: float
+
+    @property
+    def rounds(self) -> int:
+        return len(self.tokens) - 1
+
+    @property
+    def tokens_per_second(self) -> float:
+        return (len(self.tokens) - 1) / self.seconds if self.seconds else 0.0
+
+
+def _sync(e: Engine) -> None:
+    if e.cuda:
+        torch.cuda.synchronize()
+
+
+@torch.no_grad()
+def prefill(e: Engine, prompt: Sequence[int], sampling, *, resume: dict | None = None,
+            keeps: Sequence[int] = (), keep: Callable[[int, dict], None] | None = None) -> int:
+    """Commit the prompt in chunks and return its first sampled token (position len(prompt)).
+
+    ``resume`` (an ``Engine.state`` of a strict prefix) starts at its length; ``keep(n, state)`` gets the state after
+    each of ``keeps``, which cut the chunks there."""
+
+    prompt = [int(t) for t in prompt]
+    if not prompt:
+        raise ValueError("prefill needs at least one token")
+    begin = 0 if resume is None else int(resume["pos"])
+    if not 0 <= begin < len(prompt):
+        raise ValueError("a resumed prompt must extend the kept positions")
+    e.reset()
+    if resume is not None:
+        e.restore(resume)
+    e.set_sampling(sampling)
+    stops = sorted({int(p) for p in keeps if begin < int(p) < len(prompt)} | {len(prompt)})
+    s = begin
+    logits = None
+    for stop in stops:
+        while s < stop:
+            chunk = prompt[s:min(stop, s + e.prefill_rows)]
+            logits = e.forward(chunk, prompt=True)
+            s += len(chunk)
+        if keep is not None and stop < len(prompt):
+            keep(stop, e.state(stop))
+    pending = e.sample(logits)
+    if keep is not None and len(prompt) in keeps:
+        keep(len(prompt), e.state(len(prompt)))
+    return pending
+
+
+@torch.no_grad()
+def serial_decode(e: Engine, pending: int, count: int, sampling, *, stop_eos: bool = True,
+                  on_tokens: Callable[[list[int]], bool | None] | None = None) -> DecodeResult:
+    """``count`` tokens (the first is ``pending``), one row a step; stops after an end token or ``on_tokens``' True."""
+
+    e.set_sampling(sampling)
+    out = [int(pending)]
+    eos = set(e.c.eos)
+    _sync(e)
+    start = time.perf_counter()
+    while len(out) < count and not (stop_eos and out[-1] in eos):
+        tok = e.sample(e.forward([out[-1]], prompt=False))
+        out.append(tok)
+        if on_tokens is not None and on_tokens([tok]):
+            break
+    _sync(e)
+    return DecodeResult(out, time.perf_counter() - start)
