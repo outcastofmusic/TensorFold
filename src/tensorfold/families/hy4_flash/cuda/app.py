@@ -8,6 +8,12 @@ rendering those spellings. Its template wrapper maps the server's thinking switc
 a request's ``enable_thinking: false`` renders ``no_think`` and any effort with thinking on renders ``high``. The two
 ids that wrap a reply's calls (``<tool_calls>``, ``</tool_calls>``) never reach the server: the model reads them, the
 reply's text holds GLM's form.
+
+A chat prompt renders the view's spellings, and its ids are still transformers' on the checkpoint's own files: the
+template's spellings map to the same ids, and the server encodes request text that spells an added token as plain
+text (``cuda.request_text``), so a quoted ``<think>`` or ``<tool_call>`` stays text either way. A raw text prompt,
+``/tokenize`` and ``/detokenize`` read the checkpoint's own tokenizer (``raw_tok``), as vLLM does: a client writes
+``<think:opensource>`` for the control token, and ``<think>`` there is plain text.
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from tensorfold.cuda.server import App
+from tensorfold.server.token_routes import flag
 
 from .. import CONTEXT
 
@@ -97,9 +104,33 @@ class Hy4App(App):
     """The CUDA server's app over the normalized text view (``text_view``) and the effort mapping."""
 
     def __init__(self, engine, model_dir: Path, served: str, **options: Any):
+        from tokenizers import Tokenizer
+
         super().__init__(engine, text_view(Path(model_dir)), served, **options)
+        self.raw_tok = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
         self.template = EffortTemplate(self.template)
         engine.hide = {self.tok.token_to_id(t) for t in WRAPPERS} - {None}
+
+    def _prepare(self, body, chat: bool):
+        if not chat and isinstance(body, dict) and isinstance(body.get("prompt"), str):   # served as its ids
+            add = flag(body, "add_special_tokens", False)
+            body = {**body, "prompt": self.raw_tok.encode(body["prompt"], add_special_tokens=add).ids}
+        return super()._prepare(body, chat)
+
+    def tokenize(self, body):
+        if not isinstance(body, dict) or "messages" in body or not isinstance(body.get("prompt"), str):
+            return super().tokenize(body)
+        ids = [int(t) for t in self.raw_tok.encode(body["prompt"],
+                                                     add_special_tokens=flag(body, "add_special_tokens", True)).ids]
+        reply = {"count": len(ids), "tokens": ids, "max_model_len": self.max_model_len()}
+        if flag(body, "return_token_strs", False):
+            reply["token_strs"] = [self.raw_tok.id_to_token(t) for t in ids]
+        return reply
+
+    def detokenize(self, body):
+        if not isinstance(body, dict):
+            return super().detokenize(body)
+        return {"prompt": self.raw_tok.decode(self.token_ids(body.get("tokens"), "tokens"), skip_special_tokens=False)}
 
 
 def cache_bytes(c, max_len: int, prefill_rows: int) -> int:
