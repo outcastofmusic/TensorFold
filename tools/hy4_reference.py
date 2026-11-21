@@ -50,7 +50,7 @@ def tiny_model():
     loaded = set()
     experts: dict[str, dict[str, np.ndarray]] = {}
     for name, value in values.items():
-        if name == "lm_head.weight":
+        if name == "lm_head.weight" or name.startswith("model.dfly_layers."):      # transformers runs no drafter
             continue
         m = re.match(r"(.*\.mlp\.experts)\.(gate_proj|up_proj|down_proj)\.weight$", name)
         if m:

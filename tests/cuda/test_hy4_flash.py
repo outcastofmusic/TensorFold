@@ -108,3 +108,22 @@ def test_drafted_equals_serial(weights, goldens, temperature):
     got = draft_decode(e, prompt, first, 40, s, stop_eos=False, drafter=oracle, allow_copy=False)
     assert got.tokens == serial
     assert got.stats["accepted"] > got.stats["rounds"] and got.stats["accepted"] < got.stats["drafted"]
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_dfly_drafted_equals_serial(weights, goldens, temperature, tmp_path):
+    """DFly2's real rounds (random weights: few drafts land) and copies: the reply is serial decoding's."""
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.hy4_flash.cuda.dfly import DFly
+    from tensorfold.families.hy4_flash.cuda.model import draft_decode, prefill, serial_decode
+
+    prompt = goldens["long_ids"].tolist()[:20]
+    s = Sampling(seed=5, temperature=temperature)
+    e = _engine(weights)
+    serial = serial_decode(e, prefill(e, prompt, s), 40, s, stop_eos=False).tokens
+    e = _engine(weights)
+    drafter = DFly(tiny.write(tmp_path / "t"), e)
+    got = draft_decode(e, prompt, prefill(e, prompt, s), 40, s, stop_eos=False, drafter=drafter)
+    assert got.tokens == serial
+    assert got.stats["drafted"] > 0

@@ -75,7 +75,8 @@ class Engine:
         self.ids: list[int] = []                                            # the committed tokens (n-grams, states)
         width = max(c.sparse.heads, c.sliding.heads)
         rows = max(prefill_rows, DECODE_ROWS)
-        self.scratch = K.Scratch(rows, width, -(-c.index_topk // K.CHUNK), dev) if self.cuda else None
+        # a sparse row's 2,048 keys, or a draft block row's 2,048 and its block
+        self.scratch = K.Scratch(rows, width, -(-(c.index_topk + 16) // K.CHUNK), dev) if self.cuda else None
         heads = max((len(s) for s in c.engram_sizes), default=0)
         self.eg_rows = (torch.zeros((len(c.engram_layers), rows, heads, c.engram_dim), dtype=torch.float32,
                                     device=dev) if heads else None)        # a call's Engram rows, staged on the host
@@ -85,6 +86,12 @@ class Engine:
         self.sampling = None
         self.pos = 0
         self.prompt = False
+        # what a drafter reads after each call: the normed rows, the watched sparse layers' key lists by row
+        # (sel, tok, cnt), and the row of the last committed token (``rewind`` moves it back)
+        self.watch: set[int] = set()
+        self.lists: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.normed: torch.Tensor | None = None
+        self.src_row = 0
         # tests only: expert picks [T, top_k] by layer to use at positions 0.. (``replay``), and the engine's own (``seen``)
         self.replay: dict[int, torch.Tensor] | None = None
         self.seen: dict[int, list[torch.Tensor]] | None = None
@@ -133,6 +140,7 @@ class Engine:
         if n:
             self.pos -= n
             del self.ids[-n:]
+            self.src_row -= n
 
     @property
     def eos(self) -> tuple[int, ...]:
@@ -195,7 +203,10 @@ class Engine:
             tok = torch.zeros((rows, 1), dtype=torch.int32, device=x.device)
             return lo, p32 - lo + 1, torch.zeros_like(p32), tok
         tok, sel, cnt = self._index(li, a.indexer, x, qr, pos, prompt)
-        return torch.zeros_like(p32), torch.where(sel != 0, cnt, p32 + 1), sel, tok
+        cnt = torch.where(sel != 0, cnt, p32 + 1)
+        if li in self.watch:
+            self.lists[li] = (sel, tok, cnt)
+        return torch.zeros_like(p32), cnt, sel, tok
 
     def _index(self, li: int, ix: Indexer, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, prompt: bool):
         """The compressed indexer: cache the rows' token keys, pool the groups they touch, and for rows past
@@ -405,12 +416,17 @@ class Engine:
             ids = torch.as_tensor(list(tokens), dtype=torch.int32).to(self.device)
             normed = self._layers(ids, prompt)
             logits = self.head(normed if every else normed[rows - 1:rows])
+            self.normed = normed
+        self.src_row = rows - 1
         self.pos += rows
         self.ids.extend(int(t) for t in tokens)
         return logits
 
     def _step(self) -> torch.Tensor:
-        return self.head(self._layers(self.tok, False))
+        """One decode row; under capture the normed row and the watched lists it keeps are the graph's buffers."""
+
+        self.normed = self._layers(self.tok, False)
+        return self.head(self.normed)
 
     def _graphed(self) -> torch.Tensor:
         """``_step`` by graph replay. The first call runs the step eagerly (it compiles the kernels), then captures

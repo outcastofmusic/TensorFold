@@ -23,6 +23,7 @@ IHEADS, IDIM, ITOPK, WINDOW = 4, 128, 32, 16
 ENGRAM = {2: [[1009, 1013], [1019, 1021]], 4: [[1031, 1033], [1039, 1049]]}
 ENGRAM_PER_NGRAM, ENGRAM_HEADS = 64, 2
 LOOKUP = 500
+DFLY_LAYERS, DFLY_INTER = [1, 5], 512          # the drafter's target sparse layers and its MLP width
 KINDS = ["deepseek_sparse_attention" if i < 2 or (i - 1) % 4 == 0 else "sliding_attention" for i in range(LAYERS)]
 
 
@@ -52,7 +53,9 @@ def config() -> dict:
         "learnable_sink": True, "gated_mla": True, "use_mla": True, "sandwich_norm": True,
     }
     return {"architectures": ["HYV4FlashForConditionalGeneration"], "model_type": "hy_v4_flash", "text_config": text,
-            "dtype": "bfloat16"}
+            "dtype": "bfloat16", "dfly_num_hidden_layers": len(DFLY_LAYERS), "dfly_target_kv_layers": DFLY_LAYERS,
+            "dfly_target_index_layer": DFLY_LAYERS, "dfly_mask_token_id": 3, "dfly_mtp_fusion": "slot0",
+            "dfly_enable_hidden_correction": True, "dfly_context_local_window": None}
 
 
 def _bf16(x: np.ndarray) -> np.ndarray:
@@ -235,7 +238,50 @@ def tensors(seed: int = 0) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]
                 put(e + f"norm_query.{s}.weight", ones(D))
                 put(e + f"unified_per_hc_scales.{s}", normal(D, std=0.05))
             put(e + "unified_pre_gamma", ones(D))
+    _dfly(rng, stored, put, fp8, normal, ones)
     return stored, values
+
+
+def _dfly(rng, stored, put, fp8, normal, ones) -> None:
+    """DFly2's layers as the NVFP4 pack stores them: FP8-block q_b/o/gate, NVFP4 MLPs and correction, bf16 rest."""
+
+    def nv2(name, w):
+        codes, sc, g = nvfp4(w[None])
+        stored[name + ".weight"] = (codes[0], "u8")
+        stored[name + ".weight_scale"] = (sc[0], "f8")
+        stored[name + ".weight_scale_2"] = (g.reshape(()), "f32")
+
+    p = "model.dfly_layers."
+    heads = SPARSE_HEADS
+    for j in range(len(DFLY_LAYERS)):
+        a = f"{p}{j}.self_attn."
+        put(f"{p}{j}.input_layernorm.weight", ones(D))
+        put(f"{p}{j}.post_attention_layernorm.weight", ones(D))
+        put(a + "q_a_proj.weight", normal(Q_RANK, D))
+        put(a + "q_a_layernorm.weight", ones(Q_RANK))
+        put(a + "kv_a_proj_with_mqa.weight", normal(KV_RANK + ROPE, D))
+        put(a + "kv_a_layernorm.weight", ones(KV_RANK))
+        put(a + "kv_b_proj.weight", normal(heads * (NOPE + VDIM), KV_RANK, std=0.03))
+        put(a + "post_proj_norm.weight", ones(D))
+        put(a + "learnable_sink_param", normal(heads, std=1.0), "f32")
+        fp8(a + "q_b_proj", normal(heads * (NOPE + ROPE), Q_RANK))
+        fp8(a + "linear_gate", normal(heads * VDIM, D))
+        fp8(a + "o_proj", normal(D, heads * VDIM))
+        nv2(f"{p}{j}.mlp.gate_proj", normal(DFLY_INTER, D))
+        nv2(f"{p}{j}.mlp.up_proj", normal(DFLY_INTER, D))
+        nv2(f"{p}{j}.mlp.down_proj", normal(D, DFLY_INTER))
+    put(p + "final_norm.weight", ones(D))
+    put(p + "mtp_fusion.enorm.weight", ones(D))
+    put(p + "mtp_fusion.hnorm.weight", ones(D))
+    put(p + "mtp_fusion.eh_proj.weight", normal(D, 2 * D))
+    put(p + "mtp_fusion.gate", normal(D, std=0.5))
+    put(p + "hidden_correction.hidden_norm.weight", ones(D))
+    put(p + "hidden_correction.embed_norm.weight", ones(D))
+    nv2(p + "hidden_correction.gate_proj", normal(D, 2 * D))
+    nv2(p + "hidden_correction.up_proj", normal(D, 2 * D))
+    nv2(p + "hidden_correction.down_proj", normal(D, D))
+    put(p + "confidence_head.proj.weight", normal(1, D))
+    put(p + "confidence_head.proj.bias", normal(1))
 
 
 def write(folder: str | Path, seed: int = 0) -> Path:

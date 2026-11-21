@@ -169,6 +169,12 @@ class Hy4Engine:
         started = time.perf_counter()
         self.w = load(self.model_dir, layers=layers)
         self.e = Engine(self.w, max_len=self.max_len)
+        self.drafter = None
+        raw = json.loads((self.model_dir / "config.json").read_text())
+        if drafts and raw.get("dfly_target_kv_layers") and os.environ.get("TF_HY4_DFLY", "1") != "0":
+            from .dfly import DFly
+
+            self.drafter = DFly(self.model_dir, self.e)
         torch.cuda.empty_cache()
         budget = max(0, min(int(float(os.environ.get("TF_HY4_CACHE_GIB", "4")) * gib),
                             available_bytes(torch) - WORKSPACE))
@@ -181,6 +187,7 @@ class Hy4Engine:
         self.hide: set[int] = set()
         kept = (f"up to {self.store.entries} prompt states kept in {self.store.budget / gib:.1f} GiB"
                 if self.store.on else "no prompt states kept")
+        kept += ", DFly2 drafts" if self.drafter is not None else ", no DFly2 drafts"
         print(f"[tensorfold] Hy4-flash on CUDA: {len(self.w.layers)} layers, {weights / gib:.1f} GiB of weights, "
               f"one stream; {self.max_len}-token cache; {kept}; loaded in {time.perf_counter() - started:.1f}s",
               flush=True)
@@ -226,7 +233,8 @@ class Hy4Engine:
         if report([pending]) or (stop_eos and pending in self.eos) or max_tokens <= 1:
             return stats
         if drafting:
-            res = draft_decode(self.e, prompt, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=report)
+            res = draft_decode(self.e, prompt, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=report,
+                               drafter=self.drafter, allow_copy=os.environ.get("TF_HY4_COPIES", "1") != "0")
             stats.update(drafted=res.stats["drafted"], accepted=res.stats["accepted"])
         else:
             res = serial_decode(self.e, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=report)
