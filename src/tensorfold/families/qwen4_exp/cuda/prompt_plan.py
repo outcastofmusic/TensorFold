@@ -6,6 +6,10 @@ from contextlib import contextmanager
 from tensorfold.cuda.geometry import PREFILL_ROWS, indexed_prompt_bytes
 
 IDLE_ROWS = 4096
+# The most rows a prompt pass holds while other streams decode (upstream #3726, e172bcc29: 1,536 to 3,072, cold first
+# token 12-17% sooner beside 3 decoders on GB10). It narrows only a wider workspace (the EXL3 pack's 4,096 rows, a
+# widened MLX or NVFP4 plan), so no buffer grows. A row's bits do not depend on its pass.
+LIVE_ROWS = 3072
 LONG_PIECE_ENV = "TENSORFOLD_LONG_PIECE_TOKENS"
 LONG_PIECE_TOKENS = 8192   # the threshold the 25 Oct sweep picked
 _long_from = 0          # the installed threshold (use): 0 keeps every idle piece at its buffers' rows
@@ -138,9 +142,9 @@ def choose(receipt: dict, text: dict, capability: tuple[int, int], *, world: int
 
 def pass_limit(rows: int, live: bool, share: float, round_s: float | None, row_s: float | None,
                minimum: int = 128) -> int:
-    """Live replies retain the released pass bound; an idle decoder can use its full prompt workspace."""
+    """A pass beside live replies holds at most LIVE_ROWS; an idle decoder can use its full prompt workspace."""
 
-    limit = min(rows, PREFILL_ROWS) if live else rows
+    limit = min(rows, LIVE_ROWS) if live else rows
     if not live or share <= 0 or not round_s or not row_s:
         return limit
     chosen = int(round_s / (share * row_s)) // 64 * 64

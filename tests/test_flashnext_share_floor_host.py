@@ -15,6 +15,8 @@ def _decoder():
     nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     nodes.extend(node for node in plan.body if isinstance(node, ast.FunctionDef) and node.name in ("pass_limit",
                                                                                                 "piece_rows"))
+    nodes.extend(node for node in plan.body if isinstance(node, ast.Assign) and any(
+        isinstance(target, ast.Name) and target.id == "LIVE_ROWS" for target in node.targets))
     decode = ast.parse((root / "decode.py").read_text())
     nodes.extend(node for node in decode.body if isinstance(node, ast.FunctionDef) and node.name == "cap_points")
     nodes.extend(node for node in source.body if isinstance(node, ast.Assign) and any(
@@ -35,9 +37,9 @@ def _decoder():
     (2048, True, 0.25, 0.001, 0.001, 512),
     (2048, True, 0.25, 0.08, 0.0005, 640),
     (2048, True, 0.25, 0.1, 0.0004, 960),
-    (4096, True, 0.25, 1.0, 0.0001, 2048),
+    (4096, True, 0.25, 1.0, 0.0001, 3072),
     (256, True, 0.25, 0.001, 0.001, 256),
-    (4096, True, 0.0, 0.001, 0.001, 2048),
+    (4096, True, 0.0, 0.001, 0.001, 3072),
     (4096, False, 0.25, 0.001, 0.001, 4096),
 ])
 def test_floor_preserves_calibration_and_workspace_ceiling(rows, live, share, round_s, row_s, expected):
