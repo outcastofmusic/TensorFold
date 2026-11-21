@@ -13,6 +13,7 @@ target's head, greedily, in turn. This follows vLLM's ``HYV4DFlyQueryModel`` and
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,15 @@ class DFly:
         if unused:
             raise ValueError(f"unused DFly2 tensors: {unused[:5]}")
         engine.watch |= set(self.kv_layers)
+        # drafts read a slice of the head: the first ids (byte-level BPE ids run roughly by merge frequency) and every
+        # special token; the verify window reads the whole head, so replies stay serial decoding's
+        rows = int(os.environ.get("TF_HY4_DRAFT_VOCAB", "32768"))
+        head = engine.w.head
+        if 0 < rows < head.shape[0]:
+            self.vocab = torch.cat([torch.arange(rows), torch.arange(c.bos, head.shape[0])]).to(head.device)
+            self.head = head[self.vocab].contiguous()
+        else:
+            self.vocab, self.head = None, head
         self.inv = (1.0 / (c.sparse.theta ** (torch.arange(0, c.sparse.rope, 2, dtype=torch.float32)
                                               / c.sparse.rope))).to(device)
         self.offsets = torch.arange(self.width, device=device)
@@ -168,7 +178,9 @@ class DFly:
             both = torch.cat([K.rmsnorm(h, self.hidden_norm, c.eps), K.rmsnorm(e.w.embed[prev], self.embed_norm, c.eps)],
                              -1)
             h = (h.float() + self.hc_down(_silu_mul(self.hc_gate(both), self.hc_up(both))).float()).to(torch.bfloat16)
-            prev = K.head(h, e.w.head).argmax(-1)
+            prev = K.head(h, self.head).argmax(-1)
+            if self.vocab is not None:
+                prev = self.vocab[prev]
             drafts.append(prev)
         return [int(t) for t in torch.cat(drafts).tolist()]
 

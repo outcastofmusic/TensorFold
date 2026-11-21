@@ -51,21 +51,82 @@ def main() -> None:
     row = at - rnd["base"]
     print(f"first difference at reply token {d}: serial {serial[d]} drafted {drafted[d]}; verified in a "
           f"{len(rnd['tokens'])}-row window at {rnd['base']} (row {row}, copied {rnd['copied']})")
+    rec: dict = {}
+    from tensorfold.families.hy4_flash.cuda import kernels as K
+    from tensorfold.families.hy4_flash.cuda import model as MM
+
+    inner_attention = K.attention
+    seen: dict = {}
+
+    def attention(qa, cache, lo, cnt, sel, tok, sinks, scale, out, scratch=None):
+        if cache.data_ptr() == e.latent[0].data_ptr() and seen.get("on"):      # layer 0's call
+            seen[seen["on"]] = {"qa": qa.clone(), "lo": lo.clone(), "cnt": cnt.clone(), "sel": sel.clone(),
+                                "cache": cache[:at + 1].clone()}
+        return inner_attention(qa, cache, lo, cnt, sel, tok, sinks, scale, out, scratch)
+
+    MM.K.attention = attention
+
+    def watch(tag):                            # each call's per-layer streams and sublayer outputs, by layer
+        layer_fn, attn, mlp, eg = e._layer, e._attention, e._mlp, e._engram
+        def layer(i, lay, x, prompt):
+            y = layer_fn(i, lay, x, prompt)
+            rec.setdefault(tag, {})[("layer", i)] = y.clone()
+            return y
+        def attention(i, a, x, prompt):
+            y = attn(i, a, x, prompt)
+            rec.setdefault(tag, {})[("attn", i)] = y.clone()
+            return y
+        def moe(i, m, x, prompt):
+            y = mlp(i, m, x, prompt)
+            rec.setdefault(tag, {})[("mlp", i)] = y.clone()
+            return y
+        def engram(j, g, x):
+            y = eg(j, g, x)
+            rec.setdefault(tag, {})[("engram", e.c.engram_layers[j])] = y.clone()
+            return y
+        e._layer, e._attention, e._mlp, e._engram = layer, attention, moe, engram
+        return lambda: setattr(e, "_layer", layer_fn) or setattr(e, "_attention", attn) or \
+            setattr(e, "_mlp", mlp) or setattr(e, "_engram", eg)
+
     out = {}
     for name, graphs in (("one-row eager", False), ("one-row graph", True)):
         e.reset()
         e.graphs, e.graph = graphs, None
         prefill(e, ids, greedy)
         logits = None
-        for t in serial[:d]:                   # each reply token at its position, one row a call
+        for i, t in enumerate(serial[:d]):     # each reply token at its position, one row a call
+            undo = watch(name) if not graphs and i == d - 1 else None
+            seen["on"] = "one" if undo else None
             logits = e.forward([t], prompt=False)
+            if undo:
+                undo()
         out[name] = logits[-1].float()
     e.reset()
     e.graphs = False
     prefill(e, ids, greedy)
     for t in serial[:rnd["base"] - len(ids)]:
         e.forward([t], prompt=False)
+    undo = watch("window")
+    seen["on"] = "win"
     out["window"] = e.forward(rnd["tokens"], prompt=False, every=True)[row].float()
+    seen["on"] = None
+    undo()
+    a, b = seen["one"], seen["win"]
+    print(f"layer 0 attention inputs: qa row equal {torch.equal(a['qa'][-1], b['qa'][row])}, "
+          f"cnt {int(a['cnt'][-1])} vs {int(b['cnt'][row])}, lo {int(a['lo'][-1])} vs {int(b['lo'][row])}, "
+          f"sel {int(a['sel'][-1])} vs {int(b['sel'][row])}")
+    rows_differ = (a["cache"] != b["cache"]).any(-1).nonzero().flatten().tolist()
+    print(f"layer 0 latent rows that differ (positions): {rows_differ[:20]} of {at + 1}")
+    one, win = rec["one-row eager"], rec["window"]
+    for key in sorted(one, key=lambda k: (k[1], ["engram", "attn", "mlp", "layer"].index(k[0]))):
+        a, b = one[key].float().reshape(1, -1) if one[key].shape[0] == 1 else one[key][-1:].float().reshape(1, -1), \
+            win[key][row:row + 1].float().reshape(1, -1)
+        diff = float((a - b).abs().max())
+        if diff > 0:
+            print(f"first difference: {key[0]} of layer {key[1]}, max {diff:.6f} of {float(a.abs().max()):.4f}")
+            break
+    else:
+        print("every recorded output is equal for the row")
     for name, v in out.items():
         top = torch.topk(v, 2)
         print(f"{name:14s} argmax {int(top.indices[0])} top2 {top.values.tolist()} max|diff vs one-row eager| "
