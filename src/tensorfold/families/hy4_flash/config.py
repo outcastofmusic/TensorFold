@@ -148,13 +148,27 @@ def _ints(value: Any) -> list[int]:
     return [int(v) for v in value] if isinstance(value, list) else [int(value)]
 
 
+def _tokenizer_eos(model_dir: Path) -> list[int]:
+    """tokenizer_config.json's eos_token as an id from tokenizer.json's added tokens, or nothing (qwen3_5's rule)."""
+
+    config, table = model_dir / "tokenizer_config.json", model_dir / "tokenizer.json"
+    if not (config.exists() and table.exists()):
+        return []
+    eos = json.loads(config.read_text()).get("eos_token")
+    eos = eos.get("content") if isinstance(eos, dict) else eos
+    added = {t["content"]: int(t["id"]) for t in json.loads(table.read_text()).get("added_tokens", [])}
+    return [added[eos]] if eos in added else []
+
+
 def eos_tokens(model_dir: Path, raw: dict[str, Any]) -> tuple[int, ...]:
-    """The union of config.json's and generation_config.json's end tokens (playbook 2.7), config's first."""
+    """The union of config.json's, generation_config.json's and the tokenizer's end tokens (playbook 2.7), config's
+    first. All three name <｜hy_end:opensource｜> (120025) today; the tokenizer's is read as 6e0f2003 reads KnowLine's."""
 
     found = _ints(text(raw).get("eos_token_id")) + _ints(raw.get("eos_token_id"))
     gen = model_dir / "generation_config.json"
     if gen.exists():
         found += _ints(json.loads(gen.read_text()).get("eos_token_id"))
+    found += _tokenizer_eos(model_dir)
     if not found:
         raise ValueError("no eos_token_id in config.json or generation_config.json")
     return tuple(dict.fromkeys(found))
