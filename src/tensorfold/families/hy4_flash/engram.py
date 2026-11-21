@@ -23,7 +23,11 @@ from typing import ClassVar
 
 import numpy as np
 
-from tensorfold.families.qwen4_exp.ssd_table import WORKERS, _fill, _no_cache, _release
+from tensorfold.families.qwen4_exp.ssd_table import _fill, _no_cache, _release
+
+# reads in flight: a 2,048-row prompt chunk reads 32,768 random rows a table, 910 ms at 16 threads and 445 at 64
+# (128: 468), cold, 21 Nov
+WORKERS = 64
 
 MAX_READ = 1 << 20            # bytes one read of adjacent rows may cover
 
@@ -123,11 +127,14 @@ class RowReader:
                              "table of another layer or a repacked one would address rows silently")
         self.dtype, self.rows, self.dim = dtype, rows, dim
         self.wrow = dim * self.ITEM[dtype]
-        self.s0 = None
+        self.scales = None
         if dtype == "F8_E4M3":
-            sdt, sshape, self.s0 = _tensor(header, name + ".weight_scale", data, size)
+            sdt, sshape, s0 = _tensor(header, name + ".weight_scale", data, size)
             if sdt != "F32" or sshape != [rows]:
                 raise ValueError(f"{name}.weight_scale: {sdt} {sshape}, not F32 [{rows}]")
+            # the row scales stay in memory (660 MB a table): a lookup then reads one span a row, not two (a chunk's
+            # 32,768 rows 445 -> 232 ms)
+            self.scales = np.fromfile(path, dtype=np.float32, count=rows, offset=s0)
 
     @property
     def fp8(self) -> bool:
@@ -142,16 +149,17 @@ class RowReader:
         unique, inverse = np.unique(flat, return_inverse=True)
         codes = np.empty((unique.size, self.wrow), dtype=np.uint8)
         reads = self._reads(self.w0 + unique * self.wrow, self.wrow, codes)
-        scales = None
-        if self.s0 is not None:
-            scales = np.empty((unique.size, 4), dtype=np.uint8)
-            reads += self._reads(self.s0 + unique * 4, 4, scales)
         batches = min(WORKERS, len(reads))
         if batches > 1:
             list(self._pool.map(_fill, [reads[i::batches] for i in range(batches)]))
         else:
             _fill(reads)
-        return codes[inverse], None if scales is None else scales.view(np.float32).reshape(-1)[inverse]
+        return codes[inverse], None if self.scales is None else self.scales[flat]
+
+    def nbytes(self) -> int:
+        """Host bytes held: the row scales."""
+
+        return 0 if self.scales is None else self.scales.nbytes
 
     def _reads(self, offsets: np.ndarray, width: int, out: np.ndarray) -> list[tuple]:
         n = offsets.size

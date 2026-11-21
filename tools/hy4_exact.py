@@ -93,7 +93,7 @@ def main() -> None:
     out = {}
     for name, graphs in (("one-row eager", False), ("one-row graph", True)):
         e.reset()
-        e.graphs, e.graph = graphs, None
+        e.graphs, e.graph = graphs, {}
         prefill(e, ids, greedy)
         logits = None
         for i, t in enumerate(serial[:d]):     # each reply token at its position, one row a call

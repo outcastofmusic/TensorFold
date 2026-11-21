@@ -67,7 +67,7 @@ class Engine:
                                                   / c.sparse.rope))).to(dev)
         self.meta = torch.zeros(4, dtype=torch.int32, device=dev)            # meta[0]: the call's first position
         self.offsets = torch.arange(max(prefill_rows, DECODE_ROWS), dtype=torch.int32, device=dev)
-        self.tok = torch.zeros(1, dtype=torch.int32, device=dev)
+        self.tok = torch.zeros(DECODE_ROWS, dtype=torch.int32, device=dev)   # a graphed call's input tokens
         self.ids: list[int] = []                                            # the committed tokens (n-grams, states)
         width = max(c.sparse.heads, c.sliding.heads)
         rows = max(prefill_rows, DECODE_ROWS)
@@ -77,8 +77,19 @@ class Engine:
         self.eg_rows = (torch.zeros((len(c.engram_layers), rows, heads, c.engram_dim), dtype=torch.float32,
                                     device=dev) if heads else None)        # a call's Engram rows, staged on the host
         self.graphs = flag("TF_HY4_GRAPHS", True) and self.cuda
-        self.graph = None
-        self.graph_out: torch.Tensor | None = None
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._readers = ThreadPoolExecutor(len(c.engram_layers) or 1, thread_name_prefix="engram-layer")
+        self._ahead_pool = ThreadPoolExecutor(1, thread_name_prefix="engram-ahead")
+        self._ahead: tuple | None = None
+        # one graph a decode width, captured at its first use. Each keeps the normed rows and watched lists it writes,
+        # which a drafter reads after it replays. A shared pool lets one width's temporaries sit in another's kept
+        # rows, and widths replay in any order, so each gets its own unless TF_HY4_GRAPH_POOL=shared.
+        # TF_HY4_GRAPH_WIDTHS=1 graphs one-row calls only (verify windows run eagerly)
+        self.graph: dict[int, tuple] = {}
+        self.graph_pool = (torch.cuda.graph_pool_handle()
+                           if self.cuda and os.environ.get("TF_HY4_GRAPH_POOL") == "shared" else None)
+        self.graph_widths = os.environ.get("TF_HY4_GRAPH_WIDTHS", "all")
         self.sampling = None
         self.pos = 0
         self.prompt = False
@@ -362,21 +373,38 @@ class Engine:
         return K.head(normed, self.w.head)
 
     # -- Engram rows ---------------------------------------------------------------------------------------------
-    def _stage_engram(self, tokens: Sequence[int]) -> None:
-        """Read the call's Engram rows on the host and copy them into ``eg_rows`` (before a graph replays)."""
+    def _read_engram(self, tokens: Sequence[int], pos: int, previous: Sequence[int]) -> list[torch.Tensor]:
+        """A call's Engram rows, every layer's table read at once: fp32 [R, heads, dim] a layer, on the host."""
 
         c = self.c
+        grams = ngram_tokens(np.asarray(tokens), pos, np.asarray(previous[-(c.engram_ngram - 1):]), c.engram_ngram,
+                             c.pad)
+        layers = [self.w.layers[li].engram for li in c.engram_layers if li < len(self.w.layers)]
+        jobs = [self._readers.submit(gather_engram, e.table, e.hasher.rows_of(grams), c.engram_dim) for e in layers]
+        return [j.result() for j in jobs]
+
+    def prefetch(self, tokens: Sequence[int], pos: int, previous: Sequence[int]) -> None:
+        """Start reading the Engram rows of a later call (the next prompt chunk) while this one computes."""
+
+        if self.eg_rows is not None:
+            self._ahead = (pos, tuple(int(t) for t in tokens),
+                           self._ahead_pool.submit(self._read_engram, list(tokens), pos, list(previous)))
+
+    def _stage_engram(self, tokens: Sequence[int]) -> None:
+        """Copy the call's Engram rows into ``eg_rows`` (before a graph replays): prefetched when ``prefetch`` read
+        them, else read now."""
+
         if self.eg_rows is None:
             return
-        grams = ngram_tokens(np.asarray(tokens), self.pos, np.asarray(self.ids[-(c.engram_ngram - 1):]),
-                             c.engram_ngram, c.pad)
+        ahead = self._ahead
+        if ahead is not None and ahead[0] == self.pos and ahead[1] == tuple(int(t) for t in tokens):
+            self._ahead = None
+            got = ahead[2].result()
+        else:                                     # a prefetch for a later call stays for it
+            got = self._read_engram(tokens, self.pos, self.ids)
         rows = len(tokens)
-        for j, li in enumerate(c.engram_layers):
-            if li >= len(self.w.layers):          # a probe that loads the first layers only
-                break
-            e = self.w.layers[li].engram
-            got = gather_engram(e.table, e.hasher.rows_of(grams), c.engram_dim)
-            self.eg_rows[j, :rows, :got.shape[1]].copy_(got.to(self.device), non_blocking=False)
+        for j, part in enumerate(got):
+            self.eg_rows[j, :rows, :part.shape[1]].copy_(part.to(self.device), non_blocking=False)
 
     # -- calls ---------------------------------------------------------------------------------------------------
     @torch.no_grad()
@@ -390,9 +418,10 @@ class Engine:
             raise ValueError("the KV cache is full")
         self.meta[0] = self.pos
         self._stage_engram(tokens)
-        if self.graphs and not prompt and rows == 1:
-            self.tok[0] = int(tokens[0])
-            logits = self._graphed()
+        if self.graphs and not prompt and (rows == 1 or self.graph_widths == "all"):
+            self.tok[:rows] = torch.as_tensor(list(tokens), dtype=torch.int32)
+            logits = self._graphed(rows)
+            logits = logits if every else logits[rows - 1:rows]
         else:
             ids = torch.as_tensor(list(tokens), dtype=torch.int32).to(self.device)
             normed = self._layers(ids, prompt)
@@ -403,30 +432,37 @@ class Engine:
         self.ids.extend(int(t) for t in tokens)
         return logits
 
-    def _step(self) -> torch.Tensor:
-        """One decode row; under capture the normed row and the watched lists it keeps are the graph's buffers."""
+    def _step(self, rows: int) -> torch.Tensor:
+        """``rows`` decode rows from ``tok``: every row's logits; the normed rows and watched lists it keeps."""
 
-        self.normed = self._layers(self.tok, False)
+        self.normed = self._layers(self.tok[:rows], False)
         return self.head(self.normed)
 
-    def _graphed(self) -> torch.Tensor:
-        """``_step`` by graph replay. The first call runs the step eagerly (it compiles the kernels), then captures
-        it; capturing launches nothing, so the state moves once."""
+    def _graphed(self, rows: int) -> torch.Tensor:
+        """``_step`` by graph replay. A width's first call runs eagerly (it compiles the kernels), then captures it;
+        capturing launches nothing, so the state moves once. The capture points ``normed`` and ``lists`` at buffers
+        nothing has written yet, so the eager call's are put back: a drafter reads them next (served DFly2 indexed
+        those unwritten lists and tripped a device-side assert on its first request, 21 Nov)."""
 
-        if self.graph is None:
-            out = self._step()
+        have = self.graph.get(rows)
+        if have is None:
+            out = self._step(rows)
+            normed, lists = self.normed, dict(self.lists)
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
             self.graph_capturing = True
             try:
-                with torch.cuda.graph(g, capture_error_mode="thread_local"):
-                    self.graph_out = self._step()
+                with torch.cuda.graph(g, pool=self.graph_pool, capture_error_mode="thread_local"):
+                    captured = self._step(rows)
             finally:
                 self.graph_capturing = False
-            self.graph = g
+            self.graph[rows] = (g, captured, self.normed, dict(self.lists))
+            self.normed, self.lists = normed, lists
             return out
-        self.graph.replay()
-        return self.graph_out.clone()
+        g, captured, normed, lists = have
+        g.replay()
+        self.normed, self.lists = normed, dict(lists)
+        return captured.clone()
 
     def sample(self, logits: torch.Tensor) -> int:
         """The token after position pos - 1 from its logits [1, V], by the request's keyed rule (greedy at T = 0)."""
@@ -487,6 +523,10 @@ def prefill(e: Engine, prompt: Sequence[int], sampling, *, resume: dict | None =
     for stop in stops:
         while s < stop:
             chunk = prompt[s:min(stop, s + e.prefill_rows)]
+            after = s + len(chunk)
+            if after < len(prompt):              # the next chunk's Engram rows, read while this one computes
+                nxt = prompt[after:min(after + e.prefill_rows, next(p for p in stops if p > after))]
+                e.prefetch(nxt, after, prompt[max(0, after - 2):after])
             logits = e.forward(chunk, prompt=True)
             s += len(chunk)
         if keep is not None and stop < len(prompt):

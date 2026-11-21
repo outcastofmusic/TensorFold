@@ -193,3 +193,20 @@ def test_own_groups_agree(weights, goldens):
                 assert top[r].tolist() == want[r].tolist(), f"layer {layer} row {r}"
                 checked += 1
     assert checked >= 20
+
+
+def test_prefetched_prefill_equals_chunked_forwards(weights, goldens):
+    """prefill reads the next chunk's Engram rows while a chunk computes: the caches are those of plain forwards."""
+
+    import torch
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.hy4_flash.cuda.model import prefill
+
+    ids = goldens["long_ids"].tolist()
+    a = _engine(weights, prefill_rows=7)
+    prefill(a, ids, Sampling(seed=0, temperature=0.0))
+    b = _engine(weights, prefill_rows=7)
+    for s in range(0, len(ids), 7):
+        b.forward(ids[s:s + 7], prompt=True)
+    assert a.pos == b.pos and all(torch.equal(x[:a.pos], y[:b.pos]) for x, y in zip(a.latent, b.latent))
