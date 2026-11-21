@@ -73,6 +73,7 @@ def main() -> None:
             rec.setdefault(tag, {})[("layer", i)] = y.clone()
             return y
         def attention(i, a, x, prompt):
+            rec.setdefault(tag, {})[("attn_in", i)] = x.clone()
             y = attn(i, a, x, prompt)
             rec.setdefault(tag, {})[("attn", i)] = y.clone()
             return y
@@ -112,6 +113,9 @@ def main() -> None:
     out["window"] = e.forward(rnd["tokens"], prompt=False, every=True)[row].float()
     seen["on"] = None
     undo()
+    w_in, o_in = rec["window"][("attn_in", 0)], rec["one-row eager"][("attn_in", 0)]
+    print(f"layer 0 attention input rows equal to the one-row run's: {[bool(torch.equal(w_in[j], o_in[-1])) for j in [row]]}"
+          f"; window tokens {rnd['tokens'][:row + 1]} serial {serial[rnd['base'] - len(ids):rnd['base'] - len(ids) + row + 1]}")
     a, b = seen["one"], seen["win"]
     print(f"layer 0 attention inputs: qa row equal {torch.equal(a['qa'][-1], b['qa'][row])}, "
           f"cnt {int(a['cnt'][-1])} vs {int(b['cnt'][row])}, lo {int(a['lo'][-1])} vs {int(b['lo'][row])}, "
@@ -119,7 +123,7 @@ def main() -> None:
     rows_differ = (a["cache"] != b["cache"]).any(-1).nonzero().flatten().tolist()
     print(f"layer 0 latent rows that differ (positions): {rows_differ[:20]} of {at + 1}")
     one, win = rec["one-row eager"], rec["window"]
-    for key in sorted(one, key=lambda k: (k[1], ["engram", "attn", "mlp", "layer"].index(k[0]))):
+    for key in sorted(one, key=lambda k: (k[1], ["engram", "attn_in", "attn", "mlp", "layer"].index(k[0]))):
         a, b = one[key].float().reshape(1, -1) if one[key].shape[0] == 1 else one[key][-1:].float().reshape(1, -1), \
             win[key][row:row + 1].float().reshape(1, -1)
         diff = float((a - b).abs().max())
