@@ -7,7 +7,9 @@ latent cache of target sparse layer ``dfly_target_kv_layers[j]``: the keys the t
 committed row (every earlier key below 2,048 tokens), then the block's own rows, causal, which it writes into that
 cache at the block's positions (the target's verify window overwrites them). After the final norm, each of rows 1-5
 is corrected by an MLP over it and the previous token's embedding (``hidden_correction``) and read through the
-target's head, greedily, in turn. This follows vLLM's ``HYV4DFlyQueryModel`` and ``build_dfly_reuse_indices``.
+target's head, in turn. Draft i is drawn by the request's keyed sampler at position pos + 1 + i, where the verify
+window samples it (playbook 5.2): a sampled reply then accepts the drafts serial decoding would write, where greedy
+drafts matched only its argmax. This follows vLLM's ``HYV4DFlyQueryModel`` and ``build_dfly_reuse_indices``.
 """
 
 from __future__ import annotations
@@ -143,9 +145,10 @@ class DFly:
     # -- a round ---------------------------------------------------------------------------------------------------
     @torch.no_grad()
     def propose(self, e, last: int, sampling) -> list[int]:
-        """Five draft tokens after ``last`` (the pending token, at position e.pos), greedy."""
+        """Five draft tokens after ``last`` (the pending token, at position e.pos), each by ``sampling``'s keyed rule
+        at its position (greedy at T = 0)."""
 
-        from .model import _silu_mul
+        from .model import _silu_mul, keyed_rows
 
         c = e.c
         anchor = e.pos
@@ -171,6 +174,7 @@ class DFly:
             h = K.rmsnorm(hidden, layer.post_norm, c.eps)
             hidden = layer.down(_silu_mul(layer.gate(h), layer.up(h)))
         out = K.rmsnorm((hidden.float() + residual.float()).to(torch.bfloat16), self.final_norm, c.eps)
+        greedy = sampling is None or sampling.temperature <= 0
         prev = ids[:1]
         drafts = []
         for step in range(self.width - 1):
@@ -178,9 +182,12 @@ class DFly:
             both = torch.cat([K.rmsnorm(h, self.hidden_norm, c.eps), K.rmsnorm(e.w.embed[prev], self.embed_norm, c.eps)],
                              -1)
             h = (h.float() + self.hc_down(_silu_mul(self.hc_gate(both), self.hc_up(both))).float()).to(torch.bfloat16)
-            prev = K.head(h, self.head).argmax(-1)
-            if self.vocab is not None:
-                prev = self.vocab[prev]
+            logits = K.head(h, self.head)
+            if greedy:                    # stays on the device: one read-back a round
+                prev = logits.argmax(-1)
+                prev = prev if self.vocab is None else self.vocab[prev]
+            else:                         # the next step embeds it: one read-back a draft
+                prev = torch.tensor(keyed_rows(logits, [anchor + 1 + step], sampling, self.vocab), device=dev)
             drafts.append(prev)
         return [int(t) for t in torch.cat(drafts).tolist()]
 

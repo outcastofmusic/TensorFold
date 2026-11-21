@@ -472,6 +472,32 @@ class Engine:
         return choose(vals.numpy(), ids.numpy(), self.pos, s)
 
 
+def keyed_rows(logits: torch.Tensor, positions: Sequence[int], sampling, id_map: torch.Tensor | None = None
+               ) -> list[int]:
+    """Each row's token by the request's keyed rule at its position (greedy at T = 0): ``sample_rows``, the rule
+    serial steps and verify windows sample by on CUDA. ``id_map`` gives the token id of each column (a draft head over
+    a slice of the vocabulary). On the CPU, the tests' path, top_k off draws over every column."""
+
+    from tensorfold.engine.exact_sampling import MARGIN, choose_rows
+
+    if sampling is None or sampling.temperature <= 0:
+        cols = logits.argmax(dim=-1)
+        return [int(t) for t in (cols if id_map is None else id_map[cols]).tolist()]
+    if logits.is_cuda and id_map is None:
+        from tensorfold.cuda.sampling import sample_rows
+
+        return sample_rows(logits, positions, sampling)
+    if logits.is_cuda and not sampling.top_k:
+        from tensorfold.cuda.sampling import nucleus_rows
+
+        return nucleus_rows(logits, positions, sampling, id_map=id_map)
+    width = logits.shape[-1]
+    k = min(width, int(sampling.top_k) + MARGIN) if sampling.top_k else width
+    vals, cols = torch.topk(logits.float(), k, dim=-1, sorted=False)
+    ids = cols if id_map is None else id_map[cols]
+    return choose_rows(vals.cpu().numpy(), ids.cpu().numpy().astype(np.int64), positions, sampling)
+
+
 @dataclass
 class DecodeResult:
     tokens: list[int]
@@ -559,7 +585,6 @@ def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sa
     one matches, else the ``drafter``'s block (DFly2), else one row. Every window row samples by the serial rule at
     its position, and rows past the first rejected draft are rewound."""
 
-    from tensorfold.cuda.sampling import sample_rows
     from tensorfold.families.qwen3_5.cuda.decode import CopyIndex, next_copy_rows
 
     e.set_sampling(sampling)
@@ -582,7 +607,7 @@ def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sa
         tokens = [out[-1]] + guesses
         base = e.pos
         logits = e.forward(tokens, prompt=False, every=True)
-        sampled = sample_rows(logits, [base + 1 + i for i in range(len(tokens))], sampling)
+        sampled = keyed_rows(logits, [base + 1 + i for i in range(len(tokens))], sampling)
         n = 0
         while n < len(guesses) and guesses[n] == sampled[n] and not (stop_eos and sampled[n] in eos):
             n += 1
