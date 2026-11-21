@@ -82,10 +82,14 @@ class Engine:
         self._readers = ThreadPoolExecutor(len(c.engram_layers) or 1, thread_name_prefix="engram-layer")
         self._ahead_pool = ThreadPoolExecutor(1, thread_name_prefix="engram-ahead")
         self._ahead: tuple | None = None
-        # one graph a decode width, captured at its first use; they share a memory pool (never run at once). Each keeps
-        # the normed rows and watched lists it writes, which a drafter reads after it replays
+        # one graph a decode width, captured at its first use. Each keeps the normed rows and watched lists it writes,
+        # which a drafter reads after it replays. A shared pool lets one width's temporaries sit in another's kept
+        # rows, and widths replay in any order, so each gets its own unless TF_HY4_GRAPH_POOL=shared.
+        # TF_HY4_GRAPH_WIDTHS=1 graphs one-row calls only (verify windows run eagerly)
         self.graph: dict[int, tuple] = {}
-        self.graph_pool = torch.cuda.graph_pool_handle() if self.cuda else None
+        self.graph_pool = (torch.cuda.graph_pool_handle()
+                           if self.cuda and os.environ.get("TF_HY4_GRAPH_POOL") == "shared" else None)
+        self.graph_widths = os.environ.get("TF_HY4_GRAPH_WIDTHS", "all")
         self.sampling = None
         self.pos = 0
         self.prompt = False
@@ -414,7 +418,7 @@ class Engine:
             raise ValueError("the KV cache is full")
         self.meta[0] = self.pos
         self._stage_engram(tokens)
-        if self.graphs and not prompt:
+        if self.graphs and not prompt and (rows == 1 or self.graph_widths == "all"):
             self.tok[:rows] = torch.as_tensor(list(tokens), dtype=torch.int32)
             logits = self._graphed(rows)
             logits = logits if every else logits[rows - 1:rows]
@@ -436,11 +440,14 @@ class Engine:
 
     def _graphed(self, rows: int) -> torch.Tensor:
         """``_step`` by graph replay. A width's first call runs eagerly (it compiles the kernels), then captures it;
-        capturing launches nothing, so the state moves once."""
+        capturing launches nothing, so the state moves once. The capture points ``normed`` and ``lists`` at buffers
+        nothing has written yet, so the eager call's are put back: a drafter reads them next (served DFly2 indexed
+        those unwritten lists and tripped a device-side assert on its first request, 21 Nov)."""
 
         have = self.graph.get(rows)
         if have is None:
             out = self._step(rows)
+            normed, lists = self.normed, dict(self.lists)
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
             self.graph_capturing = True
@@ -450,6 +457,7 @@ class Engine:
             finally:
                 self.graph_capturing = False
             self.graph[rows] = (g, captured, self.normed, dict(self.lists))
+            self.normed, self.lists = normed, lists
             return out
         g, captured, normed, lists = have
         g.replay()
