@@ -4,11 +4,12 @@
     python tools/hy4_golden.py reference MODEL ENGINE.npz    # where transformers PR #50903 is installed
 
 ``engine`` renders four prompts (chat, a tool call, code, and a document of about 3,000 tokens that takes the sparse
-layers past 2,048 keys), decodes 32 greedy tokens each, then runs each whole sequence through one prompt pass and
+layers past 2,048 keys), decodes up to 32 greedy tokens each (to the end token), then runs each whole sequence through one prompt pass and
 saves every position's top-20 logits and the full logits of the decoded region. ``reference`` replays the same ids
 through transformers' decoder layers one at a time, on the GPU, each holding the checkpoint's weights decoded to
 bf16 (block FP8 and NVFP4) and reading its Engram rows from the tables' files. It reports top-1 agreement, the greedy
-tokens where transformers' top two stand apart, and KL(transformers || engine) over the decoded region.
+tokens where transformers' top two stand apart, and KL(transformers || engine) over the decoded region up to the
+reply's end token: past it both models are out of distribution (a golden saved before 21 Nov holds those rows).
 """
 
 from __future__ import annotations
@@ -47,6 +48,23 @@ def prompts(root: Path) -> dict[str, tuple[list[dict], list | None]]:
     }
 
 
+def reply(e, ids: list[int], first: int, sampling, steps: int = STEPS):
+    """The reply after a prefilled prompt up to and including its end token (``steps`` tokens at most), and the
+    sequence the teacher-forced pass reads: the prompt, then every reply token whose next one the engine chose."""
+
+    from tensorfold.families.hy4_flash.cuda.model import serial_decode
+
+    res = serial_decode(e, first, steps, sampling, stop_eos=True)
+    return res, list(ids) + res.tokens[:-1]
+
+
+def decoded_rows(gen, eos) -> int:
+    """The reply's rows up to and including its first end token: the ones a comparison reads."""
+
+    ends = {int(t) for t in eos}
+    return next((i + 1 for i, t in enumerate(gen) if int(t) in ends), len(gen))
+
+
 def engine(model: str, out: str) -> None:
     import torch
     from tokenizers import Tokenizer
@@ -54,7 +72,7 @@ def engine(model: str, out: str) -> None:
     from tensorfold.cuda.chat_template import ChatTemplate
     from tensorfold.engine.exact_sampling import Sampling
     from tensorfold.families.hy4_flash.cuda.app import EffortTemplate, text_view
-    from tensorfold.families.hy4_flash.cuda.model import Engine, prefill, serial_decode
+    from tensorfold.families.hy4_flash.cuda.model import Engine, prefill
     from tensorfold.families.hy4_flash.cuda.weights import load
 
     view = text_view(Path(model))
@@ -72,11 +90,10 @@ def engine(model: str, out: str) -> None:
         t0 = time.perf_counter()
         first = prefill(e, ids, greedy)
         pre = time.perf_counter() - t0
-        res = serial_decode(e, first, STEPS, greedy, stop_eos=False)
+        res, seq = reply(e, ids, first, greedy)
         gen = res.tokens
         print(f"{name}: {len(ids)} prompt tokens, prefill {pre:.2f}s, decode {res.tokens_per_second:.1f} tok/s: "
               f"{tok.decode(gen, skip_special_tokens=False)!r}", flush=True)
-        seq = ids + gen[:-1]                    # every token whose next one the engine chose
         e.reset()
         rows = []
         for s in range(0, len(seq), e.prefill_rows):
@@ -112,9 +129,11 @@ def reference(model: str, engine_npz: str) -> None:
     sys.path.insert(0, str(Path(__file__).parent))
     from hy4_reference import hf_name
 
+    from tensorfold.families.hy4_flash.config import Config
     from tensorfold.families.hy4_flash.engram import RowReader, decode_rows
 
     root = Path(model)
+    eos = Config.read(root).eos
     raw = json.loads((root / "config.json").read_text())
     text = {k: v for k, v in raw["text_config"].items() if k not in ("quantization_config", "architectures",
                                                                        "model_type")}
@@ -311,11 +330,12 @@ def reference(model: str, engine_npz: str) -> None:
             two = want.topk(2, -1).values
             gap = two[:, 0] - two[:, 1]
             sure = gap > 0.5
-            tail = torch.from_numpy(z[f"{n}_tail"].astype(np.float32)).to(dev)
-            lp, lq = want[p0 - 1:].log_softmax(-1), tail.log_softmax(-1)
+            rows = decoded_rows(z[f"{n}_gen"].tolist(), eos)
+            tail = torch.from_numpy(z[f"{n}_tail"][:rows].astype(np.float32)).to(dev)
+            lp, lq = want[p0 - 1:p0 - 1 + rows].log_softmax(-1), tail.log_softmax(-1)
             kl = (lp.exp() * (lp - lq)).sum(-1)
-            gen = torch.tensor(z[f"{n}_gen"].tolist(), device=dev)
-            greedy_ok = (want[p0 - 1:].argmax(-1) == gen[:want.shape[0] - p0 + 1])
+            gen = torch.tensor(z[f"{n}_gen"].tolist()[:rows], device=dev)
+            greedy_ok = (want[p0 - 1:p0 - 1 + rows].argmax(-1) == gen)
             at = torch.arange(len(seq), device=dev)
             buckets = {f"top1_{lo}_{hi}": round(float(agree[(at >= lo) & (at < hi)].mean()), 4)
                        for lo, hi in ((0, 512), (512, 2048), (2048, 1 << 30)) if bool(((at >= lo) & (at < hi)).any())}
@@ -323,9 +343,9 @@ def reference(model: str, engine_npz: str) -> None:
                          "top1_all": round(float(agree.mean()), 4),
                          "top1_sure": round(float(agree[sure].mean()), 4), "sure_rows": int(sure.sum()),
                          "greedy_steps_equal": f"{int(greedy_ok.sum())}/{greedy_ok.numel()}",
-                         "greedy_misses_sure": int((~greedy_ok & sure[p0 - 1:]).sum()),
+                         "greedy_misses_sure": int((~greedy_ok & sure[p0 - 1:p0 - 1 + rows]).sum()),
                          "kl_mean": round(float(kl.mean()), 5), "kl_max": round(float(kl.max()), 4),
-                         "smallest_gap_decoded": round(float(gap[p0 - 1:].min()), 4)}
+                         "smallest_gap_decoded": round(float(gap[p0 - 1:p0 - 1 + rows].min()), 4)}
             print(n, json.dumps(report[n]), flush=True)
     Path(engine_npz).with_suffix(".reference.json").write_text(json.dumps(report, indent=1))
     if dump is not None:
