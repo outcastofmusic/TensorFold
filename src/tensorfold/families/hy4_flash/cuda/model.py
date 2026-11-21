@@ -67,7 +67,7 @@ class Engine:
                                                   / c.sparse.rope))).to(dev)
         self.meta = torch.zeros(4, dtype=torch.int32, device=dev)            # meta[0]: the call's first position
         self.offsets = torch.arange(max(prefill_rows, DECODE_ROWS), dtype=torch.int32, device=dev)
-        self.tok = torch.zeros(1, dtype=torch.int32, device=dev)
+        self.tok = torch.zeros(DECODE_ROWS, dtype=torch.int32, device=dev)   # a graphed call's input tokens
         self.ids: list[int] = []                                            # the committed tokens (n-grams, states)
         width = max(c.sparse.heads, c.sliding.heads)
         rows = max(prefill_rows, DECODE_ROWS)
@@ -82,8 +82,10 @@ class Engine:
         self._readers = ThreadPoolExecutor(len(c.engram_layers) or 1, thread_name_prefix="engram-layer")
         self._ahead_pool = ThreadPoolExecutor(1, thread_name_prefix="engram-ahead")
         self._ahead: tuple | None = None
-        self.graph = None
-        self.graph_out: torch.Tensor | None = None
+        # one graph a decode width, captured at its first use; they share a memory pool (never run at once). Each keeps
+        # the normed rows and watched lists it writes, which a drafter reads after it replays
+        self.graph: dict[int, tuple] = {}
+        self.graph_pool = torch.cuda.graph_pool_handle() if self.cuda else None
         self.sampling = None
         self.pos = 0
         self.prompt = False
@@ -412,9 +414,10 @@ class Engine:
             raise ValueError("the KV cache is full")
         self.meta[0] = self.pos
         self._stage_engram(tokens)
-        if self.graphs and not prompt and rows == 1:
-            self.tok[0] = int(tokens[0])
-            logits = self._graphed()
+        if self.graphs and not prompt:
+            self.tok[:rows] = torch.as_tensor(list(tokens), dtype=torch.int32)
+            logits = self._graphed(rows)
+            logits = logits if every else logits[rows - 1:rows]
         else:
             ids = torch.as_tensor(list(tokens), dtype=torch.int32).to(self.device)
             normed = self._layers(ids, prompt)
@@ -425,30 +428,33 @@ class Engine:
         self.ids.extend(int(t) for t in tokens)
         return logits
 
-    def _step(self) -> torch.Tensor:
-        """One decode row; under capture the normed row and the watched lists it keeps are the graph's buffers."""
+    def _step(self, rows: int) -> torch.Tensor:
+        """``rows`` decode rows from ``tok``: every row's logits; the normed rows and watched lists it keeps."""
 
-        self.normed = self._layers(self.tok, False)
+        self.normed = self._layers(self.tok[:rows], False)
         return self.head(self.normed)
 
-    def _graphed(self) -> torch.Tensor:
-        """``_step`` by graph replay. The first call runs the step eagerly (it compiles the kernels), then captures
-        it; capturing launches nothing, so the state moves once."""
+    def _graphed(self, rows: int) -> torch.Tensor:
+        """``_step`` by graph replay. A width's first call runs eagerly (it compiles the kernels), then captures it;
+        capturing launches nothing, so the state moves once."""
 
-        if self.graph is None:
-            out = self._step()
+        have = self.graph.get(rows)
+        if have is None:
+            out = self._step(rows)
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
             self.graph_capturing = True
             try:
-                with torch.cuda.graph(g, capture_error_mode="thread_local"):
-                    self.graph_out = self._step()
+                with torch.cuda.graph(g, pool=self.graph_pool, capture_error_mode="thread_local"):
+                    captured = self._step(rows)
             finally:
                 self.graph_capturing = False
-            self.graph = g
+            self.graph[rows] = (g, captured, self.normed, dict(self.lists))
             return out
-        self.graph.replay()
-        return self.graph_out.clone()
+        g, captured, normed, lists = have
+        g.replay()
+        self.normed, self.lists = normed, dict(lists)
+        return captured.clone()
 
     def sample(self, logits: torch.Tensor) -> int:
         """The token after position pos - 1 from its logits [1, V], by the request's keyed rule (greedy at T = 0)."""
