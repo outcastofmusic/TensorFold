@@ -113,15 +113,16 @@ def cache_bytes(c, max_len: int, prefill_rows: int) -> int:
 
 
 def weight_bytes(model_dir: Path) -> int:
-    """The text model's bytes as loaded: every stored tensor but the vision tower, the drafter and Engram tables,
-    plus the lane matmul's fp32 scale per (64 inputs, column) of each block-FP8 projection."""
+    """The text model's bytes as loaded: every stored tensor but the vision tower, the drafter and Engram tables (their
+    row scales stay on the host, 660 MB a table), plus the lane matmul's fp32 scale per (64 inputs, column) of each
+    block-FP8 projection."""
 
     from tensorfold.cuda.capacity import headers
     from tensorfold.cuda.geometry import size
 
     total = 0
     for name, info in headers(model_dir).items():
-        if name.startswith(("vit.", "model.dfly_layers.")) or "multi_head_embedding" in name:
+        if name.startswith(("vit.", "model.dfly_layers.")) or name.endswith("multi_head_embedding.embedding.weight"):
             continue
         total += size(info, name)
         if info["dtype"] == "F8_E4M3" and name.endswith(".weight") and len(info["shape"]) == 2:
@@ -238,7 +239,8 @@ class Hy4Engine:
             stats.update(drafted=res.stats["drafted"], accepted=res.stats["accepted"])
         else:
             res = serial_decode(self.e, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=report)
-        stats.update(decode_s=round(res.seconds, 4), rounds=res.rounds, decode_tps=round(res.tokens_per_second, 2))
+        rounds = res.stats["rounds"] if drafting else res.rounds       # a drafted round commits one or more tokens
+        stats.update(decode_s=round(res.seconds, 4), rounds=rounds, decode_tps=round(res.tokens_per_second, 2))
         return stats
 
     def follow(self) -> None:

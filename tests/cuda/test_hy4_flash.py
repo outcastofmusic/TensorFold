@@ -142,3 +142,20 @@ def test_window_rows_equal_single_rows(weights, goldens, width, start):
     win.forward(ids[:start], prompt=True)
     got = win.forward(ids[start:start + width], prompt=False, every=True)
     assert torch.equal(got, want), f"max diff {float((got - want).abs().max())}"
+
+
+def test_window_graphs_equal_eager(weights, goldens):
+    """Verify windows by graph replay (one graph a width) give the eager windows' bits, at each width twice."""
+
+    ids = goldens["long_ids"].tolist()
+    out = []
+    for graphs in (False, True):
+        e = _engine(weights, graphs=graphs)
+        e.forward(ids[:10], prompt=True)
+        rows = []
+        for width in (6, 3, 6, 16, 3):
+            start = e.pos
+            rows.append(e.forward(ids[start:start + width], prompt=False, every=True))
+            e.rewind(width - 1)                      # keep one row a call, as a rejected draft leaves it
+        out.append(torch.cat(rows))
+    assert torch.equal(out[0], out[1])
