@@ -198,6 +198,8 @@ def cut_glm_call(block: str, tools: list[dict[str, Any]]) -> tuple[str, str] | N
         key = text[key_at + len("<arg_key>"):key_end].strip()
         value_end = text.find("</arg_value>", value_at)
         value = text[value_at + len("<arg_value>"):value_end if value_end >= 0 else None]
+        if "<arg_key>" in value:
+            return None                                # the value ran into the next pair: malformed (upstream #2801)
         prop = schema.get(key, {})
         if value_end >= 0:
             piece = json.dumps(decode_parameter(value, prop, python=False), ensure_ascii=False)
