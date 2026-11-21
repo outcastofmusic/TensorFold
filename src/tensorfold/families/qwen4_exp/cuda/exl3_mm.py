@@ -32,6 +32,11 @@ class Switches:
     (tf-runs/exl3-long-1021); the routed scratch grows from 1.4 to 2.8 GB."""
 
     prompt_rows: int = PROMPT_ROWS
+    # TF_FLASHNEXT_F16_FP8 (off by default, under test): the pack's fp16 matrices (hyper-connections, PLE key and
+    # value, DeltaNet a/b; 1.34 GB a token, 25% of serial decode on 18 Oct) as FP8 e4m3 with one fp32 scale per
+    # output row, so decode reads half the bytes. Replies change: the weights carry 2.5-2.7% relative error
+    # (tf-runs/hc-fp8-1111), against fp16's 0.03%.
+    f16_fp8: bool = False
 
 
 _current = Switches()          # the default is the served setting, the one ``read`` takes for an unset variable
@@ -42,8 +47,9 @@ def read() -> Switches:
     read."""
 
     from tensorfold.cuda.geometry import indexed_prefill_rows
+    from tensorfold.env_flags import flag
 
-    return Switches(prompt_rows=indexed_prefill_rows() or PROMPT_ROWS)
+    return Switches(prompt_rows=indexed_prefill_rows() or PROMPT_ROWS, f16_fp8=flag("TF_FLASHNEXT_F16_FP8"))
 
 
 def use(switches: Switches) -> Switches:
@@ -116,9 +122,10 @@ class Scratch:
 
 
 @triton.jit(do_not_specialize=["M"])
-def _f16_mm(X, W, OUT, M, N, x_stride, o_stride, K: tl.constexpr, KS: tl.constexpr, BM: tl.constexpr,
-            BN: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr):
-    """Program (m block, n block, K slice): fp32 sums of fp16(x) * w over the slice's K in BK steps; OUT or fp32 slices [KS, M, N]."""
+def _f16_mm(X, W, S, OUT, M, N, x_stride, o_stride, K: tl.constexpr, KS: tl.constexpr, BM: tl.constexpr,
+            BN: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr, FP8: tl.constexpr):
+    """Program (m block, n block, K slice): fp32 sums of fp16(x) * w over the slice's K in BK steps; OUT or fp32 slices [KS, M, N].
+    ``FP8``: W holds e4m3 values (exact in fp16) and S [N] the rows' fp32 scales, applied to each slice's sums."""
 
     pm = tl.program_id(0)
     pn = tl.program_id(1)
@@ -133,7 +140,9 @@ def _f16_mm(X, W, OUT, M, N, x_stride, o_stride, K: tl.constexpr, KS: tl.constex
     for kk in range(0, KS, BK):
         x = tl.load(X + rm[:, None] * x_stride + (k0 + kk + rk)[None, :], mask=m_ok[:, None], other=0.0)
         w = tl.load(W + rn[:, None] * K + (k0 + kk + rk)[None, :], mask=n_ok[:, None], other=0.0)
-        acc = tl.dot(x.to(tl.float16), tl.trans(w), acc)
+        acc = tl.dot(x.to(tl.float16), tl.trans(w.to(tl.float16)), acc)
+    if FP8:
+        acc = acc * tl.load(S + rn, mask=n_ok, other=0.0)[None, :]
     if F32:
         tl.store(OUT + ps * M * N + rm[:, None] * N + rn[None, :], acc, mask=m_ok[:, None] & n_ok[None, :])
     else:
@@ -168,16 +177,18 @@ def f16_split(n: int, k: int, target: int = 96) -> int:
 
 @dataclass
 class F16:
-    """y = x @ w.T for a matrix the pack leaves unquantized (fp16): fixed tiles and K slices, so a row is its own."""
+    """y = x @ w.T for a matrix the pack leaves unquantized (fp16): fixed tiles and K slices, so a row is its own.
+    With ``scale`` set, w is FP8 e4m3 and row j of the matrix is w[j] * scale[j] (``Switches.f16_fp8``)."""
 
     w: torch.Tensor
     n: int
     k: int
     sk: int
     sc: Scratch = field(repr=False)
+    scale: torch.Tensor | None = None
 
     def nbytes(self) -> int:
-        return self.w.numel() * 2
+        return self.w.numel() * self.w.element_size() + (0 if self.scale is None else self.scale.numel() * 4)
 
     def partials(self, x: torch.Tensor) -> torch.Tensor:
         """Unreduced fp32 slices [sk, M, n] (shared scratch) for a consumer that sums them in order; M <= ROWS, so a
@@ -196,9 +207,10 @@ class F16:
             raise ValueError(f"F16: x {tuple(x.shape)} does not match K={self.k}")
         bn, warps, stages = WIDE_TILE
         grid = (triton.cdiv(m, 16), triton.cdiv(self.n, bn), self.sk)
-        _f16_mm[grid](x, self.w, out, m, self.n, x.stride(0), self.n if f32 else out.stride(0),
-                      K=self.k, KS=self.k // self.sk, BM=16, BN=bn, BK=BK, F32=f32, num_warps=warps,
-                      num_stages=stages)
+        fp8 = self.scale is not None
+        _f16_mm[grid](x, self.w, self.scale if fp8 else self.w, out, m, self.n, x.stride(0),
+                      self.n if f32 else out.stride(0), K=self.k, KS=self.k // self.sk, BM=16, BN=bn, BK=BK, F32=f32,
+                      FP8=fp8, num_warps=warps, num_stages=stages)
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         if out.stride(-1) != 1:
@@ -262,10 +274,27 @@ def x3(sc: Scratch, pk, prefix: str, device, *, head: bool = False) -> X3:
     return got
 
 
+FP8_MAX = 448.0          # e4m3's largest finite value
+
+
+def to_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """[n, k] -> (e4m3 values, fp32 scale a row): each row's largest magnitude lands on FP8_MAX; a zero row keeps
+    zeros with scale 1."""
+
+    w = w.float()
+    amax = w.abs().amax(1)
+    scale = torch.where(amax > 0, amax / FP8_MAX, torch.ones_like(amax))
+    return (w / scale[:, None]).to(torch.float8_e4m3fn).contiguous(), scale.contiguous()
+
+
 def f16(sc: Scratch, rows: list[torch.Tensor], device) -> F16:
-    w = torch.cat([r.to(torch.float16) for r in rows]).to(device).contiguous()
+    w = torch.cat([r.to(torch.float16) for r in rows])
     n, k = w.shape
-    got = F16(w, n, k, f16_split(n, k), sc)
+    if current().f16_fp8:
+        values, scale = to_fp8(w)
+        got = F16(values.to(device), n, k, f16_split(n, k), sc, scale.to(device))
+    else:
+        got = F16(w.to(device).contiguous(), n, k, f16_split(n, k), sc)
     sc.users.append(got)
     return got
 
