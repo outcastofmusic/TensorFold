@@ -320,13 +320,17 @@ hy4() {
     [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh hy4-flash)"
     local budget=()
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
-    # DFly2's draft settings (cuda/dfly.py); the defaults are window 10's measured choice (notes/tf-runs/hy4-flash-1121)
+    # DFly2's draft settings (cuda/dfly.py), window 10's measured choice: against the slice + copies, +8-34% at T 0
+    # and +4-31% at T 0.9, all 60 drafted replies equal serial (notes/tf-runs/hy4-flash-1121)
     local drafts=(-e "TF_HY4_DRAFT_HEAD=${HY4_DRAFT_HEAD:-nvfp4}" -e "TF_HY4_DFLY_ADAPTIVE=${HY4_ADAPTIVE:-1}"
                   -e "TF_HY4_DFLY_FLOOR=${HY4_FLOOR:-0.15}" -e "TF_HY4_DFLY_KEYED=${HY4_KEYED:-1}")
     IMAGE=$(image)
     stop_all
+    # 65,536 tokens: at 131,072 the 89.7 GiB of weights leave the prompt-state store no memory, so no turn reuses its
+    # prefix (tool-eval: ttft 2.59 s, 31 min, responsiveness 38); at 65,536 it keeps 2.4 GiB (0.60 s, 17 min, 61), and
+    # 98,304 keeps 0.7 GiB (2026-11-21, notes/tf-runs/hy4-flash-1121 windows 11-12)
     serve tensorfold-hy4 "${drafts[@]}" -- "$model" --host 127.0.0.1 --port "$PORT" --name hy4-flash \
-        --context "${CONTEXT:-131072}" --max-tokens "${CONTEXT:-131072}" --temperature 0.9 --top-p 1.0 \
+        --context "${CONTEXT:-65536}" --max-tokens "${CONTEXT:-65536}" --temperature 0.9 --top-p 1.0 \
         "${budget[@]}" ${EXTRA:-}
     wait_ready tensorfold-hy4 "$PORT" || failed tensorfold-hy4
 }

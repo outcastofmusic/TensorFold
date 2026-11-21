@@ -15,10 +15,25 @@ commercial terms from 100 million monthly active users. The NVFP4 pack is a thir
 ```bash
 ./prepare.sh hy4-flash         # Avifenesh/Hy4-flash-NVFP4 at f9eac06c into ~/models/Hy4-flash-NVFP4 (161.1 GB)
 ./run.sh hy4-flash             # served as hy4-flash on 127.0.0.1:30000, or through ./run.sh swap
-tensorfold serve ~/models/Hy4-flash-NVFP4 --name hy4-flash --context 131072 --temperature 0.9 --top-p 1.0
 ```
 
-It runs alone: 87.3 GiB after load with 18 GiB available at a 131,072-token cache, so no Clef or d1 beside it.
+run.sh serves a 65,536-token context at temperature 0.9, top_p 1.0. DFly2 drafts with the NVFP4 draft head and
+adaptive depth at floor 0.15, keyed by the request's sampler, and copies draft too (`HY4_DRAFT_HEAD`, `HY4_ADAPTIVE`,
+`HY4_FLOOR`, `HY4_KEYED`, `CONTEXT`). It runs alone: 89.7 GiB of weights, with 20 GiB available after load and
+2.4 GiB of kept prompt states. At 131,072 tokens 17 GiB stays available but no prompt state fits, so no turn
+reuses its prefix.
+
+## Speed and quality on one GB10 (21 Nov, served, thinking off)
+
+| | chat | code | prose | json | rewrite |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| greedy tok/s | 21.7 | 26.4 | 17.4 | 35.7 | 64.3 |
+| T 0.9, top_p 1.0 tok/s | 19.1-19.9 | 29.0-29.9 | 15.8-17.2 | 39.3-40.6 | 64.9-67.1 |
+
+The decode and prefill rows were measured at 131,072 tokens. Prefill runs at 601-638 tok/s on novel text and
+764-806 on repeated filler (4k-32k tokens). TrueScore 76x2 scores 91.7 against GLM-5.3 Flash's 93.1 and Qwen3.8
+Flash Next's 88.3. tool-eval-bench 69x2 scores 86-88 against 93 and 92. The measurements are in
+`notes/tf-runs/hy4-flash-1121`.
 
 ## The checkpoint
 
