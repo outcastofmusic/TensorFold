@@ -68,7 +68,7 @@ def test_prompts_queued_together_prefill_in_one_forward(multi):
     dec = decoder(multi)
     ss = queue(dec, [20, 35, 19])
     assert dec._fill() == []                                      # none ends at its first token
-    assert dec.batches == [[(0, 20), (1, 35), (2, 19)]] and not dec.alone
+    assert dec.batches == [[(2, 19), (0, 20), (1, 35)]] and not dec.alone      # fewest rows first
     assert all(s.out == [7] for s in ss) and not dec.filling
 
 
@@ -77,9 +77,9 @@ def test_while_streams_decode_a_batch_takes_step_rows(multi):
     decoding(dec)
     queue(dec, [600, 600, 30])
     dec._fill()
-    assert dec.batches == [[(0, 600), (1, multi.STEP - 600)]]     # the second takes the rows left
+    assert dec.batches == [[(2, 30), (0, 600), (1, multi.STEP - 630)]]     # the last one in takes the rows left
     dec._fill()
-    assert dec.batches[-1] == [(1, 600), (2, 30)]
+    assert dec.alone == [(1, 600)]                               # one prompt left: its own step
 
 
 def test_nothing_decoding_a_batch_fills_one_forward(multi):
@@ -95,7 +95,7 @@ def test_a_batch_stops_at_each_prompts_next_kept_state(multi):
     dec = decoder(multi)
     queue(dec, [300, 40], stops={0: [256]})
     dec._fill()
-    assert dec.batches == [[(0, 256), (1, 40)]]
+    assert dec.batches == [[(1, 40), (0, 256)]]
 
 
 def test_background_prompts_go_alone_after_the_foreground(multi):
@@ -109,11 +109,11 @@ def test_background_prompts_go_alone_after_the_foreground(multi):
 
 def test_an_image_prompt_goes_alone_in_its_turn(multi):
     dec = decoder(multi)
-    queue(dec, [30, 20, 25], image=(0,))
+    queue(dec, [20, 25, 30], image=(0,))
     dec._fill()
-    assert dec.alone == [(0, 30)] and not dec.batches
+    assert dec.alone == [(0, 20)] and not dec.batches
     dec._fill()
-    assert dec.batches == [[(1, 20), (2, 25)]]
+    assert dec.batches == [[(1, 25), (2, 30)]]
 
 
 def test_one_prompt_takes_the_one_prompt_step(multi):
@@ -157,3 +157,31 @@ def test_a_failed_batch_ends_each_of_its_requests_and_the_rest_wait(multi):
     done = dec._fill()
     assert done == ss[:2] and all(s.done and isinstance(s.error, RuntimeError) for s in ss[:2])
     assert dec.filling == [ss[2]]
+
+
+def test_a_resumed_follow_up_fills_before_a_cold_long_prompt_queued_first(multi):
+    """#2276: ranked by uncached rows, a 200-token tail on a cached 20K history goes ahead of a cold 30K prompt."""
+
+    dec = decoder(multi)
+    decoding(dec)
+    cold, warm = queue(dec, [30000, 20200])
+    warm.st.pos = 20000                                           # its history resumed from a kept prompt state
+    dec._fill()
+    assert dec.batches == [[(1, 20200), (0, multi.STEP - 200)]]  # the follow-up's whole tail, then the cold one
+    assert warm.out == [7] and cold.out == []
+
+
+def test_a_passed_over_prompt_fills_after_eight_steps(multi):
+    """Shorter prompts arriving all the time hold a long one back at most FILL_GUARD steps."""
+
+    from tensorfold.cuda.streams import FILL_GUARD
+
+    dec = decoder(multi)
+    decoding(dec)
+    long = queue(dec, [5000])[0]
+    for step in range(FILL_GUARD + 1):
+        s = Stream([1] * multi.STEP, 4)                          # a new prompt as wide as a step, every step
+        s.sid, s.st, s.stops, s.vision, s.emit = 100 + step, SimpleNamespace(pos=0), [], None, lambda new: False
+        dec.filling.append(s)
+        dec._fill()
+    assert [sid for sid, _ in dec.alone] == [100 + i for i in range(FILL_GUARD)] + [long.sid]   # then it goes first
