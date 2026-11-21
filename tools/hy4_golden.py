@@ -344,7 +344,9 @@ def reference(model: str, engine_npz: str) -> None:
                          "top1_sure": round(float(agree[sure].mean()), 4), "sure_rows": int(sure.sum()),
                          "greedy_steps_equal": f"{int(greedy_ok.sum())}/{greedy_ok.numel()}",
                          "greedy_misses_sure": int((~greedy_ok & sure[p0 - 1:p0 - 1 + rows]).sum()),
-                         "kl_mean": round(float(kl.mean()), 5), "kl_max": round(float(kl.max()), 4),
+                         # 3 significant digits: a confident reply's KL sits far below 1e-5 (the tool reply's
+                         # rows lead by 9.4 logits at least, and 5 decimals printed its KL as 0.0)
+                         "kl_mean": float(f"{float(kl.mean()):.3g}"), "kl_max": float(f"{float(kl.max()):.3g}"),
                          "smallest_gap_decoded": round(float(gap[p0 - 1:p0 - 1 + rows].min()), 4)}
             print(n, json.dumps(report[n]), flush=True)
     Path(engine_npz).with_suffix(".reference.json").write_text(json.dumps(report, indent=1))
