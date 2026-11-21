@@ -32,6 +32,11 @@ TOOLS = [{"type": "function", "function": {"name": "get_weather", "description":
 
 
 def prompts(root: Path) -> dict[str, tuple[list[dict], list | None]]:
+    """The four built-in prompts, or ``HY4_GOLDEN_PROMPTS``' JSON file: {name: [messages, tools or null]}."""
+
+    own = os.environ.get("HY4_GOLDEN_PROMPTS")
+    if own:
+        return {k: (v[0], v[1]) for k, v in json.loads(Path(own).read_text()).items()}
     doc = "\n\n".join(p.read_text() for p in sorted((root / "docs" / "recipes").glob("*.md"))[:6])[:13000]
     return {
         "chat": ([{"role": "user", "content": "Explain in three sentences why the sky is blue."}], None),
