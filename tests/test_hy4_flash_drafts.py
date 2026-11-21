@@ -151,9 +151,53 @@ def test_dfly_draws_each_draft_by_the_keyed_rule_at_its_position(weights, checkp
     drafter = dfly.DFly(checkpoint, e, device="cpu")
     s = Sampling(seed=11, **kw)
     last = prefill(e, PROMPT, s)                     # a round's first propose reads the prompt's last row
-    ids = drafter.vocab if drafter.vocab is not None else torch.arange(drafter.head.shape[0])
+    ids = drafter.vocab if drafter.vocab is not None else torch.arange(weights.head.shape[0])
     flat = torch.linspace(4.0, 0.0, ids.numel())[torch.randperm(ids.numel(), generator=torch.Generator().manual_seed(0))]
-    monkeypatch.setattr(dfly.K, "head", lambda h, w: flat[None, :].to(h.device))
+    monkeypatch.setattr(drafter, "head", lambda h: flat[None, :].to(h.device))
     got = drafter.propose(e, last, s)
     want = [choose(flat.numpy().astype(np.float32), ids.numpy().astype(np.int64), e.pos + 1 + i, s) for i in range(5)]
     assert got == want and len(set(got)) > 1
+
+
+# -- the draft head -------------------------------------------------------------------------------------------------
+
+def test_nvfp4_quantizer_round_trips_within_its_grid():
+    """bf16 [N, K] -> e2m1 codes (low nibble first), e4m3 scales a 16 inputs, one fp32 global scale; decoded with the
+    loader's own NVFP4 decoder, each value is its block's nearest grid point."""
+
+    import torch
+
+    from tensorfold.families.hy4_flash.cuda.dfly import quantize_nvfp4
+    from tensorfold.families.hy4_flash.cuda.weights import _nvfp4_dense
+
+    w = (torch.randn(192, 256, generator=torch.Generator().manual_seed(0)) * 0.02).to(torch.bfloat16)
+    codes, scales, scale2 = quantize_nvfp4(w, rows=64)
+    assert codes.dtype == torch.uint8 and codes.shape == (192, 128)
+    assert scales.dtype == torch.float8_e4m3fn and scales.shape == (192, 16)
+    back = _nvfp4_dense(codes, scales.view(torch.uint8), torch.tensor(scale2))
+    err = ((back - w.float()) ** 2).sum() / (w.float() ** 2).sum()
+    assert err < 0.015                     # NVFP4 with amax scales: about 1% of the weight's energy
+    step = (scales.float() * scale2).repeat_interleave(16, -1)
+    assert bool(((back - w.float()).abs() <= step * 1.0 + 1e-8).all())       # within one grid step (6 -> 4 is 2)
+
+
+def test_dfly_reads_the_whole_vocabulary_through_an_nvfp4_head(weights, checkpoint, monkeypatch):
+    """The default draft head covers every id; TF_HY4_DRAFT_HEAD=slice keeps the A/B arm (the first ids and the
+    specials, bf16)."""
+
+    import torch
+
+    from tensorfold.families.hy4_flash.cuda.dfly import DFly
+
+    e = _engine(weights)
+    full = DFly(checkpoint, e, device="cpu")
+    assert full.vocab is None
+    h = (torch.randn(64, weights.head.shape[1], generator=torch.Generator().manual_seed(1))).to(torch.bfloat16)
+    got, want = full.head(h).float(), h.float() @ weights.head.float().t()
+    assert got.shape == want.shape
+    assert float((got.argmax(-1) == want.argmax(-1)).float().mean()) > 0.9
+    monkeypatch.setenv("TF_HY4_DRAFT_HEAD", "slice")
+    monkeypatch.setenv("TF_HY4_DRAFT_VOCAB", "128")
+    sliced = DFly(checkpoint, e, device="cpu")
+    assert sliced.vocab.numel() == 128 + weights.head.shape[0] - weights.config.bos
+    assert sliced.head(h).shape == (64, sliced.vocab.numel())

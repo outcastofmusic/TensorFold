@@ -7,7 +7,9 @@ latent cache of target sparse layer ``dfly_target_kv_layers[j]``: the keys the t
 committed row (every earlier key below 2,048 tokens), then the block's own rows, causal, which it writes into that
 cache at the block's positions (the target's verify window overwrites them). After the final norm, each of rows 1-5
 is corrected by an MLP over it and the previous token's embedding (``hidden_correction``) and read through the
-target's head, in turn. Draft i is drawn by the request's keyed sampler at position pos + 1 + i, where the verify
+target's head, in turn: by default an NVFP4 copy of all of it made at load (209 MB a read against the bf16 head's
+742 MB), ``TF_HY4_DRAFT_HEAD=slice`` the bf16 rows of the first ``TF_HY4_DRAFT_VOCAB`` ids and the specials. Draft i
+is drawn by the request's keyed sampler at position pos + 1 + i, where the verify
 window samples it (playbook 5.2): a sampled reply then accepts the drafts serial decoding would write, where greedy
 drafts matched only its argmax. This follows vLLM's ``HYV4DFlyQueryModel`` and ``build_dfly_reuse_indices``.
 """
@@ -17,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +40,42 @@ class DraftLayer:
     gate: Any
     up: Any
     down: Any
+
+
+GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)          # e2m1 magnitudes, codes 0-7 (code | 8: negative)
+
+
+def quantize_nvfp4(w: torch.Tensor, rows: int = 8192) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """bf16 [N, K] -> e2m1 codes uint8 [N, K/2] (low nibble first), e4m3 scales [N, K/16] and an fp32 global scale:
+    a block's scale from its largest value, each value its block's nearest grid point. ``rows`` at a time, so the
+    120,832-row head holds one chunk in fp32 (100 MB) at most."""
+
+    n, k = w.shape
+    amax = float(w.abs().max())
+    scale2 = amax / (448.0 * 6.0) if amax > 0 else 1.0
+    mids = torch.tensor([(a + b) / 2 for a, b in pairwise(GRID)], device=w.device)
+    codes = torch.empty((n, k // 2), dtype=torch.uint8, device=w.device)
+    scales = torch.empty((n, k // 16), dtype=torch.float8_e4m3fn, device=w.device)
+    for r0 in range(0, n, rows):
+        x = w[r0:r0 + rows].float().view(-1, k // 16, 16)
+        s = (x.abs().amax(-1) / 6.0 / scale2).to(torch.float8_e4m3fn)
+        step = s.float()[..., None] * scale2
+        y = torch.where(step > 0, x / step.clamp_min(1e-30), torch.zeros_like(x))
+        code = torch.bucketize(y.abs().clamp(max=6.0), mids).to(torch.uint8) | ((y < 0).to(torch.uint8) << 3)
+        code = code.view(-1, k)
+        codes[r0:r0 + rows] = code[:, 0::2] | (code[:, 1::2] << 4)
+        scales[r0:r0 + rows] = s
+    return codes, scales, scale2
+
+
+class HeadRows:
+    """The target's bf16 head, or a slice of its rows, on the head kernel (fp32 sums)."""
+
+    def __init__(self, w: torch.Tensor) -> None:
+        self.w = w
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return K.head(x, self.w)
 
 
 class Fp4Lin:
@@ -84,18 +123,35 @@ class DFly:
         if unused:
             raise ValueError(f"unused DFly2 tensors: {unused[:5]}")
         engine.watch |= set(self.kv_layers)
-        # drafts read a slice of the head: the first ids (byte-level BPE ids run roughly by merge frequency) and every
-        # special token; the verify window reads the whole head, so replies stay serial decoding's
-        rows = int(os.environ.get("TF_HY4_DRAFT_VOCAB", "32768"))
-        head = engine.w.head
-        if 0 < rows < head.shape[0]:
-            self.vocab = torch.cat([torch.arange(rows), torch.arange(c.bos, head.shape[0])]).to(head.device)
-            self.head = head[self.vocab].contiguous()
-        else:
-            self.vocab, self.head = None, head
+        self.vocab, self.head = self._head(engine.w.head, c, cuda)
         self.inv = (1.0 / (c.sparse.theta ** (torch.arange(0, c.sparse.rope, 2, dtype=torch.float32)
                                               / c.sparse.rope))).to(device)
         self.offsets = torch.arange(self.width, device=device)
+
+    @staticmethod
+    def _head(head: torch.Tensor, c, cuda: bool):
+        """(the token id of each draft logit or None for all of them, the draft head). The verify window reads the
+        whole bf16 head either way, so replies stay serial decoding's.
+
+        The slice cut a round's draft from 20 to 9.5 ms (5 reads of 742 MB to 5 of 201 MB) but left out 3/24 English,
+        3/38 code, 13/64 Greek and 5/20 Chinese tokens, and json's tokens a round fell from 5.20 to 3.92 (21 Nov).
+        NVFP4 reads 209 MB and keeps every id."""
+
+        mode = os.environ.get("TF_HY4_DRAFT_HEAD", "nvfp4")
+        if mode == "slice":     # the first ids (byte-level BPE ids run roughly by merge frequency) and every special
+            rows = int(os.environ.get("TF_HY4_DRAFT_VOCAB", "32768"))
+            if not 0 < rows < head.shape[0]:
+                return None, HeadRows(head)
+            vocab = torch.cat([torch.arange(rows), torch.arange(c.bos, head.shape[0])]).to(head.device)
+            return vocab, HeadRows(head[vocab].contiguous())
+        if mode != "nvfp4":
+            raise ValueError(f"TF_HY4_DRAFT_HEAD={mode!r}: nvfp4 or slice")
+        codes, scales, scale2 = quantize_nvfp4(head)
+        if cuda:
+            from tensorfold.cuda.nvfp4.linear import Fp4Linear
+
+            return None, Fp4Lin(Fp4Linear.from_checkpoint(codes, scales.view(torch.uint8), scale2))
+        return None, CpuLin(_nvfp4_dense(codes, scales.view(torch.uint8), torch.tensor(scale2)))
 
     def _load(self, t, c, cuda: bool, count: int) -> None:
         from tensorfold.cuda.nvfp4.linear import Fp4Linear, Fp8BlockLinear
@@ -182,7 +238,7 @@ class DFly:
             both = torch.cat([K.rmsnorm(h, self.hidden_norm, c.eps), K.rmsnorm(e.w.embed[prev], self.embed_norm, c.eps)],
                              -1)
             h = (h.float() + self.hc_down(_silu_mul(self.hc_gate(both), self.hc_up(both))).float()).to(torch.bfloat16)
-            logits = K.head(h, self.head)
+            logits = self.head(h)
             if greedy:                    # stays on the device: one read-back a round
                 prev = logits.argmax(-1)
                 prev = prev if self.vocab is None else self.vocab[prev]

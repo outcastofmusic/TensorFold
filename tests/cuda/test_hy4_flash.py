@@ -109,10 +109,14 @@ def test_drafted_equals_serial(weights, goldens, temperature):
     assert got.stats["accepted"] > got.stats["rounds"] and got.stats["accepted"] < got.stats["drafted"]
 
 
+@pytest.mark.parametrize("head", ["nvfp4", "slice"])
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
-def test_dfly_drafted_equals_serial(weights, goldens, temperature, tmp_path):
-    """DFly2's real rounds (random weights: few drafts land) and copies: the reply is serial decoding's."""
+def test_dfly_drafted_equals_serial(weights, goldens, temperature, head, tmp_path, monkeypatch):
+    """DFly2's real rounds (random weights: few drafts land) and copies, keyed drafts, either draft head: the reply is
+    serial decoding's."""
 
+    monkeypatch.setenv("TF_HY4_DRAFT_HEAD", head)
+    monkeypatch.setenv("TF_HY4_DRAFT_VOCAB", "128")
     from tensorfold.engine.exact_sampling import Sampling
     from tensorfold.families.hy4_flash.cuda.dfly import DFly
     from tensorfold.families.hy4_flash.cuda.model import draft_decode, prefill, serial_decode
@@ -159,3 +163,19 @@ def test_window_graphs_equal_eager(weights, goldens):
             e.rewind(width - 1)                      # keep one row a call, as a rejected draft leaves it
         out.append(torch.cat(rows))
     assert torch.equal(out[0], out[1])
+
+
+def test_nvfp4_draft_head_gives_its_dense_values(weights):
+    """The draft head on the lane matmul (Fp4Linear) against its own codes decoded to fp32: 6 rows, as a round reads."""
+
+    from tensorfold.families.hy4_flash.cuda.dfly import DFly, quantize_nvfp4
+    from tensorfold.families.hy4_flash.cuda.weights import _nvfp4_dense
+
+    vocab, head = DFly._head(weights.head, weights.config, True)
+    codes, scales, scale2 = quantize_nvfp4(weights.head)
+    dense = _nvfp4_dense(codes, scales.view(torch.uint8), torch.tensor(scale2, device="cuda"))
+    h = torch.randn(6, weights.head.shape[1], device="cuda", generator=torch.Generator("cuda").manual_seed(0))
+    h = h.to(torch.bfloat16)
+    got, want = head(h).float(), h.float() @ dense.t()
+    assert vocab is None and got.shape == want.shape
+    assert float((got - want).abs().max() / want.abs().max()) < 0.01
