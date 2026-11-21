@@ -18,7 +18,8 @@ from tensorfold.server.cancellation import RequestCancelled
 from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
 from tensorfold.server.messages import validate_modalities
 from tensorfold.server.probabilities import TokenBytes, probability_options
-from tensorfold.server.request_options import _EFFORT_ORDER, heard_effort, parse_numbers, thinking_fields
+from tensorfold.server.request_options import (_EFFORT_ORDER, heard_effort, parse_numbers, template_effort,
+                                               thinking_fields)
 from tensorfold.server.stopping import matched_stop, stop_options
 from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
@@ -376,7 +377,8 @@ class App:
         elif not isinstance(kwargs, dict):   # [], "", false and 0 included
             raise RequestError("chat_template_kwargs must be a JSON object or null")
         kwargs = dict(kwargs)
-        # reasoning_effort and enable_thinking as the Mac server reads them: the template hears an effort when thinking
+        # reasoning_effort and enable_thinking as the Mac server reads them: the template hears an effort when thinking,
+        # and with thinking off only one the request or the server named (template_effort)
         levels = getattr(self.template, "efforts", frozenset())
         fields = thinking_fields(body, levels)
         kwargs.pop("enable_thinking", None)
@@ -387,7 +389,7 @@ class App:
             # (tf-runs/bench3, 19 Oct), where its longest finished reply was 18,279 tokens
             max_tokens = min(max_tokens, getattr(self, "answer_budget", 0) or max_tokens)
         effort = heard_effort(fields.get("reasoning_effort"), getattr(self, "reasoning_effort", None), levels)
-        if thinking and effort:
+        if template_effort(effort, thinking):
             kwargs["reasoning_effort"] = effort
         budget = parse_numbers({"thinking_budget": body.get("thinking_budget")})["thinking_budget"]
         budget = int(budget or getattr(self, "thinking_budget", 0)) if chat and thinking else 0     # 0: the default

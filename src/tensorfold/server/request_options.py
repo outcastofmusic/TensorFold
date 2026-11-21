@@ -82,6 +82,14 @@ def heard_effort(explicit: str | None, default: str | None, levels: frozenset[st
     return coerce_effort(default if explicit is None else explicit, levels)
 
 
+def template_effort(effort: str | None, thinking: bool) -> str | None:
+    """The effort a template is given: the heard one while thinking. With thinking off, only an effort the request or
+    the server named, where "none" names none (upstream #3017): GLM-5.3 then writes ``Reasoning Effort: High`` in
+    place of its default Max, and a request that names nothing keeps the template's own default."""
+
+    return effort if thinking or effort != "none" else None
+
+
 def thinking_switch(value: Any) -> bool | None:
     """``chat_template_kwargs.thinking`` as a switch: a bool, or DeepSeek's ``{"type": "enabled" | "disabled"}``;
     None (the server's default) for anything else, which clients may send for their own templates."""

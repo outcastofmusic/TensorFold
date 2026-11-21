@@ -167,7 +167,9 @@ def render_prompt_ids(
         "enable_thinking": enable_thinking,
         "thinking_mode": "thinking" if enable_thinking else "chat",   # DeepSeek-V4's templates read this switch
     }
-    if enable_thinking and reasoning_effort:
+    from tensorfold.server.request_options import template_effort   # request_options imports this module
+
+    if template_effort(reasoning_effort, enable_thinking):
         kwargs["reasoning_effort"] = reasoning_effort
     if tools:
         kwargs["tools"] = tools

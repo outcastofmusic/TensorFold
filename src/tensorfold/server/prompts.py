@@ -7,6 +7,7 @@ from typing import Any
 
 from tensorfold.server.errors import CapacityError, RequestError, refusal
 from tensorfold.server.messages import _normalize_tool_call_arguments, normalize_messages
+from tensorfold.server.request_options import template_effort
 from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
 
 
@@ -91,7 +92,7 @@ def prepare_prompt(app, messages, tools, thinking, prompt, fields):
         kwargs = dict(add_generation_prompt=True, tokenize=False, enable_thinking=thinking)
         if tools:
             kwargs['tools'] = tools
-        if thinking and effort:
+        if template_effort(effort, thinking):
             kwargs['reasoning_effort'] = effort
         with app.tokenizer_lock:
             return app.tokenizer.apply_chat_template(template, **kwargs)

@@ -92,17 +92,32 @@ def rendered(engine):
     ({"reasoning_effort": "none"}, GLM, "assistant:"),
     ({}, GLM, "effort=high;assistant:<think>"),                                # server default medium, heard as high
     ({"reasoning_effort": "none"}, QWEN, "assistant:"),
-    ({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": False}}, QWEN, "assistant:"),
+    # thinking off renders the effort the request names (upstream #3017): GLM-5.3's head says High, not Max
+    ({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": False}}, QWEN, "effort=xhigh;assistant:"),
+    ({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": False}}, GLM, "effort=high;assistant:"),
+    ({"reasoning_effort": "low", "chat_template_kwargs": {"thinking": False}}, GLM, "effort=low;assistant:"),
+    ({"chat_template_kwargs": {"enable_thinking": False}}, GLM, "effort=high;assistant:"),   # the server's medium
     ({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": True}}, QWEN,
      "effort=medium;assistant:<think>"),                                      # the server's default effort
     ({}, QWEN, "effort=medium;assistant:<think>"),
     ({"reasoning_effort": None}, QWEN, "effort=medium;assistant:<think>"),
-    ({"chat_template_kwargs": {"enable_thinking": False}}, QWEN, "assistant:"),
+    ({"chat_template_kwargs": {"enable_thinking": False}}, QWEN, "effort=medium;assistant:"),
 ])
 @pytest.mark.parametrize("stream", [False, True])
 def test_the_effort_reaches_the_template_as_on_the_mac(tmp_path, fields, names, want, stream):
     engine = ChainEngine()
     status, _ = ask(app_for(tmp_path, engine, names, effort="medium"), stream, max_tokens=2, **fields)
+    assert status == 200 and rendered(engine) == want
+
+
+@pytest.mark.parametrize("fields, want", [
+    ({"chat_template_kwargs": {"enable_thinking": False}}, "assistant:"),          # none named: the template's own
+    ({"reasoning_effort": "none"}, "assistant:"),                                  # none is no effort
+    ({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": False}}, "effort=high;assistant:"),
+])
+def test_thinking_off_renders_only_a_named_effort(tmp_path, fields, want):
+    engine = ChainEngine()
+    status, _ = ask(app_for(tmp_path, engine, GLM, effort=None), max_tokens=2, **fields)
     assert status == 200 and rendered(engine) == want
 
 
