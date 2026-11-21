@@ -355,3 +355,188 @@ def _attention_cpu(qa, cache, lo, cnt, sel, tok, sinks, scale, out):
         p = (full - full.max(-1, keepdim=True).values).softmax(-1)[:, :n]
         out[r] = (p @ keys[:, :LW]).to(torch.bfloat16)
     return out
+
+
+# ------------------------------------------------------------------- row-invariant reductions (verify windows) ---
+# torch picks its reduction strategy by the tensor's shape: a 16-row window's Engram residual differed from a one-row
+# step's by 3.8e-6 (window 6, 21 Nov), enough to flip a near tie. Every reduction a decode row needs runs here, one
+# program a row, in one fixed order.
+
+@triton.jit
+def _rms(X, W, Y, x_stride, y_stride, eps, D: tl.constexpr, BLOCK: tl.constexpr, HAS_W: tl.constexpr):
+    r = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    ok = offs < D
+    x = tl.load(X + r * x_stride + offs, mask=ok, other=0.0).to(tl.float32)
+    y = x * (1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps))
+    if HAS_W:
+        y = y * tl.load(W + offs, mask=ok, other=0.0).to(tl.float32)
+    tl.store(Y + r * y_stride + offs, y, mask=ok)
+
+
+def rms(x: torch.Tensor, w: torch.Tensor | None, eps: float) -> torch.Tensor:
+    """fp32 x / rms(x) (times w) over the last dim of rows [..., D], each row in one fixed order; fp32 out."""
+
+    shape, d = x.shape, x.shape[-1]
+    if not x.is_cuda:
+        f = x.float()
+        n = f * torch.rsqrt(f.square().mean(-1, keepdim=True) + eps)
+        return n if w is None else n * w.float()
+    x2 = x.reshape(-1, d)
+    if x2.stride(-1) != 1:
+        x2 = x2.contiguous()
+    if w is not None and w.dim() == 2:                       # a weight a row group: [G, D] over rows [..., G, D]
+        y = torch.empty((x2.shape[0], d), dtype=torch.float32, device=x.device)
+        g = w.shape[0]
+        for j in range(g):                                    # G is small (16 Engram heads)
+            _rms[(x2.shape[0] // g,)](x2[j::g], w[j], y[j::g], x2.stride(0) * g, d * g, eps, D=d,
+                                      BLOCK=triton.next_power_of_2(d), HAS_W=True, num_warps=4)
+        return y.view(*shape[:-1], d)
+    y = torch.empty((x2.shape[0], d), dtype=torch.float32, device=x.device)
+    _rms[(x2.shape[0],)](x2, w if w is not None else x2, y, x2.stride(0), d, eps, D=d,
+                         BLOCK=triton.next_power_of_2(d), HAS_W=w is not None, num_warps=8 if d > 1024 else 4)
+    return y.view(*shape[:-1], d)
+
+
+@triton.jit
+def _dot(A, B, Y, a_stride, b_stride, D: tl.constexpr, BLOCK: tl.constexpr):
+    r = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    ok = offs < D
+    a = tl.load(A + r * a_stride + offs, mask=ok, other=0.0).to(tl.float32)
+    b = tl.load(B + r * b_stride + offs, mask=ok, other=0.0).to(tl.float32)
+    tl.store(Y + r, tl.sum(a * b, axis=0))
+
+
+def dot_rows(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """fp32 sum(a * b) over the last dim of rows [R, D], each row in one fixed order."""
+
+    if not a.is_cuda:
+        return (a.float() * b.float()).sum(-1)
+    a, b = (t if t.stride(-1) == 1 else t.contiguous() for t in (a, b))
+    y = torch.empty(a.shape[0], dtype=torch.float32, device=a.device)
+    d = a.shape[-1]
+    _dot[(a.shape[0],)](a, b, y, a.stride(0), b.stride(0), D=d, BLOCK=triton.next_power_of_2(d), num_warps=8)
+    return y
+
+
+@triton.jit
+def _norm_weights(W, Y, scale, K: tl.constexpr, BLOCK: tl.constexpr):
+    r = tl.program_id(0)
+    k = tl.arange(0, BLOCK)
+    w = tl.load(W + r * K + k, mask=k < K, other=0.0)
+    tl.store(Y + r * K + k, w / (tl.sum(w, axis=0) + 1e-20) * scale, mask=k < K)
+
+
+def norm_weights(w: torch.Tensor, scale: float) -> torch.Tensor:
+    """Routing weights [R, K] fp32 over their row's sum (+1e-20), times ``scale``."""
+
+    if not w.is_cuda:
+        return w / (w.sum(-1, keepdim=True) + 1e-20) * scale
+    w = w.contiguous()
+    y = torch.empty_like(w)
+    _norm_weights[(w.shape[0],)](w, y, scale, K=w.shape[1], BLOCK=triton.next_power_of_2(w.shape[1]), num_warps=1)
+    return y
+
+
+@triton.jit
+def _combine(Yp, W, OUT, K: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
+    r = tl.program_id(0)
+    d = tl.program_id(1) * BD + tl.arange(0, BD)
+    acc = tl.zeros((BD,), tl.float32)
+    for k in range(K):                                       # slots in order
+        acc += tl.load(Yp + (r * K + k) * D + d) * tl.load(W + r * K + k)
+    tl.store(OUT + r * D + d, acc.to(tl.bfloat16))
+
+
+def combine(y: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Experts' outputs y [R, K, D] fp32 weighted by w [R, K], summed over K in slot order -> bf16 [R, D]."""
+
+    rows, k, d = y.shape
+    if not y.is_cuda:
+        acc = y[:, 0] * w[:, :1]
+        for j in range(1, k):
+            acc = acc + y[:, j] * w[:, j:j + 1]
+        return acc.to(torch.bfloat16)
+    bd = min(256, triton.next_power_of_2(d))
+    if d % bd:
+        raise ValueError(f"combine: width {d} is not a multiple of {bd}")
+    out = torch.empty((rows, d), dtype=torch.bfloat16, device=y.device)
+    _combine[(rows, d // bd)](y.contiguous(), w.contiguous(), out, K=k, D=d, BD=bd, num_warps=4)
+    return out
+
+
+@triton.jit
+def _pool(TK, GIDS, PV, PG, APE, GN, TMP, OUT, eps, D: tl.constexpr, P: tl.constexpr, BN: tl.constexpr):
+    """Program g: group GIDS[g]'s P token keys pooled by softmax gates over its slots, BN channels at a time (the slot
+    softmax is a channel's own), then the key norm over all D (fp32)."""
+
+    g = tl.program_id(0)
+    gid = tl.load(GIDS + g).to(tl.int64)
+    rows = tl.arange(0, 16)
+    k = tl.arange(0, D)
+    ok = rows < P
+    m = tl.load(TK + (gid * P + rows[:, None]) * D + k[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+    for b in tl.static_range(D // BN):
+        n = b * BN + tl.arange(0, BN)
+        vals = tl.dot(m, tl.trans(tl.load(PV + n[:, None] * D + k[None, :])), input_precision="ieee")
+        gates = tl.dot(m, tl.trans(tl.load(PG + n[:, None] * D + k[None, :])), input_precision="ieee")
+        gates += tl.load(APE + rows[:, None] * D + n[None, :], mask=ok[:, None], other=0.0)
+        gates = tl.where(ok[:, None], gates, float("-inf"))
+        e = tl.exp(gates - tl.max(gates, 0)[None, :])
+        tl.store(TMP + g * D + n, tl.sum(vals * (e / tl.sum(e, 0)[None, :]), 0))
+    tl.debug_barrier()
+    pooled = tl.load(TMP + g * D + k)
+    out = pooled * (1.0 / tl.sqrt(tl.sum(pooled * pooled, 0) / D + eps)) * tl.load(GN + k)
+    tl.store(OUT + g * D + k, out.to(tl.bfloat16))
+
+
+def pool(tkeys: torch.Tensor, gids: torch.Tensor, pv: torch.Tensor, pg: torch.Tensor, ape: torch.Tensor,
+         g_norm: torch.Tensor, eps: float) -> torch.Tensor:
+    """The compressed indexer's group keys for groups ``gids`` [G] from token keys [N, D] -> bf16 [G, D]."""
+
+    pool_n, d = ape.shape
+    if not tkeys.is_cuda:
+        members = tkeys[(gids.long()[:, None] * pool_n + torch.arange(pool_n)).view(-1)].view(-1, pool_n, d).float()
+        vals = members @ pv.t()
+        gates = members @ pg.t() + ape
+        pooled = (vals * gates.softmax(dim=1)).sum(1)
+        return (g_norm * (pooled * torch.rsqrt(pooled.square().mean(-1, keepdim=True) + eps))).to(torch.bfloat16)
+    out = torch.empty((gids.shape[0], d), dtype=torch.bfloat16, device=tkeys.device)
+    tmp = torch.empty((gids.shape[0], d), dtype=torch.float32, device=tkeys.device)
+    _pool[(gids.shape[0],)](tkeys, gids, pv, pg, ape, g_norm, tmp, out, eps, D=d, P=pool_n, BN=64, num_warps=4)
+    return out
+
+
+@triton.jit
+def _scores(QI, HW, GK, CLOSED, OUT, G, H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, BG: tl.constexpr):
+    """Program (row, group block): sum over heads of w_h relu(q_h . k_g) for groups below the row's closed count."""
+
+    r = tl.program_id(0)
+    g = tl.program_id(1) * BG + tl.arange(0, BG)
+    h = tl.arange(0, HP)
+    k = tl.arange(0, D)
+    closed = tl.load(CLOSED + r)
+    q = tl.load(QI + (r * H + h[:, None]) * D + k[None, :], mask=(h < H)[:, None], other=0.0)
+    keys = tl.load(GK + g[:, None].to(tl.int64) * D + k[None, :], mask=(g < closed)[:, None], other=0.0)
+    s = tl.maximum(tl.dot(q, tl.trans(keys)), 0.0)                              # [H, BG] fp32
+    w = tl.load(HW + r * H + h, mask=h < H, other=0.0)
+    logit = tl.sum(s * w[:, None], 0)
+    tl.store(OUT + r * G + g, tl.where(g < closed, logit, float("-inf")), mask=g < G)
+
+
+def group_scores(qi: torch.Tensor, hw: torch.Tensor, gkeys: torch.Tensor, closed: torch.Tensor,
+                 groups: int) -> torch.Tensor:
+    """logits [R, groups] fp32 of queries qi [R, H, D] bf16 (head weights hw [R, H]) against group keys [>= groups, D];
+    -inf from each row's closed count on. Each (row, group) in one fixed order, whatever R and groups are."""
+
+    rows, heads, d = qi.shape
+    if not qi.is_cuda:
+        keys = gkeys[:groups].float()
+        logits = torch.einsum("rh,rhg->rg", hw, torch.relu(torch.einsum("rhd,gd->rhg", qi.float(), keys)))
+        return logits.masked_fill(torch.arange(groups)[None, :] >= closed[:, None], float("-inf"))
+    out = torch.empty((rows, groups), dtype=torch.float32, device=qi.device)
+    _scores[(rows, triton.cdiv(groups, 64))](qi.contiguous(), hw.contiguous(), gkeys, closed.to(torch.int32), out,
+                                             groups, H=heads, HP=max(16, triton.next_power_of_2(heads)), D=d,
+                                             BG=64, num_warps=4)
+    return out

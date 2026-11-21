@@ -128,15 +128,17 @@ def test_dfly_drafted_equals_serial(weights, goldens, temperature, tmp_path):
     assert got.stats["drafted"] > 0
 
 
+@pytest.mark.parametrize("start", [10, 32])
 @pytest.mark.parametrize("width", [2, 4, 8, 12, 16])
-def test_window_rows_equal_single_rows(weights, goldens, width):
-    """A verify window's rows are the bits of the same tokens decoded one row a call (playbook 5.1)."""
+def test_window_rows_equal_single_rows(weights, goldens, width, start):
+    """A verify window's rows are the bits of the same tokens decoded one row a call (playbook 5.1), below and past
+    the tiny indexer's 32-key limit."""
 
     ids = goldens["long_ids"].tolist()
     one = _engine(weights)
-    one.forward(ids[:10], prompt=True)
-    want = torch.cat([one.forward([t], prompt=False) for t in ids[10:10 + width]])
+    one.forward(ids[:start], prompt=True)
+    want = torch.cat([one.forward([t], prompt=False) for t in ids[start:start + width]])
     win = _engine(weights)
-    win.forward(ids[:10], prompt=True)
-    got = win.forward(ids[10:10 + width], prompt=False, every=True)
+    win.forward(ids[:start], prompt=True)
+    got = win.forward(ids[start:start + width], prompt=False, every=True)
     assert torch.equal(got, want), f"max diff {float((got - want).abs().max())}"

@@ -44,12 +44,6 @@ def _silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
     return (torch.nn.functional.silu(g.float()).to(torch.bfloat16).float() * u.float()).to(torch.bfloat16)
 
 
-def _rms_f32(x: torch.Tensor, w: torch.Tensor | None, eps: float) -> torch.Tensor:
-    f = x.float()
-    n = f * torch.rsqrt(f.square().mean(-1, keepdim=True) + eps)
-    return n if w is None else n * w.float()
-
-
 class Engine:
     """One stream's caches: ``forward`` commits a prompt chunk or decode rows, ``sample`` draws the next token."""
 
@@ -224,12 +218,7 @@ class Engine:
         groups = (rows + pool - 1) // pool + 1
         g0 = self.meta[0] // pool
         gids = (g0 + torch.arange(groups, device=x.device, dtype=torch.int32)).clamp(max=self.max_len // pool - 1)
-        members = self.tkeys[li][(gids.long()[:, None] * pool + torch.arange(pool, device=x.device)).view(-1)]
-        members = members.view(groups, pool, dim).float()
-        vals = members @ ix.pv.t()
-        gates = members @ ix.pg.t() + ix.ape
-        pooled = (vals * gates.softmax(dim=1)).sum(1)
-        gk = (ix.g_norm * (pooled * torch.rsqrt(pooled.square().mean(-1, keepdim=True) + c.eps))).to(torch.bfloat16)
+        gk = K.pool(self.tkeys[li], gids, ix.pv, ix.pg, ix.ape, ix.g_norm, c.eps)
         gk = torch.cat([gk[:, :dim - rope], self._rope(gk[:, dim - rope:], gids * pool, self.idx_inv)], -1)
         self.gkeys[li].index_copy_(0, gids.long(), gk)
         closed = (pos // pool).to(torch.int32)
@@ -241,7 +230,8 @@ class Engine:
         qi = ix.wq(qr, prompt).view(rows, c.index_heads, dim)
         qi = torch.cat([qi[..., :dim - rope], self._rope(qi[..., dim - rope:], pos, self.idx_inv)], -1)
         hw = ix.wh(x, prompt).float() * (c.index_heads ** -0.5 * dim ** -0.5)
-        logits = self._group_scores(li, qi, hw, closed)
+        groups = self.max_len // pool if self.graph_capturing else (self.pos + rows) // pool + 1
+        logits = K.group_scores(qi, hw, self.gkeys[li], closed, groups)
         ranked = logits.topk(min(self.group_topk, logits.shape[-1]), dim=-1)
         top = ranked.indices[:, :self.group_topk - 1].sort(-1).values.to(torch.int32)                   # [R, 511]
         if self.seen_groups is not None:
@@ -263,17 +253,6 @@ class Engine:
 
     graph_capturing = False
 
-    def _group_scores(self, li: int, qi: torch.Tensor, hw: torch.Tensor, closed: torch.Tensor) -> torch.Tensor:
-        """logits [R, G] fp32: sum over heads of w * relu(q . k_g) for closed groups g, -inf for the rest."""
-
-        n_groups = self.max_len // self.c.index_pool if self.graph_capturing else \
-            (self.pos + qi.shape[0]) // self.c.index_pool + 1
-        keys = self.gkeys[li][:n_groups].float()
-        scores = torch.relu(torch.einsum("rhd,gd->rhg", qi.float(), keys))
-        logits = torch.einsum("rh,rhg->rg", hw, scores)
-        valid = torch.arange(n_groups, device=qi.device)[None, :] < closed[:, None]
-        return logits.masked_fill(~valid, float("-inf"))
-
     def _engram(self, j: int, e: Engram, x: torch.Tensor) -> torch.Tensor:
         """The memory's residual for the streams x [R, S, D] from the rows staged in ``eg_rows[j]``."""
 
@@ -281,14 +260,13 @@ class Engine:
         rows = x.shape[0]
         heads = e.head_norms.shape[0]
         emb = self.eg_rows[j, :rows, :heads]                                        # fp32 [R, heads, dim]
-        flat = (_rms_f32(emb, e.head_norms, ENGRAM_EPS)).to(torch.bfloat16).reshape(rows, -1)
+        flat = K.rms(emb, e.head_norms, ENGRAM_EPS).to(torch.bfloat16).reshape(rows, -1)
         out = torch.empty_like(x)
-        value = e.value(flat, self.prompt)
-        main = (e.pre_gamma.float() * _rms_f32(value, None, ENGRAM_EPS))
+        main = e.pre_gamma.float() * K.rms(e.value(flat, self.prompt), None, ENGRAM_EPS)
         for s, key_proj in enumerate(e.keys):
-            key = _rms_f32(key_proj(flat, self.prompt), e.norm_key[s], ENGRAM_EPS).to(torch.bfloat16)
-            query = _rms_f32(x[:, s], e.norm_query[s], ENGRAM_EPS).to(torch.bfloat16)
-            g = ((key.float() * query.float()).sum(-1) * c.hidden ** -0.5).to(torch.bfloat16).float()
+            key = K.rms(key_proj(flat, self.prompt), e.norm_key[s], ENGRAM_EPS).to(torch.bfloat16)
+            query = K.rms(x[:, s], e.norm_query[s], ENGRAM_EPS).to(torch.bfloat16)
+            g = (K.dot_rows(key, query) * c.hidden ** -0.5).to(torch.bfloat16).float()
             g = torch.sigmoid(g.abs().clamp_min(1e-6).sqrt() * g.sign())
             out[:, s] = ((g[:, None] + e.hc_scales[s].float()) * main).to(torch.bfloat16)
         return out
@@ -314,8 +292,7 @@ class Engine:
             self.seen.setdefault(li, []).append(idx.clone())
         if self.replay is not None:
             idx = self.replay[li][self.pos:self.pos + rows].to(idx.device)
-        wts = scores.gather(1, idx)
-        wts = wts / (wts.sum(-1, keepdim=True) + 1e-20) * c.scaling
+        wts = K.norm_weights(scores.gather(1, idx), c.scaling)
         lat = m.pre(x, prompt)
         routed = self._experts(m, lat, idx, wts)
         shared = m.s_down(_silu_mul(m.s_gate(x, prompt), m.s_up(x, prompt)), prompt)
@@ -351,7 +328,7 @@ class Engine:
         nvx.gate_up(lat.contiguous(), m.experts, plan, act, rows, tile=tile)
         y = torch.empty((rows * c.top_k, c.latent), dtype=torch.float32, device=lat.device)
         nvx.down(act, m.experts, plan, y, rows, tile=tile)
-        return (y.view(rows, c.top_k, c.latent) * wts[:, :, None]).sum(1).to(torch.bfloat16)
+        return K.combine(y.view(rows, c.top_k, c.latent), wts)
 
     def _layers(self, ids: torch.Tensor, prompt: bool) -> torch.Tensor:
         """Every layer over the rows ``ids`` at positions pos..: the final-normed rows [R, D] bf16."""

@@ -17,6 +17,7 @@ def main() -> None:
     p.add_argument("--kind", default="json")
     p.add_argument("--widths", default="2,6,16")
     p.add_argument("--start", type=int, default=200, help="reply tokens decoded before the windows")
+    p.add_argument("--repeat", type=int, default=1, help="the prompt this many times (past the indexer's limit)")
     a = p.parse_args()
 
     import torch
@@ -33,7 +34,7 @@ def main() -> None:
 
     view = text_view(Path(a.model))
     tok = Tokenizer.from_file(str(view / "tokenizer.json"))
-    ids = tok.encode(EffortTemplate(ChatTemplate(view)).render([{"role": "user", "content": PROMPTS[a.kind]}],
+    ids = tok.encode(EffortTemplate(ChatTemplate(view)).render([{"role": "user", "content": PROMPTS[a.kind] * a.repeat}],
                                                                tools=None, enable_thinking=False),
                      add_special_tokens=False).ids
     e = Engine(load(a.model, "cuda"), max_len=8192)
@@ -97,7 +98,7 @@ def main() -> None:
                         first = (key, r, diff)
                     break
         logits_equal = torch.equal(got, torch.cat([lg for _, lg in rows]))
-        print(f"width {w}: logits equal {logits_equal}; first differing part "
+        print(f"{a.kind} x{a.repeat} at {len(ids) + a.start}: width {w}: logits equal {logits_equal}; first differing part "
               f"{'none' if first is None else f'{first[0][2]} of layer {first[0][0]} at row {first[1]}, max {first[2]:.6g}'}",
               flush=True)
 
