@@ -98,6 +98,7 @@ def main() -> None:
             undo = watch(name) if not graphs and i == d - 1 else None
             seen["on"] = "one" if undo else None
             logits = e.forward([t], prompt=False)
+            seen["on"] = None
             if undo:
                 undo()
         out[name] = logits[-1].float()

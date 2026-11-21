@@ -285,6 +285,8 @@ def reference(model: str, engine_npz: str) -> None:
         print(f"layer {i} done, {time.perf_counter() - t0:.0f}s, peak GPU {torch.cuda.max_memory_allocated() / 2**30:.1f}"
               f" GiB, peak RSS {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20:.1f} GiB", flush=True)
     if count < cfg.num_hidden_layers:
+        if dump is not None:
+            np.savez(Path(engine_npz).with_suffix(f".layers-{dump_name}.npz"), **dump)
         return
     with torch.device(dev):
         head = M.HYV4FlashHyperHead(cfg)
