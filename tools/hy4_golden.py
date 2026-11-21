@@ -92,6 +92,7 @@ def engine(model: str, out: str) -> None:
 
 # ------------------------------------------------------------------------------------------------ reference ---
 
+SUB_LAYER = 1                # the layer whose sublayer outputs a dump also keeps
 KEEP_FP32 = ("attn_hc.", "ffn_hc.", "sinks", "key_value_projection", "key_gate_projection", "intra_group_ape",
              "e_score_correction_bias", "hc_head.")
 
@@ -257,11 +258,26 @@ def reference(model: str, engine_npz: str) -> None:
         if missing:
             raise KeyError(f"layer {i}: not loaded {missing[:6]}")
         kind = cfg.layer_types[i]
+        hooks = []
+        current = [None]
+        if dump is not None and i == SUB_LAYER:      # the first MoE / Engram / FP8 layer's sublayer outputs
+            def keep(tag, now=current, at=i):
+                def hook(m, args, out):
+                    if now[0] == dump_name:
+                        dump[f"{tag}_{at}"] = (out[0] if isinstance(out, tuple) else out)[0].to(
+                            torch.bfloat16).view(torch.int16).cpu().numpy()
+                return hook
+            hooks = [layer.self_attn.register_forward_hook(keep("attn")), layer.mlp.register_forward_hook(keep("mlp"))]
+            if layer.engram_layer is not None:
+                hooks.append(layer.engram_layer.register_forward_hook(keep("engram")))
         with torch.no_grad():
             for n in seqs:
+                current[0] = n
                 hidden[n] = layer(hidden[n], attention_mask=masks[n][kind], position_embeddings=pes[n][kind],
                                   position_ids=pos[n], cache=None, use_cache=False, indexer_position_ids=pos[n],
                                   ngram_tokens=grams[n], engram_mask=torch.ones_like(grams[n][..., 0], dtype=torch.bool))
+        for h in hooks:
+            h.remove()
         if dump is not None:                         # each layer's streams for one sequence (``HY4_REF_DUMP``)
             dump[f"layer_{i}"] = hidden[dump_name][0].to(torch.bfloat16).view(torch.int16).cpu().numpy()
         del layer, state, experts
