@@ -106,3 +106,38 @@ def test_streams_with_top_k_off_draw_by_the_nucleus_rule():
     keyed = Sampling(4, 1.0, 20, 0.95)
     got = cs.sample_streams(logits, [0, 2, 3, 4], [[1, 2], [3], [4]], [s, keyed, s])
     assert got[0] == want[:2] and got[2] == want[3:]
+
+
+def test_device_uniform_has_the_host_bits():
+    from tensorfold.engine.exact_sampling import uniform_rows
+
+    rng = np.random.default_rng(5)
+    for seed in (0, 1, 2 ** 63 - 1, 0x9E3779B97F4A7C15, int(rng.integers(0, 2 ** 63))):
+        positions = [0, 1, 4095, 131071, int(rng.integers(0, 2 ** 31))]
+        ids = np.concatenate([np.arange(64), rng.integers(0, 2 ** 20, 64)]).astype(np.int64)
+        want = uniform_rows(seed, np.array(positions), np.broadcast_to(ids, (len(positions), len(ids))))
+        got = cs.uniform_device(seed, positions, torch.from_numpy(ids)).numpy()
+        assert np.array_equal(got, want), seed
+
+
+@pytest.mark.parametrize("gap", [None, 1e9])            # the device draw, and a gap no row clears (the host rule)
+@pytest.mark.parametrize("mapped", [False, True])
+@pytest.mark.parametrize("top_p", [1.0, 0.0])
+def test_top_p_off_draws_the_host_rule(top_p, mapped, gap, monkeypatch):
+    """top_p and min_p off: every row draws what ``choose_rows`` draws from the whole row, with or without an id map
+    (a draft head over a slice of the vocabulary)."""
+
+    if gap is not None:
+        monkeypatch.setattr(cs, "GUMBEL_GAP", gap)
+    for seed in range(10):
+        logits = _logits(seed, rows=7, vocab=5000)
+        positions = [100 + 13 * seed + r for r in range(7)]
+        s = Sampling(seed * 104729 + 11, 0.9, 0, top_p, 0.0)
+        id_map = torch.from_numpy(np.random.default_rng(seed).permutation(120000)[:5000]) if mapped else None
+        got = cs.nucleus_rows(logits, positions, s, id_map=id_map)
+        scaled = logits.float().double() / 0.9
+        assert (cs._gumbel_rows(scaled, positions, s, 0, id_map) is None) == (gap is not None)
+        ids = (id_map.numpy() if mapped else np.arange(5000)).astype(np.int64)
+        values = logits.float().numpy()
+        want = choose_rows(values, np.broadcast_to(ids, values.shape).copy(), positions, s)
+        assert got == want, seed
