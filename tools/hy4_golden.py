@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -114,14 +115,14 @@ def reference(model: str, engine_npz: str) -> None:
     cfg = HYV4FlashTextConfig(**text)
     cfg._attn_implementation = "eager"
     index = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
-    handles: dict[str, object] = {}
     dev = torch.device("cuda")
 
     def get(name: str) -> torch.Tensor:
-        f = index[name]
-        if f not in handles:
-            handles[f] = safe_open(str(root / f), "pt", device="cpu")
-        return handles[f].get_tensor(name)
+        """One tensor, its file opened for this read only: a kept handle keeps every page it touched mapped (RSS
+        grew 2 GiB a layer and took available memory beside production from 47 to 13 GiB, 21 Nov)."""
+
+        with safe_open(str(root / index[name]), "pt", device="cpu") as f:
+            return f.get_tensor(name)
 
     e2m1 = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], device=dev)
 
@@ -141,6 +142,20 @@ def reference(model: str, engine_npz: str) -> None:
             return e2m1[codes] * sc * s2.reshape(*s2.shape, 1, 1)
         return w
 
+    @torch.no_grad()
+    def fill(dst: torch.Tensor, name: str, chunk: int = 16) -> None:
+        """NVFP4 experts decoded ``chunk`` at a time straight into ``dst`` (bf16, exact): no whole-tensor temporaries."""
+
+        base = name[:-len(".weight")]
+        codes, sc, s2 = get(name), get(base + ".weight_scale"), get(base + ".weight_scale_2").float()
+        for e0 in range(0, codes.shape[0], chunk):
+            c = codes[e0:e0 + chunk].to(dev).to(torch.int32)
+            v = e2m1[torch.stack([c & 0xF, c >> 4], -1).flatten(-2)]
+            v *= sc[e0:e0 + chunk].to(dev).view(torch.float8_e4m3fn).float().repeat_interleave(16, -1)
+            v *= s2[e0:e0 + chunk].to(dev).reshape(-1, 1, 1)
+            dst[e0:e0 + chunk].copy_(v)
+            del c, v
+
     class Rows(nn.Module):                     # HYV4FlashEngramEmbedding over the table's file
         def __init__(self, head_vocab_sizes, embedding_dim):
             super().__init__()
@@ -156,6 +171,15 @@ def reference(model: str, engine_npz: str) -> None:
             return out.masked_fill(hash_ids.unsqueeze(-1) < 0, 0.0)
 
     M.HYV4FlashEngramEmbedding = Rows
+    if os.environ.get("HY4_REF_FP32_ATTN") == "1":     # the reference's attention in fp32, to size its bf16 rounding
+        eager = M.eager_attention_forward
+
+        def fp32_attention(module, query, key, value, attention_mask, scaling, dropout=0.0, **kw):
+            out, w = eager(module, query.float(), key.float(), value.float(),
+                           None if attention_mask is None else attention_mask.float(), scaling, dropout, **kw)
+            return out.to(query.dtype), w
+
+        M.eager_attention_forward = fp32_attention
     torch.set_default_dtype(torch.bfloat16)
     rotary = M.HYV4FlashRotaryEmbedding(cfg).to(dev)
     z = np.load(engine_npz)
@@ -180,7 +204,12 @@ def reference(model: str, engine_npz: str) -> None:
         grams[n] = M.HYV4FlashTextModel.build_ngram_tokens(type("C", (), {"config": cfg})(), x, None)
     del emb
     t0 = time.perf_counter()
-    for i in range(cfg.num_hidden_layers):
+    import resource
+
+    count = int(os.environ.get("HY4_REF_LAYERS", cfg.num_hidden_layers))
+    dump_name = os.environ.get("HY4_REF_DUMP", "")
+    dump: dict[str, np.ndarray] | None = {"ids": np.array(seqs[dump_name])} if dump_name else None
+    for i in range(count):
         with torch.device(dev):
             layer = M.HYV4FlashDecoderLayer(cfg, i)
         state = layer.state_dict()
@@ -192,7 +221,7 @@ def reference(model: str, engine_npz: str) -> None:
                 continue
             m = re.match(r".*\.mlp\.experts\.(gate_proj|up_proj|down_proj)\.weight$", name)
             if m:
-                experts[m.group(1)] = value(name)
+                experts[m.group(1)] = name
                 continue
             key = hf_name(name)[len(f"layers.{i}."):]
             if key not in state:
@@ -210,8 +239,10 @@ def reference(model: str, engine_npz: str) -> None:
             done.add(key)
         if experts:
             mlp = layer.mlp.experts
-            mlp.gate_up_proj.data = torch.cat([experts["gate_proj"], experts["up_proj"]], 1).to(torch.bfloat16)
-            mlp.down_proj.data = experts["down_proj"].to(torch.bfloat16)
+            width = mlp.gate_up_proj.shape[1] // 2
+            fill(mlp.gate_up_proj[:, :width], experts["gate_proj"])
+            fill(mlp.gate_up_proj[:, width:], experts["up_proj"])
+            fill(mlp.down_proj, experts["down_proj"])
             done |= {"mlp.experts.gate_up_proj", "mlp.experts.down_proj"}
         if layer.engram_layer is not None:
             e = layer.engram_layer
@@ -231,9 +262,14 @@ def reference(model: str, engine_npz: str) -> None:
                 hidden[n] = layer(hidden[n], attention_mask=masks[n][kind], position_embeddings=pes[n][kind],
                                   position_ids=pos[n], cache=None, use_cache=False, indexer_position_ids=pos[n],
                                   ngram_tokens=grams[n], engram_mask=torch.ones_like(grams[n][..., 0], dtype=torch.bool))
+        if dump is not None:                         # each layer's streams for one sequence (``HY4_REF_DUMP``)
+            dump[f"layer_{i}"] = hidden[dump_name][0].to(torch.bfloat16).view(torch.int16).cpu().numpy()
         del layer, state, experts
         torch.cuda.empty_cache()
-        print(f"layer {i} done, {time.perf_counter() - t0:.0f}s", flush=True)
+        print(f"layer {i} done, {time.perf_counter() - t0:.0f}s, peak GPU {torch.cuda.max_memory_allocated() / 2**30:.1f}"
+              f" GiB, peak RSS {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20:.1f} GiB", flush=True)
+    if count < cfg.num_hidden_layers:
+        return
     with torch.device(dev):
         head = M.HYV4FlashHyperHead(cfg)
         norm = M.HYV4FlashRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
@@ -257,7 +293,10 @@ def reference(model: str, engine_npz: str) -> None:
             kl = (lp.exp() * (lp - lq)).sum(-1)
             gen = torch.tensor(z[f"{n}_gen"].tolist(), device=dev)
             greedy_ok = (want[p0 - 1:].argmax(-1) == gen[:want.shape[0] - p0 + 1])
-            report[n] = {"tokens": len(seq), "prompt": p0,
+            at = torch.arange(len(seq), device=dev)
+            buckets = {f"top1_{lo}_{hi}": round(float(agree[(at >= lo) & (at < hi)].mean()), 4)
+                       for lo, hi in ((0, 512), (512, 2048), (2048, 1 << 30)) if bool(((at >= lo) & (at < hi)).any())}
+            report[n] = {"tokens": len(seq), "prompt": p0, **buckets,
                          "top1_all": round(float(agree.mean()), 4),
                          "top1_sure": round(float(agree[sure].mean()), 4), "sure_rows": int(sure.sum()),
                          "greedy_steps_equal": f"{int(greedy_ok.sum())}/{greedy_ok.numel()}",
@@ -266,6 +305,9 @@ def reference(model: str, engine_npz: str) -> None:
                          "smallest_gap_decoded": round(float(gap[p0 - 1:].min()), 4)}
             print(n, json.dumps(report[n]), flush=True)
     Path(engine_npz).with_suffix(".reference.json").write_text(json.dumps(report, indent=1))
+    if dump is not None:
+        dump["normed"] = norm(head(hidden[dump_name]))[0].to(torch.bfloat16).view(torch.int16).cpu().numpy()
+        np.savez(Path(engine_npz).with_suffix(f".layers-{dump_name}.npz"), **dump)
 
 
 def main() -> None:
