@@ -47,7 +47,8 @@ def main() -> None:
         return
     d = next(i for i, (x, y) in enumerate(zip(serial, drafted)) if x != y)
     at = len(ids) + d - 1                      # the row whose logits chose reply token d
-    rnd = next(r for r in trace if r["base"] <= at < r["base"] + len(r["tokens"]))
+    # the round that committed that row: a rejected window can cover it before a later round re-verifies it
+    rnd = [r for r in trace if r["base"] <= at <= r["base"] + r["accepted"]][-1]
     row = at - rnd["base"]
     print(f"first difference at reply token {d}: serial {serial[d]} drafted {drafted[d]}; verified in a "
           f"{len(rnd['tokens'])}-row window at {rnd['base']} (row {row}, copied {rnd['copied']})")
@@ -129,7 +130,8 @@ def main() -> None:
         diff = float((a - b).abs().max())
         if diff > 0:
             print(f"first difference: {key[0]} of layer {key[1]}, max {diff:.6f} of {float(a.abs().max()):.4f}")
-            break
+            if key[0] != "layer":
+                break
     else:
         print("every recorded output is equal for the row")
     for name, v in out.items():
