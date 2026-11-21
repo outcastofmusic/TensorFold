@@ -239,7 +239,8 @@ class Hy4Engine:
             stats.update(drafted=res.stats["drafted"], accepted=res.stats["accepted"])
         else:
             res = serial_decode(self.e, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=report)
-        stats.update(decode_s=round(res.seconds, 4), rounds=res.rounds, decode_tps=round(res.tokens_per_second, 2))
+        rounds = res.stats["rounds"] if drafting else res.rounds       # a drafted round commits one or more tokens
+        stats.update(decode_s=round(res.seconds, 4), rounds=rounds, decode_tps=round(res.tokens_per_second, 2))
         return stats
 
     def follow(self) -> None:
