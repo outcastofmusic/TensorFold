@@ -32,6 +32,7 @@ def main() -> None:
     p.add_argument("out")
     p.add_argument("--tokens", type=int, default=256)
     p.add_argument("--profile", action="store_true")
+    p.add_argument("--profile-decode", action="store_true", help="one eager decode row by kernel, and its host staging")
     a = p.parse_args()
 
     import torch
@@ -90,6 +91,34 @@ def main() -> None:
         report["chunk_s"] = round(time.perf_counter() - t0, 3)
         table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=25)
         report["profile"] = table
+        print(table, flush=True)
+    if a.profile_decode:
+        from torch.profiler import ProfilerActivity, profile
+
+        e.reset()
+        e.graphs = False
+        prefill(e, list(range(1000, 1600)), greedy)
+        for t in range(5):
+            e.forward([2000 + t], prompt=False)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for t in range(20):
+            e._stage_engram([3000 + t])
+        report["engram_stage_ms"] = round(1000 * (time.perf_counter() - t0) / 20, 3)
+        steps = []
+        for t in range(10):
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            e.forward([2100 + t], prompt=False)
+            torch.cuda.synchronize()
+            steps.append(time.perf_counter() - t1)
+        report["eager_step_ms"] = round(1000 * sorted(steps)[5], 2)
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            e.forward([2200], prompt=False)
+            torch.cuda.synchronize()
+        table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=30)
+        report["decode_profile"] = table
+        print(f"engram staging {report['engram_stage_ms']} ms a row, eager step {report['eager_step_ms']} ms", flush=True)
         print(table, flush=True)
     Path(a.out).write_text(json.dumps(report, indent=1))
     os.sys.stdout.flush()
