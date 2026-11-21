@@ -545,7 +545,7 @@ FIRST_COPY_ROWS = 16          # a copy's first window; it doubles while copies l
 @torch.no_grad()
 def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sampling, *, stop_eos: bool = True,
                  on_tokens: Callable[[list[int]], bool | None] | None = None, drafter=None,
-                 allow_copy: bool = True) -> DecodeResult:
+                 allow_copy: bool = True, trace: list | None = None) -> DecodeResult:
     """Drafted chains verified as one window, each token the one serial decoding gives: a copy from the context when
     one matches, else the ``drafter``'s block (DFly2), else one row. Every window row samples by the serial rule at
     its position, and rows past the first rejected draft are rewound."""
@@ -577,6 +577,8 @@ def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sa
         n = 0
         while n < len(guesses) and guesses[n] == sampled[n] and not (stop_eos and sampled[n] in eos):
             n += 1
+        if trace is not None:
+            trace.append({"base": base, "tokens": tokens, "sampled": sampled, "accepted": n, "copied": copied})
         e.rewind(len(tokens) - (n + 1))
         if drafter is not None:
             drafter.commit(e, n)
