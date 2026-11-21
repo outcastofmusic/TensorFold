@@ -100,7 +100,8 @@ class _Oracle:
         pass
 
 
-SAMPLINGS = [{"temperature": 0.0}, {"temperature": 1.0, "top_k": 20, "top_p": 0.95}, {"temperature": 0.9}]
+SAMPLINGS = [{"temperature": 0.0}, {"temperature": 1.0, "top_k": 20, "top_p": 0.95},
+             {"temperature": 0.9, "top_k": 0, "top_p": 1.0}]          # the last is run.sh's hy4 default
 
 
 @pytest.mark.parametrize("kw", SAMPLINGS, ids=["greedy", "top_k", "top_k_off"])

@@ -1,10 +1,15 @@
 """Hy4-flash speed probe in one process (no server): serial against drafted decode by text kind, and a prompt chunk's
 kernel profile.
 
-    python tools/hy4_probe.py MODEL OUT.json [--tokens 256] [--profile]
+    python tools/hy4_probe.py MODEL OUT.json [--tokens 256] [--profile] [--temperature 0.9]
+                              [--drafters nvfp4,slice,nvfp4+adaptive@0.15] [--trace TRACE.json]
 
-Each kind decodes greedily serial (one-row graph steps), then drafted (DFly2 and copies, then DFly2 alone), from the
-same prompt; the drafted tokens must equal the serial ones. ``--profile`` times one 2,048-row prompt chunk by kernel.
+Each kind decodes serial (one-row graph steps), then drafted (DFly2 and copies, DFly2 alone for each ``--drafters``
+draft head, copies alone), from the same prompt and key; the drafted tokens must equal the serial ones. A drafter is
+a draft head (``nvfp4`` or ``slice``, TF_HY4_DRAFT_HEAD), and ``+adaptive@FLOOR`` turns on confidence-head depth
+(TF_HY4_DFLY_ADAPTIVE, TF_HY4_DFLY_FLOOR). The drafted arms run in a rotated order a kind, so no arm is always the
+first to read rejected drafts' Engram rows cold (plan B9). ``--trace`` keeps every DFly2 round (its confidences and
+accepted count) for the confidence head's calibration. ``--profile`` times one 2,048-row prompt chunk by kernel.
 """
 
 from __future__ import annotations
@@ -32,6 +37,9 @@ def main() -> None:
     p.add_argument("out")
     p.add_argument("--tokens", type=int, default=256)
     p.add_argument("--profile", action="store_true")
+    p.add_argument("--temperature", type=float, default=0.0, help="the keyed sampler's temperature (seed 0, top_k off, top_p 1)")
+    p.add_argument("--drafters", default="nvfp4", help="comma-separated draft heads, each optionally +adaptive@FLOOR")
+    p.add_argument("--trace", help="write every DFly2 round's confidences and accepted drafts here")
     p.add_argument("--profile-decode", action="store_true", help="one eager decode row by kernel, and its host staging")
     a = p.parse_args()
 
@@ -50,32 +58,56 @@ def main() -> None:
     template = EffortTemplate(ChatTemplate(view))
     w = load(a.model, "cuda")
     e = Engine(w, max_len=16384)
-    dfly = DFly(Path(a.model), e)
-    greedy = Sampling(seed=0, temperature=0.0)
-    report: dict = {"tokens": a.tokens}
-    for name, text in PROMPTS.items():
+    drafters = {}
+    for spec in a.drafters.split(","):
+        head, _, rest = spec.partition("+")
+        env = {"TF_HY4_DRAFT_HEAD": head, "TF_HY4_DFLY_ADAPTIVE": "1" if rest.startswith("adaptive") else "0"}
+        if "@" in rest:
+            env["TF_HY4_DFLY_FLOOR"] = rest.split("@", 1)[1]
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            drafters[spec] = DFly(Path(a.model), e)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    first_spec = next(iter(drafters))
+    key = Sampling(seed=0, temperature=a.temperature, top_k=0, top_p=1.0)     # run.sh's hy4: top_k off, top_p 1
+    report: dict = {"tokens": a.tokens, "temperature": a.temperature, "drafters": list(drafters)}
+    traces: dict = {}
+    drafted = [("dfly+copy", {"drafter": drafters[first_spec], "allow_copy": True})]
+    drafted += [(f"dfly:{spec}", {"drafter": d, "allow_copy": False}) for spec, d in drafters.items()]
+    drafted += [("copy", {"drafter": None, "allow_copy": True})]
+    for i, (name, text) in enumerate(PROMPTS.items()):
         ids = tok.encode(template.render([{"role": "user", "content": text}], tools=None, enable_thinking=False),
                          add_special_tokens=False).ids
         row: dict = {"prompt": len(ids)}
         serial = None
-        for arm, kw in (("serial", None), ("dfly+copy", {"drafter": dfly, "allow_copy": True}),
-                        ("dfly", {"drafter": dfly, "allow_copy": False}), ("copy", {"drafter": None,
-                                                                                    "allow_copy": True})):
+        turn = i % len(drafted)
+        for arm, kw in [("serial", None), *drafted[turn:], *drafted[:turn]]:
             e.reset()
-            first = prefill(e, ids, greedy)
+            first = prefill(e, ids, key)
             if kw is None:
-                res = serial_decode(e, first, a.tokens, greedy, stop_eos=False)
+                res = serial_decode(e, first, a.tokens, key, stop_eos=False)
                 serial = res.tokens
                 row[arm] = {"tps": round(res.tokens_per_second, 2)}
             else:
-                res = draft_decode(e, ids, first, a.tokens, greedy, stop_eos=False, **kw)
+                trace: list = []
+                res = draft_decode(e, ids, first, a.tokens, key, stop_eos=False, trace=trace, **kw)
                 st = res.stats
                 row[arm] = {"tps": round(res.tokens_per_second, 2), "equal": res.tokens == serial,
                             "rounds": st["rounds"], "drafted": st["drafted"], "accepted": st["accepted"],
                             "per_round": round((st["accepted"] + st["rounds"]) / max(1, st["rounds"]), 2),
                             "draft_ms_round": round(1000 * st["draft_s"] / max(1, st["rounds"]), 2)}
+                traces[f"{name}/{arm}"] = [{"drafts": len(t["tokens"]) - 1, "accepted": t["accepted"],
+                                            "confidence": t.get("confidence")} for t in trace if not t["copied"]]
         report[name] = row
         print(name, json.dumps(row), flush=True)
+    if a.trace:
+        Path(a.trace).write_text(json.dumps(traces))
     if a.profile:
         from torch.profiler import ProfilerActivity, profile
 
@@ -97,7 +129,7 @@ def main() -> None:
 
         e.reset()
         e.graphs = False
-        prefill(e, list(range(1000, 1600)), greedy)
+        prefill(e, list(range(1000, 1600)), key)
         for t in range(5):
             e.forward([2000 + t], prompt=False)
         torch.cuda.synchronize()
