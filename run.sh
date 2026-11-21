@@ -320,9 +320,12 @@ hy4() {
     [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh hy4-flash)"
     local budget=()
     [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
+    # DFly2's draft settings (cuda/dfly.py); the defaults are window 10's measured choice (notes/tf-runs/hy4-flash-1121)
+    local drafts=(-e "TF_HY4_DRAFT_HEAD=${HY4_DRAFT_HEAD:-nvfp4}" -e "TF_HY4_DFLY_ADAPTIVE=${HY4_ADAPTIVE:-1}"
+                  -e "TF_HY4_DFLY_FLOOR=${HY4_FLOOR:-0.15}" -e "TF_HY4_DFLY_KEYED=${HY4_KEYED:-1}")
     IMAGE=$(image)
     stop_all
-    serve tensorfold-hy4 -- "$model" --host 127.0.0.1 --port "$PORT" --name hy4-flash \
+    serve tensorfold-hy4 "${drafts[@]}" -- "$model" --host 127.0.0.1 --port "$PORT" --name hy4-flash \
         --context "${CONTEXT:-131072}" --max-tokens "${CONTEXT:-131072}" --temperature 0.9 --top-p 1.0 \
         "${budget[@]}" ${EXTRA:-}
     wait_ready tensorfold-hy4 "$PORT" || failed tensorfold-hy4
