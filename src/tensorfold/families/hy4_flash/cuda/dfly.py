@@ -139,6 +139,19 @@ class DFly:
         self.inv = (1.0 / (c.sparse.theta ** (torch.arange(0, c.sparse.rope, 2, dtype=torch.float32)
                                               / c.sparse.rope))).to(device)
         self.offsets = torch.arange(self.width, device=device)
+        # TF_HY4_DFLY_GRAPH=0: the block's five layers run eagerly. Else they replay one CUDA graph, captured on the
+        # second round, which reads the round's inputs from the static buffers ``_stage`` fills
+        self.graphs = cuda and os.environ.get("TF_HY4_DFLY_GRAPH", "1") != "0"
+        self.graph = None
+        self.rounds = 0
+        if cuda:
+            width, d = c.index_topk, c.hidden
+            self.g_last = torch.zeros(1, dtype=torch.int64, device=device)
+            self.g_anchor = torch.zeros(1, dtype=torch.int64, device=device)
+            self.g_target = torch.zeros((1, d), dtype=torch.bfloat16, device=device)
+            self.g_lists = {li: (torch.zeros(1, dtype=torch.int32, device=device),
+                                 torch.zeros(width, dtype=torch.int32, device=device),
+                                 torch.zeros(1, dtype=torch.int32, device=device)) for li in self.kv_layers}
 
     @staticmethod
     def _head(head: torch.Tensor, c, cuda: bool):
@@ -225,28 +238,26 @@ class DFly:
         if anchor + self.width > e.max_len or e.normed is None:
             return []
         dev = e.device
-        ids = torch.full((self.width,), self.mask, dtype=torch.int64, device=dev)
-        ids[0] = int(last)
-        x = e.w.embed[ids]
-        target = e.normed[e.src_row:e.src_row + 1]
-        fused = self.eh_proj(torch.cat([K.rmsnorm(x[:1], self.enorm, c.eps), K.rmsnorm(target, self.hnorm, c.eps)],
-                                       -1))
-        x[0] = (x[0].float() + self.fuse_gate.float() * fused[0].float()).to(torch.bfloat16)
-        pos = anchor + self.offsets
-        hidden, residual = x, None
-        for j, layer in enumerate(self.layers):
-            if residual is not None:
-                hidden = (hidden.float() + residual.float()).to(torch.bfloat16)
-            residual = hidden
-            a = self._attention(e, j, layer.attn, K.rmsnorm(hidden, layer.input_norm, c.eps), pos, anchor)
-            hidden = (a.float() + residual.float()).to(torch.bfloat16)
-            residual = hidden
-            h = K.rmsnorm(hidden, layer.post_norm, c.eps)
-            hidden = layer.down(_silu_mul(layer.gate(h), layer.up(h)))
-        out = K.rmsnorm((hidden.float() + residual.float()).to(torch.bfloat16), self.final_norm, c.eps)
+        if self.graphs:
+            self._stage(e, last, anchor)
+            self.rounds += 1
+            if self.graph is not None:
+                self.graph[0].replay()
+                out = self.graph[1]
+            else:
+                out = self._block(e)
+                if self.rounds >= 2:          # the first round compiled every kernel; capture launches nothing
+                    torch.cuda.synchronize()
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, capture_error_mode="thread_local"):
+                        captured = self._block(e)
+                    self.graph = (g, captured)
+        else:
+            out = self._block(e, last, anchor)
+        ids = torch.full((1,), int(last), dtype=torch.int64, device=dev)
         depth = min(self.cap, self.width - 1 if self.floor is None else self.depth(out[1:]))
         greedy = sampling is None or sampling.temperature <= 0 or not self.keyed
-        prev = ids[:1]
+        prev = ids
         drafts = []
         for step in range(depth):
             h = out[step + 1:step + 2]
@@ -262,6 +273,49 @@ class DFly:
             drafts.append(prev)
         return [int(t) for t in torch.cat(drafts).tolist()]
 
+    def _stage(self, e, last: int, anchor: int) -> None:
+        """The round's inputs into the graph's static buffers: the pending token, its position, the target's normed
+        row and each watched layer's key list for that row (the target's buffers differ by verify width)."""
+
+        self.g_last.fill_(int(last))
+        self.g_anchor.fill_(int(anchor))
+        self.g_target.copy_(e.normed[e.src_row:e.src_row + 1])
+        r = e.src_row
+        for li, (sel, tok, cnt) in self.g_lists.items():
+            s, t, n = e.lists[li]
+            sel.copy_(s[r:r + 1])
+            tok.copy_(t[r, :tok.shape[0]])
+            cnt.copy_(n[r:r + 1])
+
+    def _block(self, e, last: int | None = None, anchor: int | None = None) -> torch.Tensor:
+        """The five layers over the pending token and five mask slots -> the final-normed rows [6, D]. With ``last``
+        and ``anchor`` it reads the engine's rows directly (eager); without, the static buffers (graphs)."""
+
+        from .model import _silu_mul
+
+        c = e.c
+        dev = e.device
+        staged = last is None
+        first = self.g_last if staged else torch.tensor([int(last)], dtype=torch.int64, device=dev)
+        ids = torch.where(self.offsets == 0, first, torch.full_like(self.offsets, self.mask))
+        x = e.w.embed[ids]
+        target = self.g_target if staged else e.normed[e.src_row:e.src_row + 1]
+        fused = self.eh_proj(torch.cat([K.rmsnorm(x[:1], self.enorm, c.eps), K.rmsnorm(target, self.hnorm, c.eps)],
+                                       -1))
+        x[0] = (x[0].float() + self.fuse_gate.float() * fused[0].float()).to(torch.bfloat16)
+        pos = (self.g_anchor if staged else torch.tensor([int(anchor)], dtype=torch.int64, device=dev)) + self.offsets
+        hidden, residual = x, None
+        for j, layer in enumerate(self.layers):
+            if residual is not None:
+                hidden = (hidden.float() + residual.float()).to(torch.bfloat16)
+            residual = hidden
+            a = self._attention(e, j, layer.attn, K.rmsnorm(hidden, layer.input_norm, c.eps), pos, staged)
+            hidden = (a.float() + residual.float()).to(torch.bfloat16)
+            residual = hidden
+            h = K.rmsnorm(hidden, layer.post_norm, c.eps)
+            hidden = layer.down(_silu_mul(layer.gate(h), layer.up(h)))
+        return K.rmsnorm((hidden.float() + residual.float()).to(torch.bfloat16), self.final_norm, c.eps)
+
     def depth(self, rows: torch.Tensor) -> int:
         """The drafts a round keeps from the slots' normed rows [5, D]: the leading slots whose chance of landing with
         every slot before it stays at or above the floor, at least one. One read-back of five floats."""
@@ -276,7 +330,7 @@ class DFly:
             keep += 1
         return max(1, keep)
 
-    def _attention(self, e, j: int, a: Attention, x: torch.Tensor, pos: torch.Tensor, anchor: int) -> torch.Tensor:
+    def _attention(self, e, j: int, a: Attention, x: torch.Tensor, pos: torch.Tensor, staged: bool) -> torch.Tensor:
         """The block's MLA over target layer ``kv_layers[j]``: the target's list for its last row, then the block."""
 
         c = e.c
@@ -289,12 +343,12 @@ class DFly:
         lat = torch.empty((rows, K.LW + K.RW), dtype=torch.bfloat16, device=x.device)
         lat[:, :K.LW] = K.rmsnorm(ckv[:, :c.kv_rank], a.kv_norm, c.eps)
         lat[:, K.LW:] = e._rope(ckv[:, c.kv_rank:], pos, self.inv)
-        e.latent[li][anchor:anchor + rows] = lat
+        e.latent[li].index_copy_(0, pos, lat)
         qa = torch.empty((rows, heads.heads, K.LW + K.RW), dtype=torch.bfloat16, device=x.device)
         qa[:, :, :K.LW] = K.absorb(q[:, :, :heads.nope], a.wk, torch.empty(
             (rows, heads.heads, K.LW), dtype=torch.bfloat16, device=x.device))
         qa[:, :, K.LW:] = e._rope(q[:, :, heads.nope:], pos, self.inv)
-        tok, cnt = self._lists(e, li, anchor, rows)
+        tok, cnt = self._lists(e, li, pos, rows, staged)
         o_lat = torch.empty((rows, heads.heads, K.LW), dtype=torch.bfloat16, device=x.device)
         ones = torch.ones(rows, dtype=torch.int32, device=x.device)
         K.attention(qa, e.latent[li], torch.zeros_like(ones), cnt, ones, tok, a.sinks, heads.qk ** -0.5, o_lat,
@@ -304,18 +358,22 @@ class DFly:
         out = (v.reshape(rows, -1).float() * sig).to(torch.bfloat16)
         return K.rmsnorm(a.o(out), a.post_norm, c.eps)
 
-    def _lists(self, e, li: int, anchor: int, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _lists(self, e, li: int, pos: torch.Tensor, rows: int, staged: bool) -> tuple[torch.Tensor, torch.Tensor]:
         """Each block row's keys: the target's list for its last committed row (its picked tokens past 2,048 keys,
         else every earlier position), then block rows 0 .. i. Returns (tokens [rows, 2048 + rows], counts)."""
 
-        sel, tok, cnt = e.lists[li]
-        r, width = e.src_row, e.c.index_topk
+        width = e.c.index_topk
+        if staged:
+            sel, tok, n = self.g_lists[li]
+        else:
+            s, t, c = e.lists[li]
+            r = e.src_row
+            sel, tok, n = s[r:r + 1], t[r, :width], c[r:r + 1]
         dev = tok.device
         k = torch.arange(rows, device=dev, dtype=torch.int32)
         out = torch.empty((rows, width + rows), dtype=torch.int32, device=dev)
-        out[:, :width] = torch.where(sel[r] != 0, tok[r, :width], torch.arange(width, device=dev, dtype=torch.int32))
-        n = cnt[r]
-        out[:, (n + k).long()] = (anchor + k)[None, :].expand(rows, rows)
+        out[:, :width] = torch.where(sel != 0, tok, torch.arange(width, device=dev, dtype=torch.int32))
+        out[:, (n + k).long()] = pos.to(torch.int32)[None, :].expand(rows, rows)
         return out, n + 1 + k
 
     def commit(self, e, accepted: int) -> None:

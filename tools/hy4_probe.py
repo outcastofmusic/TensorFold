@@ -8,7 +8,7 @@ Each kind decodes serial (one-row graph steps), then drafted (DFly2 and copies, 
 draft head, copies alone), from the same prompt and key; the drafted tokens must equal the serial ones. A drafter is
 a draft head (``nvfp4`` or ``slice``, TF_HY4_DRAFT_HEAD), and ``+adaptive@FLOOR`` turns on confidence-head depth
 (TF_HY4_DFLY_ADAPTIVE, TF_HY4_DFLY_FLOOR), ``+greedy`` drafts greedily under sampling (TF_HY4_DFLY_KEYED=0), and
-``+copy`` lets copies draft too, and ``+depth@N`` caps a round at N drafts (TF_HY4_DFLY_DEPTH). The drafted arms run in a rotated order a kind, so no arm is always the
+``+copy`` lets copies draft too (``+glmcopy``: by GLM's rule, TF_HY4_COPY=glm), and ``+depth@N`` caps a round at N drafts (TF_HY4_DFLY_DEPTH). The drafted arms run in a rotated order a kind, so no arm is always the
 first to read rejected drafts' Engram rows cold (plan B9). ``--trace`` keeps every DFly2 round (its confidences and
 accepted count) for the confidence head's calibration. ``--profile`` times one 2,048-row prompt chunk by kernel.
 """
@@ -84,7 +84,9 @@ def main() -> None:
     report: dict = {"tokens": a.tokens, "temperature": a.temperature, "drafters": list(drafters)}
     traces: dict = {}
     drafted = [("dfly+copy", {"drafter": drafters[first_spec], "allow_copy": True})]
-    drafted += [(f"dfly:{spec}", {"drafter": d, "allow_copy": "copy" in spec.split("+")}) for spec, d in drafters.items()]
+    drafted += [(f"dfly:{spec}", {"drafter": d, "allow_copy": bool({"copy", "glmcopy"} & set(spec.split("+"))),
+                                  "copy_rule": "glm" if "glmcopy" in spec.split("+") else "qwen"})
+                for spec, d in drafters.items()]
     drafted += [("copy", {"drafter": None, "allow_copy": True})]
     for i, (name, text) in enumerate(PROMPTS.items()):
         ids = tok.encode(template.render([{"role": "user", "content": text}], tools=None, enable_thinking=False),

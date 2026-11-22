@@ -10,6 +10,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 LW, RW = 512, 64       # the latent's normed width (values too) and its rotated width: a key is 576 wide
 CHUNK = 512            # keys a chunk program reads; a row's chunk partials merge in chunk order
@@ -643,3 +644,114 @@ def group_scores(qi: torch.Tensor, hw: torch.Tensor, gkeys: torch.Tensor, closed
                                              groups, H=heads, HP=max(16, triton.next_power_of_2(heads)), D=d,
                                              BG=64, num_warps=4)
     return out
+
+
+# ------------------------------------------------------------------------------------------- small fusions ---
+# Each replaces a chain of torch launches with one program a row block and keeps its bits: libdevice's cosf, sinf and
+# expf are the functions torch's kernels call, and every product and sum is rounded on its own (``mul_rn``,
+# ``add_rn``), as torch's separate launches round them, so no FMA contraction changes a value.
+
+@triton.jit
+def _rope(X, POS, INV, OUT, N, x_stride, H, RW: tl.constexpr, BR: tl.constexpr):
+    """Program (row block): rows n of X [N, RW] (stride x_stride) at position POS[n // H], pairs (x[2i], x[2i+1])
+    turned by bf16(cos), bf16(sin) of pos * INV[i]."""
+
+    n = tl.program_id(0) * BR + tl.arange(0, BR)
+    ok = n < N
+    i = tl.arange(0, RW // 2)
+    p = tl.load(POS + n // H, mask=ok, other=0).to(tl.float32)
+    ang = libdevice.mul_rn(p[:, None], tl.load(INV + i)[None, :])
+    c = libdevice.cos(ang).to(tl.bfloat16).to(tl.float32)
+    s = libdevice.sin(ang).to(tl.bfloat16).to(tl.float32)
+    a = tl.load(X + n[:, None] * x_stride + 2 * i[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+    b = tl.load(X + n[:, None] * x_stride + 2 * i[None, :] + 1, mask=ok[:, None], other=0.0).to(tl.float32)
+    o0 = libdevice.sub_rn(libdevice.mul_rn(a, c), libdevice.mul_rn(b, s))
+    o1 = libdevice.add_rn(libdevice.mul_rn(b, c), libdevice.mul_rn(a, s))
+    tl.store(OUT + n[:, None] * RW + 2 * i[None, :], o0.to(tl.bfloat16), mask=ok[:, None])
+    tl.store(OUT + n[:, None] * RW + 2 * i[None, :] + 1, o1.to(tl.bfloat16), mask=ok[:, None])
+
+
+def rope(x: torch.Tensor, pos: torch.Tensor, inv: torch.Tensor) -> torch.Tensor:
+    """``Engine._rope`` in one launch: x [R, ..., RW] bf16 (rows of RW evenly strided, as slices of a wider row are),
+    pos [R] int, inv fp32 [RW / 2] -> a new contiguous bf16 tensor of x's shape."""
+
+    rw = x.shape[-1]
+    heads = x[0].numel() // rw if x.shape[0] else 1
+    flat = x.reshape(-1, rw)                     # a view when the rows are evenly strided, else a copy
+    if flat.stride(-1) != 1:
+        flat = flat.contiguous()
+    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    n = flat.shape[0]
+    br = 16
+    _rope[(triton.cdiv(n, br),)](flat, pos, inv, out, n, flat.stride(0), heads, RW=rw, BR=br, num_warps=4)
+    return out
+
+
+@triton.jit
+def _silu_mul_k(G, U, OUT, N, BLOCK: tl.constexpr):
+    """bf16(bf16(silu(g)) * u): torch's silu is x / (1 + expf(-x)) in fp32."""
+
+    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ok = o < N
+    g = tl.load(G + o, mask=ok, other=0.0).to(tl.float32)
+    u = tl.load(U + o, mask=ok, other=0.0).to(tl.float32)
+    act = libdevice.div_rn(g, libdevice.add_rn(1.0, libdevice.exp(-g))).to(tl.bfloat16).to(tl.float32)
+    tl.store(OUT + o, libdevice.mul_rn(act, u).to(tl.bfloat16), mask=ok)
+
+
+def silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """``model._silu_mul`` in one launch (contiguous bf16 g and u of one shape)."""
+
+    g, u = g.contiguous(), u.contiguous()
+    out = torch.empty_like(g)
+    n = g.numel()
+    _silu_mul_k[(triton.cdiv(n, 1024),)](g, u, out, n, BLOCK=1024, num_warps=4)
+    return out
+
+
+@triton.jit
+def _gate_mul_k(V, G, OUT, N, BLOCK: tl.constexpr):
+    """bf16(v * bf16(sigmoid(gate))): torch's sigmoid is 1 / (1 + expf(-x)) in fp32."""
+
+    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ok = o < N
+    g = tl.load(G + o, mask=ok, other=0.0).to(tl.float32)
+    v = tl.load(V + o, mask=ok, other=0.0).to(tl.float32)
+    sig = libdevice.div_rn(1.0, libdevice.add_rn(1.0, libdevice.exp(-g))).to(tl.bfloat16).to(tl.float32)
+    tl.store(OUT + o, libdevice.mul_rn(v, sig).to(tl.bfloat16), mask=ok)
+
+
+def gate_mul(v: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """Gated MLA's output: v [R, ...] times bf16(sigmoid(gate [R, n])) -> [R, n] bf16, one launch."""
+
+    v, gate = v.reshape(gate.shape).contiguous(), gate.contiguous()
+    out = torch.empty_like(gate, dtype=torch.bfloat16)
+    n = gate.numel()
+    _gate_mul_k[(triton.cdiv(n, 1024),)](v, gate, out, n, BLOCK=1024, num_warps=4)
+    return out
+
+
+@triton.jit
+def _add_rmsnorm(A, B, W, Y, eps, D: tl.constexpr, BLOCK: tl.constexpr):
+    """``_rmsnorm`` of bf16(a + b) in fp32: the MoE's routed plus shared sum and its combine norm."""
+
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    ok = offs < D
+    a = tl.load(A + row * D + offs, mask=ok, other=0.0).to(tl.float32)
+    b = tl.load(B + row * D + offs, mask=ok, other=0.0).to(tl.float32)
+    x = libdevice.add_rn(a, b).to(tl.bfloat16).to(tl.float32)
+    inv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps)
+    n = (x * inv).to(tl.bfloat16).to(tl.float32)
+    w = tl.load(W + offs, mask=ok, other=0.0).to(tl.float32)
+    tl.store(Y + row * D + offs, (n * w).to(tl.bfloat16), mask=ok)
+
+
+def add_rmsnorm(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    """rmsnorm(bf16(a + b), w) for bf16 rows [R, D], one launch."""
+
+    a, b = a.contiguous(), b.contiguous()
+    d = a.shape[-1]
+    y = torch.empty_like(a)
+    _add_rmsnorm[(a.shape[0],)](a, b, w, y, eps, D=d, BLOCK=triton.next_power_of_2(d), num_warps=8)
+    return y

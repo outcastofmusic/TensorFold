@@ -298,3 +298,96 @@ def test_nvfp4_trunk_drafted_equals_serial(goldens, temperature, tmp_path, monke
     got = draft_decode(e, prompt, prefill(e, prompt, s), 40, s, stop_eos=False, drafter=drafter)
     assert got.tokens == serial
     assert got.stats["drafted"] > 0
+
+
+def test_fused_small_ops_keep_the_torch_bits(monkeypatch):
+    """RoPE, SwiGLU, the attention gate and the MoE's sum and norm in one launch each give the torch chains' bits, on
+    the shapes and value ranges decode and prompt rows give them (positions to 131,072, strided slices)."""
+
+    from tensorfold.families.hy4_flash.cuda import kernels as K
+    from tensorfold.families.hy4_flash.cuda import model
+
+    g = torch.Generator("cuda").manual_seed(7)
+
+    def rnd(*shape, scale=1.0):
+        return (torch.randn(*shape, device="cuda", generator=g) * scale).to(torch.bfloat16)
+
+    inv = (1.0 / (1e7 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))).cuda()
+    for rows in (1, 6, 2048):
+        pos = torch.randint(0, 131072, (rows,), device="cuda", generator=g, dtype=torch.int32)
+        wide = rnd(rows, 8, 256, scale=4.0)
+        for x in (wide[:, :, 192:], rnd(rows, 576)[:, 512:], rnd(rows, 64)):
+            monkeypatch.setattr(model, "FUSED", False)
+            want = model.Engine._rope(x, pos, inv)
+            monkeypatch.setattr(model, "FUSED", True)
+            assert torch.equal(model.Engine._rope(x, pos, inv), want)
+        a, b = rnd(rows, 1536, scale=6.0), rnd(rows, 1536, scale=2.0)
+        monkeypatch.setattr(model, "FUSED", False)
+        want = model._silu_mul(a, b)
+        monkeypatch.setattr(model, "FUSED", True)
+        assert torch.equal(model._silu_mul(a, b), want)
+        v, gate = rnd(rows, 32, 256), rnd(rows, 8192, scale=5.0)
+        sig = torch.sigmoid(gate.float()).to(torch.bfloat16).float()
+        assert torch.equal(K.gate_mul(v, gate), (v.reshape(rows, -1).float() * sig).to(torch.bfloat16))
+        r, s, w = rnd(rows, 3072), rnd(rows, 3072), rnd(3072) + 1
+        want = K.rmsnorm((r.float() + s.float()).to(torch.bfloat16), w, 1e-5)
+        assert torch.equal(K.add_rmsnorm(r, s, w, 1e-5), want)
+
+
+def test_fused_engine_gives_the_unfused_logits(weights, goldens, monkeypatch):
+    """The whole engine with and without the fusions: prompt and decode logits bit for bit."""
+
+    from tensorfold.families.hy4_flash.cuda import model
+
+    ids = goldens["long_ids"].tolist()[:40]
+    out = []
+    for fused in (False, True):
+        monkeypatch.setattr(model, "FUSED", fused)
+        e = _engine(weights)
+        rows = [e.forward(ids[:32], prompt=True, every=True)]
+        rows += [e.forward(ids[32:38], prompt=False, every=True), e.forward(ids[38:39], prompt=False)]
+        out.append(torch.cat([r.float() for r in rows]))
+    assert torch.equal(out[0], out[1])
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_dfly_graph_drafts_the_eager_tokens(weights, goldens, temperature, tmp_path, monkeypatch):
+    """DFly2's block replayed as a CUDA graph (``TF_HY4_DFLY_GRAPH``) proposes the eager block's drafts, round by
+    round, while the target's verify widths (and their key lists) change under it."""
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.hy4_flash.cuda.dfly import DFly
+    from tensorfold.families.hy4_flash.cuda.model import draft_decode, prefill
+
+    prompt = goldens["long_ids"].tolist()[:20]
+    s = Sampling(seed=5, temperature=temperature)
+    ckpt = tiny.write(tmp_path / "t")
+    rounds = []
+    for graph in ("0", "1"):
+        monkeypatch.setenv("TF_HY4_DFLY_GRAPH", graph)
+        e = _engine(weights, graphs=True)
+        drafter = DFly(ckpt, e)
+        trace: list = []
+        got = draft_decode(e, prompt, prefill(e, prompt, s), 48, s, stop_eos=False, drafter=drafter,
+                           allow_copy=False, trace=trace)
+        rounds.append((got.tokens, [t["tokens"] for t in trace]))
+        assert (drafter.graph is not None) == (graph == "1")
+    assert rounds[0] == rounds[1]
+
+
+@pytest.mark.parametrize("rule", ["qwen", "glm"])
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_copy_rules_give_serial_replies(weights, temperature, rule):
+    """Copies by either rule (``copy_rule``; glm: a 7-row first window and the 8-token back gate) on a prompt that
+    repeats itself: the reply is serial decoding's."""
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.hy4_flash.cuda.model import draft_decode, prefill, serial_decode
+
+    prompt = (list(range(10, 40)) * 2)[:56]
+    s = Sampling(seed=4, temperature=temperature)
+    e = _engine(weights, graphs=True, max_len=192)
+    serial = serial_decode(e, prefill(e, prompt, s), 48, s, stop_eos=False).tokens
+    e = _engine(weights, graphs=True, max_len=192)
+    got = draft_decode(e, prompt, prefill(e, prompt, s), 48, s, stop_eos=False, copy_rule=rule)
+    assert got.tokens == serial

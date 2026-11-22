@@ -36,11 +36,16 @@ PREFILL_ROWS = 2048
 # Tencent's llama.cpp patch spells out. bf16's 2^-7 sat above the streams' mean square (0.002 at layer 1), shrank the
 # query norm, divided the gate logits by about 3 and put layer 1's streams 69% (mean) off transformers' (21 Nov)
 ENGRAM_EPS = float(os.environ.get("TF_HY4_ENGRAM_EPS", str(torch.finfo(torch.float32).eps)))
+# one launch each for RoPE, SwiGLU, the attention gate and the MoE's sum and norm (``kernels`` "small fusions"), the
+# same bits as the torch chains they replace; TF_HY4_FUSED=0 keeps the chains (A/B)
+FUSED = flag("TF_HY4_FUSED", True)
 
 
 def _silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
     """bf16(bf16(silu(g)) * u), transformers' SwiGLU on bf16 tensors."""
 
+    if FUSED and g.is_cuda:
+        return K.silu_mul(g, u)
     return (torch.nn.functional.silu(g.float()).to(torch.bfloat16).float() * u.float()).to(torch.bfloat16)
 
 
@@ -163,6 +168,8 @@ class Engine:
     def _rope(x: torch.Tensor, pos: torch.Tensor, inv: torch.Tensor) -> torch.Tensor:
         """Interleaved pairs (x[2i], x[2i+1]) turned by pos * inv[i], with transformers' bf16 cos and sin."""
 
+        if FUSED and x.is_cuda:
+            return K.rope(x, pos, inv)
         ang = pos.float()[:, None] * inv[None, :]
         cos, sin = ang.cos().to(torch.bfloat16).float(), ang.sin().to(torch.bfloat16).float()
         shape = [cos.shape[0]] + [1] * (x.dim() - 2) + [cos.shape[1]]
@@ -195,8 +202,11 @@ class Engine:
         o_lat = torch.empty((rows, heads.heads, K.LW), dtype=torch.bfloat16, device=x.device)
         K.attention(qa, self.latent[li], lo, cnt, sel, tok, a.sinks, heads.qk ** -0.5, o_lat, self.scratch)
         v = K.expand(o_lat, a.wv, torch.empty((rows, heads.heads, heads.v), dtype=torch.bfloat16, device=x.device))
-        sig = torch.sigmoid(gate.float()).to(torch.bfloat16).float()
-        out = (v.reshape(rows, -1).float() * sig).to(torch.bfloat16)
+        if FUSED and x.is_cuda:
+            out = K.gate_mul(v, gate)
+        else:
+            sig = torch.sigmoid(gate.float()).to(torch.bfloat16).float()
+            out = (v.reshape(rows, -1).float() * sig).to(torch.bfloat16)
         return K.rmsnorm(a.o(out, prompt), a.post_norm, c.eps)
 
     def _keys(self, li: int, a: Attention, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, prompt: bool):
@@ -307,6 +317,8 @@ class Engine:
         lat = m.pre(x, prompt)
         routed = self._experts(m, lat, idx, wts)
         shared = m.s_down(_silu_mul(m.s_gate(x, prompt), m.s_up(x, prompt)), prompt)
+        if FUSED and x.is_cuda:
+            return K.add_rmsnorm(m.post(routed, prompt), shared, m.combine_norm, c.eps)
         h = (m.post(routed, prompt).float() + shared.float()).to(torch.bfloat16)
         return K.rmsnorm(h, m.combine_norm, c.eps)
 
@@ -584,12 +596,16 @@ def serial_decode(e: Engine, pending: int, count: int, sampling, *, stop_eos: bo
 
 
 FIRST_COPY_ROWS = 16          # a copy's first window; it doubles while copies land whole, up to DECODE_ROWS
+# TF_HY4_COPY=glm (or ``copy_rule="glm"``): GLM's copy rule (qwen4_exp ``copy_drafts``), the earlier copy whose
+# match runs furthest back, only where it runs TF_HY4_COPY_BACK (8) tokens before the 8 it matches, from a
+# TF_HY4_COPY_FIRST-row (7) window that doubles while copies land whole. Unset: the qwen3_5 rule, a 16-row first
+# window and no back gate
 
 
 @torch.no_grad()
 def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sampling, *, stop_eos: bool = True,
                  on_tokens: Callable[[list[int]], bool | None] | None = None, drafter=None,
-                 allow_copy: bool = True, trace: list | None = None) -> DecodeResult:
+                 allow_copy: bool = True, trace: list | None = None, copy_rule: str | None = None) -> DecodeResult:
     """Drafted chains verified as one window, each token the one serial decoding gives: a copy from the context when
     one matches, else the ``drafter``'s block (DFly2), else one row. Every window row samples by the serial rule at
     its position, and rows past the first rejected draft are rewound."""
@@ -600,7 +616,14 @@ def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sa
     out = [int(pending)]
     ctx = list(context) + out
     eos = set(e.c.eos)
-    copies = CopyIndex() if allow_copy else None
+    glm = allow_copy and (copy_rule or os.environ.get("TF_HY4_COPY", "qwen")) == "glm"
+    if glm:
+        from tensorfold.families.qwen4_exp.cuda import copy_drafts
+
+        copies = copy_drafts.CopyIndex(ctx, rows=int(os.environ.get("TF_HY4_COPY_FIRST", "7")), most=DECODE_ROWS,
+                                       min_back=int(os.environ.get("TF_HY4_COPY_BACK", "8")))
+    else:
+        copies = CopyIndex() if allow_copy else None
     rows = FIRST_COPY_ROWS
     stats = {"rounds": 0, "drafted": 0, "accepted": 0, "copy": 0, "draft_s": 0.0}
     _sync(e)
@@ -608,7 +631,10 @@ def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sa
     while len(out) < count and not (stop_eos and out[-1] in eos):
         t0 = time.perf_counter()
         room = min(count - len(out) - 1, DECODE_ROWS - 1)
-        guesses = copies.propose(ctx, min(rows, DECODE_ROWS) - 1)[:room] if copies is not None else []
+        if glm:
+            guesses = copies.chain(room) if room > 0 else []
+        else:
+            guesses = copies.propose(ctx, min(rows, DECODE_ROWS) - 1)[:room] if copies is not None else []
         copied = bool(guesses)
         if not guesses and drafter is not None and room > 0:
             guesses = drafter.propose(e, out[-1], sampling)[:room]
@@ -630,8 +656,13 @@ def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sa
         out.extend(new)
         ctx.extend(new)
         if copied:
-            rows = next_copy_rows(rows, n == len(guesses), FIRST_COPY_ROWS, DECODE_ROWS)
+            if glm:
+                copies.verified(len(guesses), n)
+            else:
+                rows = next_copy_rows(rows, n == len(guesses), FIRST_COPY_ROWS, DECODE_ROWS)
             stats["copy"] += 1
+        if glm:
+            copies.extend(new)
         stats["rounds"] += 1
         stats["drafted"] += len(guesses)
         stats["accepted"] += n
