@@ -391,3 +391,32 @@ def test_copy_rules_give_serial_replies(weights, temperature, rule):
     e = _engine(weights, graphs=True, max_len=192)
     got = draft_decode(e, prompt, prefill(e, prompt, s), 48, s, stop_eos=False, copy_rule=rule)
     assert got.tokens == serial
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_constrained_drafted_replies_equal_serial(weights, temperature, tmp_path):
+    """response_format on the GPU: DFly2 rounds and copies under a JSON schema give the serial constrained reply, and
+    every token is the grammar's (tests/test_hy4_response_format.py has the toy vocabulary)."""
+
+    from tests.test_hy4_response_format import _spec
+
+    xgr = pytest.importorskip("xgrammar")
+    from tensorfold.engine import grammar
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.hy4_flash.cuda.dfly import DFly
+    from tensorfold.families.hy4_flash.cuda.model import draft_decode, prefill, serial_decode
+
+    vocab = ["\x00", "</s>"] + [chr(t) for t in range(2, tiny.V)]
+    g = grammar.Grammars(xgr.TokenizerInfo(vocab, xgr.VocabType.RAW, vocab_size=tiny.V, stop_token_ids=[1]))
+    prompt = [(t % 60) + 40 for t in range(24)]
+    s = Sampling(seed=9, temperature=temperature)
+    e = _engine(weights, graphs=True, max_len=128)
+    c = g.constraint(g.compile(_spec("json_schema")))
+    serial = serial_decode(e, prefill(e, prompt, s, constraint=c), 40, s, constraint=c).tokens
+    e = _engine(weights, graphs=True, max_len=128)
+    c = g.constraint(g.compile(_spec("json_schema")))
+    drafter = DFly(tiny.write(tmp_path / "t"), e)
+    got = draft_decode(e, prompt, prefill(e, prompt, s, constraint=c), 40, s, drafter=drafter, constraint=c)
+    assert got.tokens == serial
+    m = xgr.GrammarMatcher(g.compile(_spec("json_schema")))
+    assert all(m.accept_token(t) for t in serial)

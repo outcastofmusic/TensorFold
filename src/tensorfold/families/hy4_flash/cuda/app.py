@@ -229,8 +229,9 @@ class Hy4Engine:
         return self.max_len
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens: Callable[[list[int]], bool | None],
-                 draft: bool = True, stop_eos: bool = True) -> dict[str, Any]:
+                 draft: bool = True, stop_eos: bool = True, constraint=None) -> dict[str, Any]:
         """Prefill, then one-row decode steps until an end token, ``max_tokens`` or ``on_tokens``' True.
+        ``constraint``: the request's ``response_format`` grammar, which masks every sampled row.
 
         A request resumes from the longest kept prefix of its prompt and keeps states at its message starts and
         its end; ``draft: false``, the reference, prefills afresh and keeps nothing."""
@@ -257,7 +258,8 @@ class Hy4Engine:
 
         t0 = time.perf_counter()
         pending = prefill(self.e, prompt, sampling, resume=hit.state if hit is not None else None,
-                          keeps=keep_points(prompt, begin, self.marks) if reuse else (), keep=keep)
+                          keeps=keep_points(prompt, begin, self.marks) if reuse else (), keep=keep,
+                          constraint=constraint)
         prefill_s = time.perf_counter() - t0
         drafting = bool(draft) and self.drafts
         stats: dict[str, Any] = {"prefill_s": round(prefill_s, 4), "cached": begin, "drafts": drafting,
@@ -266,10 +268,12 @@ class Hy4Engine:
             return stats
         if drafting:
             res = draft_decode(self.e, prompt, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=report,
-                               drafter=self.drafter, allow_copy=os.environ.get("TF_HY4_COPIES", "1") != "0")
+                               drafter=self.drafter, allow_copy=os.environ.get("TF_HY4_COPIES", "1") != "0",
+                               constraint=constraint)
             stats.update(drafted=res.stats["drafted"], accepted=res.stats["accepted"])
         else:
-            res = serial_decode(self.e, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=report)
+            res = serial_decode(self.e, pending, max_tokens, sampling, stop_eos=stop_eos, on_tokens=report,
+                                constraint=constraint)
         rounds = res.stats["rounds"] if drafting else res.rounds       # a drafted round commits one or more tokens
         stats.update(decode_s=round(res.seconds, 4), rounds=rounds, decode_tps=round(res.tokens_per_second, 2))
         return stats

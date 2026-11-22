@@ -540,8 +540,9 @@ def _sync(e: Engine) -> None:
 
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling, *, resume: dict | None = None,
-            keeps: Sequence[int] = (), keep: Callable[[int, dict], None] | None = None) -> int:
-    """Commit the prompt in chunks and return its first sampled token (position len(prompt)).
+            keeps: Sequence[int] = (), keep: Callable[[int, dict], None] | None = None, constraint=None) -> int:
+    """Commit the prompt in chunks and return its first sampled token (position len(prompt)); ``constraint`` (a
+    request's grammar, ``tensorfold.engine.grammar.Constraint``) masks that token's row and follows it.
 
     ``resume`` (an ``Engine.state`` of a strict prefix) starts at its length; ``keep(n, state)`` gets the state after
     each of ``keeps``, which cut the chunks there."""
@@ -570,7 +571,11 @@ def prefill(e: Engine, prompt: Sequence[int], sampling, *, resume: dict | None =
             s += len(chunk)
         if keep is not None and stop < len(prompt):
             keep(stop, e.state(stop))
+    if constraint is not None:
+        constraint.mask(logits)
     pending = e.sample(logits)
+    if constraint is not None:
+        constraint.advance([pending])
     if keep is not None and len(prompt) in keeps:
         keep(len(prompt), e.state(len(prompt)))
     return pending
@@ -578,8 +583,9 @@ def prefill(e: Engine, prompt: Sequence[int], sampling, *, resume: dict | None =
 
 @torch.no_grad()
 def serial_decode(e: Engine, pending: int, count: int, sampling, *, stop_eos: bool = True,
-                  on_tokens: Callable[[list[int]], bool | None] | None = None) -> DecodeResult:
-    """``count`` tokens (the first is ``pending``), one row a step; stops after an end token or ``on_tokens``' True."""
+                  on_tokens: Callable[[list[int]], bool | None] | None = None, constraint=None) -> DecodeResult:
+    """``count`` tokens (the first is ``pending``), one row a step; stops after an end token or ``on_tokens``' True.
+    ``constraint`` masks each step's row by the request's grammar and follows the chosen token."""
 
     e.set_sampling(sampling)
     out = [int(pending)]
@@ -587,7 +593,12 @@ def serial_decode(e: Engine, pending: int, count: int, sampling, *, stop_eos: bo
     _sync(e)
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in eos):
-        tok = e.sample(e.forward([out[-1]], prompt=False))
+        logits = e.forward([out[-1]], prompt=False)
+        if constraint is not None:
+            constraint.mask(logits)
+        tok = e.sample(logits)
+        if constraint is not None:
+            constraint.advance([tok])
         out.append(tok)
         if on_tokens is not None and on_tokens([tok]):
             break
@@ -605,10 +616,12 @@ FIRST_COPY_ROWS = 16          # a copy's first window; it doubles while copies l
 @torch.no_grad()
 def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sampling, *, stop_eos: bool = True,
                  on_tokens: Callable[[list[int]], bool | None] | None = None, drafter=None,
-                 allow_copy: bool = True, trace: list | None = None, copy_rule: str | None = None) -> DecodeResult:
+                 allow_copy: bool = True, trace: list | None = None, copy_rule: str | None = None,
+                 constraint=None) -> DecodeResult:
     """Drafted chains verified as one window, each token the one serial decoding gives: a copy from the context when
     one matches, else the ``drafter``'s block (DFly2), else one row. Every window row samples by the serial rule at
-    its position, and rows past the first rejected draft are rewound."""
+    its position, and rows past the first rejected draft are rewound. ``constraint`` (the request's grammar) drops
+    drafts no grammar path keeps and masks each row by its path, as serial steps mask theirs."""
 
     from tensorfold.families.qwen3_5.cuda.decode import CopyIndex, next_copy_rows
 
@@ -640,8 +653,15 @@ def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sa
             guesses = drafter.propose(e, out[-1], sampling)[:room]
         stats["draft_s"] += time.perf_counter() - t0
         tokens = [out[-1]] + guesses
+        window = None
+        if constraint is not None:
+            window = constraint.window(tokens, list(range(-1, len(tokens) - 1)))
+            tokens = list(window.tokens)
+            guesses = tokens[1:]
         base = e.pos
         logits = e.forward(tokens, prompt=False, every=True)
+        if window is not None:
+            constraint.mask(logits, window)
         sampled = keyed_rows(logits, [base + 1 + i for i in range(len(tokens))], sampling)
         n = 0
         while n < len(guesses) and guesses[n] == sampled[n] and not (stop_eos and sampled[n] in eos):
@@ -653,6 +673,8 @@ def draft_decode(e: Engine, context: Sequence[int], pending: int, count: int, sa
         if drafter is not None:
             drafter.commit(e, n)
         new = guesses[:n] + [sampled[n]]
+        if constraint is not None:
+            constraint.advance(new)
         out.extend(new)
         ctx.extend(new)
         if copied:
