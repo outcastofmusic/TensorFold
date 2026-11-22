@@ -18,6 +18,7 @@ import os
 import struct
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 from typing import ClassVar
 
@@ -30,6 +31,17 @@ from tensorfold.families.qwen4_exp.ssd_table import _fill, _no_cache, _release
 WORKERS = 64
 
 MAX_READ = 1 << 20            # bytes one read of adjacent rows may cover
+# a gather of this many distinct rows or more reads on native threads (``rowread.cpp``) with the GIL released; fewer
+# (a decode call's 16 rows a table) stay on the Python pool. TF_HY4_NATIVE_READS=0: always the Python pool
+NATIVE_ROWS = 512
+
+
+@lru_cache(maxsize=1)
+def _native():
+    from torch.utils import cpp_extension
+
+    return cpp_extension.load(name="tensorfold_hy4_rowread_v1", sources=[str(Path(__file__).with_name("rowread.cpp"))],
+                              extra_cflags=["-O2"], verbose=False)
 
 
 def multipliers(seed: int, layer_id: int, compressed_vocab: int, ngram: int) -> np.ndarray:
@@ -148,6 +160,9 @@ class RowReader:
             raise ValueError(f"Engram rows must lie in [0, {self.rows})")
         unique, inverse = np.unique(flat, return_inverse=True)
         codes = np.empty((unique.size, self.wrow), dtype=np.uint8)
+        if unique.size >= NATIVE_ROWS and os.environ.get("TF_HY4_NATIVE_READS", "1") != "0":
+            self._native_reads(self.w0 + unique * self.wrow, self.wrow, codes)
+            return codes[inverse], None if self.scales is None else self.scales[flat]
         reads = self._reads(self.w0 + unique * self.wrow, self.wrow, codes)
         batches = min(WORKERS, len(reads))
         if batches > 1:
@@ -160,6 +175,22 @@ class RowReader:
         """Host bytes held: the row scales."""
 
         return 0 if self.scales is None else self.scales.nbytes
+
+    def _native_reads(self, offsets: np.ndarray, width: int, out: np.ndarray) -> None:
+        """``_reads``' coalesced spans, read by ``rowread.cpp`` on WORKERS native threads."""
+
+        import torch
+
+        n = offsets.size
+        cut = np.ones(n, dtype=bool)
+        cut[1:] = offsets[1:] != offsets[:-1] + width
+        first = np.flatnonzero(cut)
+        cut |= (np.arange(n) - first[np.cumsum(cut) - 1]) % max(1, MAX_READ // width) == 0
+        first = np.flatnonzero(cut)
+        count = np.diff(first, append=n)
+        _native().gather(self._fds[0], torch.from_numpy(offsets[first].astype(np.int64)),
+                         torch.from_numpy((count * width).astype(np.int64)),
+                         torch.from_numpy((first * width).astype(np.int64)), torch.from_numpy(out.reshape(-1)), WORKERS)
 
     def _reads(self, offsets: np.ndarray, width: int, out: np.ndarray) -> list[tuple]:
         n = offsets.size

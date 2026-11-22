@@ -440,3 +440,19 @@ def test_side_stream_shared_expert_keeps_the_bits(weights, goldens, monkeypatch)
             rows += [e.forward(ids[34:38], prompt=False, every=True)]
             out.append(torch.cat([r.float() for r in rows]))
     assert all(torch.equal(out[0], o) for o in out[1:])
+
+
+def test_lazy_engram_staging_keeps_the_logits(weights, goldens, monkeypatch):
+    """A prompt chunk that awaits each Engram table before its layer (TF_HY4_LAZY_ENGRAM) gives the logits of one that
+    reads all four first, with and without the next chunk's prefetch."""
+
+    from tensorfold.families.hy4_flash.cuda import model
+
+    ids = goldens["long_ids"].tolist()[:48]
+    out = []
+    for lazy in (False, True):
+        monkeypatch.setattr(model, "LAZY_ENGRAM", lazy)
+        e = _engine(weights, prefill_rows=16)
+        s = model.prefill(e, ids, None)
+        out.append((s, e.forward([s], prompt=False).float()))
+    assert out[0][0] == out[1][0] and torch.equal(out[0][1], out[1][1])

@@ -39,6 +39,9 @@ ENGRAM_EPS = float(os.environ.get("TF_HY4_ENGRAM_EPS", str(torch.finfo(torch.flo
 # one launch each for RoPE, SwiGLU, the attention gate and the MoE's sum and norm (``kernels`` "small fusions"), the
 # same bits as the torch chains they replace; TF_HY4_FUSED=0 keeps the chains (A/B)
 FUSED = flag("TF_HY4_FUSED", True)
+# a prompt chunk without a prefetch (the first, or one after a kept state) starts its layers once table 1's rows are
+# in and reads tables 2-4 under layers 1-30; TF_HY4_LAZY_ENGRAM=0 reads all four before the chunk
+LAZY_ENGRAM = flag("TF_HY4_LAZY_ENGRAM", True)
 # TF_HY4_SIDE=1: a decode call's shared expert runs on a side stream beside the routed experts (fork and join inside
 # the graph), the same kernels on the same inputs, so the same bits (Bolt's shared_stream, AngelSlim's MOE_CONCURRENT)
 SIDE = flag("TF_HY4_SIDE", False)
@@ -91,6 +94,7 @@ class Engine:
         self._readers = ThreadPoolExecutor(len(c.engram_layers) or 1, thread_name_prefix="engram-layer")
         self._ahead_pool = ThreadPoolExecutor(1, thread_name_prefix="engram-ahead")
         self._ahead: tuple | None = None
+        self._pending: list | None = None      # a prompt chunk's table reads, each awaited before its layer
         # one graph a decode width, captured at its first use. Each keeps the normed rows and watched lists it writes,
         # which a drafter reads after it replays. A shared pool lets one width's temporaries sit in another's kept
         # rows, and widths replay in any order, so each gets its own unless TF_HY4_GRAPH_POOL=shared.
@@ -277,6 +281,7 @@ class Engine:
         return self.graph_capturing or self.pos + rows - 1 >= self.c.index_topk
 
     graph_capturing = False
+    prompt_call = False
 
     def _engram(self, j: int, e: Engram, x: torch.Tensor) -> torch.Tensor:
         """The memory's residual for the streams x [R, S, D] from the rows staged in ``eg_rows[j]``."""
@@ -284,6 +289,9 @@ class Engine:
         c = self.c
         rows = x.shape[0]
         heads = e.head_norms.shape[0]
+        if self._pending is not None:             # this chunk's table j, read while the layers before it ran
+            part = self._pending[j].result()
+            self.eg_rows[j, :rows, :part.shape[1]].copy_(part.to(self.device), non_blocking=False)
         emb = self.eg_rows[j, :rows, :heads]                                        # fp32 [R, heads, dim]
         flat = K.rms(emb, e.head_norms, ENGRAM_EPS).to(torch.bfloat16).reshape(rows, -1)
         out = torch.empty_like(x)
@@ -405,12 +413,16 @@ class Engine:
     def _read_engram(self, tokens: Sequence[int], pos: int, previous: Sequence[int]) -> list[torch.Tensor]:
         """A call's Engram rows, every layer's table read at once: fp32 [R, heads, dim] a layer, on the host."""
 
+        return [j.result() for j in self._submit_engram(tokens, pos, previous)]
+
+    def _submit_engram(self, tokens: Sequence[int], pos: int, previous: Sequence[int]) -> list:
+        """``_read_engram``'s reads started, a future a table."""
+
         c = self.c
         grams = ngram_tokens(np.asarray(tokens), pos, np.asarray(previous[-(c.engram_ngram - 1):]), c.engram_ngram,
                              c.pad)
         layers = [self.w.layers[li].engram for li in c.engram_layers if li < len(self.w.layers)]
-        jobs = [self._readers.submit(gather_engram, e.table, e.hasher.rows_of(grams), c.engram_dim) for e in layers]
-        return [j.result() for j in jobs]
+        return [self._readers.submit(gather_engram, e.table, e.hasher.rows_of(grams), c.engram_dim) for e in layers]
 
     def prefetch(self, tokens: Sequence[int], pos: int, previous: Sequence[int]) -> None:
         """Start reading the Engram rows of a later call (the next prompt chunk) while this one computes."""
@@ -423,12 +435,16 @@ class Engine:
         """Copy the call's Engram rows into ``eg_rows`` (before a graph replays): prefetched when ``prefetch`` read
         them, else read now."""
 
+        self._pending = None
         if self.eg_rows is None:
             return
         ahead = self._ahead
         if ahead is not None and ahead[0] == self.pos and ahead[1] == tuple(int(t) for t in tokens):
             self._ahead = None
             got = ahead[2].result()
+        elif self.prompt_call and LAZY_ENGRAM:   # a prompt chunk waits for a table only before its layer
+            self._pending = self._submit_engram(tokens, self.pos, self.ids)
+            return
         else:                                     # a prefetch for a later call stays for it
             got = self._read_engram(tokens, self.pos, self.ids)
         rows = len(tokens)
@@ -446,6 +462,7 @@ class Engine:
         if self.pos + rows > self.max_len:
             raise ValueError("the KV cache is full")
         self.meta[0] = self.pos
+        self.prompt_call = prompt
         self._stage_engram(tokens)
         if self.graphs and not prompt and (rows == 1 or self.graph_widths == "all"):
             self.tok[:rows] = torch.as_tensor(list(tokens), dtype=torch.int32)
