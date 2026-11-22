@@ -551,3 +551,48 @@ def test_dense_graphs_give_the_scoring_graph_bits(weights, goldens, width, monke
                 assert torch.equal(sel, b[li][0]) and torch.equal(cnt, b[li][2])
                 assert torch.equal(torch.where(sel[:, None] != 0, tok, 0), torch.where(b[li][0][:, None] != 0,
                                                                                          b[li][1], 0))
+
+
+@pytest.mark.parametrize("rows", [1, 6, 16, 300])
+def test_route_kernel_gives_torch_s_picks_and_scores(rows):
+    """``kernels.route`` against torch's sigmoid, topk and gather on router logits at the real model's scale and on
+    logits with many near-equal scores."""
+
+    from tensorfold.families.hy4_flash.cuda import kernels as K
+
+    g = torch.Generator("cuda").manual_seed(5)
+    bias = torch.randn(512, device="cuda", generator=g) * 0.05
+    for scale in (0.5, 3.0, 12.0):
+        logits = torch.randn(rows, 512, device="cuda", generator=g) * scale
+        scores = torch.sigmoid(logits)
+        want = torch.topk(scores + bias, 16, dim=-1).indices
+        idx, picked = K.route(logits, bias, 16)
+        assert torch.equal(idx.long(), want)
+        assert torch.equal(picked, scores.gather(1, want))
+
+
+def test_paired_bf16_projections_keep_each_s_bits(weights):
+    from tensorfold.families.hy4_flash.cuda.weights import pair
+
+    g = torch.Generator("cuda").manual_seed(9)
+    m = next(layer.mlp for layer in weights.layers if hasattr(layer.mlp, "s_gate"))
+    for rows, prompt in ((1, False), (6, False), (16, False), (40, True)):
+        x = torch.randn(rows, m.s_gate.k, device="cuda", generator=g).to(torch.bfloat16)
+        a, b = pair(m.s_gate, m.s_up, x, prompt)
+        assert torch.equal(a, m.s_gate(x, prompt)) and torch.equal(b, m.s_up(x, prompt))
+
+
+def test_route_and_pair_engine_gives_the_torch_logits(weights, goldens, monkeypatch):
+    from tensorfold.families.hy4_flash.cuda import model
+    from tensorfold.families.hy4_flash.cuda import weights as W
+
+    ids = goldens["long_ids"].tolist()[:40]
+    out = []
+    for on in (False, True):
+        monkeypatch.setattr(model, "ROUTE", on)
+        monkeypatch.setattr(W, "PAIR", on)
+        e = _engine(weights)
+        rows = [e.forward(ids[:32], prompt=True, every=True)]
+        rows += [e.forward(ids[32:38], prompt=False, every=True), e.forward(ids[38:39], prompt=False)]
+        out.append(torch.cat([r.float() for r in rows]))
+    assert torch.equal(out[0], out[1])

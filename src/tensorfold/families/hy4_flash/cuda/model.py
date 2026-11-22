@@ -29,7 +29,7 @@ from tensorfold.env_flags import flag
 from ..config import SPARSE
 from ..engram import ngram_tokens
 from . import kernels as K
-from .weights import DECODE_ROWS, Attention, Dense, Engram, Indexer, Layer, MoE, Weights, gather_engram
+from .weights import DECODE_ROWS, Attention, Dense, Engram, Indexer, Layer, MoE, Weights, gather_engram, pair
 
 PREFILL_ROWS = 2048
 # Engram's norms are nn.RMSNorm without an epsilon, which torch computes with fp32's (1.19e-7) even on bf16 rows, as
@@ -48,6 +48,8 @@ SIDE = flag("TF_HY4_SIDE", False)
 # a graph captured while every row sits below the indexer's dense limit (2,048 keys) skips the indexer's scoring, which
 # no row reads there; past the limit the graph that scores takes over. TF_HY4_DENSE_GRAPHS=0: one graph a width
 DENSE_GRAPHS = flag("TF_HY4_DENSE_GRAPHS", True)
+# the router's sigmoid, top-k and gather in one launch (``kernels.route``), torch's bits; TF_HY4_ROUTE=0: torch's ops
+ROUTE = flag("TF_HY4_ROUTE", True)
 
 
 class _Geometry:
@@ -353,7 +355,7 @@ class Engine:
     def _mlp(self, li: int, m, x: torch.Tensor, prompt: bool) -> torch.Tensor:
         c = self.c
         if isinstance(m, Dense):
-            return K.rmsnorm(m.down(_silu_mul(m.gate(x, prompt), m.up(x, prompt)), prompt), m.post_norm, c.eps)
+            return K.rmsnorm(m.down(_silu_mul(*pair(m.gate, m.up, x, prompt)), prompt), m.post_norm, c.eps)
         return self._moe(li, m, x, prompt)
 
     def _moe(self, li: int, m: MoE, x: torch.Tensor, prompt: bool) -> torch.Tensor:
@@ -365,19 +367,23 @@ class Engine:
             logits = moe_mod.router(x, m.router)
         else:
             logits = x.float() @ m.router.float().t()
-        scores = torch.sigmoid(logits)
-        idx = torch.topk(scores + m.bias, c.top_k, dim=-1).indices
-        if self.seen is not None:
-            self.seen.setdefault(li, []).append(idx.clone())
-        if self.replay is not None:
-            idx = self.replay[li][self.pos:self.pos + rows].to(idx.device)
-        wts = K.norm_weights(scores.gather(1, idx), c.scaling)
+        if ROUTE and self.cuda and self.seen is None and self.replay is None:
+            idx, picked = K.route(logits, m.bias, c.top_k)   # sigmoid, top-k and gather in one launch
+        else:
+            scores = torch.sigmoid(logits)
+            idx = torch.topk(scores + m.bias, c.top_k, dim=-1).indices
+            if self.seen is not None:
+                self.seen.setdefault(li, []).append(idx.clone())
+            if self.replay is not None:
+                idx = self.replay[li][self.pos:self.pos + rows].to(idx.device)
+            picked = scores.gather(1, idx)
+        wts = K.norm_weights(picked, c.scaling)
         side = self.side if rows <= DECODE_ROWS else None
         if side is not None:                  # the shared expert beside the routed ones, joined before the sum
             main = torch.cuda.current_stream()
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                shared = m.s_down(_silu_mul(m.s_gate(x, prompt), m.s_up(x, prompt)), prompt)
+                shared = m.s_down(_silu_mul(*pair(m.s_gate, m.s_up, x, prompt)), prompt)
         lat = m.pre(x, prompt)
         routed = self._experts(m, lat, idx, wts)
         if side is not None:
@@ -386,7 +392,7 @@ class Engine:
                 shared.record_stream(main)
                 x.record_stream(side)
         else:
-            shared = m.s_down(_silu_mul(m.s_gate(x, prompt), m.s_up(x, prompt)), prompt)
+            shared = m.s_down(_silu_mul(*pair(m.s_gate, m.s_up, x, prompt)), prompt)
         if FUSED and x.is_cuda:
             return K.add_rmsnorm(m.post(routed, prompt), shared, m.combine_norm, c.eps)
         h = (m.post(routed, prompt).float() + shared.float()).to(torch.bfloat16)

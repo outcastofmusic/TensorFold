@@ -540,6 +540,38 @@ def _norm_weights(W, Y, scale, K: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(Y + r * K + k, w / (tl.sum(w, axis=0) + 1e-20) * scale, mask=k < K)
 
 
+@triton.jit
+def _route(L, BIAS, IDX, VAL, E: tl.constexpr, K: tl.constexpr, BE: tl.constexpr):
+    """Program r: torch.sigmoid of row r's E router logits (1 / (1 + expf(-l)), each step rounded as torch's kernel
+    rounds it), then the K largest of score + bias, largest first and the lower id among equals, as torch.topk
+    orders them; their ids and their scores (not the biased keys)."""
+
+    r = tl.program_id(0)
+    e = tl.arange(0, BE)
+    ok = e < E
+    lg = tl.load(L + r * E + e, mask=ok, other=0.0)
+    sc = libdevice.div_rn(1.0, libdevice.add_rn(1.0, libdevice.exp(-lg)))
+    key = tl.where(ok, libdevice.add_rn(sc, tl.load(BIAS + e, mask=ok, other=0.0)), float("-inf"))
+    for j in tl.static_range(K):
+        top = tl.max(key, 0)
+        pick = tl.min(tl.where(key == top, e, BE), 0)
+        tl.store(IDX + r * K + j, pick.to(tl.int32))
+        tl.store(VAL + r * K + j, tl.sum(tl.where(e == pick, sc, 0.0), 0))
+        key = tl.where(e == pick, float("-inf"), key)
+
+
+def route(logits: torch.Tensor, bias: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """fp32 router logits [R, E] -> (ids int32 [R, k], their sigmoid scores fp32 [R, k]) in one launch: the experts
+    ``topk(sigmoid(logits) + bias, k)`` picks, in its order, and ``sigmoid(logits).gather`` of them."""
+
+    rows, e = logits.shape
+    idx = torch.empty((rows, k), dtype=torch.int32, device=logits.device)
+    val = torch.empty((rows, k), dtype=torch.float32, device=logits.device)
+    _route[(rows,)](logits.contiguous(), bias.contiguous(), idx, val, E=e, K=k, BE=triton.next_power_of_2(e),
+                    num_warps=4)
+    return idx, val
+
+
 def norm_weights(w: torch.Tensor, scale: float) -> torch.Tensor:
     """Routing weights [R, K] fp32 over their row's sum (+1e-20), times ``scale``."""
 

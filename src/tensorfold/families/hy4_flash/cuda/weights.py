@@ -97,6 +97,24 @@ class F4Lin:
         return self.lin.nbytes()
 
 
+def pair(a, b, x: torch.Tensor, prompt: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(a(x, prompt), b(x, prompt))``: two bf16 projections of the same rows in one launch (``b16``'s pair kernels,
+    each its single kernel's bits), any other pair one call each. TF_HY4_PAIR=0: one call each."""
+
+    if PAIR and isinstance(a, B16Lin) and isinstance(b, B16Lin) and a.bias is None and b.bias is None and x.is_cuda:
+        from tensorfold.families.qwen3_5.cuda import b16
+
+        if prompt and x.shape[0] > DECODE_ROWS:
+            ya, yb = b16.prompt_pair(x, a.w, b.w)
+        else:
+            ya, yb = b16.matmul_pair(x, a.w, b.w)
+        return ya, yb
+    return a(x, prompt), b(x, prompt)
+
+
+PAIR = __import__("os").environ.get("TF_HY4_PAIR", "1") != "0"
+
+
 # ---------------------------------------------------------------------------------------------- layers ---
 
 @dataclass
