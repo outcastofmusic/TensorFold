@@ -65,7 +65,10 @@ def decoded_rows(gen, eos) -> int:
     return next((i + 1 for i, t in enumerate(gen) if int(t) in ends), len(gen))
 
 
-def engine(model: str, out: str) -> None:
+PROMPT_ROWS = 256           # prompt rows whose full logits a golden also keeps (``_ptail``): teacher-forced KL there
+
+
+def engine(model: str, out: str, same: str | None = None) -> None:
     import torch
     from tokenizers import Tokenizer
 
@@ -84,15 +87,21 @@ def engine(model: str, out: str) -> None:
     e = Engine(w, max_len=8192)
     greedy = Sampling(seed=0, temperature=0.0)
     saved: dict[str, np.ndarray] = {}
+    fixed = np.load(same) if same else None
     for name, (messages, tools) in prompts(Path(__file__).parents[1]).items():
         text = template.render(messages, tools=tools, enable_thinking=False)
         ids = tok.encode(text, add_special_tokens=False).ids
-        t0 = time.perf_counter()
-        first = prefill(e, ids, greedy)
-        pre = time.perf_counter() - t0
-        res, seq = reply(e, ids, first, greedy)
-        gen = res.tokens
-        print(f"{name}: {len(ids)} prompt tokens, prefill {pre:.2f}s, decode {res.tokens_per_second:.1f} tok/s: "
+        if fixed is not None:            # another golden's sequence: teacher-forced on the same ids, no decode
+            if fixed[f"{name}_ids"][:len(ids)].tolist() != ids:
+                raise ValueError(f"{same}: {name}'s prompt differs from this render")
+            gen, seq, tps, pre = fixed[f"{name}_gen"].tolist(), fixed[f"{name}_ids"].tolist(), 0.0, 0.0
+        else:
+            t0 = time.perf_counter()
+            first = prefill(e, ids, greedy)
+            pre = time.perf_counter() - t0
+            res, seq = reply(e, ids, first, greedy)
+            gen, tps = res.tokens, res.tokens_per_second
+        print(f"{name}: {len(ids)} prompt tokens, prefill {pre:.2f}s, decode {tps:.1f} tok/s: "
               f"{tok.decode(gen, skip_special_tokens=False)!r}", flush=True)
         e.reset()
         rows = []
@@ -106,7 +115,9 @@ def engine(model: str, out: str) -> None:
         saved[f"{name}_top_ids"] = top.cpu().numpy().astype(np.int32)
         saved[f"{name}_top_vals"] = vals.cpu().numpy()
         saved[f"{name}_tail"] = logits[len(ids) - 1:].cpu().numpy().astype(np.float16)
-        saved[f"{name}_decode_tps"] = np.array([res.tokens_per_second])
+        saved[f"{name}_ptail"] = logits[max(0, len(ids) - 1 - PROMPT_ROWS):len(ids) - 1].cpu().numpy().astype(
+            np.float16)
+        saved[f"{name}_decode_tps"] = np.array([tps])
         saved[f"{name}_prefill_s"] = np.array([pre])
         e.reset()
     np.savez(out, **saved)
@@ -119,7 +130,7 @@ KEEP_FP32 = ("attn_hc.", "ffn_hc.", "sinks", "key_value_projection", "key_gate_p
              "e_score_correction_bias", "hc_head.")
 
 
-def reference(model: str, engine_npz: str) -> None:
+def reference(model: str, engine_npz: str, others: list[str] | None = None) -> None:
     import torch
     from safetensors import safe_open
     from torch import nn
@@ -320,10 +331,31 @@ def reference(model: str, engine_npz: str) -> None:
     head.hc_scale.data = value("model.hc_head.hc_head_scale").float()
     norm.weight.data = value("model.norm.weight")
     lm = value("lm_head.weight").float()
+    for other in others or []:       # goldens teacher-forced on the same sequences (``engine --same``)
+        zo = np.load(other)
+        if any(zo[f"{n}_ids"].tolist() != seq for n, seq in seqs.items()):
+            raise ValueError(f"{other} holds other sequences than {engine_npz}")
+    with torch.no_grad():
+        wants = {n: norm(head(hidden[n]))[0].float() @ lm.t() for n in seqs}           # [T, V] fp32
+    for path in [engine_npz] + list(others or []):
+        print(f"-- {path}", flush=True)
+        report = _compare(np.load(path), seqs, wants, eos, dev)
+        Path(path).with_suffix(".reference.json").write_text(json.dumps(report, indent=1))
+    if dump is not None:
+        dump["normed"] = norm(head(hidden[dump_name]))[0].to(torch.bfloat16).view(torch.int16).cpu().numpy()
+        np.savez(Path(engine_npz).with_suffix(f".layers-{dump_name}.npz"), **dump)
+
+
+def _compare(z, seqs, wants, eos, dev) -> dict:
+    """One golden against transformers' logits: top-1 agreement, greedy steps, and KL(transformers || engine) over the
+    reply up to its end token, and over the last ``PROMPT_ROWS`` prompt rows when the golden keeps them."""
+
+    import torch
+
     report = {}
     with torch.no_grad():
         for n, seq in seqs.items():
-            want = norm(head(hidden[n]))[0].float() @ lm.t()                       # [T, V] fp32
+            want = wants[n]
             p0 = int(z[f"{n}_prompt"][0])
             top = torch.from_numpy(z[f"{n}_top_ids"][:, 0]).to(dev)
             agree = (want.argmax(-1) == top).float()
@@ -348,11 +380,14 @@ def reference(model: str, engine_npz: str) -> None:
                          # rows lead by 9.4 logits at least, and 5 decimals printed its KL as 0.0)
                          "kl_mean": float(f"{float(kl.mean()):.3g}"), "kl_max": float(f"{float(kl.max()):.3g}"),
                          "smallest_gap_decoded": round(float(gap[p0 - 1:p0 - 1 + rows].min()), 4)}
+            if f"{n}_ptail" in z.files:
+                pt = torch.from_numpy(z[f"{n}_ptail"].astype(np.float32)).to(dev)
+                lp, lq = want[p0 - 1 - pt.shape[0]:p0 - 1].log_softmax(-1), pt.log_softmax(-1)
+                kp = (lp.exp() * (lp - lq)).sum(-1)
+                report[n]["kl_prompt_mean"] = float(f"{float(kp.mean()):.3g}")
+                report[n]["kl_prompt_rows"] = int(kp.numel())
             print(n, json.dumps(report[n]), flush=True)
-    Path(engine_npz).with_suffix(".reference.json").write_text(json.dumps(report, indent=1))
-    if dump is not None:
-        dump["normed"] = norm(head(hidden[dump_name]))[0].to(torch.bfloat16).view(torch.int16).cpu().numpy()
-        np.savez(Path(engine_npz).with_suffix(f".layers-{dump_name}.npz"), **dump)
+    return report
 
 
 def main() -> None:
@@ -361,14 +396,16 @@ def main() -> None:
     a = sub.add_parser("engine")
     a.add_argument("model")
     a.add_argument("out")
+    a.add_argument("--same", help="another golden: teacher-force its sequences instead of decoding")
     b = sub.add_parser("reference")
     b.add_argument("model")
     b.add_argument("engine_npz")
+    b.add_argument("others", nargs="*", help="goldens made with --same ENGINE_NPZ, compared in the same pass")
     args = p.parse_args()
     if args.cmd == "engine":
-        engine(args.model, args.out)
+        engine(args.model, args.out, args.same)
     else:
-        reference(args.model, args.engine_npz)
+        reference(args.model, args.engine_npz, args.others)
 
 
 if __name__ == "__main__":
