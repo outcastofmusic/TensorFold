@@ -370,7 +370,8 @@ class Engine:
     def head(self, normed: torch.Tensor) -> torch.Tensor:
         """fp32 logits [n, V]: the bf16 rows times the bf16 head, summed in fp32 (``enable_lm_head_fp32``)."""
 
-        return K.head(normed, self.w.head)
+        head = self.w.head
+        return K.head(normed, head) if isinstance(head, torch.Tensor) else head(normed)
 
     # -- Engram rows ---------------------------------------------------------------------------------------------
     def _read_engram(self, tokens: Sequence[int], pos: int, previous: Sequence[int]) -> list[torch.Tensor]:

@@ -206,3 +206,95 @@ def test_graphed_calls_keep_the_eager_rows(weights, goldens):
             assert torch.equal(tok[sparse], gtok[sparse]), (width, li)
         for e in engines:
             e.rewind(width - 1)
+
+
+def test_nvfp4_head_is_the_dense_head_bit_for_bit(weights):
+    """``Head4`` sums code x block scale (exact in bf16) on the same tile and K order as the bf16 head, then applies the
+    global scale: its logits are the dense head's on those values times the scale, at every row count."""
+
+    from tensorfold.families.hy4_flash.cuda import kernels as K
+    from tensorfold.families.hy4_flash.cuda.dfly import quantize_nvfp4
+
+    codes, scales, scale2 = quantize_nvfp4(weights.head)
+    h4 = K.Head4(codes, scales, scale2)
+    w = (h4.dense() / scale2).to(torch.bfloat16)
+    x = torch.randn(16, weights.head.shape[1], device="cuda", generator=torch.Generator("cuda").manual_seed(0))
+    x = x.to(torch.bfloat16)
+    want = K.head(x, w) * scale2
+    assert torch.equal(h4(x), want)
+    for rows in (1, 6):
+        assert torch.equal(h4(x[:rows]), want[:rows])
+
+
+@pytest.mark.parametrize("rows", [1, 6, 40])
+def test_row_fp8_kv_b_matches_its_dense_values(weights, rows):
+    """absorb and expand on e4m3 kv_b rows with a scale each, against fp32 math on the decoded values."""
+
+    from tensorfold.families.hy4_flash.cuda import kernels as K
+
+    a = weights.layers[2].attn
+    g = torch.Generator("cuda").manual_seed(rows)
+    for w in (a.wk, a.wv):
+        top = w.float().abs().amax(-1, keepdim=True)
+        s = torch.where(top > 0, top / 448.0, torch.ones_like(top))
+        f8 = K.RowF8((w.float() / s).to(torch.float8_e4m3fn), s[..., 0])
+        dense = f8.dense()
+        heads, n, lw = w.shape
+        if w is a.wk:
+            q = torch.randn(rows, heads, n, device="cuda", generator=g).to(torch.bfloat16)
+            got = K.absorb(q, f8, torch.empty((rows, heads, lw), dtype=torch.bfloat16, device="cuda"))
+            want = torch.einsum("rhd,hdn->rhn", q.float(), dense)
+        else:
+            o = torch.randn(rows, heads, lw, device="cuda", generator=g).to(torch.bfloat16)
+            got = K.expand(o, f8, torch.empty((rows, heads, n), dtype=torch.bfloat16, device="cuda"))
+            want = torch.einsum("rhn,hdn->rhd", o.float(), dense)
+        assert float((got.float() - want).abs().max() / want.abs().max()) < 0.01
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_nvfp4_trunk_drafted_equals_serial(goldens, temperature, tmp_path, monkeypatch):
+    """With the trunk in NVFP4 and kv_b in row FP8 (``TF_HY4_TRUNK``), DFly2 rounds with graphs give serial
+    decoding's reply: the NVFP4 linears and head keep a row's bits in any window."""
+
+    import importlib.util
+    import re
+
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.hy4_flash.cuda.dfly import DFly
+    from tensorfold.families.hy4_flash.cuda.model import draft_decode, prefill, serial_decode
+    from tensorfold.families.hy4_flash.cuda.weights import load
+
+    spec = importlib.util.spec_from_file_location("hy4_trunk", Path(__file__).parents[2] / "tools" / "hy4_trunk.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    ckpt = tiny.write(tmp_path / "tiny")
+    pats = [re.compile(p) for p in tool.CLASSES.values()]
+    out = {}
+    with safe_open(str(ckpt / "model-00001.safetensors"), "pt") as f:
+        for name in f.keys():  # noqa: SIM118 (a safetensors handle is not iterable)
+            base = name.removesuffix(".weight")
+            if base == name or not any(p.search(base) for p in pats) or f.get_slice(name).get_dtype() != "BF16":
+                continue                    # the tiny checkpoint's FP8 attention stays as stored
+            w = f.get_tensor(name)
+            if base.endswith("kv_b_proj"):
+                out[name], out[base + ".weight_scale_row"], _ = tool.quantize_rows(w)
+            else:
+                codes, sc, s2, _ = tool.quantize(w)
+                out[name], out[base + ".weight_scale"], out[base + ".weight_scale_2"] = codes, sc, torch.tensor(s2)
+    (tmp_path / "trunk").mkdir()
+    save_file(out, str(tmp_path / "trunk" / "trunk.safetensors"))
+    monkeypatch.setenv("TF_HY4_TRUNK", str(tmp_path / "trunk"))
+    w = load(ckpt, "cuda")
+    assert not isinstance(w.head, torch.Tensor)
+    prompt = goldens["long_ids"].tolist()[:20]
+    s = Sampling(seed=5, temperature=temperature)
+    e = _engine(w)
+    serial = serial_decode(e, prefill(e, prompt, s), 40, s, stop_eos=False).tokens
+    e = _engine(w, graphs=True)
+    drafter = DFly(ckpt, e)
+    got = draft_decode(e, prompt, prefill(e, prompt, s), 40, s, stop_eos=False, drafter=drafter)
+    assert got.tokens == serial
+    assert got.stats["drafted"] > 0

@@ -80,6 +80,23 @@ class F8Lin:
         return self.lin.nbytes()
 
 
+class F4Lin:
+    """An NVFP4 projection on ``Fp4Linear`` (or a block FP8 one on ``Fp8BlockLinear``): decode rows on the lane matmul,
+    prompt chunks on its exact prompt GEMM; a bias added in bf16 after the matmul, as ``nn.Linear`` adds it."""
+
+    def __init__(self, lin, bias: torch.Tensor | None = None) -> None:
+        self.lin = lin
+        self.bias = None if bias is None else bias.to(torch.bfloat16).contiguous()
+        self.n, self.k = lin.n, lin.k
+
+    def __call__(self, x: torch.Tensor, prompt: bool = False) -> torch.Tensor:
+        y = self.lin.prefill(x) if prompt and x.shape[0] > DECODE_ROWS else self.lin(x)
+        return y if self.bias is None else (y.float() + self.bias.float()).to(torch.bfloat16)
+
+    def nbytes(self) -> int:
+        return self.lin.nbytes()
+
+
 # ---------------------------------------------------------------------------------------------- layers ---
 
 @dataclass
@@ -103,8 +120,8 @@ class Attention:
     q_b: Any
     kv_a: Any
     kv_norm: torch.Tensor
-    wk: torch.Tensor           # kv_b's key rows per head [H, nope, 512] bf16 (absorbed into the query)
-    wv: torch.Tensor           # kv_b's value rows per head [H, v, 512] bf16
+    wk: Any                    # kv_b's key rows per head [H, nope, 512] bf16 or ``kernels.RowF8`` (absorbed into the query)
+    wv: Any                    # kv_b's value rows per head [H, v, 512] bf16 or ``kernels.RowF8``
     gate: Any
     o: Any
     post_norm: torch.Tensor
@@ -170,12 +187,13 @@ class Weights:
     embed: torch.Tensor        # bf16 [V, D]
     layers: list[Layer]
     norm: torch.Tensor
-    head: torch.Tensor         # bf16 [V, D] (computed in fp32)
+    head: Any                  # bf16 [V, D], or an NVFP4 ``kernels.Head4`` (computed in fp32 either way)
     hc_head: HC
     device: torch.device = field(default_factory=lambda: torch.device("cpu"))
 
     def nbytes(self) -> int:
-        total = self.embed.numel() * 2 + self.head.numel() * 2
+        total = self.embed.numel() * 2
+        total += self.head.numel() * 2 if isinstance(self.head, torch.Tensor) else self.head.nbytes()
         for layer in self.layers:
             for part in (layer.attn, layer.mlp, layer.engram):
                 if part is None:
@@ -238,28 +256,79 @@ class _Reader:
         self.t.close()
 
 
-def load(model_dir: str | Path, device: str = "cuda", *, layers: int | None = None) -> Weights:
-    """The checkpoint's text model on ``device`` (``layers``: the first so many, for tests and probes)."""
+class _Trunk:
+    """NVFP4 replacements for the checkpoint's projections (``tools/hy4_trunk.py`` writes them from the BF16 release):
+    ``<name>.weight`` codes, ``.weight_scale`` e4m3 and ``.weight_scale_2`` fp32 by the checkpoint's own names."""
+
+    def __init__(self, folder: str | None, device: str) -> None:
+        from tensorfold.cuda.direct_read import SafeTensors
+
+        self.device = device
+        files = sorted(Path(folder).glob("*.safetensors")) if folder else []
+        if folder and not files:
+            raise ValueError(f"TF_HY4_TRUNK={folder}: no safetensors files there")
+        self.t = SafeTensors(files) if files else None
+
+    def __contains__(self, name: str) -> bool:
+        return self.t is not None and name + ".weight" in self.t
+
+    def fp8(self, name: str) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """(e4m3 [N, K], fp32 block scales) when ``name`` is stored in block FP8, else None."""
+
+        if name + ".weight_scale_inv" not in self.t:
+            return None
+        return self.t.get(name + ".weight", self.device), self.t.get(name + ".weight_scale_inv", self.device)
+
+    def rows(self, name: str) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """(e4m3 [N, K], fp32 scale a row [N]) when ``name`` is stored in row-scaled FP8 (kv_b), else None."""
+
+        if self.t is None or name + ".weight_scale_row" not in self.t:
+            return None
+        return self.t.get(name + ".weight", self.device), self.t.get(name + ".weight_scale_row", self.device)
+
+    def get(self, name: str) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """(codes uint8 [N, K/2], e4m3 scales [N, K/16], the global scale) of NVFP4 projection ``name``."""
+
+        g = self.t.get
+        return (g(name + ".weight", self.device).view(torch.uint8), g(name + ".weight_scale", self.device),
+                float(g(name + ".weight_scale_2").float().reshape(-1)[0]))
+
+    def close(self) -> None:
+        if self.t is not None:
+            self.t.close()
+
+
+def load(model_dir: str | Path, device: str = "cuda", *, layers: int | None = None,
+         trunk: str | None = None) -> Weights:
+    """The checkpoint's text model on ``device`` (``layers``: the first so many, for tests and probes). ``trunk``
+    (default ``TF_HY4_TRUNK``) names a folder of NVFP4 projections that replace the checkpoint's bf16 or FP8 ones."""
+
+    import os
 
     model_dir = Path(model_dir)
     cfg = Config.read(model_dir)
     cuda = torch.device(device).type == "cuda"
     r = _Reader(model_dir, device)
+    q = _Trunk(trunk if trunk is not None else os.environ.get("TF_HY4_TRUNK") or None, device)
     try:
-        w = _build(model_dir, cfg, r, device, cuda, layers)
+        w = _build(model_dir, cfg, r, device, cuda, layers, q)
         if layers is None:
             left = [n for n in r.left() if not n.startswith("model.layers.") or int(n.split(".")[2]) < cfg.layers]
             if left:
                 raise ValueError(f"unused checkpoint tensors: {left[:6]} ...")
     finally:
         r.close()
+        q.close()
     if cuda:
         torch.cuda.empty_cache()
     return w
 
 
-def _build(model_dir: Path, cfg: Config, r: _Reader, device: str, cuda: bool, count: int | None) -> Weights:
-    from tensorfold.cuda.nvfp4.linear import Fp8BlockLinear
+def _build(model_dir: Path, cfg: Config, r: _Reader, device: str, cuda: bool, count: int | None,
+           trunk: _Trunk) -> Weights:
+    from tensorfold.cuda.nvfp4.linear import Fp4Linear, Fp8BlockLinear
+
+    from .kernels import Head4, RowF8
 
     def bf16(name: str) -> torch.Tensor:
         return r.get(name).to(torch.bfloat16).contiguous()
@@ -272,6 +341,16 @@ def _build(model_dir: Path, cfg: Config, r: _Reader, device: str, cuda: bool, co
 
         b = bf16(name + ".bias") if bias else None
         w = r.get(name + ".weight")
+        if name in trunk:                  # the checkpoint's copy is read off its list and dropped
+            if name + ".weight_scale_inv" in r:
+                r.get(name + ".weight_scale_inv")
+            f8 = trunk.fp8(name)
+            if f8 is not None:
+                return CpuLin(_fp8_block_dense(*f8), b) if not cuda else F4Lin(Fp8BlockLinear.from_checkpoint(*f8), b)
+            codes, scales, scale2 = trunk.get(name)
+            if not cuda:
+                return CpuLin(_nvfp4_dense(codes, scales.view(torch.uint8), torch.tensor(scale2)), b)
+            return F4Lin(Fp4Linear.from_checkpoint(codes, scales.view(torch.uint8), scale2), b)
         if w.dtype == torch.float8_e4m3fn:
             s = r.get(name + ".weight_scale_inv")
             if not cuda:
@@ -295,6 +374,13 @@ def _build(model_dir: Path, cfg: Config, r: _Reader, device: str, cuda: bool, co
         a = p + "self_attn."
         heads = cfg.heads_of(i)
         kv_b = bf16(a + "kv_b_proj.weight").view(heads.heads, heads.nope + heads.v, cfg.kv_rank)
+        wk, wv = kv_b[:, :heads.nope].contiguous(), kv_b[:, heads.nope:].contiguous()
+        f8 = trunk.rows(a + "kv_b_proj")
+        if f8 is not None:                # e4m3 rows with a scale each, read by absorb and expand as stored
+            del kv_b, wk, wv
+            codes = f8[0].view(torch.uint8).view(heads.heads, heads.nope + heads.v, cfg.kv_rank)
+            sc = f8[1].float().view(heads.heads, heads.nope + heads.v)
+            wk, wv = RowF8(codes[:, :heads.nope], sc[:, :heads.nope]), RowF8(codes[:, heads.nope:], sc[:, heads.nope:])
         idx = None
         if cfg.kinds[i] == SPARSE:
             ci = a + "compressed_indexer."
@@ -305,8 +391,7 @@ def _build(model_dir: Path, cfg: Config, r: _Reader, device: str, cuda: bool, co
         attn = Attention(kind=cfg.kinds[i], heads=heads.heads, q_a=lin(a + "q_a_proj"),
                          q_norm=bf16(a + "q_a_layernorm.weight"), q_b=lin(a + "q_b_proj"),
                          kv_a=lin(a + "kv_a_proj_with_mqa"), kv_norm=bf16(a + "kv_a_layernorm.weight"),
-                         wk=kv_b[:, :heads.nope].contiguous(), wv=kv_b[:, heads.nope:].contiguous(),
-                         gate=lin(a + "linear_gate"), o=lin(a + "o_proj"), post_norm=bf16(a + "post_proj_norm.weight"),
+                         wk=wk, wv=wv, gate=lin(a + "linear_gate"), o=lin(a + "o_proj"), post_norm=bf16(a + "post_proj_norm.weight"),
                          sinks=f32(a + "learnable_sink_param"), indexer=idx)
         m = p + "mlp."
         if cfg.moe(i):
@@ -339,7 +424,11 @@ def _build(model_dir: Path, cfg: Config, r: _Reader, device: str, cuda: bool, co
                          post_norm=bf16(p + "post_attention_layernorm.weight"),
                          attn_hc=hc(p + "hc_attn_layer.hc_pre."), ffn_hc=hc(p + "hc_mlp_layer.hc_pre."),
                          attn=attn, mlp=mlp, engram=eg))
-    return Weights(cfg, bf16("model.embed_tokens.weight"), out, bf16("model.norm.weight"), bf16("lm_head.weight"),
+    head = bf16("lm_head.weight")
+    if "lm_head" in trunk:
+        del head
+        head = Head4(*trunk.get("lm_head"))
+    return Weights(cfg, bf16("model.embed_tokens.weight"), out, bf16("model.norm.weight"), head,
                    hc("model.hc_head.", head=True), torch.device(device))
 
 

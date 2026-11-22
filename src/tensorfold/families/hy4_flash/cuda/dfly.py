@@ -148,6 +148,8 @@ class DFly:
         NVFP4 reads 209 MB and keeps every id."""
 
         mode = os.environ.get("TF_HY4_DRAFT_HEAD", "nvfp4")
+        if not isinstance(head, torch.Tensor):          # the target's head is NVFP4 already (``TF_HY4_TRUNK``)
+            return None, head
         if mode == "slice":     # the first ids (byte-level BPE ids run roughly by merge frequency) and every special
             rows = int(os.environ.get("TF_HY4_DRAFT_VOCAB", "32768"))
             if not 0 < rows < head.shape[0]:
