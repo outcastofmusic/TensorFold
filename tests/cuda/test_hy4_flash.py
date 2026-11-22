@@ -366,7 +366,7 @@ def test_dfly_graph_drafts_the_eager_tokens(weights, goldens, temperature, tmp_p
     rounds = []
     for graph in ("0", "1"):
         monkeypatch.setenv("TF_HY4_DFLY_GRAPH", graph)
-        e = _engine(weights, graphs=True)
+        e = _engine(weights, graphs=True, max_len=128)
         drafter = DFly(ckpt, e)
         trace: list = []
         got = draft_decode(e, prompt, prefill(e, prompt, s), 48, s, stop_eos=False, drafter=drafter,
