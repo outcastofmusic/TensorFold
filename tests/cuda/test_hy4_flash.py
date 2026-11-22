@@ -420,3 +420,23 @@ def test_constrained_drafted_replies_equal_serial(weights, temperature, tmp_path
     assert got.tokens == serial
     m = xgr.GrammarMatcher(g.compile(_spec("json_schema")))
     assert all(m.accept_token(t) for t in serial)
+
+
+def test_side_stream_shared_expert_keeps_the_bits(weights, goldens, monkeypatch):
+    """TF_HY4_SIDE: the shared expert on a side stream, eager and graphed, gives the same decode logits."""
+
+    from tensorfold.families.hy4_flash.cuda import model
+
+    ids = goldens["long_ids"].tolist()[:40]
+    out = []
+    for side in (False, True):
+        monkeypatch.setattr(model, "SIDE", side)
+        for graphs in (False, True):
+            e = _engine(weights, graphs=graphs)
+            assert (e.side is not None) == side
+            rows = [e.forward(ids[:32], prompt=True)]
+            rows += [e.forward(ids[32:38], prompt=False, every=True)]
+            rows += [e.forward([t], prompt=False) for t in ids[38:40]]
+            rows += [e.forward(ids[34:38], prompt=False, every=True)]
+            out.append(torch.cat([r.float() for r in rows]))
+    assert all(torch.equal(out[0], o) for o in out[1:])

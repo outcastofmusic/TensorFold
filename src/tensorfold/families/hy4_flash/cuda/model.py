@@ -39,6 +39,9 @@ ENGRAM_EPS = float(os.environ.get("TF_HY4_ENGRAM_EPS", str(torch.finfo(torch.flo
 # one launch each for RoPE, SwiGLU, the attention gate and the MoE's sum and norm (``kernels`` "small fusions"), the
 # same bits as the torch chains they replace; TF_HY4_FUSED=0 keeps the chains (A/B)
 FUSED = flag("TF_HY4_FUSED", True)
+# TF_HY4_SIDE=1: a decode call's shared expert runs on a side stream beside the routed experts (fork and join inside
+# the graph), the same kernels on the same inputs, so the same bits (Bolt's shared_stream, AngelSlim's MOE_CONCURRENT)
+SIDE = flag("TF_HY4_SIDE", False)
 
 
 def _silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
@@ -82,6 +85,7 @@ class Engine:
         self.eg_rows = (torch.zeros((len(c.engram_layers), rows, heads, c.engram_dim), dtype=torch.float32,
                                     device=dev) if heads else None)        # a call's Engram rows, staged on the host
         self.graphs = flag("TF_HY4_GRAPHS", True) and self.cuda
+        self.side = torch.cuda.Stream(device=dev) if self.cuda and SIDE else None
         from concurrent.futures import ThreadPoolExecutor
 
         self._readers = ThreadPoolExecutor(len(c.engram_layers) or 1, thread_name_prefix="engram-layer")
@@ -314,9 +318,21 @@ class Engine:
         if self.replay is not None:
             idx = self.replay[li][self.pos:self.pos + rows].to(idx.device)
         wts = K.norm_weights(scores.gather(1, idx), c.scaling)
+        side = self.side if rows <= DECODE_ROWS else None
+        if side is not None:                  # the shared expert beside the routed ones, joined before the sum
+            main = torch.cuda.current_stream()
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                shared = m.s_down(_silu_mul(m.s_gate(x, prompt), m.s_up(x, prompt)), prompt)
         lat = m.pre(x, prompt)
         routed = self._experts(m, lat, idx, wts)
-        shared = m.s_down(_silu_mul(m.s_gate(x, prompt), m.s_up(x, prompt)), prompt)
+        if side is not None:
+            main.wait_stream(side)
+            if not torch.cuda.is_current_stream_capturing():  # eager: neither block is reused before both finish
+                shared.record_stream(main)
+                x.record_stream(side)
+        else:
+            shared = m.s_down(_silu_mul(m.s_gate(x, prompt), m.s_up(x, prompt)), prompt)
         if FUSED and x.is_cuda:
             return K.add_rmsnorm(m.post(routed, prompt), shared, m.combine_norm, c.eps)
         h = (m.post(routed, prompt).float() + shared.float()).to(torch.bfloat16)
