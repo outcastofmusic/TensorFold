@@ -35,6 +35,8 @@
 # Qwen 27B: CONTEXT=262144 (KV 64 KiB a token)  PARALLEL=8 (1: one stream)  THINK_BUDGET=8000 (0: none); no Clef, no disk states
 # Hy4:   CONTEXT=65536  THINK_BUDGET=8000  HY4_DRAFT_HEAD=nvfp4  HY4_ADAPTIVE=1  HY4_FLOOR=0.15  HY4_KEYED=1  HY4_DEPTH=5
 #        HY4_COPY=qwen (glm: GLM's copy rule)  HY4_TRUNK= (a folder under $MODELS: NVFP4 trunk from the BF16 release)
+#        HY4_TRUNK_ONLY= / HY4_TRUNK_SKIP= (regexes over projection names: which of the folder's take effect)
+#        HY4_DECODE_ROWS=16 (32: copy windows up to 32 rows)
 # Bolt:  CONTEXT=131072 (a stream's KV is 8 KiB a token)  THINK_BUDGET=8000 (0: none); no disk states, one stream
 # LFM2:  CONTEXT=131072 (KV 20 KiB a token)  THINK_BUDGET=8000 (0: none); one stream, no drafts, no disk states.
 #        LFM Open License v1.0: commercial use is licensed only under US$10M annual revenue
@@ -331,6 +333,9 @@ hy4() {
     # Hy4-flash-trunk-full decodes chat 27-29 tok/s against 20-22 and scores TrueScore 92.8 (+0.0 [-2.0, +2.4]), but
     # its KL against BF16 is 0.065 against the pack's 0.022 (notes/tf-runs/hy4-opt2-1122)
     [ -z "${HY4_TRUNK:-}" ] || drafts+=(-e "TF_HY4_TRUNK=$MODELS/$HY4_TRUNK")
+    [ -z "${HY4_TRUNK_ONLY:-}" ] || drafts+=(-e "TF_HY4_TRUNK_ONLY=$HY4_TRUNK_ONLY")
+    [ -z "${HY4_TRUNK_SKIP:-}" ] || drafts+=(-e "TF_HY4_TRUNK_SKIP=$HY4_TRUNK_SKIP")
+    [ -z "${HY4_DECODE_ROWS:-}" ] || drafts+=(-e "TF_HY4_DECODE_ROWS=$HY4_DECODE_ROWS")
     IMAGE=$(image)
     stop_all
     # 65,536 tokens: at 131,072 the 89.7 GiB of weights leave the prompt-state store no memory, so no turn reuses its
