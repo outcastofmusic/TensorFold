@@ -16,6 +16,7 @@ accepted count) for the confidence head's calibration. ``--profile`` times one 2
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -100,7 +101,8 @@ def main() -> None:
             if kw is None:
                 res = serial_decode(e, first, a.tokens, key, stop_eos=False)
                 serial = res.tokens
-                row[arm] = {"tps": round(res.tokens_per_second, 2)}
+                row[arm] = {"tps": round(res.tokens_per_second, 2),
+                            "sha": hashlib.sha1(str(serial).encode()).hexdigest()[:12]}
             else:
                 trace: list = []
                 res = draft_decode(e, ids, first, a.tokens, key, stop_eos=False, trace=trace, **kw)
