@@ -37,7 +37,7 @@ NATIVE_ROWS = 512
 # a gather of at most this many distinct rows (a decode call's: 16 a token and table) queues every read with
 # POSIX_FADV_WILLNEED and reads them in the calling thread. A step's 64 rows took 4.1-5.4 ms on the pool (thread
 # hand-offs, warm or cold) and 0.12 ms warm, 0.7-0.9 ms cold this way (22 Nov, CPU bench). TF_HY4_INLINE_ROWS=0: the pool
-INLINE_ROWS = int(os.environ.get("TF_HY4_INLINE_ROWS", "256"))
+INLINE_ROWS = int(os.environ.get("TF_HY4_INLINE_ROWS", "511"))   # under NATIVE_ROWS: a 32-row window
 
 
 @lru_cache(maxsize=1)
