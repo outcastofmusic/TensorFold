@@ -239,3 +239,14 @@ def test_stats_folder_drives_the_formats(trunk_tool, checkpoint, tmp_path):
     assert rep["lm_head"]["format"] == "nvfp4-weighted"
     assert rep["model.layers.2.mlp.shared_experts.gate_proj"]["format"] == "nvfp4"
     assert 0 < rep["lm_head"]["rel_out"] < 0.05
+
+
+def test_factors_above_one_lower_the_error(trunk_tool):
+    """A block whose largest value lands on 4 or 3 (factor 1.1-1.6) can fit the rest better than the amax rule."""
+
+    import torch
+
+    w = (torch.randn(128, 512, generator=torch.Generator().manual_seed(2)) * 0.02).to(torch.bfloat16)
+    low = trunk_tool.quantize(w, (1.05, 1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7))[3]
+    wide = trunk_tool.quantize(w, (1.6, 1.5, 1.4, 1.3, 1.2, 1.1, 1.05, 1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7))[3]
+    assert wide < 0.95 * low

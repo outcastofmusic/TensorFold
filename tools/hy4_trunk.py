@@ -240,7 +240,10 @@ def main() -> None:
     p.add_argument("model")
     p.add_argument("out")
     p.add_argument("--classes", default="attn,shared,latent,head")
-    p.add_argument("--search", default="1.05,1.0,0.975,0.95,0.925,0.9,0.875,0.85,0.825,0.8,0.775,0.75,0.7")
+    # factors above 1 map a block's largest value to 4 or 3 and give the rest finer steps: 1.1-1.6 took the relative
+    # error of real expert and o_proj rows from 0.0074 to 0.0066, the NVFP4 pack's own (22 Nov)
+    p.add_argument("--search", default="1.6,1.5,1.4,1.3,1.2,1.1,1.05,1.0,0.975,0.95,0.925,0.9,0.875,0.85,0.825,0.8,"
+                                       "0.775,0.75,0.7")
     p.add_argument("--fp8", default="", help="classes written in block FP8 instead of NVFP4")
     p.add_argument("--layers", default="", help="first,last layer (inclusive); default every layer")
     p.add_argument("--stats", default="", help="tools/hy4_calib.py's folder: GPTQ, or diagonal-weighted scales")
