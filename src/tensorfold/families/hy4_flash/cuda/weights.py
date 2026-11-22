@@ -278,17 +278,33 @@ class _Trunk:
     """NVFP4 replacements for the checkpoint's projections (``tools/hy4_trunk.py`` writes them from the BF16 release):
     ``<name>.weight`` codes, ``.weight_scale`` e4m3 and ``.weight_scale_2`` fp32 by the checkpoint's own names."""
 
-    def __init__(self, folder: str | None, device: str) -> None:
+    def __init__(self, folder: str | None, device: str, only: str | None = None, skip: str | None = None) -> None:
+        import os
+        import re
+
         from tensorfold.cuda.direct_read import SafeTensors
 
         self.device = device
+        # TF_HY4_TRUNK_ONLY / TF_HY4_TRUNK_SKIP: regular expressions over projection names (``model.layers.7.
+        # self_attn.o_proj``, ``lm_head``) that take a folder's replacement, or keep the checkpoint's: one class of
+        # a trunk folder at a time (a sensitivity window), or a folder's layout less its sensitive tensors
+        only = os.environ.get("TF_HY4_TRUNK_ONLY") if only is None else only
+        skip = os.environ.get("TF_HY4_TRUNK_SKIP") if skip is None else skip
+        self.only = re.compile(only) if only else None
+        self.skip = re.compile(skip) if skip else None
         files = sorted(Path(folder).glob("*.safetensors")) if folder else []
         if folder and not files:
             raise ValueError(f"TF_HY4_TRUNK={folder}: no safetensors files there")
         self.t = SafeTensors(files) if files else None
 
+    def taken(self, name: str) -> bool:
+        """Whether the filters let projection ``name`` take the folder's replacement."""
+
+        return ((self.only is None or self.only.search(name) is not None)
+                and (self.skip is None or self.skip.search(name) is None))
+
     def __contains__(self, name: str) -> bool:
-        return self.t is not None and name + ".weight" in self.t
+        return self.t is not None and name + ".weight" in self.t and self.taken(name)
 
     def fp8(self, name: str) -> tuple[torch.Tensor, torch.Tensor] | None:
         """(e4m3 [N, K], fp32 block scales) when ``name`` is stored in block FP8, else None."""
@@ -300,7 +316,7 @@ class _Trunk:
     def rows(self, name: str) -> tuple[torch.Tensor, torch.Tensor] | None:
         """(e4m3 [N, K], fp32 scale a row [N]) when ``name`` is stored in row-scaled FP8 (kv_b), else None."""
 
-        if self.t is None or name + ".weight_scale_row" not in self.t:
+        if self.t is None or name + ".weight_scale_row" not in self.t or not self.taken(name):
             return None
         return self.t.get(name + ".weight", self.device), self.t.get(name + ".weight_scale_row", self.device)
 

@@ -2,6 +2,7 @@
 
     python tools/hy4_golden.py engine MODEL OUT.npz          # in the serving image, on the GPU
     python tools/hy4_golden.py reference MODEL ENGINE.npz    # where transformers PR #50903 is installed
+    python tools/hy4_golden.py compare ENGINE.bf16.npz OTHER.npz ...   # CPU: KL against the saved reference
 
 ``engine`` renders four prompts (chat, a tool call, code, and a document of about 3,000 tokens that takes the sparse
 layers past 2,048 keys), decodes up to 32 greedy tokens each (to the end token), then runs each whole sequence through one prompt pass and
@@ -10,6 +11,9 @@ through transformers' decoder layers one at a time, on the GPU, each holding the
 bf16 (block FP8 and NVFP4) and reading its Engram rows from the tables' files. It reports top-1 agreement, the greedy
 tokens where transformers' top two stand apart, and KL(transformers || engine) over the decoded region up to the
 reply's end token: past it both models are out of distribution (a golden saved before 21 Nov holds those rows).
+``reference`` also saves transformers' logits of the compared rows (``ENGINE.bf16.npz``), so ``compare`` measures any
+later golden of the same sequences (``engine --same``) on the CPU in seconds instead of another reference pass.
+``HY4_GOLDEN_PROMPTS`` names a JSON file of prompts, ``HY4_GOLDEN_STEPS`` the reply length (32).
 """
 
 from __future__ import annotations
@@ -24,7 +28,8 @@ from pathlib import Path
 
 import numpy as np
 
-STEPS = 32
+STEPS = int(os.environ.get("HY4_GOLDEN_STEPS", "32"))
+MAX_LEN = int(os.environ.get("HY4_GOLDEN_MAX_LEN", "8192"))
 TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "Current weather for a city",
                                            "parameters": {"type": "object", "properties": {
                                                "city": {"type": "string"}, "unit": {"type": "string",
@@ -84,7 +89,7 @@ def engine(model: str, out: str, same: str | None = None) -> None:
     t0 = time.perf_counter()
     w = load(model, "cuda")
     print(f"loaded in {time.perf_counter() - t0:.1f}s, {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
-    e = Engine(w, max_len=8192)
+    e = Engine(w, max_len=MAX_LEN)
     greedy = Sampling(seed=0, temperature=0.0)
     saved: dict[str, np.ndarray] = {}
     fixed = np.load(same) if same else None
@@ -337,6 +342,7 @@ def reference(model: str, engine_npz: str, others: list[str] | None = None) -> N
             raise ValueError(f"{other} holds other sequences than {engine_npz}")
     with torch.no_grad():
         wants = {n: norm(head(hidden[n]))[0].float() @ lm.t() for n in seqs}           # [T, V] fp32
+    save_wants(np.load(engine_npz), wants, eos, Path(engine_npz).with_suffix(".bf16.npz"))
     for path in [engine_npz] + list(others or []):
         print(f"-- {path}", flush=True)
         report = _compare(np.load(path), seqs, wants, eos, dev)
@@ -390,6 +396,77 @@ def _compare(z, seqs, wants, eos, dev) -> dict:
     return report
 
 
+def save_wants(z, wants: dict, eos, path: Path) -> None:
+    """The reference's fp32 logits of the rows a comparison reads (the reply to its end, the last ``PROMPT_ROWS``
+    prompt rows) with the sequences they belong to: ``compare``'s input."""
+
+    saved: dict[str, np.ndarray] = {"eos": np.array(list(eos), np.int64)}
+    for n, want in wants.items():
+        p0 = int(z[f"{n}_prompt"][0])
+        rows = decoded_rows(z[f"{n}_gen"].tolist(), eos)
+        lo = max(0, p0 - 1 - PROMPT_ROWS)
+        saved[f"{n}_ids"] = z[f"{n}_ids"]
+        saved[f"{n}_prompt"] = z[f"{n}_prompt"]
+        saved[f"{n}_gen"] = z[f"{n}_gen"]
+        saved[f"{n}_want_tail"] = want[p0 - 1:p0 - 1 + rows].float().cpu().numpy()
+        saved[f"{n}_want_ptail"] = want[lo:p0 - 1].float().cpu().numpy()
+    np.savez(path, **saved)
+
+
+def _kl(want: np.ndarray, got: np.ndarray):
+    """Rows' KL(want || got) of fp32 logits [T, V] (torch on the CPU, one row block at a time)."""
+
+    import torch
+
+    out = []
+    for r0 in range(0, want.shape[0], 64):
+        lp = torch.from_numpy(want[r0:r0 + 64].astype(np.float32)).log_softmax(-1)
+        lq = torch.from_numpy(got[r0:r0 + 64].astype(np.float32)).log_softmax(-1)
+        out.append((lp.exp() * (lp - lq)).sum(-1))
+    return torch.cat(out) if out else torch.zeros(0)
+
+
+def compare_saved(ref: str, goldens: list[str]) -> dict:
+    """Each golden (made with ``engine --same`` on the reference's sequences) against the saved reference rows: reply
+    KL up to the end token, prompt KL over the last ``PROMPT_ROWS`` rows, and greedy agreement on the reply rows.
+    Writes GOLDEN.kl.json and returns {golden: report}."""
+
+    r = np.load(ref)
+    eos = tuple(int(t) for t in r["eos"])
+    names = sorted({k[:-len("_want_tail")] for k in r.files if k.endswith("_want_tail")})
+    out = {}
+    for path in goldens:
+        z = np.load(path)
+        report: dict = {}
+        reply_kl, prompt_kl = [], []
+        for n in names:
+            if z[f"{n}_ids"].tolist() != r[f"{n}_ids"].tolist():
+                raise ValueError(f"{path}: {n} holds another sequence than {ref}")
+            want = r[f"{n}_want_tail"]
+            rows = want.shape[0]
+            kl = _kl(want, z[f"{n}_tail"][:rows])
+            gen = z[f"{n}_gen"][:rows]
+            same = int((want.argmax(-1) == gen).sum())
+            report[n] = {"kl_mean": float(f"{float(kl.mean()):.3g}"), "kl_max": float(f"{float(kl.max()):.3g}"),
+                         "rows": rows, "greedy_steps_equal": f"{same}/{rows}"}
+            reply_kl.append(kl)
+            pw = r[f"{n}_want_ptail"]
+            if f"{n}_ptail" in z.files and pw.shape[0]:
+                kp = _kl(pw, z[f"{n}_ptail"][-pw.shape[0]:])
+                report[n]["kl_prompt_mean"] = float(f"{float(kp.mean()):.3g}")
+                prompt_kl.append(kp)
+        import torch
+
+        report["_mean"] = {"reply_kl_by_prompt": float(f"{np.mean([report[n]['kl_mean'] for n in names]):.4g}"),
+                           "reply_kl_by_row": float(f"{float(torch.cat(reply_kl).mean()):.4g}"),
+                           "prompt_kl_by_row": float(f"{float(torch.cat(prompt_kl).mean()):.4g}") if prompt_kl
+                           else None}
+        Path(path).with_suffix(".kl.json").write_text(json.dumps(report, indent=1))
+        print(path, json.dumps(report["_mean"]), flush=True)
+        out[path] = report
+    return out
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -401,9 +478,14 @@ def main() -> None:
     b.add_argument("model")
     b.add_argument("engine_npz")
     b.add_argument("others", nargs="*", help="goldens made with --same ENGINE_NPZ, compared in the same pass")
+    c = sub.add_parser("compare")
+    c.add_argument("ref", help="ENGINE.bf16.npz, saved by reference")
+    c.add_argument("goldens", nargs="+")
     args = p.parse_args()
     if args.cmd == "engine":
         engine(args.model, args.out, args.same)
+    elif args.cmd == "compare":
+        compare_saved(args.ref, args.goldens)
     else:
         reference(args.model, args.engine_npz, args.others)
 

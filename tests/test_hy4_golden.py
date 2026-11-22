@@ -53,3 +53,35 @@ def test_the_reference_reads_rows_up_to_the_first_end(golden, gen, rows):
     """An engine golden saved before the fix holds tokens past the end: the reference reads only the rows before it."""
 
     assert golden.decoded_rows(gen, (1,)) == rows
+
+
+def test_compare_reads_the_saved_reference_rows(golden, tmp_path):
+    """``save_wants`` then ``compare``: a golden equal to the reference scores KL 0 and full agreement; one with a
+    perturbed row scores that row's KL, computed by hand."""
+
+    import numpy as np
+    import torch
+
+    v, p0, eos = 50, 6, (1,)
+    rng = np.random.default_rng(0)
+    seq = list(range(10, 10 + p0)) + [7, 8, 9]
+    gen = [7, 8, 9, 1, 4]                               # rows up to the end token: 4
+    want = torch.from_numpy(rng.normal(size=(len(seq), v)).astype(np.float32))
+    want[p0 - 1:p0 + 3, :] -= 20
+    for i, t in enumerate(gen[:4]):
+        want[p0 - 1 + i, t] += 40
+    base = {"a_ids": np.array(seq), "a_prompt": np.array([p0]), "a_gen": np.array(gen)}
+    golden.save_wants(base, {"a": want}, eos, tmp_path / "ref.bf16.npz")
+    same = dict(base, a_tail=want[p0 - 1:].numpy().astype(np.float16), a_ptail=want[:p0 - 1].numpy().astype(np.float16))
+    off = dict(same, a_tail=same["a_tail"].copy())
+    off["a_tail"][2, 3] += 5.0
+    np.savez(tmp_path / "same.npz", **same)
+    np.savez(tmp_path / "off.npz", **off)
+    rep = golden.compare_saved(str(tmp_path / "ref.bf16.npz"), [str(tmp_path / "same.npz"), str(tmp_path / "off.npz")])
+    s, o = rep[str(tmp_path / "same.npz")], rep[str(tmp_path / "off.npz")]
+    assert s["a"]["rows"] == 4 and s["a"]["greedy_steps_equal"] == "4/4"
+    assert s["a"]["kl_mean"] < 1e-4 and s["a"]["kl_prompt_mean"] < 1e-4
+    lp = want[p0 + 1].log_softmax(-1)
+    lq = torch.from_numpy(off["a_tail"][2].astype(np.float32)).log_softmax(-1)
+    one = float((lp.exp() * (lp - lq)).sum())
+    assert abs(o["a"]["kl_max"] - one) < 2e-3 * max(one, 1e-3)
