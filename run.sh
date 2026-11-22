@@ -327,7 +327,9 @@ hy4() {
     local drafts=(-e "TF_HY4_DRAFT_HEAD=${HY4_DRAFT_HEAD:-nvfp4}" -e "TF_HY4_DFLY_ADAPTIVE=${HY4_ADAPTIVE:-1}"
                   -e "TF_HY4_DFLY_FLOOR=${HY4_FLOOR:-0.15}" -e "TF_HY4_DFLY_KEYED=${HY4_KEYED:-1}"
                   -e "TF_HY4_DFLY_DEPTH=${HY4_DEPTH:-5}" -e "TF_HY4_COPY=${HY4_COPY:-qwen}")
-    # HY4_TRUNK: a folder under $MODELS of NVFP4 trunk projections (tools/hy4_trunk.py) that replace the pack's
+    # HY4_TRUNK: a folder under $MODELS of NVFP4 trunk projections (tools/hy4_trunk.py) that replace the pack's. Off:
+    # Hy4-flash-trunk-full decodes chat 27-29 tok/s against 20-22 and scores TrueScore 92.8 (+0.0 [-2.0, +2.4]), but
+    # its KL against BF16 is 0.065 against the pack's 0.022 (notes/tf-runs/hy4-opt2-1122)
     [ -z "${HY4_TRUNK:-}" ] || drafts+=(-e "TF_HY4_TRUNK=$MODELS/$HY4_TRUNK")
     IMAGE=$(image)
     stop_all
