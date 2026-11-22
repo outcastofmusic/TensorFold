@@ -867,6 +867,77 @@ def _hc_boundary(X, PP, YP, FN, BASE, SCALE, POST, H, NW, OUT, eps, hc_eps, mag,
     tl.store(OUT + r * D + offs, (n * w).to(tl.bfloat16), mask=ok)
 
 
+@triton.jit
+def _hc_part(X, PP, YP, FN, PART, D: tl.constexpr, S: tl.constexpr, M: tl.constexpr, BD: tl.constexpr,
+             WRITE: tl.constexpr):
+    """Program (r, c): chunk c of ``_hc_boundary``'s loop (stream c // (D / BD), BD columns): its write-back, then its
+    term of the mixes, tl.sum(FN * x) over the chunk, the same expression on the same tile as the one-program
+    kernel's, into PART[r, c]."""
+
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    s = c // (D // BD)
+    d = (c % (D // BD)) * BD + tl.arange(0, BD)
+    m = tl.arange(0, M)
+    if WRITE:
+        p = tl.load(PP + r * S + s)
+        y = tl.load(YP + r * D + d).to(tl.float32)
+        x = tl.load(X + (r * S + s) * D + d).to(tl.float32)
+        tl.store(X + (r * S + s) * D + d, (p * y + x).to(tl.bfloat16))
+        tl.debug_barrier()
+    x = tl.load(X + (r * S + s) * D + d).to(tl.float32)
+    f = tl.load(FN + m[:, None] * (S * D) + s * D + d[None, :])
+    tl.store(PART + (r * (S * (D // BD)) + c) * M + m, tl.sum(f * x[None, :], axis=1))
+
+
+@triton.jit
+def _hc_finish(X, PART, BASE, SCALE, POST, H, NW, OUT, eps, hc_eps, mag, rms_eps, D: tl.constexpr, S: tl.constexpr,
+               M: tl.constexpr, BD: tl.constexpr, BLOCK: tl.constexpr):
+    """Program r: ``_hc_boundary`` after its write-back, with the mixes' chunk terms read from PART and added in the
+    loop's order; the squares' sum, the gates, the collapse and the norm are the one-program kernel's code."""
+
+    r = tl.program_id(0)
+    m = tl.arange(0, M)
+    acc = tl.zeros((M,), tl.float32)
+    ss = tl.zeros((BD,), tl.float32)
+    c = 0
+    for s in tl.static_range(S):
+        for d0 in range(0, D, BD):
+            d = d0 + tl.arange(0, BD)
+            x = tl.load(X + (r * S + s) * D + d).to(tl.float32)
+            ss += x * x
+            acc += tl.load(PART + (r * (S * (D // BD)) + c) * M + m)
+            c += 1
+    inv = 1.0 / tl.sqrt(tl.sum(ss, axis=0) / (S * D) + eps)
+    mixes = acc * inv
+    base = tl.load(BASE + m)
+    sc = tl.where(m < S, tl.load(SCALE), tl.load(SCALE + 1))
+    gate = tl.sigmoid(mixes * sc + base)
+    pre = gate + hc_eps
+    post = mag * gate + hc_eps
+    tl.store(POST + r * S + (m - S), post, mask=m >= S)
+    for d0 in range(0, D, BD):
+        d = d0 + tl.arange(0, BD)
+        out = tl.zeros((BD,), tl.float32)
+        for s in tl.static_range(S):
+            ps = tl.sum(tl.where(m == s, pre, 0.0), axis=0)
+            out += ps * tl.load(X + (r * S + s) * D + d).to(tl.float32)
+        tl.store(H + r * D + d, out.to(tl.bfloat16))
+    tl.debug_barrier()
+    offs = tl.arange(0, BLOCK)
+    ok = offs < D
+    x = tl.load(H + r * D + offs, mask=ok, other=0.0).to(tl.float32)
+    inv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + rms_eps)
+    n = (x * inv).to(tl.bfloat16).to(tl.float32)
+    w = tl.load(NW + offs, mask=ok, other=0.0).to(tl.float32)
+    tl.store(OUT + r * D + offs, (n * w).to(tl.bfloat16), mask=ok)
+
+
+# TF_HY4_HC_SPLIT=0: the one-program boundary kernel. Split (default): the mixes' 48 chunk terms of a row on 48
+# programs, then the rest on one; the one program read hc_fn's 393 KB alone, 60 us a boundary (window 3 profile)
+HC_SPLIT = __import__("os").environ.get("TF_HY4_HC_SPLIT", "1") != "0"
+
+
 def hc_boundary(x: torch.Tensor, pending: tuple[torch.Tensor, torch.Tensor] | None, fn: torch.Tensor,
                 base: torch.Tensor, scale: torch.Tensor, norm: torch.Tensor, *, eps: float, hc_eps: float,
                 magnitude: float, rms_eps: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -879,6 +950,13 @@ def hc_boundary(x: torch.Tensor, pending: tuple[torch.Tensor, torch.Tensor] | No
     h = torch.empty((rows, d), dtype=torch.bfloat16, device=x.device)
     out = torch.empty((rows, d), dtype=torch.bfloat16, device=x.device)
     pp, yp = pending if pending is not None else (post, h)
+    if HC_SPLIT and d % 256 == 0:
+        part = torch.empty((rows, s * (d // 256), m), dtype=torch.float32, device=x.device)
+        _hc_part[(rows, s * (d // 256))](x, pp, yp.contiguous(), fn, part, D=d, S=s, M=m, BD=256,
+                                         WRITE=pending is not None, num_warps=8)
+        _hc_finish[(rows,)](x, part, base, scale, post, h, norm, out, eps, hc_eps, magnitude, rms_eps, D=d, S=s, M=m,
+                            BD=256, BLOCK=triton.next_power_of_2(d), num_warps=8)
+        return post, out
     _hc_boundary[(rows,)](x, pp, yp.contiguous(), fn, base, scale, post, h, norm, out, eps, hc_eps, magnitude,
                           rms_eps, D=d, S=s, M=m, BD=256, BLOCK=triton.next_power_of_2(d), WRITE=pending is not None,
                           num_warps=8)

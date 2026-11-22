@@ -621,3 +621,31 @@ def test_wide_windows_equal_single_rows(weights, goldens, width):
             got = win.forward(ids[start:start + width], prompt=False, every=True)
             win.rewind(width)
             assert torch.equal(got, want), f"graphs {graphs}: max diff {float((got - want).abs().max())}"
+
+
+@pytest.mark.parametrize("rows", [1, 6, 16, 300])
+def test_split_hc_boundary_keeps_the_one_program_bits(rows, monkeypatch):
+    """TF_HY4_HC_SPLIT: the mixes' chunk terms on their own programs, summed in the loop's order, give the
+    one-program kernel's streams, post gates and normed row bit for bit (and the three kernels')."""
+
+    from tensorfold.families.hy4_flash.cuda import kernels as K
+
+    g = torch.Generator("cuda").manual_seed(100 + rows)
+    s, d = 4, 3072
+    for scale_x in (0.05, 3.0):
+        x = (torch.randn(rows, s, d, device="cuda", generator=g) * scale_x).to(torch.bfloat16)
+        y = (torch.randn(rows, d, device="cuda", generator=g)).to(torch.bfloat16)
+        pp = torch.rand(rows, s, device="cuda", generator=g) * 2
+        fn = torch.randn(2 * s, s * d, device="cuda", generator=g) * 0.01
+        base, scale = torch.randn(2 * s, device="cuda", generator=g), torch.rand(2, device="cuda", generator=g)
+        nw = (torch.rand(d, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
+        for pending in (None, (pp, y)):
+            outs = []
+            for split in (False, True):
+                monkeypatch.setattr(K, "HC_SPLIT", split)
+                b = x.clone()
+                post, h = K.hc_boundary(b, pending, fn, base, scale, nw, eps=1e-5, hc_eps=1e-6, magnitude=2.0,
+                                        rms_eps=1e-5)
+                outs.append((b, post, h))
+            for u, v in zip(*outs):
+                assert torch.equal(u, v)
