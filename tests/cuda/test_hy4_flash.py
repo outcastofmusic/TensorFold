@@ -596,3 +596,28 @@ def test_route_and_pair_engine_gives_the_torch_logits(weights, goldens, monkeypa
         rows += [e.forward(ids[32:38], prompt=False, every=True), e.forward(ids[38:39], prompt=False)]
         out.append(torch.cat([r.float() for r in rows]))
     assert torch.equal(out[0], out[1])
+
+
+@pytest.mark.parametrize("width", [17, 24, 32])
+def test_wide_windows_equal_single_rows(weights, goldens, width):
+    """TF_HY4_DECODE_ROWS=32 (set before the import): windows of 17-32 rows keep each row's one-row bits, eager and
+    by graph replay. Skipped at the default 16."""
+
+    from tensorfold.families.hy4_flash.cuda.weights import DECODE_ROWS
+
+    if DECODE_ROWS < width:
+        pytest.skip(f"TF_HY4_DECODE_ROWS={DECODE_ROWS}")
+    ids = goldens["long_ids"].tolist()
+    start = 8
+    if len(ids) < start + width:
+        pytest.skip("the golden is shorter than the window")
+    one = _engine(weights)
+    one.forward(ids[:start], prompt=True)
+    want = torch.cat([one.forward([t], prompt=False) for t in ids[start:start + width]])
+    for graphs in (False, True):
+        win = _engine(weights, graphs=graphs)
+        win.forward(ids[:start], prompt=True)
+        for _ in range(2):                       # a graph's first call runs eagerly, its second replays
+            got = win.forward(ids[start:start + width], prompt=False, every=True)
+            win.rewind(width)
+            assert torch.equal(got, want), f"graphs {graphs}: max diff {float((got - want).abs().max())}"

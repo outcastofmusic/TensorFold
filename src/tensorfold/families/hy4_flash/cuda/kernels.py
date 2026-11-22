@@ -244,7 +244,8 @@ class Head4:
 
 # ----------------------------------------------------------------------------------- MLA absorb and expand ---
 
-ROW_KERNEL = 16          # calls of up to this many rows take the per-row kernels; prompt chunks batched matmuls
+# calls of up to this many rows take the per-row kernels, prompt chunks batched matmuls (weights.DECODE_ROWS)
+ROW_KERNEL = int(__import__("os").environ.get("TF_HY4_DECODE_ROWS", "16"))
 
 
 @triton.jit

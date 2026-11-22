@@ -364,7 +364,10 @@ class Engine:
         if self.cuda:
             from tensorfold.cuda import moe as moe_mod
 
-            logits = moe_mod.router(x, m.router)
+            if 16 < rows <= DECODE_ROWS:       # a wide decode window: the router's 16-row tile, a row's bits
+                logits = torch.cat([moe_mod.router(x[r:r + 16], m.router) for r in range(0, rows, 16)])
+            else:
+                logits = moe_mod.router(x, m.router)
         else:
             logits = x.float() @ m.router.float().t()
         if ROUTE and self.cuda and self.seen is None and self.replay is None:
