@@ -21,7 +21,7 @@ HB = 16                # heads a program
 # --------------------------------------------------------------------------------------------- RMSNorm ---
 
 @triton.jit
-def _rmsnorm(X, W, Y, x_stride, eps, D: tl.constexpr, BLOCK: tl.constexpr):
+def _rmsnorm(X, W, Y, x_stride, y_stride, eps, D: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     ok = offs < D
@@ -29,11 +29,12 @@ def _rmsnorm(X, W, Y, x_stride, eps, D: tl.constexpr, BLOCK: tl.constexpr):
     inv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps)
     n = (x * inv).to(tl.bfloat16).to(tl.float32)
     w = tl.load(W + offs, mask=ok, other=0.0).to(tl.float32)
-    tl.store(Y + row * D + offs, (n * w).to(tl.bfloat16), mask=ok)
+    tl.store(Y + row * y_stride + offs, (n * w).to(tl.bfloat16), mask=ok)
 
 
 def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float, out: torch.Tensor | None = None) -> torch.Tensor:
-    """transformers' RMSNorm: bf16(w * bf16(x / rms(x))) over the last dim of bf16 rows [R, D]."""
+    """transformers' RMSNorm: bf16(w * bf16(x / rms(x))) over the last dim of bf16 rows [R, D]. ``out`` (CUDA) may
+    be a row-strided view, such as the normed part of a wider row."""
 
     d = x.shape[-1]
     if not x.is_cuda:
@@ -44,8 +45,11 @@ def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float, out: torch.Tensor | No
     if x2.stride(-1) != 1:
         x2 = x2.contiguous()
     y = out if out is not None else torch.empty((x2.shape[0], d), dtype=torch.bfloat16, device=x.device)
-    _rmsnorm[(x2.shape[0],)](x2, w, y, x2.stride(0), eps, D=d, BLOCK=triton.next_power_of_2(d), num_warps=8)
-    return y.view(*x.shape[:-1], d)
+    if y.dim() != 2 or y.stride(-1) != 1 or y.shape != x2.shape:
+        raise ValueError(f"rmsnorm out must be [{x2.shape[0]}, {d}] with unit column stride")
+    _rmsnorm[(x2.shape[0],)](x2, w, y, x2.stride(0), y.stride(0), eps, D=d, BLOCK=triton.next_power_of_2(d),
+                             num_warps=8)
+    return y if out is not None else y.view(*x.shape[:-1], d)
 
 
 # ---------------------------------------------------------------------------------------- hyper-connections ---
@@ -244,8 +248,8 @@ ROW_KERNEL = 16          # calls of up to this many rows take the per-row kernel
 
 
 @triton.jit
-def _absorb(Q, WK, SK, QA, R, q_stride, H: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, LW: tl.constexpr,
-            BN: tl.constexpr, F8: tl.constexpr):
+def _absorb(Q, WK, SK, QA, R, q_stride, qa_stride, H: tl.constexpr, D: tl.constexpr, DP: tl.constexpr,
+            LW: tl.constexpr, BN: tl.constexpr, F8: tl.constexpr):
     """Program (head, latent block): QA[r, h, n] = sum_k Q[r, h, k] WK[h, k, n], one fp32 sum a row. ``F8``: WK holds
     e4m3 codes and SK [H, D] each row's fp32 scale."""
 
@@ -260,7 +264,7 @@ def _absorb(Q, WK, SK, QA, R, q_stride, H: tl.constexpr, D: tl.constexpr, DP: tl
         w = tl.load(WK + (h * D + k[:, None]) * LW + n[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
     for r in range(R):
         q = tl.load(Q + r * q_stride + h * D + k, mask=ok, other=0.0).to(tl.float32)
-        tl.store(QA + (r * H + h) * LW + n, tl.sum(q[:, None] * w, axis=0).to(tl.bfloat16))
+        tl.store(QA + (r * H + h) * qa_stride + n, tl.sum(q[:, None] * w, axis=0).to(tl.bfloat16))
 
 
 @triton.jit
@@ -300,7 +304,8 @@ class RowF8:
 
 
 def absorb(q: torch.Tensor, wk, out: torch.Tensor) -> torch.Tensor:
-    """q [R, H, D] (rows may be strided) times kv_b's key rows wk [H, D, LW] (bf16 or ``RowF8``) -> out [R, H, LW]."""
+    """q [R, H, D] (rows may be strided) times kv_b's key rows wk [H, D, LW] (bf16 or ``RowF8``) -> out [R, H, LW];
+    on the row kernel ``out`` may be the first LW columns of wider (row, head) rows, such as the absorbed query's."""
 
     rows, heads, d = q.shape
     lw = wk.shape[2]
@@ -315,8 +320,11 @@ def absorb(q: torch.Tensor, wk, out: torch.Tensor) -> torch.Tensor:
         return out
     if q.stride(2) != 1 or q.stride(1) != d:
         q = q.contiguous()
-    _absorb[(heads, lw // 64)](q, wk.codes if f8 else wk, wk.scales if f8 else wk, out, rows, q.stride(0), H=heads,
-                               D=d, DP=triton.next_power_of_2(d), LW=lw, BN=64, F8=f8, num_warps=4)
+    step = out.stride(1)
+    if out.stride(2) != 1 or (rows > 1 and out.stride(0) != heads * step):
+        raise ValueError("absorb out must hold evenly strided (row, head) rows")
+    _absorb[(heads, lw // 64)](q, wk.codes if f8 else wk, wk.scales if f8 else wk, out, rows, q.stride(0), step,
+                               H=heads, D=d, DP=triton.next_power_of_2(d), LW=lw, BN=64, F8=f8, num_warps=4)
     return out
 
 
@@ -652,7 +660,7 @@ def group_scores(qi: torch.Tensor, hw: torch.Tensor, gkeys: torch.Tensor, closed
 # ``add_rn``), as torch's separate launches round them, so no FMA contraction changes a value.
 
 @triton.jit
-def _rope(X, POS, INV, OUT, N, x_stride, H, RW: tl.constexpr, BR: tl.constexpr):
+def _rope(X, POS, INV, OUT, N, x_stride, o_stride, H, RW: tl.constexpr, BR: tl.constexpr):
     """Program (row block): rows n of X [N, RW] (stride x_stride) at position POS[n // H], pairs (x[2i], x[2i+1])
     turned by bf16(cos), bf16(sin) of pos * INV[i]."""
 
@@ -667,23 +675,40 @@ def _rope(X, POS, INV, OUT, N, x_stride, H, RW: tl.constexpr, BR: tl.constexpr):
     b = tl.load(X + n[:, None] * x_stride + 2 * i[None, :] + 1, mask=ok[:, None], other=0.0).to(tl.float32)
     o0 = libdevice.sub_rn(libdevice.mul_rn(a, c), libdevice.mul_rn(b, s))
     o1 = libdevice.add_rn(libdevice.mul_rn(b, c), libdevice.mul_rn(a, s))
-    tl.store(OUT + n[:, None] * RW + 2 * i[None, :], o0.to(tl.bfloat16), mask=ok[:, None])
-    tl.store(OUT + n[:, None] * RW + 2 * i[None, :] + 1, o1.to(tl.bfloat16), mask=ok[:, None])
+    tl.store(OUT + n[:, None] * o_stride + 2 * i[None, :], o0.to(tl.bfloat16), mask=ok[:, None])
+    tl.store(OUT + n[:, None] * o_stride + 2 * i[None, :] + 1, o1.to(tl.bfloat16), mask=ok[:, None])
 
 
-def rope(x: torch.Tensor, pos: torch.Tensor, inv: torch.Tensor) -> torch.Tensor:
+def _rows(t: torch.Tensor) -> int | None:
+    """The stride between t's RW-wide rows when every leading index steps evenly (slices of wider rows), else None."""
+
+    step = t.stride(-2) if t.dim() > 1 else t.shape[-1]
+    for i in range(t.dim() - 2, 0, -1):
+        if t.shape[i] > 1 and t.stride(i - 1) != t.shape[i] * t.stride(i):
+            return None
+        if t.shape[i] == 1 and t.dim() > 2 and t.stride(i - 1) != step:
+            return None
+    return step if t.stride(-1) == 1 else None
+
+
+def rope(x: torch.Tensor, pos: torch.Tensor, inv: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """``Engine._rope`` in one launch: x [R, ..., RW] bf16 (rows of RW evenly strided, as slices of a wider row are),
-    pos [R] int, inv fp32 [RW / 2] -> a new contiguous bf16 tensor of x's shape."""
+    pos [R] int, inv fp32 [RW / 2] -> a new contiguous bf16 tensor of x's shape, or ``out`` (x's shape, its rows
+    evenly strided: the rotated part of a wider row) written in place."""
 
     rw = x.shape[-1]
     heads = x[0].numel() // rw if x.shape[0] else 1
     flat = x.reshape(-1, rw)                     # a view when the rows are evenly strided, else a copy
     if flat.stride(-1) != 1:
         flat = flat.contiguous()
-    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    if out is None:
+        out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    step = _rows(out)
+    if out.shape != x.shape or out.dtype != torch.bfloat16 or step is None:
+        raise ValueError("rope out must have x's shape and evenly strided bf16 rows")
     n = flat.shape[0]
     br = 16
-    _rope[(triton.cdiv(n, br),)](flat, pos, inv, out, n, flat.stride(0), heads, RW=rw, BR=br, num_warps=4)
+    _rope[(triton.cdiv(n, br),)](flat, pos, inv, out, n, flat.stride(0), step, heads, RW=rw, BR=br, num_warps=4)
     return out
 
 

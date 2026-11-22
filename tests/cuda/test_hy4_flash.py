@@ -482,3 +482,72 @@ def test_hc_boundary_keeps_the_three_kernels_bits(rows):
         got_post, got = K.hc_boundary(b, pending, fn, base, scale, nw, eps=1e-5, hc_eps=1e-6, magnitude=2.0,
                                       rms_eps=1e-5)
         assert torch.equal(a, b) and torch.equal(post, got_post) and torch.equal(want, got)
+
+
+@pytest.mark.parametrize("rows", [1, 6, 16, 40])
+def test_in_place_writes_keep_the_bits(rows):
+    """RMSNorm, RoPE and the absorb write into slices of wider rows (the latent row, the absorbed query, a rotated
+    part in place) with the bits of the copies they replace."""
+
+    from tensorfold.families.hy4_flash.cuda import kernels as K
+
+    g = torch.Generator("cuda").manual_seed(11)
+
+    def rnd(*shape, scale=1.0):
+        return (torch.randn(*shape, device="cuda", generator=g) * scale).to(torch.bfloat16)
+
+    inv = (1.0 / (1e7 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))).cuda()
+    pos = torch.randint(0, 131072, (rows,), device="cuda", generator=g, dtype=torch.int32)
+    ckv, w = rnd(rows, 576, scale=3.0), rnd(512) + 1
+    lat = torch.empty((rows, 576), dtype=torch.bfloat16, device="cuda")
+    K.rmsnorm(ckv[:, :512], w, 1e-5, out=lat[:, :512])
+    K.rope(ckv[:, 512:], pos, inv, out=lat[:, 512:])
+    assert torch.equal(lat[:, :512], K.rmsnorm(ckv[:, :512], w, 1e-5))
+    assert torch.equal(lat[:, 512:], K.rope(ckv[:, 512:], pos, inv))
+    for heads, f8 in ((32, False), (64, False), (64, True)):
+        q = rnd(rows, heads, 256, scale=2.0)
+        wk = rnd(heads, 192, 512, scale=0.05)
+        if f8:
+            sc = wk.float().abs().amax(-1) / 448
+            wk = K.RowF8((wk.float() / sc[..., None]).to(torch.float8_e4m3fn).view(torch.uint8), sc)
+        qa = torch.empty((rows, heads, 576), dtype=torch.bfloat16, device="cuda")
+        K.absorb(q[:, :, :192], wk, qa[:, :, :512])
+        K.rope(q[:, :, 192:], pos, inv, out=qa[:, :, 512:])
+        want = K.absorb(q[:, :, :192], wk, torch.empty((rows, heads, 512), dtype=torch.bfloat16, device="cuda"))
+        assert torch.equal(qa[:, :, :512], want)
+        assert torch.equal(qa[:, :, 512:], K.rope(q[:, :, 192:], pos, inv))
+    keys = rnd(rows, 16, 128, scale=2.0)
+    want = torch.cat([keys[..., :64], K.rope(keys[..., 64:], pos, inv)], -1)
+    K.rope(keys[..., 64:], pos, inv, out=keys[..., 64:])
+    assert torch.equal(keys, want)
+
+
+@pytest.mark.parametrize("width", [1, 6])
+def test_dense_graphs_give_the_scoring_graph_bits(weights, goldens, width, monkeypatch):
+    """Graphs captured below the indexer's dense limit skip its scoring; decoding across the limit gives the logits
+    and key lists of one scoring graph a width, and of eager calls."""
+
+    from tensorfold.families.hy4_flash.cuda import model
+
+    ids = goldens["long_ids"].tolist()
+    out = []
+    for arm in ("eager", "one", "dense"):
+        monkeypatch.setattr(model, "DENSE_GRAPHS", arm == "dense")
+        e = _engine(weights, graphs=arm != "eager")
+        e.watch = {i for i, layer in enumerate(weights.layers) if layer.attn.indexer is not None}
+        e.forward(ids[:8], prompt=True)
+        got, lists = [], []
+        for at in range(8, len(ids) - width + 1, width):
+            got.append(e.forward(ids[at:at + width], prompt=False, every=True))
+            lists.append({li: tuple(t.clone() for t in v) for li, v in e.lists.items()})
+        out.append((torch.cat(got), lists))
+        if arm == "dense":
+            assert {k[1] for k in e.graph} == {True, False}
+    for logits, lists in out[1:]:
+        assert torch.equal(logits, out[0][0])
+        for a, b in zip(lists, out[0][1]):
+            for li in a:
+                sel, tok, cnt = a[li]
+                assert torch.equal(sel, b[li][0]) and torch.equal(cnt, b[li][2])
+                assert torch.equal(torch.where(sel[:, None] != 0, tok, 0), torch.where(b[li][0][:, None] != 0,
+                                                                                         b[li][1], 0))

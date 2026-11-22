@@ -45,6 +45,15 @@ LAZY_ENGRAM = flag("TF_HY4_LAZY_ENGRAM", True)
 # TF_HY4_SIDE=1: a decode call's shared expert runs on a side stream beside the routed experts (fork and join inside
 # the graph), the same kernels on the same inputs, so the same bits (Bolt's shared_stream, AngelSlim's MOE_CONCURRENT)
 SIDE = flag("TF_HY4_SIDE", False)
+# a graph captured while every row sits below the indexer's dense limit (2,048 keys) skips the indexer's scoring, which
+# no row reads there; past the limit the graph that scores takes over. TF_HY4_DENSE_GRAPHS=0: one graph a width
+DENSE_GRAPHS = flag("TF_HY4_DENSE_GRAPHS", True)
+
+
+class _Geometry:
+    """A call's positional tensors (``Engine._geometry``)."""
+
+    pos: torch.Tensor
 
 
 def _silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
@@ -99,7 +108,8 @@ class Engine:
         # which a drafter reads after it replays. A shared pool lets one width's temporaries sit in another's kept
         # rows, and widths replay in any order, so each gets its own unless TF_HY4_GRAPH_POOL=shared.
         # TF_HY4_GRAPH_WIDTHS=1 graphs one-row calls only (verify windows run eagerly)
-        self.graph: dict[int, tuple] = {}
+        self.graph: dict[tuple[int, bool], tuple] = {}     # (width, below the dense limit) -> graph
+        self._geo: _Geometry | None = None
         self.graph_pool = (torch.cuda.graph_pool_handle()
                            if self.cuda and os.environ.get("TF_HY4_GRAPH_POOL") == "shared" else None)
         self.graph_widths = os.environ.get("TF_HY4_GRAPH_WIDTHS", "all")
@@ -172,6 +182,37 @@ class Engine:
 
         return self.meta[0] + self.offsets[:rows]
 
+    def _geometry(self, rows: int) -> "_Geometry":
+        """What every layer of a call derives from its positions alone, made once a call: positions, the sliding
+        layers' key lists, and the sparse layers' closed groups, dense limits and pooled group ids. Each layer made
+        these with its own launches before (about 15 a layer); the values are the same."""
+
+        c = self.c
+        g = _Geometry()
+        pos = g.pos = self._positions(rows)
+        g.pos_long = pos.long()
+        p32 = g.p32 = pos.to(torch.int32)
+        dev = pos.device
+        g.zeros = torch.zeros_like(p32)
+        g.lo = torch.clamp(p32 - (c.window - 1), min=0)
+        g.cnt = p32 - g.lo + 1
+        g.tok1 = torch.zeros((rows, 1), dtype=torch.int32, device=dev)
+        if self.tkeys:
+            pool = c.index_pool
+            groups = (rows + pool - 1) // pool + 1
+            g0 = self.meta[0] // pool
+            g.gids = (g0 + torch.arange(groups, device=dev, dtype=torch.int32)).clamp(max=self.max_len // pool - 1)
+            g.gids_long = g.gids.long()
+            g.gids_pos = g.gids * pool
+            g.closed = (pos // pool).to(torch.int32)
+            g.sel = (g.closed >= self.group_topk).to(torch.int32)
+            limit = (self.group_topk - 1) * pool + pos.to(torch.int32) % pool + 1
+            g.cnt_sparse = torch.where(g.sel != 0, limit, p32 + 1)
+            g.ar_pool = torch.arange(pool, device=dev, dtype=torch.int32)
+            g.own = g.closed[:, None] * pool + g.ar_pool
+            g.tok_dense = torch.zeros((rows, c.index_topk), dtype=torch.int32, device=dev)
+        return g
+
     @staticmethod
     def _rope(x: torch.Tensor, pos: torch.Tensor, inv: torch.Tensor) -> torch.Tensor:
         """Interleaved pairs (x[2i], x[2i+1]) turned by pos * inv[i], with transformers' bf16 cos and sin."""
@@ -192,20 +233,27 @@ class Engine:
         c = self.c
         rows = x.shape[0]
         heads = c.heads_of(li)
-        pos = self._positions(rows)
+        geo = self._geo
+        pos = geo.pos
         inv = self.inv[SPARSE if a.kind == SPARSE else "sliding"]
         gate = a.gate(x, prompt)
         qr = K.rmsnorm(a.q_a(x, prompt), a.q_norm, c.eps)
         q = a.q_b(qr, prompt).view(rows, heads.heads, heads.qk)
         ckv = a.kv_a(x, prompt)
         lat = torch.empty((rows, K.LW + K.RW), dtype=torch.bfloat16, device=x.device)
-        lat[:, :K.LW] = K.rmsnorm(ckv[:, :c.kv_rank], a.kv_norm, c.eps)
-        lat[:, K.LW:] = self._rope(ckv[:, c.kv_rank:], pos, inv)
-        self.latent[li].index_copy_(0, pos.long(), lat)
         qa = torch.empty((rows, heads.heads, K.LW + K.RW), dtype=torch.bfloat16, device=x.device)
-        qa[:, :, :K.LW] = K.absorb(q[:, :, :heads.nope], a.wk, torch.empty(
-            (rows, heads.heads, K.LW), dtype=torch.bfloat16, device=x.device))
-        qa[:, :, K.LW:] = self._rope(q[:, :, heads.nope:], pos, inv)
+        if FUSED and x.is_cuda:              # each part written in place: no temporary and no copy launch
+            K.rmsnorm(ckv[:, :c.kv_rank], a.kv_norm, c.eps, out=lat[:, :K.LW])
+            K.rope(ckv[:, c.kv_rank:], pos, inv, out=lat[:, K.LW:])
+            K.absorb(q[:, :, :heads.nope], a.wk, qa[:, :, :K.LW])
+            K.rope(q[:, :, heads.nope:], pos, inv, out=qa[:, :, K.LW:])
+        else:
+            lat[:, :K.LW] = K.rmsnorm(ckv[:, :c.kv_rank], a.kv_norm, c.eps)
+            lat[:, K.LW:] = self._rope(ckv[:, c.kv_rank:], pos, inv)
+            qa[:, :, :K.LW] = K.absorb(q[:, :, :heads.nope], a.wk, torch.empty(
+                (rows, heads.heads, K.LW), dtype=torch.bfloat16, device=x.device))
+            qa[:, :, K.LW:] = self._rope(q[:, :, heads.nope:], pos, inv)
+        self.latent[li].index_copy_(0, geo.pos_long, lat)
         lo, cnt, sel, tok = self._keys(li, a, x, qr, pos, prompt)
         o_lat = torch.empty((rows, heads.heads, K.LW), dtype=torch.bfloat16, device=x.device)
         K.attention(qa, self.latent[li], lo, cnt, sel, tok, a.sinks, heads.qk ** -0.5, o_lat, self.scratch)
@@ -220,44 +268,41 @@ class Engine:
     def _keys(self, li: int, a: Attention, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, prompt: bool):
         """Each row's key list: (lo, cnt, sel, tok) for ``kernels.attention``."""
 
-        c = self.c
-        rows = x.shape[0]
-        p32 = pos.to(torch.int32)
+        geo = self._geo
         if a.indexer is None:
-            lo = torch.clamp(p32 - (c.window - 1), min=0)
-            tok = torch.zeros((rows, 1), dtype=torch.int32, device=x.device)
-            return lo, p32 - lo + 1, torch.zeros_like(p32), tok
+            return geo.lo, geo.cnt, geo.zeros, geo.tok1
         tok, sel, cnt = self._index(li, a.indexer, x, qr, pos, prompt)
-        cnt = torch.where(sel != 0, cnt, p32 + 1)
         if li in self.watch:
             self.lists[li] = (sel, tok, cnt)
-        return torch.zeros_like(p32), cnt, sel, tok
+        return geo.zeros, cnt, sel, tok
 
     def _index(self, li: int, ix: Indexer, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, prompt: bool):
         """The compressed indexer: cache the rows' token keys, pool the groups they touch, and for rows past
         ``index_topk`` keys pick the 511 best closed groups plus the row's own group (tokens ascending)."""
 
         c = self.c
+        geo = self._geo
         rows = x.shape[0]
         pool, dim, rope = c.index_pool, c.index_dim, c.sparse.rope
+        inplace = FUSED and x.is_cuda
         tk = K.rmsnorm(ix.wk(x, prompt), ix.k_norm, c.eps)
-        self.tkeys[li].index_copy_(0, pos.long(), tk)
-        # every group the call touches: a group's key is right once its last token is in, and no row reads a group
-        # before it closes
-        groups = (rows + pool - 1) // pool + 1
-        g0 = self.meta[0] // pool
-        gids = (g0 + torch.arange(groups, device=x.device, dtype=torch.int32)).clamp(max=self.max_len // pool - 1)
-        gk = K.pool(self.tkeys[li], gids, ix.pv, ix.pg, ix.ape, ix.g_norm, c.eps)
-        gk = torch.cat([gk[:, :dim - rope], self._rope(gk[:, dim - rope:], gids * pool, self.idx_inv)], -1)
-        self.gkeys[li].index_copy_(0, gids.long(), gk)
-        closed = (pos // pool).to(torch.int32)
-        sel = (closed >= self.group_topk).to(torch.int32)
-        tok = torch.zeros((rows, c.index_topk), dtype=torch.int32, device=x.device)
-        cnt = (self.group_topk - 1) * pool + pos.to(torch.int32) % pool + 1
-        if not self._sparse_rows(rows):
-            return tok, sel, cnt
+        self.tkeys[li].index_copy_(0, geo.pos_long, tk)
+        # every group the call touches (``geo.gids``): a group's key is right once its last token is in, and no row
+        # reads a group before it closes
+        gk = K.pool(self.tkeys[li], geo.gids, ix.pv, ix.pg, ix.ape, ix.g_norm, c.eps)
+        if inplace:                         # rows rotate in place: each program reads its rows before it writes them
+            K.rope(gk[:, dim - rope:], geo.gids_pos, self.idx_inv, out=gk[:, dim - rope:])
+        else:
+            gk = torch.cat([gk[:, :dim - rope], self._rope(gk[:, dim - rope:], geo.gids_pos, self.idx_inv)], -1)
+        self.gkeys[li].index_copy_(0, geo.gids_long, gk)
+        closed, sel, cnt = geo.closed, geo.sel, geo.cnt_sparse
+        if not self._sparse_rows(rows):     # no row past the dense limit: attention and drafts read no list
+            return geo.tok_dense, sel, cnt
         qi = ix.wq(qr, prompt).view(rows, c.index_heads, dim)
-        qi = torch.cat([qi[..., :dim - rope], self._rope(qi[..., dim - rope:], pos, self.idx_inv)], -1)
+        if inplace:
+            K.rope(qi[..., dim - rope:], pos, self.idx_inv, out=qi[..., dim - rope:])
+        else:
+            qi = torch.cat([qi[..., :dim - rope], self._rope(qi[..., dim - rope:], pos, self.idx_inv)], -1)
         hw = ix.wh(x, prompt).float() * (c.index_heads ** -0.5 * dim ** -0.5)
         groups = self.max_len // pool if self.graph_capturing else (self.pos + rows) // pool + 1
         logits = K.group_scores(qi, hw, self.gkeys[li], closed, groups)
@@ -269,18 +314,19 @@ class Engine:
         if self.replay_groups is not None:
             forced = self.replay_groups[li][self.pos:self.pos + rows].to(top.device, torch.int32)
             top = torch.where(sel[:, None] != 0, forced, top)
-        expand = (top[:, :, None] * pool + torch.arange(pool, device=x.device, dtype=torch.int32)).view(rows, -1)
-        own = closed[:, None] * pool + torch.arange(pool, device=x.device, dtype=torch.int32)
-        tok[:, :expand.shape[1]] = expand
-        tok[:, expand.shape[1]:] = own
-        return tok, sel, cnt
+        expand = (top[:, :, None] * pool + geo.ar_pool).view(rows, -1)
+        return torch.cat([expand, geo.own], 1), sel, cnt
 
     def _sparse_rows(self, rows: int) -> bool:
-        """Whether any row of the call can sit past the dense limit (host-known; a graph always scores)."""
+        """Whether any row of the call can sit past the dense limit (host-known). A graph captured past the limit
+        scores every step; one captured below it (``graph_dense``) replays only below it and scores nothing."""
 
-        return self.graph_capturing or self.pos + rows - 1 >= self.c.index_topk
+        if self.graph_capturing:
+            return not self.graph_dense
+        return self.pos + rows - 1 >= self.c.index_topk
 
     graph_capturing = False
+    graph_dense = False
     prompt_call = False
 
     def _engram(self, j: int, e: Engram, x: torch.Tensor) -> torch.Tensor:
@@ -383,6 +429,7 @@ class Engine:
         c, w = self.c, self.w
         self.prompt = prompt
         rows = ids.shape[0]
+        self._geo = self._geometry(rows)
         x = w.embed[ids.long()][:, None, :].expand(rows, c.hc, c.hidden).contiguous()
         if FUSED and x.is_cuda:               # each sublayer boundary in one launch (``kernels.hc_boundary``)
             pending = None
@@ -515,19 +562,21 @@ class Engine:
         nothing has written yet, so the eager call's are put back: a drafter reads them next (served DFly2 indexed
         those unwritten lists and tripped a device-side assert on its first request, 21 Nov)."""
 
-        have = self.graph.get(rows)
+        dense = bool(self.tkeys) and DENSE_GRAPHS and self.pos + rows - 1 < self.c.index_topk
+        key = (rows, dense)
+        have = self.graph.get(key)
         if have is None:
             out = self._step(rows)
             normed, lists = self.normed, dict(self.lists)
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
-            self.graph_capturing = True
+            self.graph_capturing, self.graph_dense = True, dense
             try:
                 with torch.cuda.graph(g, pool=self.graph_pool, capture_error_mode="thread_local"):
                     captured = self._step(rows)
             finally:
-                self.graph_capturing = False
-            self.graph[rows] = (g, captured, self.normed, dict(self.lists))
+                self.graph_capturing = self.graph_dense = False
+            self.graph[key] = (g, captured, self.normed, dict(self.lists))
             self.normed, self.lists = normed, lists
             return out
         g, captured, normed, lists = have
