@@ -245,9 +245,9 @@ class Engine:
         pos = geo.pos
         inv = self.inv[SPARSE if a.kind == SPARSE else "sliding"]
         gate = a.gate(x, prompt)
-        qr = K.rmsnorm(a.q_a(x, prompt), a.q_norm, c.eps)
+        q_low, ckv = pair(a.q_a, a.kv_a, x, prompt)          # one launch when both are bf16
+        qr = K.rmsnorm(q_low, a.q_norm, c.eps)
         q = a.q_b(qr, prompt).view(rows, heads.heads, heads.qk)
-        ckv = a.kv_a(x, prompt)
         lat = torch.empty((rows, K.LW + K.RW), dtype=torch.bfloat16, device=x.device)
         qa = torch.empty((rows, heads.heads, K.LW + K.RW), dtype=torch.bfloat16, device=x.device)
         if FUSED and x.is_cuda:              # each part written in place: no temporary and no copy launch
