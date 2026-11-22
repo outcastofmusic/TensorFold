@@ -34,6 +34,10 @@ MAX_READ = 1 << 20            # bytes one read of adjacent rows may cover
 # a gather of this many distinct rows or more reads on native threads (``rowread.cpp``) with the GIL released; fewer
 # (a decode call's 16 rows a table) stay on the Python pool. TF_HY4_NATIVE_READS=0: always the Python pool
 NATIVE_ROWS = 512
+# a gather of at most this many distinct rows (a decode call's: 16 a token and table) queues every read with
+# POSIX_FADV_WILLNEED and reads them in the calling thread. A step's 64 rows took 4.1-5.4 ms on the pool (thread
+# hand-offs, warm or cold) and 0.12 ms warm, 0.7-0.9 ms cold this way (22 Nov, CPU bench). TF_HY4_INLINE_ROWS=0: the pool
+INLINE_ROWS = int(os.environ.get("TF_HY4_INLINE_ROWS", "256"))
 
 
 @lru_cache(maxsize=1)
@@ -152,6 +156,14 @@ class RowReader:
     def fp8(self) -> bool:
         return self.dtype == "F8_E4M3"
 
+    def advise(self, ids: np.ndarray) -> None:
+        """Ask the kernel to start reading rows ``ids`` (POSIX_FADV_WILLNEED): a later ``gather`` of a few rows then
+        waits for one read's latency, not one a row."""
+
+        fd = self._fds[0]
+        for off in (self.w0 + np.unique(np.asarray(ids, dtype=np.int64)) * self.wrow).tolist():
+            os.posix_fadvise(fd, off, self.wrow, os.POSIX_FADV_WILLNEED)
+
     def gather(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
         """Rows ``ids`` -> (bytes [n, row bytes] uint8, fp32 scales [n] or None for bf16), in ``ids``' order."""
 
@@ -164,6 +176,11 @@ class RowReader:
             self._native_reads(self.w0 + unique * self.wrow, self.wrow, codes)
             return codes[inverse], None if self.scales is None else self.scales[flat]
         reads = self._reads(self.w0 + unique * self.wrow, self.wrow, codes)
+        if unique.size <= INLINE_ROWS:      # a decode call: every read queued, then read here in turn
+            for fd, off, size, _, _ in reads:
+                os.posix_fadvise(fd, off, size, os.POSIX_FADV_WILLNEED)
+            _fill(reads)
+            return codes[inverse], None if self.scales is None else self.scales[flat]
         batches = min(WORKERS, len(reads))
         if batches > 1:
             list(self._pool.map(_fill, [reads[i::batches] for i in range(batches)]))

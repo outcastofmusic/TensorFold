@@ -50,6 +50,8 @@ SIDE = flag("TF_HY4_SIDE", False)
 DENSE_GRAPHS = flag("TF_HY4_DENSE_GRAPHS", True)
 # the router's sigmoid, top-k and gather in one launch (``kernels.route``), torch's bits; TF_HY4_ROUTE=0: torch's ops
 ROUTE = flag("TF_HY4_ROUTE", True)
+# a decode call's Engram rows read in the calling thread after queueing every table's reads (``_read_engram``)
+INLINE_READS = flag("TF_HY4_INLINE_READS", True)
 
 
 class _Geometry:
@@ -103,6 +105,8 @@ class Engine:
         from concurrent.futures import ThreadPoolExecutor
 
         self._readers = ThreadPoolExecutor(len(c.engram_layers) or 1, thread_name_prefix="engram-layer")
+        self._eg_host = (torch.zeros((len(c.engram_layers), DECODE_ROWS, heads, c.engram_dim), dtype=torch.float32,
+                                     pin_memory=True) if heads and self.cuda else None)
         self._ahead_pool = ThreadPoolExecutor(1, thread_name_prefix="engram-ahead")
         self._ahead: tuple | None = None
         self._pending: list | None = None      # a prompt chunk's table reads, each awaited before its layer
@@ -492,9 +496,20 @@ class Engine:
 
     # -- Engram rows ---------------------------------------------------------------------------------------------
     def _read_engram(self, tokens: Sequence[int], pos: int, previous: Sequence[int]) -> list[torch.Tensor]:
-        """A call's Engram rows, every layer's table read at once: fp32 [R, heads, dim] a layer, on the host."""
+        """A call's Engram rows, every layer's table read at once: fp32 [R, heads, dim] a layer, on the host. A decode
+        call's few rows are queued in every table first, then read in this thread (no pool hand-offs)."""
 
-        return [j.result() for j in self._submit_engram(tokens, pos, previous)]
+        c = self.c
+        if len(tokens) > DECODE_ROWS or not INLINE_READS:
+            return [j.result() for j in self._submit_engram(tokens, pos, previous)]
+        grams = ngram_tokens(np.asarray(tokens), pos, np.asarray(previous[-(c.engram_ngram - 1):]), c.engram_ngram,
+                             c.pad)
+        layers = [self.w.layers[li].engram for li in c.engram_layers if li < len(self.w.layers)]
+        plans = [(e, e.hasher.rows_of(grams)) for e in layers]
+        for e, rows in plans:
+            if hasattr(e.table, "advise"):
+                e.table.advise(rows)
+        return [gather_engram(e.table, rows, c.engram_dim) for e, rows in plans]
 
     def _submit_engram(self, tokens: Sequence[int], pos: int, previous: Sequence[int]) -> list:
         """``_read_engram``'s reads started, a future a table."""
@@ -529,6 +544,12 @@ class Engine:
         else:                                     # a prefetch for a later call stays for it
             got = self._read_engram(tokens, self.pos, self.ids)
         rows = len(tokens)
+        if rows <= DECODE_ROWS and self.cuda and all(p.shape[1] == self.eg_rows.shape[2] for p in got):
+            host = self._eg_host[:, :rows]               # one copy for the four tables
+            for j, part in enumerate(got):
+                host[j].copy_(part)
+            self.eg_rows[:, :rows].copy_(host, non_blocking=False)
+            return
         for j, part in enumerate(got):
             self.eg_rows[j, :rows, :part.shape[1]].copy_(part.to(self.device), non_blocking=False)
 
