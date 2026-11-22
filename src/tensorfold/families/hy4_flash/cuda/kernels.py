@@ -14,6 +14,9 @@ from triton.language.extra.cuda import libdevice
 
 LW, RW = 512, 64       # the latent's normed width (values too) and its rotated width: a key is 576 wide
 CHUNK = 512            # keys a chunk program reads; a row's chunk partials merge in chunk order
+# software pipelining of _chunks' key tiles: the same arithmetic in the same order, the next tile's loads issued
+# early. A decode layer's 16 key tiles run as one chain, 50 us (window 3); TF_HY4_ATTN_STAGES=2 to time it
+ATTN_STAGES = int(__import__("os").environ.get("TF_HY4_ATTN_STAGES", "1"))
 KT = 32                # keys a tensor-core tile
 HB = 16                # heads a program
 
@@ -453,7 +456,7 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, lo: torch.Tensor, cnt: torc
         s = Scratch(rows, heads, nch, qa.device)
     _chunks[(rows, triton.cdiv(heads, HB), nch)](qa, cache, lo, cnt, sel, tok, s.po, s.pm, s.pl, rows, W=width,
                                                  H=heads, scale=scale, HBT=HB, KTT=KT, CH=CHUNK, num_warps=8,
-                                                 num_stages=1)
+                                                 num_stages=ATTN_STAGES)
     _merge[(rows, heads)](s.po, s.pm, s.pl, sinks, out, cnt, rows, H=heads, NCH=nch, CH=CHUNK, num_warps=4)
     return out
 

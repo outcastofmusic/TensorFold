@@ -649,3 +649,29 @@ def test_split_hc_boundary_keeps_the_one_program_bits(rows, monkeypatch):
                 outs.append((b, post, h))
             for u, v in zip(*outs):
                 assert torch.equal(u, v)
+
+
+def test_attention_stages_keep_the_bits(monkeypatch):
+    """TF_HY4_ATTN_STAGES: pipelined key tiles give the one-stage kernel's bits (sliding and listed rows)."""
+
+    from tensorfold.families.hy4_flash.cuda import kernels as K
+
+    g = torch.Generator("cuda").manual_seed(4)
+    for heads, width, rows in ((64, 1, 1), (32, 2048, 1), (32, 2048, 6)):
+        cache = (torch.randn(4096, 576, device="cuda", generator=g)).to(torch.bfloat16)
+        qa = (torch.randn(rows, heads, 576, device="cuda", generator=g) * 0.1).to(torch.bfloat16)
+        pos = torch.arange(3000, 3000 + rows, device="cuda", dtype=torch.int32)
+        if width == 1:
+            lo, cnt = pos - 511, torch.full_like(pos, 512)
+            sel, tok = torch.zeros_like(pos), torch.zeros((rows, 1), dtype=torch.int32, device="cuda")
+        else:
+            lo, cnt, sel = torch.zeros_like(pos), torch.full_like(pos, 2048), torch.ones_like(pos)
+            tok = torch.sort(torch.randperm(3000, generator=torch.Generator().manual_seed(rows))[:2048])[0]
+            tok = tok.to(torch.int32).cuda().expand(rows, -1).contiguous()
+        sinks = torch.randn(heads, device="cuda", generator=g)
+        outs = []
+        for stages in (1, 2):
+            monkeypatch.setattr(K, "ATTN_STAGES", stages)
+            out = torch.empty((rows, heads, 512), dtype=torch.bfloat16, device="cuda")
+            outs.append(K.attention(qa, cache, lo, cnt, sel, tok, sinks, 0.07, out))
+        assert torch.equal(outs[0], outs[1])

@@ -205,7 +205,9 @@ class Engine:
         g.tok1 = torch.zeros((rows, 1), dtype=torch.int32, device=dev)
         if self.tkeys:
             pool = c.index_pool
-            groups = (rows + pool - 1) // pool + 1
+            # the most groups R rows can span (R - 1 past the first's slot, which is at most pool - 1): one for a
+            # decode row, which pooled a second, unread group before (half of _pool's 77 us, window 3)
+            groups = (rows + pool - 2) // pool + 1
             g0 = self.meta[0] // pool
             g.gids = (g0 + torch.arange(groups, device=dev, dtype=torch.int32)).clamp(max=self.max_len // pool - 1)
             g.gids_long = g.gids.long()
