@@ -384,8 +384,14 @@ class Engine:
         self.prompt = prompt
         rows = ids.shape[0]
         x = w.embed[ids.long()][:, None, :].expand(rows, c.hc, c.hidden).contiguous()
-        for i, layer in enumerate(w.layers):
-            x = self._layer(i, layer, x, prompt)
+        if FUSED and x.is_cuda:               # each sublayer boundary in one launch (``kernels.hc_boundary``)
+            pending = None
+            for i, layer in enumerate(w.layers):
+                pending = self._layer_fused(i, layer, x, prompt, pending)
+            K.hc_post(x, *pending)
+        else:
+            for i, layer in enumerate(w.layers):
+                x = self._layer(i, layer, x, prompt)
         _, h = K.hc_pre(x, w.hc_head.fn, w.hc_head.base, w.hc_head.scale, eps=c.eps, hc_eps=c.hc_eps, head=True)
         return K.rmsnorm(h, w.norm, c.eps)
 
@@ -402,6 +408,25 @@ class Engine:
         y = self._mlp(i, layer.mlp, K.rmsnorm(h, layer.post_norm, c.eps), prompt)
         K.hc_post(x, post, y)
         return x
+
+    def _layer_fused(self, i: int, layer: Layer, x: torch.Tensor, prompt: bool, pending):
+        """``_layer`` with the previous MLP's write-back, each collapse and its norm fused; x updated in place. Returns
+        this layer's MLP (post, output), which the next boundary writes back."""
+
+        c = self.c
+        if layer.engram is not None:
+            if pending is not None:
+                K.hc_post(x, *pending)
+                pending = None
+            x.copy_((x.float() + self._engram(c.engram_layers.index(i), layer.engram, x).float()).to(torch.bfloat16))
+        hc = layer.attn_hc
+        post, h = K.hc_boundary(x, pending, hc.fn, hc.base, hc.scale, layer.input_norm, eps=c.eps, hc_eps=c.hc_eps,
+                                magnitude=c.hc_magnitude, rms_eps=c.eps)
+        y = self._attention(i, layer.attn, h, prompt)
+        hc = layer.ffn_hc
+        post, h = K.hc_boundary(x, (post, y), hc.fn, hc.base, hc.scale, layer.post_norm, eps=c.eps, hc_eps=c.hc_eps,
+                                magnitude=c.hc_magnitude, rms_eps=c.eps)
+        return post, self._mlp(i, layer.mlp, h, prompt)
 
     def head(self, normed: torch.Tensor) -> torch.Tensor:
         """fp32 logits [n, V]: the bf16 rows times the bf16 head, summed in fp32 (``enable_lm_head_fp32``)."""

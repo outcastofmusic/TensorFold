@@ -456,3 +456,28 @@ def test_lazy_engram_staging_keeps_the_logits(weights, goldens, monkeypatch):
         s = model.prefill(e, ids, None)
         out.append((s, e.forward([s], prompt=False).float()))
     assert out[0][0] == out[1][0] and torch.equal(out[0][1], out[1][1])
+
+
+@pytest.mark.parametrize("rows", [1, 6, 300])
+def test_hc_boundary_keeps_the_three_kernels_bits(rows):
+    """``hc_boundary``: the write-back, the collapse and the norm in one launch, bit for bit, at Hy4's widths."""
+
+    from tensorfold.families.hy4_flash.cuda import kernels as K
+
+    g = torch.Generator("cuda").manual_seed(rows)
+    s, d = 4, 3072
+    x = (torch.randn(rows, s, d, device="cuda", generator=g) * 0.05).to(torch.bfloat16)
+    y = (torch.randn(rows, d, device="cuda", generator=g)).to(torch.bfloat16)
+    pp = torch.rand(rows, s, device="cuda", generator=g) * 2
+    fn = torch.randn(2 * s, s * d, device="cuda", generator=g) * 0.01
+    base, scale = torch.randn(2 * s, device="cuda", generator=g), torch.rand(2, device="cuda", generator=g)
+    nw = (torch.rand(d, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
+    for pending in (None, (pp, y)):
+        a, b = x.clone(), x.clone()
+        if pending is not None:
+            K.hc_post(a, *pending)
+        post, h = K.hc_pre(a, fn, base, scale, eps=1e-5, hc_eps=1e-6, magnitude=2.0)
+        want = K.rmsnorm(h, nw, 1e-5)
+        got_post, got = K.hc_boundary(b, pending, fn, base, scale, nw, eps=1e-5, hc_eps=1e-6, magnitude=2.0,
+                                      rms_eps=1e-5)
+        assert torch.equal(a, b) and torch.equal(post, got_post) and torch.equal(want, got)

@@ -755,3 +755,73 @@ def add_rmsnorm(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor, eps: float) -
     y = torch.empty_like(a)
     _add_rmsnorm[(a.shape[0],)](a, b, w, y, eps, D=d, BLOCK=triton.next_power_of_2(d), num_warps=8)
     return y
+
+
+@triton.jit
+def _hc_boundary(X, PP, YP, FN, BASE, SCALE, POST, H, NW, OUT, eps, hc_eps, mag, rms_eps, D: tl.constexpr,
+                 S: tl.constexpr, M: tl.constexpr, BD: tl.constexpr, BLOCK: tl.constexpr, WRITE: tl.constexpr):
+    """Program r: a sublayer boundary in one launch. ``WRITE``: the previous sublayer's write-back (``_hc_post``'s
+    expression) into the streams; then ``_hc_pre``'s mixes, gates and collapse into H; then ``_rmsnorm`` of that row
+    into OUT. Each phase is its kernel's code and reads what the last wrote through global memory after a barrier."""
+
+    r = tl.program_id(0)
+    if WRITE:
+        for s in tl.static_range(S):
+            p = tl.load(PP + r * S + s)
+            for d0 in range(0, D, BD):
+                d = d0 + tl.arange(0, BD)
+                y = tl.load(YP + r * D + d).to(tl.float32)
+                x = tl.load(X + (r * S + s) * D + d).to(tl.float32)
+                tl.store(X + (r * S + s) * D + d, (p * y + x).to(tl.bfloat16))
+        tl.debug_barrier()
+    m = tl.arange(0, M)
+    acc = tl.zeros((M,), tl.float32)
+    ss = tl.zeros((BD,), tl.float32)
+    for s in tl.static_range(S):
+        for d0 in range(0, D, BD):
+            d = d0 + tl.arange(0, BD)
+            x = tl.load(X + (r * S + s) * D + d).to(tl.float32)
+            ss += x * x
+            f = tl.load(FN + m[:, None] * (S * D) + s * D + d[None, :])
+            acc += tl.sum(f * x[None, :], axis=1)
+    inv = 1.0 / tl.sqrt(tl.sum(ss, axis=0) / (S * D) + eps)
+    mixes = acc * inv
+    base = tl.load(BASE + m)
+    sc = tl.where(m < S, tl.load(SCALE), tl.load(SCALE + 1))
+    gate = tl.sigmoid(mixes * sc + base)
+    pre = gate + hc_eps
+    post = mag * gate + hc_eps
+    tl.store(POST + r * S + (m - S), post, mask=m >= S)
+    for d0 in range(0, D, BD):
+        d = d0 + tl.arange(0, BD)
+        out = tl.zeros((BD,), tl.float32)
+        for s in tl.static_range(S):
+            ps = tl.sum(tl.where(m == s, pre, 0.0), axis=0)
+            out += ps * tl.load(X + (r * S + s) * D + d).to(tl.float32)
+        tl.store(H + r * D + d, out.to(tl.bfloat16))
+    tl.debug_barrier()
+    offs = tl.arange(0, BLOCK)
+    ok = offs < D
+    x = tl.load(H + r * D + offs, mask=ok, other=0.0).to(tl.float32)
+    inv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + rms_eps)
+    n = (x * inv).to(tl.bfloat16).to(tl.float32)
+    w = tl.load(NW + offs, mask=ok, other=0.0).to(tl.float32)
+    tl.store(OUT + r * D + offs, (n * w).to(tl.bfloat16), mask=ok)
+
+
+def hc_boundary(x: torch.Tensor, pending: tuple[torch.Tensor, torch.Tensor] | None, fn: torch.Tensor,
+                base: torch.Tensor, scale: torch.Tensor, norm: torch.Tensor, *, eps: float, hc_eps: float,
+                magnitude: float, rms_eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """``hc_post(x, *pending)`` (when pending), ``hc_pre`` and ``rmsnorm`` of its row in one launch, the same bits:
+    streams x [R, S, D] bf16, updated in place -> (post [R, S] fp32, the normed row [R, D] bf16)."""
+
+    rows, s, d = x.shape
+    m = fn.shape[0]
+    post = torch.empty((rows, s), dtype=torch.float32, device=x.device)
+    h = torch.empty((rows, d), dtype=torch.bfloat16, device=x.device)
+    out = torch.empty((rows, d), dtype=torch.bfloat16, device=x.device)
+    pp, yp = pending if pending is not None else (post, h)
+    _hc_boundary[(rows,)](x, pp, yp.contiguous(), fn, base, scale, post, h, norm, out, eps, hc_eps, magnitude,
+                          rms_eps, D=d, S=s, M=m, BD=256, BLOCK=triton.next_power_of_2(d), WRITE=pending is not None,
+                          num_warps=8)
+    return post, out
