@@ -208,22 +208,23 @@ def test_graphed_calls_keep_the_eager_rows(weights, goldens):
             e.rewind(width - 1)
 
 
-def test_nvfp4_head_is_the_dense_head_bit_for_bit(weights):
-    """``Head4`` sums code x block scale (exact in bf16) on the same tile and K order as the bf16 head, then applies the
-    global scale: its logits are the dense head's on those values times the scale, at every row count."""
+def test_nvfp4_head_keeps_a_row_s_bits_in_any_window(weights):
+    """``Head4`` gives a row the same fp32 logits alone, in a 6-row window and in a 16-row tile (verify windows sample
+    them against serial steps), within 1% of its dense values. The mma on codes decoded in registers need not sum in
+    the dense head kernel's order, so it is not that kernel's bits (window 2, 22 Nov)."""
 
     from tensorfold.families.hy4_flash.cuda import kernels as K
     from tensorfold.families.hy4_flash.cuda.dfly import quantize_nvfp4
 
     codes, scales, scale2 = quantize_nvfp4(weights.head)
     h4 = K.Head4(codes, scales, scale2)
-    w = (h4.dense() / scale2).to(torch.bfloat16)
     x = torch.randn(16, weights.head.shape[1], device="cuda", generator=torch.Generator("cuda").manual_seed(0))
     x = x.to(torch.bfloat16)
-    want = K.head(x, w) * scale2
-    assert torch.equal(h4(x), want)
+    full = h4(x)
     for rows in (1, 6):
-        assert torch.equal(h4(x[:rows]), want[:rows])
+        assert torch.equal(h4(x[:rows]), full[:rows])
+    want = x.float() @ h4.dense().t()
+    assert float((full - want).abs().max() / want.abs().max()) < 0.01
 
 
 @pytest.mark.parametrize("rows", [1, 6, 40])
