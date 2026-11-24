@@ -24,9 +24,10 @@ import torch
 from ..config import SPARSE, Config
 from ..engram import Hasher, RowReader
 
-# calls of up to this many rows run the decode kernels, prompt chunks the prompt kernels. TF_HY4_DECODE_ROWS=32 lets a
-# copy window grow to 32 rows: every decode kernel keeps a row's bits at any width up to it
-DECODE_ROWS = int(__import__("os").environ.get("TF_HY4_DECODE_ROWS", "16"))
+# calls of up to this many rows run the decode kernels, prompt chunks the prompt kernels. At 32 a copy window grows to
+# 32 rows, and every decode kernel keeps a row's bits at any width up to it: rewrite 76.6 -> 83.6 tok/s with replies
+# equal to serial, the other prompts unchanged (window G1 probe 6, 22 Nov). TF_HY4_DECODE_ROWS=16 restores 16
+DECODE_ROWS = int(__import__("os").environ.get("TF_HY4_DECODE_ROWS", "32"))
 if not 16 <= DECODE_ROWS <= 32:
     raise ValueError(f"TF_HY4_DECODE_ROWS={DECODE_ROWS}: 16 to 32")
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
