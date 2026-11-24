@@ -36,7 +36,7 @@
 # Hy4:   CONTEXT=65536  THINK_BUDGET=8000  HY4_DRAFT_HEAD=nvfp4  HY4_ADAPTIVE=1  HY4_FLOOR=0.15  HY4_KEYED=1  HY4_DEPTH=5
 #        HY4_COPY=qwen (glm: GLM's copy rule)  HY4_TRUNK= (a folder under $MODELS: NVFP4 trunk from the BF16 release)
 #        HY4_TRUNK_ONLY= / HY4_TRUNK_SKIP= (regexes over projection names: which of the folder's take effect)
-#        HY4_DECODE_ROWS=16 (32: copy windows up to 32 rows)
+#        HY4_DECODE_ROWS=32 (16: copy windows stop at 16 rows)
 # Bolt:  CONTEXT=131072 (a stream's KV is 8 KiB a token)  THINK_BUDGET=8000 (0: none); no disk states, one stream
 # LFM2:  CONTEXT=131072 (KV 20 KiB a token)  THINK_BUDGET=8000 (0: none); one stream, no drafts, no disk states.
 #        LFM Open License v1.0: commercial use is licensed only under US$10M annual revenue
