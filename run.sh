@@ -9,6 +9,7 @@
 #   ./run.sh nemotron-bolt     Nemotron 3.5 Bolt 74B-A9B (24 GB) with its LiLiCorr draft model
 #   ./run.sh lfm2-24b          Liquid's LFM2.5-24B-A2B (block FP8, 24.75 GB): tool routing and sub-agents
 #   ./run.sh nemotron-3.5-super    Nemotron 3.5 Super VL 120B-A12B (NVFP4, 75.1 GB) on upstream's native 1.2.2 server
+#   ./run.sh hy4-flash         Tencent's Hy4-flash 220B-A11B (NVFP4 experts, 88.5 GiB; Engram tables read from disk)
 #                              With D1=1 each model target but GLM also starts d1-3B, Liquid AI's decision model, on :30003 once
 #                              the model answers (POST /v1/systemone and /v1/decisions; docs/d1-sidecar.md)
 #   ./run.sh swap              one endpoint on 127.0.0.1:30000 that loads whichever model a request names (swap.py)
@@ -25,13 +26,17 @@
 #   SWAP_DRAIN=600  SWAP_HOLD=0  SWAP_TIMEOUT=3600  SWAP_PERSIST=120   swap.py's waits, in seconds (its header says what each does)
 #   TF_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 #   EXTRA="..."                more `tensorfold serve` flags
-#   QWEN_MODEL, QWEN_FP4_MODEL, QWEN27_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL, SUPER_MODEL, D1_MODEL   another checkpoint folder under $MODELS
+#   QWEN_MODEL, QWEN_FP4_MODEL, QWEN27_MODEL, CLEF_MODEL, GLM_MODEL, BOLT_MODEL, LFM2_MODEL, SUPER_MODEL, HY4_MODEL, D1_MODEL   another checkpoint folder under $MODELS
 # Qwen, Qwen FP4, GLM:  STATES=1 (0: kept states stay in memory only)  STATES_GIB=64: what each model's folder in the tensorfold-states volume holds, every build's states together;  STATES_TTL_H=72: hours a state stays unused;  Qwen: STATES_ALL=0: each slot's shortest and longest state go to disk (1: every kept state)
 # Qwen:  CONTEXT=262144  PARALLEL=8 (FP4-Local: 4)  KEPT=4 a stream (TENSORFOLD_KEPT_STATES)  KV=int8  THINK_BUDGET=8000 (0: none)  GUARD=1 (0: no guard; CLEF_MODEL a KnowLine or Clef folder, served under its folder's name, GUARD_NAME another)  GUARD_THRESHOLD=0.6 (Clef: 0.8)  VISION=1 (0: text only)  GRID=4096 (TENSORFOLD_GRID_ANCHORS; 0: off)
 # GLM:   CONTEXT=98304   THINK_BUDGET=8000 (0: none)   ANSWER_BUDGET=24576 (thinking off, no max_tokens asked; 0: none)   DRAFTER=cfontes (modal: the MIT one; none: no draft model, then CONTEXT=131072 fits)   COPIES=1 (0: no copy drafts in DFlash2 rounds)
 #        TIMING=0 (1: time the draft steps at start, which the `auto:...` draft chooser needs)
 # Qwen FP4-Local: Qwen's settings, VISION=0 by default (the image tower run.sh converts belongs to the EXL3 pack)
 # Qwen 27B: CONTEXT=262144 (KV 64 KiB a token)  PARALLEL=8 (1: one stream)  THINK_BUDGET=8000 (0: none); no Clef, no disk states
+# Hy4:   CONTEXT=65536  THINK_BUDGET=8000  HY4_DRAFT_HEAD=nvfp4  HY4_ADAPTIVE=1  HY4_FLOOR=0.15  HY4_KEYED=1  HY4_DEPTH=5
+#        HY4_COPY=qwen (glm: GLM's copy rule)  HY4_TRUNK= (a folder under $MODELS: NVFP4 trunk from the BF16 release)
+#        HY4_TRUNK_ONLY= / HY4_TRUNK_SKIP= (regexes over projection names: which of the folder's take effect)
+#        HY4_DECODE_ROWS=16 (32: copy windows up to 32 rows)
 # Bolt:  CONTEXT=131072 (a stream's KV is 8 KiB a token)  THINK_BUDGET=8000 (0: none); no disk states, one stream
 # LFM2:  CONTEXT=131072 (KV 20 KiB a token)  THINK_BUDGET=8000 (0: none); one stream, no drafts, no disk states.
 #        LFM Open License v1.0: commercial use is licensed only under US$10M annual revenue
@@ -46,7 +51,7 @@ PORT="${PORT:-30000}"
 CLEF_PORT="${CLEF_PORT:-30001}"
 D1_PORT="${D1_PORT:-30003}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
-NAMES="tensorfold-serve clef-serve tensorfold-q27 tensorfold-glm tensorfold-bolt tensorfold-lfm2 tensorfold-super d1-serve tensorfold-build"
+NAMES="tensorfold-serve clef-serve tensorfold-q27 tensorfold-glm tensorfold-bolt tensorfold-lfm2 tensorfold-super tensorfold-hy4 d1-serve tensorfold-build"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/tensorfold-run"
 
 die() { echo "run: $*" >&2; exit 1; }
@@ -56,11 +61,11 @@ avail_mib() { awk '/MemAvailable/{printf "%d", $2 / 1024}' /proc/meminfo; }
 
 uncache() {  # drop the served checkpoints' files from the page cache (they stay on disk)
     local f
-    for f in "$MODELS"/{Qwen3.8-Flash-Next-exl3-3.05bpw,Qwen3.8-Flash-Next-FP4-Local,Qwen3.8-27B-exl3-3.00bpw,Qwen3.8-27B-DFlash2,KnowLine-4B-Gen5.5,clef-flash,glm53-flash-mosaic-12l,glm53-flash-sushi-experts-mosaic-dense,GLM-5.3-Flash-DFlash*,Nemotron-3.5-Bolt-74B-A9B-24GB*,LFM2.5-24B-A2B-FP8,NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4,d1-3B}/*.safetensors \
+    for f in "$MODELS"/{Qwen3.8-Flash-Next-exl3-3.05bpw,Qwen3.8-Flash-Next-FP4-Local,Qwen3.8-27B-exl3-3.00bpw,Qwen3.8-27B-DFlash2,KnowLine-4B-Gen5.5,clef-flash,glm53-flash-mosaic-12l,glm53-flash-sushi-experts-mosaic-dense,GLM-5.3-Flash-DFlash*,Nemotron-3.5-Bolt-74B-A9B-24GB*,LFM2.5-24B-A2B-FP8,NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4,Hy4-flash-NVFP4,d1-3B}/*.safetensors \
              "$MODELS"/Qwen3.8-Flash-Next-FP4-Local/tensors/*.safetensors \
              "${QWEN_MODEL:-}"/*.safetensors "${QWEN_FP4_MODEL:-}"/*.safetensors "${QWEN27_MODEL:-}"/*.safetensors "${CLEF_MODEL:-}"/*.safetensors \
              "${GLM_MODEL:-}"/*.safetensors "${BOLT_MODEL:-}"/*.safetensors "${LFM2_MODEL:-}"/*.safetensors \
-             "${SUPER_MODEL:-}"/*.safetensors "${D1_MODEL:-}"/*.safetensors; do
+             "${SUPER_MODEL:-}"/*.safetensors "${HY4_MODEL:-}"/*.safetensors "${D1_MODEL:-}"/*.safetensors; do
         [ -f "$f" ] && dd if="$f" iflag=nocache count=0 status=none 2>/dev/null
     done
     return 0
@@ -311,6 +316,37 @@ lfm2() {
     d1
 }
 
+# Tencent's Hy4-flash from Avifenesh's NVFP4 pack: one stream, no Clef or d1 beside it (88.5 GiB of weights). Its
+# template thinks unless told no_think: the app maps enable_thinking false to no_think. Tencent's sampling defaults
+# (generation_config.json: temperature 0.9, top_p 1.0).
+hy4() {
+    local model="${HY4_MODEL:-$MODELS/Hy4-flash-NVFP4}"
+    [ -e "$model/config.json" ] || die "no checkpoint at $model (run ./prepare.sh hy4-flash)"
+    local budget=()
+    [ "${THINK_BUDGET:-8000}" = 0 ] || budget=(--thinking-budget "${THINK_BUDGET:-8000}")
+    # DFly2's draft settings (cuda/dfly.py), window 10's measured choice: against the slice + copies, +8-34% at T 0
+    # and +4-31% at T 0.9, all 60 drafted replies equal serial (notes/tf-runs/hy4-flash-1121)
+    local drafts=(-e "TF_HY4_DRAFT_HEAD=${HY4_DRAFT_HEAD:-nvfp4}" -e "TF_HY4_DFLY_ADAPTIVE=${HY4_ADAPTIVE:-1}"
+                  -e "TF_HY4_DFLY_FLOOR=${HY4_FLOOR:-0.15}" -e "TF_HY4_DFLY_KEYED=${HY4_KEYED:-1}"
+                  -e "TF_HY4_DFLY_DEPTH=${HY4_DEPTH:-5}" -e "TF_HY4_COPY=${HY4_COPY:-qwen}")
+    # HY4_TRUNK: a folder under $MODELS of NVFP4 trunk projections (tools/hy4_trunk.py) that replace the pack's. Off:
+    # Hy4-flash-trunk-full decodes chat 27-29 tok/s against 20-22 and scores TrueScore 92.8 (+0.0 [-2.0, +2.4]), but
+    # its KL against BF16 is 0.065 against the pack's 0.022 (notes/tf-runs/hy4-opt2-1122)
+    [ -z "${HY4_TRUNK:-}" ] || drafts+=(-e "TF_HY4_TRUNK=$MODELS/$HY4_TRUNK")
+    [ -z "${HY4_TRUNK_ONLY:-}" ] || drafts+=(-e "TF_HY4_TRUNK_ONLY=$HY4_TRUNK_ONLY")
+    [ -z "${HY4_TRUNK_SKIP:-}" ] || drafts+=(-e "TF_HY4_TRUNK_SKIP=$HY4_TRUNK_SKIP")
+    [ -z "${HY4_DECODE_ROWS:-}" ] || drafts+=(-e "TF_HY4_DECODE_ROWS=$HY4_DECODE_ROWS")
+    IMAGE=$(image)
+    stop_all
+    # 65,536 tokens: at 131,072 the 89.7 GiB of weights leave the prompt-state store no memory, so no turn reuses its
+    # prefix (tool-eval: ttft 2.59 s, 31 min, responsiveness 38); at 65,536 it keeps 2.4 GiB (0.60 s, 17 min, 61), and
+    # 98,304 keeps 0.7 GiB (2026-11-21, notes/tf-runs/hy4-flash-1121 windows 11-12)
+    serve tensorfold-hy4 "${drafts[@]}" -- "$model" --host 127.0.0.1 --port "$PORT" --name hy4-flash \
+        --context "${CONTEXT:-65536}" --max-tokens "${CONTEXT:-65536}" --temperature 0.9 --top-p 1.0 \
+        "${budget[@]}" ${EXTRA:-}
+    wait_ready tensorfold-hy4 "$PORT" || failed tensorfold-hy4
+}
+
 # Upstream TensorFold's native server, not this checkout's Python engine: TrueScore 94.1 and planning 62.6, thinking
 # off, ready in 44 s with 40 GiB available after load (2026-10-18). It runs the checkpoint's own FP8/NVFP4 math
 # (--precision checkpoint, the Blackwell default), whose replies differ from --precision full's (KL 0.0077 nats).
@@ -411,7 +447,7 @@ take_lock() {
     mkdir -p "$STATE"; exec 9>"$STATE/run.lock"; flock 9; run_locked=1
 }
 case "${1:-}" in
-    qwen-flash-next|glm-5.3-flash|qwen-flash-next-fp4|qwen-27b|nemotron-bolt|lfm2-24b|nemotron-3.5-super)
+    qwen-flash-next|glm-5.3-flash|qwen-flash-next-fp4|qwen-27b|nemotron-bolt|lfm2-24b|nemotron-3.5-super|hy4-flash)
         if [ -n "${TF_SWAP_CHILD:-}" ] || ! swapping; then take_lock; fi ;;
 esac
 case "${1:-}" in
@@ -423,9 +459,10 @@ case "${1:-}" in
     nemotron-bolt)   ask_swap "$1" || { take_lock; bolt; } ;;
     lfm2-24b)        ask_swap "$1" || { take_lock; lfm2; } ;;
     nemotron-3.5-super) ask_swap "$1" || { take_lock; super; } ;;
+    hy4-flash)       ask_swap "$1" || { take_lock; hy4; } ;;
     swap)            swap "${2:-}" ;;
     stop)            if swapping; then stop_swap; fi
                      stop_all ;;
     status)          status ;;
-    *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

@@ -13,6 +13,11 @@ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows, unif
 
 MASS = 2.0 ** 40        # a token's share of the mass in fixed point: shard sums are exact, so ranks agree bit for bit
 NUCLEUS = 1024          # candidates a rank reads for a top_k-off draw; a row they don't cover reads whole shards
+# With top_p and min_p off a draw is the keyed Gumbel-max over every column, scored on the device. Host and device
+# float64 logs of the same u differ by about 1e-14 on these scores, so a row whose best score leads the next by more
+# than this gap has the host rule's winner; a closer row takes the host rule
+GUMBEL_GAP = 1e-9
+_M64 = (1 << 64) - 1
 
 
 def sample_rows(logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None) -> list[int]:
@@ -115,6 +120,10 @@ def nucleus_rows(logits: torch.Tensor, positions: Sequence[int], sampling: Sampl
     """top_k off: the keyed draw over the top_p nucleus then min_p, cut by fixed-point mass, the same on each shape."""
 
     scaled = logits.float().double() / max(float(sampling.temperature), 1e-6)
+    if gather is one_rank and probs is None and not 0.0 < sampling.top_p < 1.0 and sampling.min_p <= 0.0:
+        drawn = _gumbel_rows(scaled, positions, sampling, offset, id_map)
+        if drawn is not None:
+            return drawn
     top = _stacked(gather, scaled.max(dim=-1).values).max(dim=0).values           # every rank's maxima
     mass = torch.floor(torch.exp(scaled - top[:, None]) * MASS).to(torch.int64)
     got = _shares(gather, scaled, mass, NUCLEUS, offset, id_map)
@@ -182,3 +191,58 @@ def _draw(got, positions, s: Sampling) -> list[tuple[int, float]] | None:
         best = int(np.argmax(score))
         drawn.append((int(i[best]), float(m[best]) / total))
     return drawn
+
+
+def _mix64(x: int) -> int:
+    x ^= x >> 30
+    x = (x * 0xBF58476D1CE4E5B9) & _M64
+    x ^= x >> 27
+    x = (x * 0x94D049BB133111EB) & _M64
+    return x ^ (x >> 31)
+
+
+def _signed(x: int) -> int:
+    return x - (1 << 64) if x >> 63 else x
+
+
+def _shr(x: torch.Tensor, n: int) -> torch.Tensor:
+    """A logical right shift of int64 words that hold uint64 bits."""
+
+    return (x >> n) & ((1 << (64 - n)) - 1)
+
+
+def _mix_device(x: torch.Tensor) -> torch.Tensor:
+    """``exact_sampling._mix`` on int64 words (products wrap mod 2^64, the same bits as uint64)."""
+
+    x = x ^ _shr(x, 30)
+    x = x * _signed(0xBF58476D1CE4E5B9)
+    x = x ^ _shr(x, 27)
+    x = x * _signed(0x94D049BB133111EB)
+    return x ^ _shr(x, 31)
+
+
+def uniform_device(seed: int, positions: Sequence[int], ids: torch.Tensor) -> torch.Tensor:
+    """``exact_sampling.uniform_rows`` on the device: row r, column c is uniform(seed, positions[r], ids[c]), same bits."""
+
+    head = _mix64((seed & _M64) + 0x9E3779B97F4A7C15 & _M64)
+    rows = [_signed(_mix64(head ^ (int(p) * 0xD1B54A32D192ED03 & _M64))) for p in positions]
+    x = torch.tensor(rows, dtype=torch.int64, device=ids.device)[:, None] ^ ids.to(torch.int64)[None, :]
+    return _shr(_mix_device(x), 11).double() * 2.0 ** -53 + 2.0 ** -54
+
+
+def _gumbel_rows(scaled, positions, s: Sampling, offset: int, id_map) -> list[int] | None:
+    """top_p and min_p off: each row's argmax of scaled + Gumbel(uniform(seed, position, id)) over every column, on the
+    device; None when some row's top two lie within GUMBEL_GAP (the host rule then decides)."""
+
+    cols = torch.arange(scaled.shape[1], dtype=torch.int64, device=scaled.device)
+    ids = id_map.to(torch.int64) if id_map is not None else cols + int(offset)
+    score = scaled - torch.log(-torch.log(uniform_device(s.seed, positions, ids)))
+    best = score.topk(2, dim=-1) if score.shape[1] > 1 else None
+    if best is None:
+        return [int(t) for t in ids[:1].tolist()] * scaled.shape[0]
+    lead, at = (best.values[:, 0] - best.values[:, 1]), best.indices[:, 0]
+    got = torch.cat([lead, ids[at].double()]).cpu()
+    rows = scaled.shape[0]
+    if bool((got[:rows] <= GUMBEL_GAP).any()):
+        return None
+    return [int(t) for t in got[rows:].tolist()]

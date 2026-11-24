@@ -22,7 +22,7 @@ pytest.importorskip("jinja2")
 pytest.importorskip("tokenizers")
 transformers = pytest.importorskip("transformers")
 
-from tensorfold.cuda.prompt_ids import PromptIds  # noqa: E402
+from tensorfold.cuda.prompt_ids import PromptIds
 
 MODELS = Path(os.environ.get("MODELS", str(Path.home() / "models")))
 # name: (folder under $MODELS, the tokens a chat prompt may hold once: BOS or the template's own prefix)
@@ -32,7 +32,9 @@ SERVED = {
     "glm": ("glm53-flash-sushi-experts-mosaic-dense", ("[gMASK]", "<sop>")),
     "bolt": ("Nemotron-3.5-Bolt-74B-A9B-24GB", ()),         # its template writes no <s>, nor does transformers
     "lfm2": ("LFM2.5-24B-A2B-FP8", ("<|startoftext|>",)),
+    "hy4": ("Hy4-flash-NVFP4", ()),
 }
+TURN_BOS = {"hy4"}          # the template opens every turn with the BOS id (<｜hy_start:opensource｜>, 120000)
 
 CHK_TXT = [
     "",
@@ -176,7 +178,7 @@ def test_a_chat_prompt_holds_one_bos_at_most(name):
         reference = hf.prompt(body, messages, tools)
         text = ours.decode(prompt, skip_special_tokens=False)
         for token_id, token in marks.items():
-            assert prompt.count(token_id) <= 1, (label, token)
+            assert prompt.count(token_id) <= 1 or name in TURN_BOS, (label, token)
             assert prompt.count(token_id) == reference.count(token_id), (label, token)
             # the rendered text sent back as a raw prompt, or to /tokenize, gets no second copy
             raw = served._prepare({"prompt": text}, False).prompt
@@ -216,4 +218,4 @@ def test_the_engine_is_handed_the_prompt_as_rendered(name):
     want = served._prepare(body, True).prompt
     served.run(body, True, lambda delta: True)
     assert engine.prompts == [want]
-    assert all(want.count(token_id) <= 1 for token_id in bos_ids(name))
+    assert name in TURN_BOS or all(want.count(token_id) <= 1 for token_id in bos_ids(name))

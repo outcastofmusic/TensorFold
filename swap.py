@@ -42,7 +42,7 @@ from tensorfold.server import request_guard  # noqa: E402
 
 TARGET = {"qwen3.8-flash-next": "qwen-flash-next", "glm-5.3-flash": "glm-5.3-flash",    # served name: run.sh target
           "qwen3.8-flash-next-fp4": "qwen-flash-next-fp4", "qwen3.8-27b": "qwen-27b", "nemotron-3.5-bolt": "nemotron-bolt",
-          "lfm2.5-24b-a2b": "lfm2-24b", "nemotron-3.5-super": "nemotron-3.5-super"}
+          "lfm2.5-24b-a2b": "lfm2-24b", "nemotron-3.5-super": "nemotron-3.5-super", "hy4-flash": "hy4-flash"}
 ALIAS = {target: name for name, target in TARGET.items()}
 PORT = int(os.environ.get("PORT", "30000"))
 BACKEND = int(os.environ.get("BACKEND_PORT", "30002"))

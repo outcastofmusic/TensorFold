@@ -31,7 +31,9 @@ SERVED = {
     "lfm2": ("LFM2.5-24B-A2B-FP8", "tensorfold.families.lfm2_moe.config"),
     "knowline": ("KnowLine-4B-Gen5.5-serve", "tensorfold.families.qwen3_5.cuda.weights"),
     "qwen27": ("Qwen3.8-27B-exl3-3.00bpw", "tensorfold.families.qwen3_5.cuda.weights"),
+    "hy4": ("Hy4-flash-NVFP4", "tensorfold.families.hy4_flash.config"),
 }
+READS_TOKENIZER_EOS = ("hy4", "knowline", "qwen27")     # families that also stop on tokenizer_config.json's eos_token
 
 def folder_of(name: str) -> Path:
     folder = MODELS / SERVED[name][0]
@@ -135,3 +137,12 @@ def test_an_end_id_only_in_config_is_kept(name, tmp_path):
     every, spare = known_and_spare(folder)
     got = family_eos(name, copy(folder, tmp_path, [*every, spare], every))
     assert spare in got and set(every) <= set(got)
+
+
+@pytest.mark.parametrize("name", READS_TOKENIZER_EOS)
+def test_an_end_id_only_in_the_tokenizer_is_kept(name, tmp_path):
+    folder = folder_of(name)
+    tokenizer_eos = chat_end_ids(folder)[0]
+    _, spare = known_and_spare(folder)
+    got = family_eos(name, copy(folder, tmp_path, [spare], [spare]))
+    assert tokenizer_eos in got and spare in got
