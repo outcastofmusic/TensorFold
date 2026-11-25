@@ -21,7 +21,7 @@ def count_tokens(app: Any, chat: dict[str, Any]) -> int:
         return len(app.prepare(chat, True).prompt)
     from tensorfold.server.messages import normalize_messages
     from tensorfold.server.prompts import has_images, prepare_images
-    from tensorfold.server.request_options import heard_effort, thinking_fields
+    from tensorfold.server.request_options import heard_effort, template_effort, thinking_fields
     from tensorfold.server.text import render_prompt_ids
     from tensorfold.server.tools import active_tool_specs
 
@@ -38,7 +38,7 @@ def count_tokens(app: Any, chat: dict[str, Any]) -> int:
             kwargs = {"tokenize": False, "add_generation_prompt": True, "enable_thinking": thinking}
             if tools:
                 kwargs["tools"] = tools
-            if thinking and effort:
+            if template_effort(effort, thinking):
                 kwargs["reasoning_effort"] = effort
             with app.tokenizer_lock:
                 return app.tokenizer.apply_chat_template(messages, **kwargs)

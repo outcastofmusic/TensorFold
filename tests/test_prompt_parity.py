@@ -174,6 +174,13 @@ def test_the_mac_and_cuda_render_the_same_prompt(name, default_effort):
     ("glm", {"reasoning_effort": "medium"}, "Reasoning Effort: High"), # medium is the nearest named level
     ("glm", {"reasoning_effort": "xhigh"}, "Reasoning Effort: Max"),   # xhigh stays xhigh; the template renders Max
     ("glm", {"reasoning_effort": "minimal"}, "Reasoning Effort: Low"),
+    # thinking off: the named effort (upstream #3017), and the template's Max when none is named
+    ("glm", {"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": False}}, "Reasoning Effort: High"),
+    ("glm", {"reasoning_effort": "low", "chat_template_kwargs": {"thinking": False}}, "Reasoning Effort: Low"),
+    ("glm", {"chat_template_kwargs": {"enable_thinking": False}}, "Reasoning Effort: Max"),
+    ("glm", {"reasoning_effort": "none"}, "Reasoning Effort: Max"),
+    ("qwen27", {"reasoning_effort": "low", "chat_template_kwargs": {"enable_thinking": False}},
+     "<|im_start|>system\nYou are terse."),                             # Qwen3.8 reads the effort only thinking
 ])
 def test_the_effort_each_template_writes(name, request_fields, words):
     folder = _folder(name)
