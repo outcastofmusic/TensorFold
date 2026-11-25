@@ -96,16 +96,20 @@ def compare(ours: list[dict], theirs: list[dict]) -> tuple[int, int, float]:
     return same, total, worst
 
 
+_before: dict[str, int] = {}
+
+
 @pytest.fixture(scope="module")
 def engine():
     from tensorfold.families.lfm2.engine import Engine
 
     torch.cuda.reset_peak_memory_stats()
+    _before["bytes"] = torch.cuda.memory_allocated()     # what earlier modules still hold in this process
     return Engine(D1, context=4096, context_explicit=True)
 
 
 def test_memory_after_load(engine):
-    held = torch.cuda.memory_allocated() / GIB
+    held = (torch.cuda.memory_allocated() - _before["bytes"]) / GIB
     print(f"\nd1-3B loaded: {held:.2f} GiB allocated, peak {torch.cuda.max_memory_allocated() / GIB:.2f} GiB, "
           f"{engine.load_s:.1f} s")
     assert held < 7.0

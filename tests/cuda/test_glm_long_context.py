@@ -36,10 +36,13 @@ def _prompt(seed=11, n=PROMPT):
 
 def test_sparse_graphs_are_used_past_the_dense_limit(engine_long):
     g = engine_long.e.graphs
-    assert g is not None and g.sparse and g.sparse_mtp, "no sparse CUDA graphs captured for a long-context engine"
+    assert g is not None and g.sparse_mtp, "no sparse MTP graphs captured for a long-context engine"
+    # TF_GLM_LAZY_SPARSE (default on, ab6c111c): a main sparse shape is captured after its first eager step
+    assert g.lazy and not g.sparse
     before = dict(engine_long.e.replays)
     _generate(engine_long, _prompt(seed=16), None, tokens=32)
     used = {k: engine_long.e.replays[k] - before[k] for k in before}
+    assert g.sparse, "no sparse graph captured after the first sparse step"
     assert used["sparse"] > 0 and used["sparse_mtp"] > 0, used
     assert used["main"] == 0, used                  # every step of this reply is past the dense limit
 

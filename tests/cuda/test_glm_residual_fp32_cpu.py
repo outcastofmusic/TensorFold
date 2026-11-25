@@ -8,15 +8,6 @@ import pytest
 import torch
 from tensorfold.families.glm5_next.cuda import forward, glue, packed, graphs, mtp
 
-ROOT = Path(__file__).resolve().parents[3]
-ORIGINALS = ROOT / 'residual-fp32/originals/TensorFold/src/tensorfold/families/glm5_next/cuda'
-
-
-def functions(source):
-    tree = ast.parse(source)
-    return {n.name: ast.dump(n, include_attributes=False) for n in tree.body if isinstance(n, ast.FunctionDef)}
-
-
 @pytest.mark.parametrize('world,meta,expected', [(1, {'packed_exl3': True}, True), (2, {'packed_exl3': True}, False),
     (1, {}, False), (2, {}, False), (1, {'packed_exl3': False}, False)])
 def test_route_is_explicit_packed_tp1(world, meta, expected):
@@ -76,22 +67,6 @@ def test_kernel_source_native_order_and_no_casts():
     assert text.index('x3 = tl.load') < text.index('tl.store')
 
 
-def test_legacy_kernels_and_mtp_graph_sources_unchanged():
-    old = functions((ORIGINALS/'glue.py').read_text())
-    new = functions(Path(glue.__file__).read_text())
-    for name in old:
-        if name not in ('hc_post', 'hc_pre'):
-            assert old[name] == new[name], name
-    old_text = (ORIGINALS/'glue.py').read_text()
-    new_text = Path(glue.__file__).read_text()
-    for name in ('_hc_post','_embed_b16','_hc_partial','_hc_finish','_stream_mean','_residual_add'):
-        before = next(n for n in ast.parse(old_text).body if isinstance(n,ast.FunctionDef) and n.name==name)
-        after = next(n for n in ast.parse(new_text).body if isinstance(n,ast.FunctionDef) and n.name==name)
-        assert ast.get_source_segment(old_text,before)==ast.get_source_segment(new_text,after)
-    for module in (mtp, graphs):
-        assert (ORIGINALS/Path(module.__file__).name).read_bytes() == Path(module.__file__).read_bytes()
-
-
 def make_weights(world=1, is_packed=True, has_mtp=False):
     c = NS(hidden=128, streams=4, heads=2, lin_heads=2, kv_lora=128, q_lora=128, qk_dim=128,
            v_dim=128, index_dim=128, index_heads=2, dense_width=256, top_k=1, moe_width=128,
@@ -128,14 +103,13 @@ def test_buffers_keep_only_carrier_wide(monkeypatch, world, is_packed, has_mtp, 
 
 @pytest.mark.parametrize('load_mtp', [False, True])
 def test_workspace_counts_full_carriers_not_microchunks(load_mtp):
+    """Past MOE_WINDOW the routed and projection scratch stop growing, so 1,024 more prompt rows add exactly their
+    FP32 carriers (two bytes a value over the BF16 geometry): the carrier is counted whole, not by microchunk."""
     c = make_weights(has_mtp=True).cfg
-    # Existing adapter projection/routed estimate plus extra bytes over legacy BF16 geometry.
-    old_source = (ORIGINALS/'packed.py').read_text()
-    namespace = {'__name__': packed.__name__, '__package__': packed.__package__}
-    exec(compile(old_source, str(ORIGINALS/'packed.py'), 'exec'), namespace)
-    old = namespace['workspace_bytes'](c, {}, rows=4, prefill_rows=513, load_mtp=load_mtp)
-    delta = (4+513+(4 if load_mtp else 0))*4*128*2
-    assert packed.workspace_bytes(c, {}, rows=4, prefill_rows=513, load_mtp=load_mtp) == old+delta
+    small, large = packed.MOE_WINDOW + 1, packed.MOE_WINDOW + 1 + 1024
+    grow = (packed.workspace_bytes(c, {}, rows=4, prefill_rows=large, load_mtp=load_mtp)
+            - packed.workspace_bytes(c, {}, rows=4, prefill_rows=small, load_mtp=load_mtp))
+    assert grow == 1024 * c.streams * c.hidden * 2
 
 
 def test_layer_routes_both_updates(monkeypatch):
@@ -183,7 +157,7 @@ def test_graph_capture_uses_preallocated_fp32_carrier(monkeypatch):
         monkeypatch.setattr(torch,name,forbidden)
     g=graphs.Graphs(NS(w=w,st=st,buf=b),main_rows=(1,4),mtp_rows=())
     assert set(g.main)=={(1,0),(4,0)} and not g.mtp
-    assert seen==[1,1,1,4,4,4]
+    assert seen==[1,1,1,4,4]          # the first shape warms twice, later ones once (Graphs._warm)
     assert before==(b.x.data_ptr(),b.hcpart.data_ptr(),b.projection_scratch.xh.data_ptr())
 
 

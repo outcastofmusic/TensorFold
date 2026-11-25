@@ -84,6 +84,17 @@ SWITCHES = ("TF_GLM_SHARED_STREAM", "TF_GLM_KDA_WIDE", "TF_GLM_EARLY_LAUNCH")
 _held: dict[str, object] = {}
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _release_engines():
+    """Free the held engine when the module ends: the next GLM module loads a whole model of its own (95 GB), and a
+    leftover engine left it 0 tokens of room (25 Nov gate)."""
+
+    yield
+    _held.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _engine(kind: str):
     """One engine at a time, as each holds the whole model: "eager", "graphs-off" or "graphs-on" (captured with every
     switch set that way at startup)."""

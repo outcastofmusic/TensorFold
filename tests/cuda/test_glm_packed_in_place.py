@@ -48,6 +48,17 @@ def copies(on: bool):
 _held: dict[str, object] = {}
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _release_engines():
+    """Free the held engine when the module ends: the next GLM module loads a whole model of its own (95 GB), and a
+    leftover engine left it 0 tokens of room (25 Nov gate)."""
+
+    yield
+    _held.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _engine(kind: str):
     """One engine at a time, as each holds the whole model: "eager", or "graphs-old" / "graphs-new" (captured on that
     path)."""
