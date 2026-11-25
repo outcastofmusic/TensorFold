@@ -68,3 +68,18 @@ def test_repeating_text_copies_a_whole_window_rather_than_the_latest_short_one(d
     monkeypatch.setattr(decode, "COPY_SOURCE", "longest")
     context = [3, 1, 4, 1, 5, 9, 2, 6] * 12
     assert decode.CopyIndex().propose(context, 32) == ([3, 1, 4, 1, 5, 9, 2, 6] * 4)
+
+
+@pytest.mark.parametrize(("unsure", "reach", "held", "gate", "beside"), [
+    (True, 40, 20.0, "adaptive", True),        # an unsure copy always gets the tree
+    (False, 2, 3.0, "adaptive", True),         # short copies holding little (json keys)
+    (False, 2, 14.0, "adaptive", False),       # short copies holding long (an edit's start)
+    (False, 40, 3.0, "adaptive", False),       # a long match never
+    (False, 2, 14.0, "short", True),
+    (False, 2, 3.0, "unsure", False),
+])
+def test_the_gates_choose_which_copies_get_the_tree(decode, monkeypatch, unsure, reach, held, gate, beside):
+    monkeypatch.setattr(decode, "COPY_TREE_GATE", gate)
+    index = decode.CopyIndex()
+    index.unsure, index.reach = unsure, reach
+    assert decode._tree_beside(index, False, held) is beside

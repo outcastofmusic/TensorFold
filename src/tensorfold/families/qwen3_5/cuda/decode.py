@@ -21,6 +21,7 @@ COPY_TREE = os.environ.get("TF_Q27_COPY_TREE", "1") == "1"
 # ...beside which copies (TF_Q27_COPY_TREE_GATE): "miss", after a copy round whose first copied token missed;
 # "broken", after one that did not land whole; "unsure", beside a copy whose sources disagree on its next token
 # (CopyIndex.unsure); "short" (the default), beside an unsure one or one matching fewer than ``min_match`` tokens before its gram;
+# "adaptive", beside an unsure one or a short one while this reply's short copies hold under SHORT_HELD tokens;
 # "none", every one. Ungated, copy prompts gained 31% and edits lost 10-12%: their copies land and the drafter's pass is
 # spent for nothing (tf-runs/qwen27-t4-1027, qwen27-t4b-1027). On the saved outputs an unsure copy missed its first
 # token in 19 of 19 rounds, a sure one in 7 of 121 (tf-runs/copy-tree-1028). Served A/B, 12 boots, texts identical
@@ -234,13 +235,22 @@ def hang_tree(copied: list[int], tree: list[int], tree_parents: list[int]) -> tu
     return guesses, parents, len(copied)
 
 
-def _tree_beside(copies: CopyIndex, missed: bool) -> bool:
-    """Whether this round's copy gets the draft tree beside it (``COPY_TREE_GATE``)."""
+# "adaptive": a short copy (sources agree, none matching before its gram) gets the tree while this reply's short copies
+# hold under this many tokens on average (half-life one round). Short copies held 4.7 tokens and a tree beside them
+# added 4.8 (json, code); at an edit's start they held about 14 and the tree added nothing (tf-runs/copy-tree-1028)
+SHORT_HELD = 8.0
+
+
+def _tree_beside(copies: CopyIndex, missed: bool, short_held: float) -> bool:
+    """Whether this round's copy gets the draft tree beside it (``COPY_TREE_GATE``; ``short_held``: the reply's short
+    copies' average hold)."""
 
     if COPY_TREE_GATE == "unsure":
         return copies.unsure
     if COPY_TREE_GATE == "short":
         return copies.unsure or copies.reach < copies.n
+    if COPY_TREE_GATE == "adaptive":
+        return copies.unsure or (copies.reach < copies.n and short_held < SHORT_HELD)
     return missed
 
 
@@ -295,6 +305,7 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
     copies = CopyIndex() if allow_copy else None
     copy_rows = next_copy_rows(tree_rows, False, tree_rows, max_rows)
     copy_missed = COPY_TREE_GATE == "none"   # the last copy round failed the gate's test (see COPY_TREE_GATE)
+    short_held = SHORT_HELD / 2              # the reply's short copies' average hold, a coin toss to start ("adaptive")
     stages = dict(draft=0.0, verify=0.0, sample=0.0, commit=0.0)
     rounds = drafted_rows = accepted_drafts = 0
     widths: list[int] = []
@@ -304,7 +315,7 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
         stage = time.perf_counter()
         copied = copies.propose(context, copy_rows - 1) if copies is not None else []
         chain, beside = len(copied), False
-        if copied and draft is not None and COPY_TREE and _tree_beside(copies, copy_missed):
+        if copied and draft is not None and COPY_TREE and _tree_beside(copies, copy_missed, short_held):
             beside = True
             copied = copied[:max_rows - tree_rows]
             tree, tree_of = draft.propose_tree(out[-1], len(context), tree_rows - 1, sampling)
@@ -380,6 +391,8 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
             copy_rows = next_copy_rows(copy_rows, whole, tree_rows, max_rows)
             copy_missed = (COPY_TREE_GATE == "none" or (COPY_TREE_GATE == "broken" and not whole)
                            or path[1:2] != [1])
+            if not copies.unsure and copies.reach < copies.n:
+                short_held = (short_held + sum(1 for row in path[1:] if row <= chain)) / 2
         rounds += 1
         drafted_rows += len(tokens) - 1
         accepted_drafts += len(path) - 1
