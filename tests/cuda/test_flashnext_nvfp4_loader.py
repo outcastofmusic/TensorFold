@@ -147,7 +147,7 @@ def test_the_loader_reads_the_published_bf16_table(tmp_path: Path) -> None:
     """The published revision stores the n-gram table as bf16 rows with no per-shard scales and biases: the
     loader takes that layout as it ships, and a gather hands back the checkpoint's own bytes."""
 
-    from tensorfold.families.qwen4_exp.host_table import BF16Table
+    from tensorfold.families.qwen4_exp.host_table import BF16Table, ReadAhead
 
     tiny = write(tmp_path / "bf16", ple_bf16=True)
     ngram = Config.read(tiny).ngram(0)
@@ -159,7 +159,9 @@ def test_the_loader_reads_the_published_bf16_table(tmp_path: Path) -> None:
         pytest.skip("the loader builds CUDA tensors")
     w = load(tiny, mtp=True, draft_vocab=None)
     ple = next(layer.ple for layer in w.layers if layer.ple is not None)
-    assert isinstance(ple.table, BF16Table), "a bf16 table must not go through the 4-bit HostTable"
+    # the loader reads the next lookups' rows ahead (perf/ngram-pread): the table sits inside ReadAhead
+    assert isinstance(ple.table, ReadAhead)
+    assert isinstance(ple.table.table, BF16Table), "a bf16 table must not go through the 4-bit HostTable"
     assert (ple.table.rows, ple.table.width) == (ngram.rows, ngram.dims)
     ids = np.array([0, 17, ngram.rows - 1, 500])
     got = ple.table.gather(ids)
@@ -196,7 +198,7 @@ def test_the_loader_reads_mxfp8_linears_and_an_nvfp4_table(tmp_path: Path) -> No
     stored, the n-gram table's NVFP4 rows come back as bf16(code x scale x table scale), and the engine decodes."""
 
     from tensorfold.cuda.nvfp4.linear import Mx8Linear
-    from tensorfold.families.qwen4_exp.host_table import NVFP4Table
+    from tensorfold.families.qwen4_exp.host_table import NVFP4Table, ReadAhead
 
     tiny = write(tmp_path / "mx", mxfp8=True, ple_nvfp4=True, hidden=512)      # PLE kernels: 512-wide streams
     config = json.loads((tiny / "config.json").read_text())
@@ -217,7 +219,7 @@ def test_the_loader_reads_mxfp8_linears_and_an_nvfp4_table(tmp_path: Path) -> No
     assert all(isinstance(f, Mx8Linear) for f in (gdn.proj, gdn.out, attn.proj, attn.o))
     assert isinstance(w.layers[0].moe.experts.shared.gu, Mx8Linear)
     ple = next(layer.ple for layer in w.layers if layer.ple is not None)
-    assert isinstance(ple.table, NVFP4Table)
+    assert isinstance(ple.table, ReadAhead) and isinstance(ple.table.table, NVFP4Table)
     name = "model.layers.1.ple.ple_embedding.ngram_embedding."
     from safetensors import safe_open
 
