@@ -82,7 +82,7 @@ def test_pieces_keep_message_points_within_the_slots_and_live_row_limits():
         fill[0] = SimpleNamespace(stops=[])
     m.fills[1][0].stops = [800, 1_000, 1_600]           # one spare slot: two states, the second ending the piece
     pieces = m._pieces()
-    assert [(s.sid, a, n) for s, a, n in pieces] == [(1, 0, 1_000), (0, 0, 1_048)]
+    assert [(s.sid, a, n) for s, a, n in pieces] == [(1, 0, 1_000), (0, 0, 2_072)]    # LIVE_ROWS = 3,072 beside a reply
     m.streams.clear()
     assert sum(n for _, _, n in m._pieces()) == 4_096
 

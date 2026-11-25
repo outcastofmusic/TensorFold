@@ -14,7 +14,7 @@ from tensorfold.cuda.sampling import sample_streams
 from tensorfold.cuda.streams import PrefixCache, Stream, accept, fill_order, next_fill, took_fill
 from tensorfold.engine.grammar import GrammarError, pack
 
-from .decode import COPY_TREE, COPY_TREE_GATE, CopyIndex, _tree_beside, clone_state, hang_tree, next_copy_rows
+from .decode import COPY_TREE, COPY_TREE_GATE, SHORT_HELD, CopyIndex, _tree_beside, clone_state, hang_tree, next_copy_rows
 from .decode_tp import SAMPLING_WORDS as W, _sample_split, _share, first_token, pack_sampling, unpack_sampling
 from .draft_tree import allocate
 from .engine import entry_end
@@ -498,6 +498,7 @@ class MultiDecoder:
 
         s.copy_rows = next_copy_rows(self.max_rows, False, self.max_rows, self.copy_rows)
         s.copy_missed = COPY_TREE_GATE == "none"
+        s.short_held = SHORT_HELD / 2              # the stream's short copies' average hold ("adaptive"), as draft_decode
 
     def _copy_cap(self, n: int) -> int:
         """The widest copy window in a round of ``n`` streams: a lone stream's widest; beside others SHARED_COPY_ROWS,
@@ -517,7 +518,7 @@ class MultiDecoder:
             return TREE if self.draft is not None else ONE
         # as draft_decode: an unsure copy shares its window with the tree, if the copy keeps a gram's worth of rows
         if (self.draft is not None and COPY_TREE and rows - self.max_rows >= copies.n
-                and _tree_beside(copies, s.copy_missed)):
+                and _tree_beside(copies, s.copy_missed, s.short_held)):
             copied[s.sid] = copied[s.sid][:rows - self.max_rows]
             return BESIDE
         return COPY
@@ -529,6 +530,9 @@ class MultiDecoder:
         s.copy_rows = next_copy_rows(min(s.copy_rows, self.copy_cap), whole, self.max_rows, self.copy_rows)
         s.copy_missed = (COPY_TREE_GATE == "none" or (COPY_TREE_GATE == "broken" and not whole)
                          or path[1:2] != [1])
+        copies = s.copies
+        if copies is not None and not copies.unsure and copies.reach < copies.n:
+            s.short_held = (s.short_held + sum(1 for row in path[1:] if row <= chain)) / 2
 
     def _trees(self, plan, blocks) -> dict[int, tuple[list[int], list[int], list[float]]]:
         """Rank 0: each tree stream's nodes, parents and path scores, in the policy's pop order."""
