@@ -121,7 +121,8 @@ class FlashNextEngine:
             raise ValueError("--ple-on-ssd reads the MLX checkpoint's n-gram tables; an EXL3 pack maps its own table "
                              "from its file, so drop --ple-on-ssd")
         from .decode import Engine
-        from .prompt_plan import choose as prompt_plan, long_piece_tokens, storage, use as use_long_pieces
+        from .prompt_plan import (choose as prompt_plan, long_piece_tokens, prompt_tail, storage,
+                                  use as use_long_pieces, use_tail)
         from .kvcache import BITS_OF, check as check_kv
         from .weights import draft_token_ids, load
         from tensorfold.cuda.capacity import admit, config, gather_ints
@@ -133,6 +134,8 @@ class FlashNextEngine:
         chunk = exl3_mm.current().prompt_rows if exl3 else indexed_prefill_rows()
         # TENSORFOLD_LONG_PIECE_TOKENS: an NVFP4 checkpoint's 4,096-row idle pieces, while that many rows remain
         long_from = long_piece_tokens()
+        # TENSORFOLD_PROMPT_TAIL=1: a prompt's last two idle pieces split evenly instead of ending in a short one
+        even_tail = prompt_tail()
 
         if tp not in (1, 2) or rank not in range(tp):
             raise ValueError(f"rank {rank} of {tp}: Flash Next runs on one GPU or two")
@@ -191,6 +194,8 @@ class FlashNextEngine:
         # the MLX checkpoint's wide pieces and a set TENSORFOLD_PREFILL_ROWS keep one width
         self.long_from = long_from if prompt_workspace and storage(text.get("_quantization") or {}) == "nvfp4" else 0
         use_long_pieces(self.long_from)
+        self.even_tail = even_tail
+        use_tail(even_tail)
         if prompt_workspace:
             peak = self.capacity_plan["total_bytes_estimate"] / 2**30
             print(f"[tensorfold] {self.prefill_rows}-row idle prompt workspace {prompt_workspace / 2**30:.2f} GiB; "
@@ -470,7 +475,7 @@ class FlashNextEngine:
         mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len, self.streams,
                              int(self.graphs_enabled),
                              len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype],
-                             self.prefill_rows, int(bool(vision)), int(prompt_precision.fp8())],
+                             self.prefill_rows, int(self.even_tail), int(bool(vision)), int(prompt_precision.fp8())],
                             dtype=torch.int64, device="cuda")
         both = torch.empty((2 * mine.numel(),), dtype=torch.int64, device="cuda")
         self.comm.all_gather(mine, both)
@@ -478,7 +483,8 @@ class FlashNextEngine:
         prompt_precision.same_on_ranks(int(both[0, -1]), int(both[1, -1]))
         if not torch.equal(both[0], both[1]):
             raise RuntimeError(f"the two ranks were started with different settings (drafts, confidence, context, "
-                               f"parallel streams, graphs, draft vocabulary, KV cache, prompt rows, --vision): "
+                               f"parallel streams, graphs, draft vocabulary, KV cache, prompt rows, prompt tail, "
+                               f"--vision): "
                                f"rank 0 {both[0].tolist()}, rank 1 {both[1].tolist()}")
 
     def _key(self, n: int) -> str:

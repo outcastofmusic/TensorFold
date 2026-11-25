@@ -7,6 +7,7 @@ recipe, patch 0014 (MIT licence), built on the TensorFold contributors' kernels.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -17,8 +18,25 @@ COLS = 32                 # output columns a block
 WORDS = 144               # int32 a (32 columns, 32 inputs) block: 128 code words, then 16 of e4m3 scales
 PREFILL_TILE = 16         # this kernel's prompt item: 64 ran 1.53x slower on Flash Next's routed prompts
 TILE_ITEM = 64            # the shared-memory tile's prompt item (MiaAI-Lab's plan)
-TILE_ROWS = 1024          # prompt chunks of at least this many rows take the tile: fewer leave too few pairs an expert
+TILE_ROWS_ENV = "TENSORFOLD_EXPERT_TILE_ROWS"
 TILE_WARPS = 4            # column blocks a tile unit (one CTA)
+
+
+def tile_rows() -> int:
+    """TENSORFOLD_EXPERT_TILE_ROWS (unset or empty: 1,024): prompt chunks of at least this many rows take the tile,
+    fewer leave too few pairs an expert. MiaAI-Lab's recipe starts it at 256. Both kernels write the same bytes
+    (tests/cuda/test_nvfp4_expert_tile.py covers 129 to 4,096 rows), so the switch is for speed A/Bs only
+    (tf-runs/prefill-gap-1028 M3). A value that is not a whole number above 0 stops the start."""
+
+    value = os.environ.get(TILE_ROWS_ENV, "").strip()
+    if not value:
+        return 1024
+    if not value.isdecimal() or int(value) < 1:
+        raise ValueError(f"{TILE_ROWS_ENV}: a row count above 0, not {value!r}")
+    return int(value)
+
+
+TILE_ROWS = tile_rows()   # read once at import: ``tiled`` runs every layer of every pass
 
 
 def _i32(v: torch.Tensor) -> torch.Tensor:

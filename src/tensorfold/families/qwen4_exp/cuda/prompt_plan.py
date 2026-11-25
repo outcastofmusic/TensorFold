@@ -13,6 +13,10 @@ LIVE_ROWS = 3072
 LONG_PIECE_ENV = "TENSORFOLD_LONG_PIECE_TOKENS"
 LONG_PIECE_TOKENS = 8192   # the threshold the 25 Oct sweep picked
 _long_from = 0          # the installed threshold (use): 0 keeps every idle piece at its buffers' rows
+TAIL_ENV = "TENSORFOLD_PROMPT_TAIL"
+TAIL_ROWS = 512         # a last piece shorter than this splits the last two evenly (MiaAI-Lab's recipe 0013)
+TAIL_ALIGN = 16
+_even_tail = False      # the installed rule (use_tail)
 
 
 def long_piece_tokens() -> int:
@@ -27,6 +31,48 @@ def long_piece_tokens() -> int:
     if not value.isdecimal():
         raise ValueError(f"{LONG_PIECE_ENV}: a token count of 0 or more, not {value!r}")
     return int(value)
+
+
+def prompt_tail() -> bool:
+    """TENSORFOLD_PROMPT_TAIL=1 evens out a prompt's last two idle pieces (``even_tail``); unset, empty or 0 keeps
+    the plain cut. Off until the prefill-gap-1028 M3 A/B measures it. Any other value stops the start."""
+
+    value = os.environ.get(TAIL_ENV, "").strip()
+    if value not in ("", "0", "1"):
+        raise ValueError(f"{TAIL_ENV}: 0 or 1, not {value!r}")
+    return value == "1"
+
+
+def use_tail(on: bool) -> bool:
+    """Install the even-tail rule ``piece_rows`` applies; returns the previous setting."""
+
+    global _even_tail
+    previous, _even_tail = _even_tail, bool(on)
+    return previous
+
+
+@contextmanager
+def even_tails(on: bool):
+    """``use_tail(on)`` for the block, then the previous setting again."""
+
+    previous = use_tail(on)
+    try:
+        yield
+    finally:
+        use_tail(previous)
+
+
+def even_tail(width: int, left: int) -> int:
+    """The next piece's rows when ``left`` rows remain and pieces take ``width``: once a full piece would leave fewer
+    than TAIL_ROWS, the last two pieces split ``left`` evenly, the first rounded down to a multiple of TAIL_ALIGN.
+    sparkDash prompts end 39-57 rows past a multiple of 2,048, and that short pass reads almost every expert's
+    weights for a few rows (about 150 ms a prompt on EXL3, tf-runs/prefill-gap-1028). 4,135 rows at 2,048 a piece:
+    2,048, then 1,040 and 1,047."""
+
+    if not 0 < left - width < TAIL_ROWS:
+        return width
+    half = left // 2 // TAIL_ALIGN * TAIL_ALIGN
+    return half if half and left - half <= width else width
 
 
 def use(tokens: int) -> int:
@@ -50,11 +96,11 @@ def long_pieces(tokens: int):
 
 def piece_rows(rows: int, left: int) -> int:
     """An idle piece's rows when ``left`` prompt rows remain to fill: the buffers' ``rows``, or PREFILL_ROWS while
-    fewer than the installed threshold remain. A row's bits do not depend on its piece, so the switch keeps them."""
+    fewer than the installed threshold remain, then evened by ``even_tail`` near the end while TENSORFOLD_PROMPT_TAIL
+    is installed. A row's bits do not depend on its piece, so neither switch changes them."""
 
-    if not _long_from or rows <= PREFILL_ROWS or left >= _long_from:
-        return rows
-    return PREFILL_ROWS
+    width = rows if not _long_from or rows <= PREFILL_ROWS or left >= _long_from else PREFILL_ROWS
+    return even_tail(width, left) if _even_tail else width
 
 
 def warm_widths(rows: int) -> list[int]:
@@ -66,9 +112,10 @@ def warm_widths(rows: int) -> list[int]:
 
 @contextmanager
 def pieces_of(width: int, rows: int):
-    """Every idle piece ``width`` rows for the block (``rows``: the buffers'): a warm-up's fixed widths."""
+    """Every idle piece ``width`` rows for the block (``rows``: the buffers'): a warm-up's fixed widths, its tail
+    left uneven so the warm prompt still runs one full piece."""
 
-    with long_pieces(0 if width == rows else 1 << 62):     # no prompt reaches 2^62 rows: every piece narrows
+    with long_pieces(0 if width == rows else 1 << 62), even_tails(False):   # no prompt reaches 2^62 rows
         yield
 
 
