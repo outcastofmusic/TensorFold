@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..host_table import open_table, shard_keys
+from ..host_table import ReadAhead, open_table, shard_keys
 from .bf16 import b16_from_rows, quantize4, stack_b16
 from tensorfold.cuda import experts as grouped
 
@@ -199,7 +199,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         if table.rows != ngram.rows:
             raise ValueError(f"n-gram tables hold {table.rows} rows, expected {ngram.rows}")
         conv = raw(name + ".conv1d.weight").reshape(cfg.streams * cfg.hidden, cfg.ple_kernel).to(torch.bfloat16)
-        return PLEW(table, b16(name + ".key_proj"), b16(name + ".value_proj"),
+        return PLEW(ReadAhead(table, depth=8), b16(name + ".key_proj"), b16(name + ".value_proj"),
                     cscale(name + ".norm_key.weight"), cscale(name + ".norm_query.weight"),
                     cscale(name + ".norm_conv.weight"), conv.contiguous(), ngram)
 
@@ -369,7 +369,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
 
             in_background(table.prefetch, table_reads)      # the caller waits for it (``wait_all``)
         conv = raw(name + ".conv1d.weight").reshape(cfg.streams * cfg.hidden, cfg.ple_kernel).to(torch.bfloat16)
-        return PLEW(table, q4(name + ".key_proj"), q4(name + ".value_proj"),
+        return PLEW(ReadAhead(table, depth=8), q4(name + ".key_proj"), q4(name + ".value_proj"),
                     cscale(name + ".norm_key.weight"), cscale(name + ".norm_query.weight"),
                     cscale(name + ".norm_conv.weight"), conv.contiguous(), ngram)
 

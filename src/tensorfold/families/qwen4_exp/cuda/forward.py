@@ -511,6 +511,17 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
     return segs
 
 
+def read_ahead(w: Weights, windows: Sequence[tuple[np.ndarray, Sequence[int]]]) -> None:
+    """Start reading the n-gram rows of a coming pass's windows, each (history before it, its tokens): ``stage`` of
+    the same windows then takes rows already read. Tables without ``read_ahead`` read at ``stage`` as before."""
+
+    for layer in w.layers:
+        p = layer.ple
+        if p is not None and hasattr(p.table, "read_ahead"):
+            for history, tokens in windows:
+                p.table.read_ahead(p.ngram.ids(history, np.asarray(tokens, dtype=np.int64)))
+
+
 def compute(w: Weights, segs: Sequence[Seg], b: Buffers, *, logits: bool = True, context: int | None = None,
             ends: Sequence[int] = (), cuts: Sequence[Cut] = (), features=None):
     """The forward's GPU work on staged rows (capturable); ``context`` bounds attention, ``ends`` get the head, ``cuts`` keep states."""

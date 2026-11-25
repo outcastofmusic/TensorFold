@@ -86,7 +86,7 @@ def test_standalone_calibration_uses_completed_nonconvergent_work(converged, fai
     dec.converged, dec.row_s, dec.w, dec.pbuf = converged, prior, object(), object()
     dec.pass_plan, dec.pass_index = None, 0
     dec._pieces, dec._note_passed = lambda *_: pieces, lambda _: None
-    dec._prompt_candidates = lambda *_: None
+    dec._prompt_candidates = dec._read_ahead = lambda *_: None
     dec._end_rows, dec._cuts, dec._absorb = lambda *_: [], lambda *_: [], lambda *_: []
     dec._joined, dec._failed = lambda *args: ("joined", args[-2]), lambda *_: ("failed", None)
     namespace["stage"] = lambda *_: []

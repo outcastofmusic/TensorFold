@@ -162,3 +162,124 @@ class SSDTable:
         """Close the checkpoint's files and the read threads (also done at exit); a later gather raises."""
 
         self._closer()
+
+
+GATHER_ENV = "TF_NGRAM_GATHER"
+PREAD_WORKERS = 64          # reads in flight for a memory-mapped table's gather (Mia's 0013 runs up to 128)
+PREAD_INLINE = 32           # a gather of fewer reads (a decode step's) runs on the calling thread
+_PAGE = 4096
+_pread_pool: ThreadPoolExecutor | None = None
+
+
+def gather_mode() -> str:
+    """TF_NGRAM_GATHER: "mmap" (unset or empty) copies a mapped table's rows out of its memory map on GATHER_THREADS
+    threads; "pread" reads them with os.pread on PREAD_WORKERS threads. Both give the same bytes. On 28 Oct 2026 (CPU,
+    1.1 GB NVFP4 table, 8 cores) pread took 490-600 ms for a 4,096-row piece's 65,536 resident rows against 80-95 for
+    the map, since each read holds the GIL around a 1 us syscall, and 133-144 ms against 57-104 for 8,192 cold rows."""
+
+    mode = os.environ.get(GATHER_ENV, "").strip() or "mmap"
+    if mode not in ("pread", "mmap"):
+        raise ValueError(f"{GATHER_ENV}: pread or mmap, not {mode!r}")
+    return mode
+
+
+def row_reader(components: list[list[np.ndarray]]) -> RowReader | None:
+    """A ``RowReader`` over the tables' memory maps under TF_NGRAM_GATHER=pread, else None (the maps' copy)."""
+
+    return RowReader(components) if gather_mode() == "pread" else None
+
+
+def _shared_pool() -> ThreadPoolExecutor:
+    global _pread_pool
+    if _pread_pool is None:            # one pool for every table: threads start with the first prompt-sized gather
+        _pread_pool = ThreadPoolExecutor(PREAD_WORKERS, thread_name_prefix="ngram-pread")
+    return _pread_pool
+
+
+class RowReader:
+    """The rows a memory-mapped table's fancy index gives, read with os.pread instead of page faults.
+
+    ``components[c][s]`` is component c (words, scales, ...) of shard s: a 2-D read-only ``np.memmap``; the shards of
+    a component share a row width. A gather reads each distinct row once, and rows sharing a page in one read. The
+    reads go through the page cache, so pages the startup prefetch or a pin holds still serve them."""
+
+    def __init__(self, components: list[list[np.ndarray]]) -> None:
+        self._fds: list[int] = []
+        self._closer = weakref.finalize(self, _close_fds, self._fds)
+        opened: dict[str, int] = {}
+        self.parts = []                 # (file index per shard, file offset of row 0 per shard, bytes a row)
+        for arrays in components:
+            fidx, base = [], []
+            for a in arrays:
+                if not isinstance(a, np.memmap) or not a.flags.c_contiguous or a.ndim != 2:
+                    raise ValueError("a pread gather reads contiguous 2-D memory-mapped shards")
+                if a.filename not in opened:
+                    fd = os.open(a.filename, os.O_RDONLY)
+                    self._fds.append(fd)
+                    if hasattr(os, "posix_fadvise"):
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)    # as the maps' MADV_RANDOM: no readahead
+                    opened[a.filename] = len(self._fds) - 1
+                fidx.append(opened[a.filename])
+                base.append(a.offset)
+            widths = {a.shape[1] * a.itemsize for a in arrays}
+            if len(widths) != 1:
+                raise ValueError("the n-gram shards differ in row width")
+            self.parts.append((np.array(fidx, dtype=np.int64), np.array(base, dtype=np.int64), widths.pop()))
+        self.starts = np.cumsum([0] + [a.shape[0] for a in components[0]], dtype=np.int64)
+        self._fd_of = np.array(self._fds, dtype=np.int64)
+
+    def read(self, ids: np.ndarray) -> list[np.ndarray]:
+        """Rows ``ids`` (global, in the table) -> each component's bytes, uint8 [n, bytes a row]."""
+
+        flat = np.asarray(ids, dtype=np.int64).reshape(-1)
+        unique, inverse = np.unique(flat, return_inverse=True)
+        shard = np.searchsorted(self.starts, unique, side="right") - 1
+        local = unique - self.starts[shard]
+        reads, fills = [], []
+        for fidx, base, width in self.parts:
+            buf, rows, at, got = self._spans(fidx[shard], base[shard] + local * width, width)
+            reads += got
+            fills.append((buf, rows, at, width))
+        if len(reads) >= PREAD_INLINE:
+            batches = min(PREAD_WORKERS, len(reads))
+            list(_shared_pool().map(_fill, [reads[i::batches] for i in range(batches)]))
+        else:
+            _fill(reads)
+        outs = []
+        for buf, rows, at, width in fills:
+            out = np.empty((unique.size, width), dtype=np.uint8)
+            out[rows] = buf[at[:, None] + np.arange(width)]
+            outs.append(out[inverse])
+        return outs
+
+    def _spans(self, where: np.ndarray, offsets: np.ndarray, width: int):
+        """Reads covering the rows, a span per run of rows in one file whose next row starts in the page the run
+        ends in: (buffer, row order, each row's place in the buffer, [(fd, offset, size, buffer view, place)])."""
+
+        order = np.lexsort((offsets, where))
+        f, o = where[order], offsets[order]
+        n = o.size
+        if not n:
+            return np.empty(0, np.uint8), order, np.empty(0, np.int64), []
+        cut = np.ones(n, dtype=bool)
+        cut[1:] = (f[1:] != f[:-1]) | (o[1:] // _PAGE > (o[:-1] + width - 1) // _PAGE)
+        first = np.flatnonzero(cut)
+        cut |= (np.arange(n) - first[np.cumsum(cut) - 1]) % max(1, MAX_READ // (width + _PAGE)) == 0
+        first = np.flatnonzero(cut)
+        last = np.append(first[1:], n) - 1
+        sizes = o[last] + width - o[first]
+        places = np.concatenate([[0], np.cumsum(sizes)[:-1]]).astype(np.int64)
+        buf = np.empty(int(sizes.sum()), dtype=np.uint8)
+        span = np.cumsum(cut) - 1
+        at = places[span] + o - o[first][span]
+        view = memoryview(buf)
+        return buf, order, at, list(zip(self._fd_of[f[first]].tolist(), o[first].tolist(), sizes.tolist(),
+                                        [view] * first.size, places.tolist()))
+
+    def close(self) -> None:
+        self._closer()
+
+
+def _close_fds(fds: list[int]) -> None:
+    while fds:
+        os.close(fds.pop())

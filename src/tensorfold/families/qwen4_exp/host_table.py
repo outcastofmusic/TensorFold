@@ -11,11 +11,13 @@ from typing import Any
 
 import numpy as np
 
-from tensorfold.families.qwen4_exp.ssd_table import SSDTable
+from tensorfold.families.qwen4_exp.ssd_table import SSDTable, row_reader
 
 _PARTS = ("weight", "scales", "biases")
-# a prompt chunk's gather copies big row runs on worker threads (GIL released); bytes stay the same as single-threaded
-GATHER_THREADS = 16
+# a prompt chunk's gather copies big row runs on worker threads (GIL released); bytes stay the same as single-threaded.
+# 64: each worker waits on one page fault at a time, so the threads are the reads in flight on a cold table (8,192
+# cold NVFP4 rows took 57-104 ms on 64 against 207-282 on 16, 28 Oct CPU bench); resident rows cost the same
+GATHER_THREADS = 64
 GATHER_SPLIT = 512
 
 
@@ -90,11 +92,15 @@ class HostTable:
         self.nbytes = sum(a.nbytes for a in self.words + self.scales + self.biases)
         # threads start with the first threaded gather
         self._pool = ThreadPoolExecutor(GATHER_THREADS, thread_name_prefix="ngram-gather")
+        self._reader = row_reader([self.words, self.scales, self.biases])
 
     def gather(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Rows ``ids`` (global) -> words [n, W] uint32, scales and biases [n, G] (bf16 bits as uint16)."""
 
         flat = np.asarray(ids, dtype=np.int64).reshape(-1)
+        if self._reader is not None:
+            w, sc, bi = self._reader.read(flat)
+            return w.view(np.uint32), sc.view(np.uint16), bi.view(np.uint16)
         n = len(flat)
         shard = np.searchsorted(self.starts, flat, side="right") - 1
         local = flat - self.starts[shard]
@@ -170,6 +176,7 @@ class BF16Table:
         self.wrow = self.width * 2                      # bytes a row
         self.nbytes = sum(a.nbytes for a in self.values)
         self._pool = ThreadPoolExecutor(GATHER_THREADS, thread_name_prefix="ngram-gather")
+        self._reader = row_reader([self.values])
 
     def _where(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Each id's shard and row in it, after checking the ids lie in the table."""
@@ -184,6 +191,8 @@ class BF16Table:
         """Rows ``ids`` (global) -> [n, W] uint16 (the bf16 bits of W values)."""
 
         shard, local = self._where(ids)
+        if self._reader is not None:                    # the shards' own dtype: FP8Table's lookup takes uint8 codes
+            return self._reader.read(ids)[0].view(self.values[0].dtype)
         out = np.empty((shard.size, self.width), dtype=np.uint16)
 
         def copy(f: int, at: np.ndarray) -> None:
@@ -237,6 +246,7 @@ class FP8Table(BF16Table):
         self.wrow = self.width
         self.nbytes = sum(a.nbytes for a in self.values)
         self._pool = ThreadPoolExecutor(GATHER_THREADS, thread_name_prefix="ngram-gather")
+        self._reader = row_reader([self.values])
         f32 = (e4m3(np.arange(256)) * np.float32(scale)).astype(np.float32).view(np.uint32).astype(np.uint64)
         self.lut = ((f32 + 0x7FFF + ((f32 >> 16) & 1)) >> 16).astype(np.uint16)   # round to nearest even
         self.lut[(np.arange(256) & 0x7F) == 0x7F] = 0x7FC0                         # e4m3's NaN codes stay NaN
@@ -270,18 +280,22 @@ class NVFP4Table(BF16Table):
         self.nbytes = sum(a.nbytes for a in self.values + self.scales)
         self.e2m1, self.e4m3, self.g = E2M1, e4m3(np.arange(256)), np.float32(scale)
         self._pool = ThreadPoolExecutor(GATHER_THREADS, thread_name_prefix="ngram-gather")
+        self._reader = row_reader([self.values, self.scales])
 
     def gather(self, ids: np.ndarray) -> np.ndarray:
         """Rows ``ids`` (global) -> [n, W] uint16: bf16 bits of the fp32 code x block scale x table scale, rounded once."""
 
         shard, local = self._where(ids)
-        codes = np.empty((shard.size, self.width // 2), dtype=np.uint8)
-        blocks = np.empty((shard.size, self.width // 16), dtype=np.uint8)
+        if self._reader is not None:
+            codes, blocks = self._reader.read(ids)
+        else:
+            codes = np.empty((shard.size, self.width // 2), dtype=np.uint8)
+            blocks = np.empty((shard.size, self.width // 16), dtype=np.uint8)
 
-        def copy(f: int, at: np.ndarray) -> None:
-            codes[at], blocks[at] = self.values[f][local[at]], self.scales[f][local[at]]
+            def copy(f: int, at: np.ndarray) -> None:
+                codes[at], blocks[at] = self.values[f][local[at]], self.scales[f][local[at]]
 
-        _copy_rows(self._pool, shard, copy)
+            _copy_rows(self._pool, shard, copy)
         nib = np.stack([codes & 0xF, codes >> 4], -1).reshape(shard.size, self.width)
         v = (self.e2m1[nib] * np.repeat(self.e4m3[blocks], 16, axis=1)).astype(np.float32) * self.g
         f32 = v.astype(np.float32).view(np.uint32).astype(np.uint64)
@@ -289,6 +303,25 @@ class NVFP4Table(BF16Table):
 
     def lock(self) -> bool:
         return False
+
+    def lock_runs(self, budget: int) -> int:
+        """TF_NGRAM_LOCK_SCALES=1: pin the block scales alone (10 of a row's 90 bytes, 3.0 GiB on FP4-Local, whose
+        misses double each row's), within ``budget`` bytes; bytes newly pinned. The container's memlock limit must
+        allow them (``--ulimit memlock``), else mlock refuses and nothing more is pinned. Unset: nothing."""
+
+        from tensorfold.env_flags import flag
+
+        if not flag("TF_NGRAM_LOCK_SCALES"):
+            return 0
+        if not hasattr(self, "_pins"):
+            from tensorfold.cuda.ngram_pages import Pins
+
+            self._pins = Pins()
+        return self._pins.runs(self.scales, max(0, int(budget)))
+
+    @property
+    def pinned_bytes(self) -> int:
+        return self._pins.nbytes if hasattr(self, "_pins") else 0
 
     def prefetch(self, workers: int = 16) -> float:
         return _prefetch(self.values + self.scales, workers)
@@ -336,10 +369,12 @@ class ReadAhead:
 
     depth = 2                           # lookups read ahead at most (the next prompt chunk, and the one after)
 
-    def __init__(self, table: Any) -> None:
+    def __init__(self, table: Any, depth: int | None = None) -> None:
         from concurrent.futures import ThreadPoolExecutor
 
         self.table = table
+        if depth is not None:
+            self.depth = depth
         self._pool = ThreadPoolExecutor(1, thread_name_prefix="ngram-read-ahead")
         self._ahead: dict[bytes, Any] = {}
 
