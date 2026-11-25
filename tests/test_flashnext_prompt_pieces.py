@@ -178,13 +178,18 @@ def test_the_extra_nvfp4_rows_fit_the_bytes_the_plan_adds(monkeypatch, allocatio
 @pytest.mark.parametrize("share,round_s,row_s", [(0, None, None), (0.5, None, None), (0.5, 0.1, 0.0001)])
 def test_idle_pieces_are_wide_and_live_pieces_never_exceed_the_released_limit(share, round_s, row_s):
     assert pass_limit(4096, False, share, round_s, row_s) == 4096
-    assert 128 <= pass_limit(4096, True, share, round_s, row_s) <= 2048
+    assert 128 <= pass_limit(4096, True, share, round_s, row_s) <= 3072
 
 
 def test_decode_share_and_small_test_buffers_keep_their_bounds():
     assert pass_limit(4096, True, 0.5, 0.05, 0.0001) == 960
     assert pass_limit(4096, True, 0.5, 0.0001, 0.0001) == 128
     assert pass_limit(16, True, 0.5, 0.0001, 0.0001) == 16
+
+
+def test_a_pass_beside_decoders_holds_3072_rows_of_a_4096_row_workspace():
+    assert pass_limit(4096, True, 0.0, None, None) == 3072
+    assert pass_limit(2048, True, 0.0, None, None) == 2048       # never past the buffers' rows
 
 
 @pytest.mark.torch
@@ -202,7 +207,7 @@ def test_both_planner_paths_bound_live_pieces_and_restore_idle_width():
     assert dec._pieces() == [(prompt, 0, 4096)]
     reply = SimpleNamespace(done=False)
     dec.streams[2] = reply
-    assert dec._pieces() == dec._pieces(dec._pass_rows()) == [(prompt, 0, 2048)]
+    assert dec._pieces() == dec._pieces(dec._pass_rows()) == [(prompt, 0, 3072)]
     dec.share, dec.round_s, dec.row_s = 0.5, 0.05, 0.0001
     assert dec._pieces() == [(prompt, 0, 960)]
     reply.done = True
@@ -304,4 +309,4 @@ def test_an_idle_pass_narrows_by_the_rows_every_filling_prompt_has_left():
         dec.fills[1][2] = 0
         assert dec._pieces() == [(b, 0, 3000), (a, 0, 1096)]     # 12,000 left
         dec.streams[3] = SimpleNamespace(done=False)
-        assert dec._pass_rows() == 2048                      # live replies keep the released bound
+        assert dec._pass_rows() == 3072                      # beside live replies: LIVE_ROWS
