@@ -15,7 +15,7 @@ from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.sampling import comm_gather, nucleus_rows, sample_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
-from . import CONFIDENCE, DEPTH
+from . import CONFIDENCE, DEPTH, PRODUCT
 from .forward import Cut, commit, cut_snapshot, forward
 from . import image_rows
 from .state import CAND, Buffers, State
@@ -272,11 +272,13 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
     st = e.st
     logits = absorb(e, streams, next_tokens)
     drafts: list[int] = []
+    chance = 1.0                             # the product of the drafts' probabilities so far (PRODUCT)
     for j in range(count):
         low = False
         if confidence > 0:
             d, p = e.sample_draft(logits, position + j, sampling)
-            low = p < confidence
+            chance *= p
+            low = p < confidence or chance < PRODUCT
             if low and j > 0:
                 break
         else:

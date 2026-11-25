@@ -29,7 +29,7 @@ from .multi_fill import FILL_GUARD, PASS_MIN, PromptPasses
 from .prompt_plan import pieces_of, warm_widths
 from .multi_tp import Link as Link
 from .multi_tp import OutOfStep, TwoRanks
-from ..cuda import CONFIDENCE, DEPTH
+from ..cuda import CONFIDENCE, DEPTH, PRODUCT
 
 FIRST, STEP = 256, 8192          # rows an idle slot keeps; rows a stream's caches grow by at a time
 GIB = 1024**3
@@ -667,6 +667,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
         if len(copying) == len(active):
             return steps if probs is not None else None
+        chance: dict[int, float] = {}            # stream id -> the product of its drafts' probabilities (PRODUCT)
         for j in range(self.depth):
             # level one picks for every absorbed stream (the two-rank gather reads them in order); copiers drop out
             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
@@ -682,7 +683,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                         nxt.append((s, row, d))
                         steps[s.sid] += 1
                     continue
-                low = self.confidence > 0 and p < self.confidence
+                chance[s.sid] = chance.get(s.sid, 1.0) * p
+                low = self.confidence > 0 and (p < self.confidence or chance[s.sid] < PRODUCT)
                 if low and j > 0:
                     continue
                 s.drafts.append(d)
