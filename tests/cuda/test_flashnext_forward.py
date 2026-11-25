@@ -393,7 +393,9 @@ def test_the_family_hook_serves_the_recipe(tmp_path, sampling):
     assert (DEPTH, CONFIDENCE, CONTEXT) == (6, 0.7, 8192)
     _checkpoint(tmp_path)
     eng = cuda_engine(tmp_path, context=8185)                  # the synthetic checkpoint names no native window
-    assert (eng.depth, eng.confidence, eng.max_len, eng.tp) == (6, 0.7, 8192, 1)
+    # the cache holds the window plus the widest copy window (COPY_ROWS = 32 since 4d19bfa1, 20 Oct), not depth + 1
+    assert (eng.depth, eng.confidence, eng.copy_rows, eng.tp) == (6, 0.7, 32, 1)
+    assert eng.max_len == 8185 + eng.copy_rows
     assert eng.w.draft_ids is not None
     prompt = [5, 17, 99, 250, 1023, 7, 64, 300, 11, 12, 13]
     first = prefill(eng.e, prompt, sampling)
