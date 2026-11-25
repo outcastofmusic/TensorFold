@@ -11,7 +11,7 @@ from tensorfold.cuda.capacity import available_bytes
 from tensorfold.cuda.markers import MIN_GAP
 from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
 from tensorfold.cuda.sampling import sample_streams
-from tensorfold.cuda.streams import PrefixCache, Stream, accept, next_fill
+from tensorfold.cuda.streams import PrefixCache, Stream, accept, fill_order, next_fill, took_fill
 from tensorfold.engine.grammar import GrammarError, pack
 
 from .decode import COPY_TREE, COPY_TREE_GATE, CopyIndex, _tree_beside, clone_state, hang_tree, next_copy_rows
@@ -272,11 +272,12 @@ class MultiDecoder:
         return []
 
     def _fill(self) -> list[Stream]:
-        """Prefill queued prompts a step: several foreground ones in one forward (``_batch``), else the oldest to its
-        next kept state, or STEP rows while others decode."""
+        """Prefill queued prompts a step: several foreground ones in one forward (``_batch``), else the first in
+        ``fill_order`` to its next kept state, or STEP rows while others decode."""
 
         batch = self._batch() if BATCH and sum(not x.background for x in self.filling) > 1 else []
         if len(batch) > 1:
+            took_fill(self.filling, [s for s, _ in batch])
             return self._fill_batch(batch)
         s = next_fill(self.filling)
         pos, n = s.st.pos, len(s.prompt)
@@ -298,12 +299,12 @@ class MultiDecoder:
         return [s] if s.done else []
 
     def _batch(self) -> list[tuple[Stream, int]]:
-        """Foreground prompts for one prefill forward, oldest first, each to its next kept state or its end: STEP rows
-        in all while streams decode, a forward's prompt rows otherwise; the last one in takes the rows left."""
+        """Foreground prompts for one prefill forward in ``fill_order``, each to its next kept state or its end: STEP
+        rows in all while streams decode, a forward's prompt rows otherwise; the last one in takes the rows left."""
 
         room = STEP if any(not x.done for x in self.streams.values()) else getattr(self.w, "prompt_rows", CHUNK)
         out = []
-        for s in self.filling:
+        for s in fill_order(self.filling):
             if s.background:
                 continue
             if s.vision is not None or room <= 0:          # an image prompt goes alone, in its turn

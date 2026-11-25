@@ -48,6 +48,7 @@ class Stream:
     # the same by drafter, {"mtp": [drafted, kept], "copy": [...]}, when the engine counts them (else None)
     drafters: dict | None = None
     cached: int = 0
+    passed: int = 0                                       # prefill steps other prompts took since this one's last
     disk_tokens: int = 0                                  # of ``cached``, the tokens a state read from disk resumed
     disk_s: float = 0.0
     prefill_s: float = 0.0
@@ -111,10 +112,35 @@ class Stream:
                       carry=self.stats(), owed=[*self.out, *self.owed])
 
 
-def next_fill(filling: list[Stream]) -> Stream:
-    """The queued prompt to prefill next: the oldest foreground one, else the oldest."""
+FILL_GUARD = 8      # prefill steps a queued prompt can be passed over before it goes first (upstream #2276)
 
-    return next((s for s in filling if not s.background), filling[0])
+
+def fill_order(filling: list[Stream]) -> list[Stream]:
+    """Queued prompts in the order they prefill: any passed over FILL_GUARD steps (longest wait first), then
+    foreground before background, then the fewest uncached rows, so a short follow-up resumed from a kept history
+    does not wait behind another request's cold prompt (upstream #2276). Ties keep arrival order."""
+
+    def key(s: Stream):
+        due = s.passed >= FILL_GUARD
+        return (not due, -s.passed if due else 0, s.background, len(s.prompt) - s.st.pos)
+
+    return sorted(filling, key=key)
+
+
+def took_fill(filling: list[Stream], took: list[Stream]) -> None:
+    """Count a prefill step against every queued prompt it left out; one it took starts over."""
+
+    ids = {id(s) for s in took}
+    for s in filling:
+        s.passed = 0 if id(s) in ids else s.passed + 1
+
+
+def next_fill(filling: list[Stream]) -> Stream:
+    """The queued prompt to prefill next (``fill_order``), its step counted against the others."""
+
+    s = fill_order(filling)[0]
+    took_fill(filling, [s])
+    return s
 
 
 def accept(tokens: Sequence[int], parents: Sequence[int], sampled: Sequence[int], room: int,

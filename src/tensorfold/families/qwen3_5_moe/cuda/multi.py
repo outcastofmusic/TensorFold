@@ -88,7 +88,8 @@ class MultiDecoder:
         self.filling.append(s)
 
     def _fill(self) -> list[Stream]:
-        """Prefill the oldest queued prompt a step: to its next kept state, or STEP rows while others decode."""
+        """Prefill the first queued prompt in ``fill_order`` a step: to its next kept state, or STEP rows while others
+        decode."""
 
         s = next_fill(self.filling)
         pos, n = s.st.pos, len(s.prompt)
