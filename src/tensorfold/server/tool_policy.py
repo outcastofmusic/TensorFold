@@ -1,6 +1,7 @@
 import re
 from typing import Any, Callable
 
+from tensorfold.server.code_spans import PENDING, Quoted
 from tensorfold.server.errors import RequestError
 from tensorfold.server.text import _CALLS, _LEADS
 
@@ -16,7 +17,8 @@ class _ToolTextFilter:
     """Hide tool envelopes while retaining only a partial tag between prose deltas.
 
     With ``accept`` (an envelope's text -> whether it parses to an offered call), a closed envelope that is rejected
-    before the one call shows as text, and the first accepted one is the call; without it every envelope hides."""
+    before the one call shows as text, and the first accepted one is the call; without it every envelope hides. An
+    opener quoted in Markdown code shows, and one that may still be waits (upstream #3588)."""
 
     def __init__(self, accept: Callable[[str], bool] | None = None):
         self.accept, self.called = accept, False
@@ -25,9 +27,29 @@ class _ToolTextFilter:
         self.hidden = None              # the closer the hidden envelope ends at
         self.opened = None              # (closer, leads) of an opener whose payload has not shown a lead yet
         self.held: list[str] = []       # that opener and the whitespace after it, shown if no lead follows
+        self.text = ""                  # everything fed, for Markdown code around an opener
+        self.prose = 0                  # where the text after the last hidden envelope begins
 
-    def feed(self, text: str) -> str:
+    def _quoted(self, start: int, finished: bool) -> int | None:
+        """``Quoted.check`` for ``self.pending[start]``, an opener; built only for openers, which are rare."""
+
+        return Quoted(self.text, finished, self.prose).check(len(self.text) - len(self.pending) + start)
+
+    def _code(self, start: int, finished: bool, out: list[str]) -> bool:
+        """For an opener at ``self.pending[start]``: True when it is quoted (its code moved to ``out``) or may still be
+        (nothing moved: the caller waits for more text). ``finished`` decides every place."""
+
+        code = self._quoted(start, finished)
+        if code is None:
+            return False
+        upto = start if code == PENDING else code - (len(self.text) - len(self.pending))
+        out.append(self.pending[:upto])
+        self.pending = self.pending[upto:]
+        return True
+
+    def feed(self, text: str, finished: bool = False) -> str:
         self.pending += text
+        self.text += text
         out = []
         while self.pending:
             if self.hidden:
@@ -41,6 +63,7 @@ class _ToolTextFilter:
                 self.envelope.append(self.pending[:end + len(close)])
                 self.pending = self.pending[end + len(close):]
                 self.hidden = None
+                self.prose = len(self.text) - len(self.pending)
                 if self.accept is not None and not self.called:
                     envelope = "".join(self.envelope)
                     if self.accept(envelope):
@@ -74,6 +97,10 @@ class _ToolTextFilter:
                 opener, closer, leads = envelope
                 if len(self.pending) < len(opener):            # a partial opener: wait for the rest
                     break
+                if self._code(0, finished, out):
+                    if not out[-1]:                            # it may still be quoted: wait
+                        break
+                    continue
                 self.pending = self.pending[len(opener):]
                 if leads:
                     self.opened, self.held = (closer.lower(), leads), [opener]
@@ -94,6 +121,10 @@ class _ToolTextFilter:
                 continue
             name = self.pending[1:end]
             if re.fullmatch(r"(?:[A-Za-z_][\w.-]*:)?tool_call", name, flags=re.I):
+                if self._code(0, finished, out):
+                    if not out[-1]:                            # it may still be quoted: wait
+                        break
+                    continue
                 self.hidden, self.envelope = f"</{name.lower()}>", [self.pending[:end + 1]]
             else:
                 out.append(self.pending[:end + 1])
@@ -101,9 +132,10 @@ class _ToolTextFilter:
         return "".join(out)
 
     def finish(self) -> str:
+        out = self.feed("", finished=True)              # an opener held while it might be quoted is decided now
         tail = "" if self.hidden or self.opened else self.pending
         self.pending, self.opened, self.held = "", None, []
-        return tail
+        return out + tail
 
 
 class ToolCallPolicy:

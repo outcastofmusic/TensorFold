@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from tensorfold.server.code_spans import PENDING, Quoted, live_find
 from tensorfold.server.messages import _normalize_tool_call_arguments, late_system_role, normalize_messages
 
 _THINK_END = "</think>"
@@ -63,7 +64,8 @@ def split_thinking(text: str, *, finished: bool, markers: tuple[str, str] = THIN
         end = close_at if close_at >= 0 and text.startswith(closer, close_at) else -1
     if end >= 0:
         return text[:end], text[end + len(closer):].lstrip("\n")
-    call = min((at for at in (text.find(opener) for opener, _ in _CALLS) if at >= 0), default=-1)
+    quoted = Quoted(text, finished)                   # a call quoted in Markdown code is reasoning (upstream #3588)
+    call = min((at for at in (live_find(text, opener, quoted) for opener, _ in _CALLS) if at >= 0), default=-1)
     if call >= 0:
         # a call written before the block closes: held while the block may still close, the answer if the reply ends
         if not finished:
@@ -101,10 +103,12 @@ def hide_tool_calls(text: str, *, finished: bool, opener: str | None = None) -> 
     soon as they open. Another family's opener in the reply is usually prose that names it, so it hides only once
     its payload starts as that family writes it (``_LEADS``). An opener without leads (``<tool_call>``, LFM2's)
     cannot be told from prose and hides only while the serving family is unknown. A finished reply that ends in
-    another family's opener ends in prose, unless the family is unknown."""
+    another family's opener ends in prose, unless the family is unknown. An opener in Markdown code is prose, and one
+    that may still be (a backtick span not closed yet) waits (upstream #3588)."""
 
     out: list[str] = []
     pos = 0
+    quoted = Quoted(text, finished)
     at = {o: text.find(o) for o, _ in _CALLS}           # each opener's next place; a find only ever moves forward
     while True:
         for o, where in at.items():
@@ -118,6 +122,14 @@ def hide_tool_calls(text: str, *, finished: bool, opener: str | None = None) -> 
             return "".join(out)
         start, found_opener = min(found)
         after = start + len(found_opener)
+        code = quoted.check(start)
+        if code == PENDING:
+            out.append(text[pos:start])
+            return "".join(out)
+        if code is not None:                                            # quoted in code: prose
+            out.append(text[pos:code])
+            pos = code
+            continue
         leads = _LEADS.get(found_opener, ())
         if found_opener != opener and (leads or opener is not None):
             body = _SPACE.match(text, after).end()
@@ -136,6 +148,7 @@ def hide_tool_calls(text: str, *, finished: bool, opener: str | None = None) -> 
         if end < 0:
             return "".join(out)
         pos = end + len(_CLOSERS[found_opener])
+        quoted.jump(pos)
 
 
 def call_opener(rendered: str) -> str | None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Sequence
 
+from tensorfold.server.code_spans import PENDING, Quoted
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas, typed_parameter
 
 _OPEN = "<tool_call>"
@@ -262,6 +263,7 @@ class ToolCallStreamer:
         self.held = ""
         self.streamed = False
         self.calls: list[dict[str, str]] = []      # every call streamed so far: its id, name and arguments sent
+        self.prose = 0          # where the prose after the last closed call begins, for Markdown code (#3588)
 
     def _args(self, fragment: str) -> dict[str, Any]:
         self.calls[self.index]["arguments"] += fragment
@@ -294,17 +296,24 @@ class ToolCallStreamer:
 
         return json.dumps(text, ensure_ascii=False)[1:-1]
 
-    def feed(self, text: str) -> list[dict[str, Any]]:
+    def feed(self, text: str, finished: bool = False) -> list[dict[str, Any]]:
+        """The deltas of ``text`` (the answer so far; ``finished``: all of it) beyond what was fed before. An opener
+        quoted in Markdown code is prose, and one that may still be waits, as the final parser reads them."""
+
         import uuid
 
         out: list[dict[str, Any]] = []
         while self.state != "abort":
             rest = text[self.pos:]
             if self.state == "outside":
-                j = rest.find(_OPEN)
+                j = text.find(_OPEN, self.pos)
+                if j >= 0:
+                    quoted = Quoted(text, finished, self.prose)
+                    while j >= 0 and (code := quoted.check(j)) is not None:
+                        j = -1 if code == PENDING else text.find(_OPEN, code)
                 if j < 0:
                     break
-                self.pos += j + len(_OPEN)
+                self.pos = j + len(_OPEN)
                 self.state = "call"
             elif self.state == "call":
                 m = re.match(r"\s*<function=([^>\n]+)>\n?", rest)
@@ -379,6 +388,7 @@ class ToolCallStreamer:
                 if m is None:
                     break
                 self.pos += m.end()
+                self.prose = self.pos
                 self.state = "outside"
         return out
 
